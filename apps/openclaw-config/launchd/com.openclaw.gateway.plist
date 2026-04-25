@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.openclaw.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/zsh</string>
+      <string>-lc</string>
+      <string>export PATH="$HOME/.local/node-v24/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; set -a; [ -f "__REPO_ROOT__/.env.local" ] &amp;&amp; source "__REPO_ROOT__/.env.local"; set +a; openclaw gateway run --force</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/openclaw-gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/openclaw-gateway.err.log</string>
+  </dict>
+</plist>
