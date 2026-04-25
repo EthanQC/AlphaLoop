@@ -127,7 +127,7 @@ function renderDailyReport(info, data) {
     `- 交易/执行报告：${tradeRows.length} 条，其中拒绝/未执行 ${rejectedRows.length} 条。`,
     `- 建议/偏好报告：${dailyRows.length} 条。`,
     `- 人工审批编辑：${data.approvalRows.length} 条。`,
-    `- 规则提案：${data.proposalRows.length} 条。`,
+    `- 规则提案：${data.proposalRows.length} 条（只摘要，未确认不生效）。`,
     `- 当前本地模拟盘持仓：${data.paperPositions.length} 个。`,
     "- 期权自动化：已禁用，不纳入日报生成、建议或执行。",
     "",
@@ -180,7 +180,7 @@ function renderWeeklyReport(info, data) {
     "",
     `- 执行/交易报告：${tradeRows.length} 条。`,
     `- 日常建议/偏好报告：${dailyRows.length} 条。`,
-    `- 规则提案：${data.proposalRows.length} 条。`,
+    `- 规则提案：${data.proposalRows.length} 条（周报只摘要，不自动应用）。`,
     `- 当前本地模拟盘持仓：${data.paperPositions.length} 个。`,
     "- 期权自动化：已禁用，周报只保留历史风险提示，不提供任何期权行动建议。",
     "",
@@ -243,13 +243,18 @@ function renderProposalDigest(rows) {
   }
 
   return rows.map((row) => [
-    `### ${translateRuleScope(row.scope)}：${translateRuleRecommendation(row.recommendation)}`,
+    `### ${singleLine(row.title) || `${translateRuleScope(row.scope)}：${translateRuleRecommendation(row.recommendation)}`}`,
     "",
+    `- 提案编号：${row.id}`,
     `- 时间：${row.created_at}`,
     `- 版本：${row.current_version} -> ${row.candidate_version}`,
+    `- 生命周期：${translateProposalStatus(row.status)}；未确认不生效。`,
+    `- 推荐动作：${translateRuleRecommendation(row.recommendation)}`,
+    `- 触发原因：${renderChineseProposalText(row.trigger_reason || row.summary)}`,
     `- 摘要：${renderChineseProposalSummary(row.summary)}`,
     `- 旧新对比：${renderChineseRuleComparison(row)}`,
-    "- 激活状态：未自动激活，等待人工确认。"
+    `- 风险：${renderChineseRisks(row.risks)}`,
+    "- 激活状态：报告只做摘要；必须人工运行带确认参数的激活脚本后才会生效。"
   ].join("\n")).join("\n\n");
 }
 
@@ -384,6 +389,8 @@ function translateRuleScope(scope) {
 
 function translateRuleRecommendation(recommendation) {
   const labels = {
+    suggest_activation: "建议激活（仍需人工确认）",
+    continue_observe: "继续观察",
     promote: "建议形成候选版本",
     hold: "继续观察",
     reject: "不建议采用"
@@ -391,8 +398,21 @@ function translateRuleRecommendation(recommendation) {
   return labels[recommendation] ?? `建议 ${recommendation}`;
 }
 
+function translateProposalStatus(status) {
+  const labels = {
+    pending_confirmation: "待人工确认",
+    activated: "已由人工确认激活",
+    rejected: "已由人工拒绝",
+    archived: "已归档"
+  };
+  return labels[status] ?? "待人工确认";
+}
+
 function renderChineseProposalSummary(value) {
   const text = String(value ?? "");
+  if (containsCjk(text)) {
+    return singleLine(text);
+  }
   if (/live rules have enough local evidence/iu.test(text)) {
     return "本地证据支持生成实盘候选更新，但不会自动激活。";
   }
@@ -403,6 +423,14 @@ function renderChineseProposalSummary(value) {
 }
 
 function renderChineseRuleComparison(row) {
+  const comparisons = normalizeComparisonRows(row.old_vs_new);
+  if (comparisons.length > 0) {
+    return comparisons
+      .slice(0, 4)
+      .map((entry) => `${entry.field}：${entry.oldValue} -> ${entry.newValue}（${entry.reason}）`)
+      .join("；");
+  }
+
   const delta = translateKnownRuleDelta(row.old_vs_new);
   const parts = [
     `旧版本 ${row.current_version ?? "未知"}`,
@@ -421,6 +449,65 @@ function translateKnownRuleDelta(value) {
     return "本窗口暂不推荐修改规则，继续收集执行和审批证据。";
   }
   return null;
+}
+
+function renderChineseProposalText(value) {
+  const text = singleLine(value);
+  return containsCjk(text) ? text : "触发原因已入库；旧英文模板不会在报告中展开，需查看归档记录。";
+}
+
+function renderChineseRisks(value) {
+  const risks = parseJsonArray(value)
+    .filter((entry) => typeof entry === "string" && entry.trim().length > 0)
+    .map((entry) => singleLine(entry, 100));
+  if (risks.length === 0) {
+    return "风险已入库；人工确认前必须复核完整提案。";
+  }
+  return risks.slice(0, 3).join("；");
+}
+
+function normalizeComparisonRows(value) {
+  const parsed = parseJsonArray(value);
+  return parsed
+    .map((entry) => {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        return {
+          field: singleLine(entry.field ?? "规则项", 60),
+          oldValue: singleLine(entry.oldValue ?? "", 80),
+          newValue: singleLine(entry.newValue ?? "", 80),
+          reason: singleLine(entry.reason ?? "人工确认前复核。", 100)
+        };
+      }
+      if (typeof entry === "string") {
+        const translated = translateKnownRuleDelta(entry);
+        return translated
+          ? {
+              field: "旧格式提案",
+              oldValue: "旧模板",
+              newValue: translated,
+              reason: "历史提案仅供归档参考。"
+            }
+          : null;
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function containsCjk(value) {
+  return /[\u3400-\u9fff]/u.test(String(value ?? ""));
 }
 
 function renderPreferenceSnapshot(row) {
@@ -506,14 +593,43 @@ function selectApprovalRows(db, info) {
 }
 
 function selectProposalRows(db, info) {
+  ensureProposalReportColumns(db);
   return db
     .prepare(`
-      SELECT scope, summary, old_vs_new, evidence, recommendation, current_version, candidate_version, created_at
+      SELECT id, title, scope, summary, trigger_reason, old_vs_new, evidence, expected_benefit,
+             risks, rollback_plan, recommendation, status, current_version, candidate_version, created_at
       FROM rule_proposals
+      WHERE COALESCE(status, 'pending_confirmation') != 'archived'
+        AND NOT (
+          COALESCE(title, '') = ''
+          AND (
+            summary LIKE 'live rules have enough local evidence%'
+            OR summary LIKE 'paper rules remain on hold%'
+            OR old_vs_new LIKE '%No rule delta recommended yet%'
+            OR old_vs_new LIKE '%Tighten live entry discipline%'
+          )
+        )
       ORDER BY created_at ASC
     `)
     .all()
     .filter((row) => isWithinWindow(row.created_at, info));
+}
+
+function ensureProposalReportColumns(db) {
+  ensureReportColumn(db, "rule_proposals", "title", "TEXT NOT NULL DEFAULT ''");
+  ensureReportColumn(db, "rule_proposals", "trigger_reason", "TEXT NOT NULL DEFAULT ''");
+  ensureReportColumn(db, "rule_proposals", "expected_benefit", "TEXT NOT NULL DEFAULT ''");
+  ensureReportColumn(db, "rule_proposals", "risks", "TEXT NOT NULL DEFAULT '[]'");
+  ensureReportColumn(db, "rule_proposals", "rollback_plan", "TEXT NOT NULL DEFAULT ''");
+  ensureReportColumn(db, "rule_proposals", "status", "TEXT NOT NULL DEFAULT 'pending_confirmation'");
+}
+
+function ensureReportColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((entry) => entry.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
 }
 
 function selectPaperPositions(db) {

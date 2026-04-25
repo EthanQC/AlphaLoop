@@ -9,7 +9,7 @@ This folder contains the OpenClaw-side configuration templates for the local tra
 - `launchd/*.plist`: macOS LaunchAgent templates
 - `scripts/*.sh`: helper scripts to sync workspaces and install LaunchAgents
 - `scripts/bootstrap-preferences.mjs`: build a baseline preference snapshot from notes and approvals
-- `scripts/generate-rule-proposal.mjs`: generate local rule proposals from reports and approvals
+- `scripts/generate-rule-proposal.mjs`: 从 SQLite 执行事实、审批编辑和当前规则生成中文、待确认、可审计的规则提案
 
 ## Setup flow
 
@@ -41,6 +41,12 @@ pnpm install
 pnpm build
 pnpm preferences:bootstrap
 pnpm proposals:generate
+```
+
+规则提案默认不会激活。若人工确认候选规则已落地，需要显式运行：
+
+```bash
+node apps/openclaw-config/scripts/activate-rule-version.mjs activate <live|paper> <version> --proposal-id <id> --confirm HUMAN_APPROVED
 ```
 
 8. Install the sidecar LaunchAgents and the official OpenClaw gateway service:
