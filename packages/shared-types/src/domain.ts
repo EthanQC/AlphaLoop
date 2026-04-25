@@ -15,6 +15,14 @@ export type Environment = "live" | "paper" | "shadow";
 export type OrderSide = "buy" | "sell";
 export type RiskDecisionStatus = "allow" | "block" | "require_review";
 export type QueueStatus = "pending" | "inflight" | "acked" | "dead_letter";
+export type ExecutionResultStatus = "accepted" | "rejected" | "simulated" | "submitted" | "pending";
+export type OfficialPaperOrderLifecycleStage =
+  | "submitted"
+  | "pending"
+  | "filled"
+  | "cancelled"
+  | "rejected"
+  | "unknown";
 export type OptionStrategy =
   | "long_call"
   | "long_put"
@@ -75,12 +83,39 @@ export interface RiskDecision {
 export interface ExecutionResult {
   ticketId: string;
   environment: Environment;
-  status: "accepted" | "rejected" | "simulated";
+  status: ExecutionResultStatus;
   provider: "broker-executor" | "longbridge-paper" | "paper-sim" | "options-shadow";
   externalOrderId?: string;
   fillPrice?: number;
+  limitPrice?: number;
+  brokerStatus?: string;
+  brokerOrderStage?: OfficialPaperOrderLifecycleStage;
+  submittedAt?: string;
+  observedAt?: string;
+  rawBrokerPayload?: JsonValue;
   reportId?: string;
   reasons: string[];
+}
+
+export interface OfficialPaperOrderLifecycle {
+  id: string;
+  ticketId?: string;
+  externalOrderId: string;
+  provider: "longbridge-paper";
+  environment: "paper";
+  accountMode: "paper";
+  symbol: string;
+  assetClass: EquityAssetClass;
+  side: OrderSide;
+  quantity: number;
+  limitPrice?: number;
+  brokerStatus: string;
+  localStatus: ExecutionResultStatus;
+  lifecycleStage: OfficialPaperOrderLifecycleStage;
+  submittedAt: string;
+  lastObservedAt: string;
+  raw?: JsonValue;
+  notes: string[];
 }
 
 export interface AdviceCard {
@@ -128,16 +163,41 @@ export interface RuleSet {
   notes: string[];
 }
 
+export type RuleProposalStatus = "pending_confirmation" | "activated" | "rejected" | "archived";
+export type RuleProposalRecommendation =
+  | "suggest_activation"
+  | "continue_observe"
+  | "reject"
+  | "promote"
+  | "hold";
+
+export interface RuleProposalComparison {
+  field: string;
+  oldValue: string;
+  newValue: string;
+  reason: string;
+}
+
 export interface RuleProposal {
   id: string;
   createdAt: string;
   scope: "live" | "paper";
   currentVersion: string;
   candidateVersion: string;
+  title: string;
   summary: string;
-  oldVsNew: string[];
+  triggerReason: string;
+  oldVsNew: RuleProposalComparison[];
   evidence: string[];
-  recommendation: "promote" | "hold";
+  expectedBenefit: string;
+  risks: string[];
+  rollbackPlan: string;
+  recommendation: RuleProposalRecommendation;
+  status: RuleProposalStatus;
+  proposalPath?: string;
+  decidedAt?: string;
+  decidedBy?: string;
+  decisionReason?: string;
 }
 
 export interface ExecutionReport {

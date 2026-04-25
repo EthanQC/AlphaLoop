@@ -7,11 +7,13 @@ import type {
   ApprovalEdit,
   Event,
   ExecutionReport,
+  OfficialPaperOrderLifecycle,
   OptionContract,
   PaperPosition,
   PreferenceSnapshot,
   QueueRecord,
   QueueStatus,
+  RuleProposalComparison,
   RuleProposal,
   RuleSet,
   ShadowPosition
@@ -212,7 +214,51 @@ export function migrate(db: DatabaseSync): void {
       status TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS official_paper_order_lifecycle (
+      id TEXT PRIMARY KEY,
+      ticket_id TEXT,
+      external_order_id TEXT NOT NULL UNIQUE,
+      provider TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      account_mode TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      asset_class TEXT NOT NULL,
+      side TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      limit_price REAL,
+      broker_status TEXT NOT NULL,
+      local_status TEXT NOT NULL,
+      lifecycle_stage TEXT NOT NULL,
+      submitted_at TEXT NOT NULL,
+      last_observed_at TEXT NOT NULL,
+      raw TEXT NOT NULL,
+      notes TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
+      ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
   `);
+
+  ensureColumn(db, "rule_proposals", "title", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "rule_proposals", "trigger_reason", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "rule_proposals", "expected_benefit", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "rule_proposals", "risks", "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(db, "rule_proposals", "rollback_plan", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "rule_proposals", "status", "TEXT NOT NULL DEFAULT 'pending_confirmation'");
+  ensureColumn(db, "rule_proposals", "proposal_path", "TEXT");
+  ensureColumn(db, "rule_proposals", "decided_at", "TEXT");
+  ensureColumn(db, "rule_proposals", "decided_by", "TEXT");
+  ensureColumn(db, "rule_proposals", "decision_reason", "TEXT");
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (columns.some((entry) => entry.name === column)) {
+    return;
+  }
+
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
 }
 
 export class EventStoreRepository {
@@ -540,6 +586,66 @@ export class ExecutionReportRepository {
   }
 }
 
+export class OfficialPaperOrderLifecycleRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  save(record: OfficialPaperOrderLifecycle): void {
+    this.db
+      .prepare(`
+        INSERT INTO official_paper_order_lifecycle
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(external_order_id) DO UPDATE SET
+          ticket_id = COALESCE(excluded.ticket_id, official_paper_order_lifecycle.ticket_id),
+          provider = excluded.provider,
+          environment = excluded.environment,
+          account_mode = excluded.account_mode,
+          symbol = excluded.symbol,
+          asset_class = excluded.asset_class,
+          side = excluded.side,
+          quantity = excluded.quantity,
+          limit_price = COALESCE(excluded.limit_price, official_paper_order_lifecycle.limit_price),
+          broker_status = excluded.broker_status,
+          local_status = excluded.local_status,
+          lifecycle_stage = excluded.lifecycle_stage,
+          submitted_at = official_paper_order_lifecycle.submitted_at,
+          last_observed_at = excluded.last_observed_at,
+          raw = excluded.raw,
+          notes = excluded.notes
+      `)
+      .run(
+        record.id,
+        record.ticketId ?? null,
+        record.externalOrderId,
+        record.provider,
+        record.environment,
+        record.accountMode,
+        record.symbol,
+        record.assetClass,
+        record.side,
+        record.quantity,
+        record.limitPrice ?? null,
+        record.brokerStatus,
+        record.localStatus,
+        record.lifecycleStage,
+        record.submittedAt,
+        record.lastObservedAt,
+        toJson(record.raw ?? null),
+        toJson(record.notes)
+      );
+  }
+
+  listRecent(limit = 50): OfficialPaperOrderLifecycle[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM official_paper_order_lifecycle ORDER BY last_observed_at DESC LIMIT ?`)
+      .all(limit) as Array<Record<string, unknown>>;
+
+    return rows.map(mapOfficialPaperOrderLifecycle);
+  }
+}
+
 export interface NotificationTarget {
   channel: string;
   targetType: "open_id" | "chat_id";
@@ -591,8 +697,10 @@ export class RuleProposalRepository {
     this.db
       .prepare(`
         INSERT OR REPLACE INTO rule_proposals
-        (id, created_at, scope, current_version, candidate_version, summary, old_vs_new, evidence, recommendation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, created_at, scope, current_version, candidate_version, title, summary, trigger_reason,
+         old_vs_new, evidence, expected_benefit, risks, rollback_plan, recommendation, status,
+         proposal_path, decided_at, decided_by, decision_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         proposal.id,
@@ -600,10 +708,20 @@ export class RuleProposalRepository {
         proposal.scope,
         proposal.currentVersion,
         proposal.candidateVersion,
+        proposal.title,
         proposal.summary,
+        proposal.triggerReason,
         toJson(proposal.oldVsNew),
         toJson(proposal.evidence),
-        proposal.recommendation
+        proposal.expectedBenefit,
+        toJson(proposal.risks),
+        proposal.rollbackPlan,
+        proposal.recommendation,
+        proposal.status,
+        proposal.proposalPath ?? null,
+        proposal.decidedAt ?? null,
+        proposal.decidedBy ?? null,
+        proposal.decisionReason ?? null
       );
   }
 
@@ -876,6 +994,38 @@ function mapPaperPosition(row: Record<string, unknown>): PaperPosition {
   };
 }
 
+function mapOfficialPaperOrderLifecycle(row: Record<string, unknown>): OfficialPaperOrderLifecycle {
+  const limitPrice = row.limit_price === null || row.limit_price === undefined
+    ? undefined
+    : Number(row.limit_price);
+
+  const lifecycle: OfficialPaperOrderLifecycle = {
+    id: String(row.id),
+    ...(row.ticket_id ? { ticketId: String(row.ticket_id) } : {}),
+    externalOrderId: String(row.external_order_id),
+    provider: "longbridge-paper",
+    environment: "paper",
+    accountMode: "paper",
+    symbol: String(row.symbol),
+    assetClass: String(row.asset_class) as OfficialPaperOrderLifecycle["assetClass"],
+    side: String(row.side) as OfficialPaperOrderLifecycle["side"],
+    quantity: Number(row.quantity),
+    brokerStatus: String(row.broker_status),
+    localStatus: String(row.local_status) as OfficialPaperOrderLifecycle["localStatus"],
+    lifecycleStage: String(row.lifecycle_stage) as OfficialPaperOrderLifecycle["lifecycleStage"],
+    submittedAt: String(row.submitted_at),
+    lastObservedAt: String(row.last_observed_at),
+    raw: fromJson(String(row.raw)),
+    notes: fromJson<string[]>(String(row.notes))
+  };
+
+  if (limitPrice !== undefined && Number.isFinite(limitPrice)) {
+    lifecycle.limitPrice = limitPrice;
+  }
+
+  return lifecycle;
+}
+
 function mapAdviceCard(row: Record<string, unknown>): AdviceCard {
   return {
     id: String(row.id),
@@ -901,9 +1051,44 @@ function mapRuleProposal(row: Record<string, unknown>): RuleProposal {
     scope: String(row.scope) as RuleProposal["scope"],
     currentVersion: String(row.current_version),
     candidateVersion: String(row.candidate_version),
+    title: String(row.title ?? ""),
     summary: String(row.summary),
-    oldVsNew: fromJson<string[]>(String(row.old_vs_new)),
+    triggerReason: String(row.trigger_reason ?? ""),
+    oldVsNew: normalizeRuleProposalComparisons(fromJson<unknown>(String(row.old_vs_new))),
     evidence: fromJson<string[]>(String(row.evidence)),
-    recommendation: String(row.recommendation) as RuleProposal["recommendation"]
+    expectedBenefit: String(row.expected_benefit ?? ""),
+    risks: fromJson<string[]>(String(row.risks ?? "[]")),
+    rollbackPlan: String(row.rollback_plan ?? ""),
+    recommendation: String(row.recommendation) as RuleProposal["recommendation"],
+    status: String(row.status ?? "pending_confirmation") as RuleProposal["status"],
+    ...(row.proposal_path ? { proposalPath: String(row.proposal_path) } : {}),
+    ...(row.decided_at ? { decidedAt: String(row.decided_at) } : {}),
+    ...(row.decided_by ? { decidedBy: String(row.decided_by) } : {}),
+    ...(row.decision_reason ? { decisionReason: String(row.decision_reason) } : {})
   };
+}
+
+function normalizeRuleProposalComparisons(value: unknown): RuleProposalComparison[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map((entry) => {
+    if (typeof entry === "object" && entry !== null) {
+      const candidate = entry as Partial<RuleProposalComparison>;
+      return {
+        field: String(candidate.field ?? "未命名规则项"),
+        oldValue: String(candidate.oldValue ?? ""),
+        newValue: String(candidate.newValue ?? ""),
+        reason: String(candidate.reason ?? "")
+      };
+    }
+
+    return {
+      field: "旧格式提案",
+      oldValue: String(entry),
+      newValue: "已归档或待人工重写",
+      reason: "历史字符串格式不再作为可激活规则差异。"
+    };
+  });
 }

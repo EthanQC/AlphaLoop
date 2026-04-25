@@ -3,9 +3,11 @@ import { createServer } from "node:http";
 import {
   AuditLogRepository,
   ExecutionReportRepository,
+  OfficialPaperOrderLifecycleRepository,
   PaperBookRepository,
   RuleRegistry,
   type ExecutionResult,
+  type OrderTicket,
   assertOrderTicket,
   createId,
   loadLocalEnv,
@@ -30,6 +32,7 @@ const { dbPath } = resolveRuntimePaths(repoRoot);
 const db = openTradingDatabase(dbPath);
 const audit = new AuditLogRepository(db);
 const reports = new ExecutionReportRepository(db);
+const officialPaperOrders = new OfficialPaperOrderLifecycleRepository(db);
 const rules = new RuleRegistry(repoRoot);
 const paperBook = new PaperBookRepository(db);
 const paperEngine = new PaperExecutionEngine(paperBook);
@@ -50,6 +53,8 @@ const server = createServer(async (req, res) => {
         service: "broker-executor",
         liveExecutionEnabled,
         officialPaperExecutionEnabled,
+        accountMode: process.env.LONGBRIDGE_ACCOUNT_MODE ?? "unset",
+        optionAutomationEnabled: false,
         longbridgeAuth: sanitizeLongbridgeAuth(longbridgeAuth),
         paperOpenPositions: paperBook.listOpenPositions().length
       });
@@ -132,7 +137,7 @@ const server = createServer(async (req, res) => {
         id: reportId,
         category: "trade",
         title: `Execution report for ${body.ticket.symbol}`,
-        body: buildExecutionReportBody(body.ticket.id, result.reasons),
+        body: buildExecutionReportBody(body.ticket.id, result),
         metadata: {
           ticketId: body.ticket.id,
           environment: body.ticket.environment,
@@ -141,6 +146,8 @@ const server = createServer(async (req, res) => {
         },
         createdAt: new Date().toISOString()
       });
+
+      saveOfficialPaperLifecycle(body.ticket, result);
 
       audit.write("broker-executor", "ticket.processed", {
         ticketId: body.ticket.id,
@@ -166,9 +173,28 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`broker-executor listening on http://127.0.0.1:${port}`);
 });
 
-function buildExecutionReportBody(ticketId: string, reasons: string[]): string {
-  const lines = [`Ticket: ${ticketId}`, "", "Reasons:"];
-  for (const reason of reasons) {
+function buildExecutionReportBody(ticketId: string, result: ExecutionResult): string {
+  const lines = [
+    `Ticket: ${ticketId}`,
+    `Status: ${result.status}`,
+    `Provider: ${result.provider}`
+  ];
+
+  if (result.externalOrderId) {
+    lines.push(`External order id: ${result.externalOrderId}`);
+  }
+  if (result.brokerStatus) {
+    lines.push(`Broker status: ${result.brokerStatus}`);
+  }
+  if (result.brokerOrderStage) {
+    lines.push(`Lifecycle stage: ${result.brokerOrderStage}`);
+  }
+  if (typeof result.limitPrice === "number") {
+    lines.push(`Limit price: ${result.limitPrice.toFixed(2)}`);
+  }
+
+  lines.push("", "Reasons:");
+  for (const reason of result.reasons) {
     lines.push(`- ${reason}`);
   }
   return lines.join("\n");
@@ -177,4 +203,37 @@ function buildExecutionReportBody(ticketId: string, reasons: string[]): string {
 function sanitizeLongbridgeAuth(state: LongbridgeAuthState): Omit<LongbridgeAuthState, "tokenPath"> {
   const { tokenPath: _tokenPath, ...safeState } = state;
   return safeState;
+}
+
+function saveOfficialPaperLifecycle(ticket: OrderTicket, result: ExecutionResult): void {
+  if (
+    result.provider !== "longbridge-paper" ||
+    ticket.environment !== "paper" ||
+    (ticket.assetClass !== "stock" && ticket.assetClass !== "etf") ||
+    !result.externalOrderId
+  ) {
+    return;
+  }
+
+  const observedAt = result.observedAt ?? new Date().toISOString();
+  officialPaperOrders.save({
+    id: `lb_order_${result.externalOrderId}`,
+    ticketId: ticket.id,
+    externalOrderId: result.externalOrderId,
+    provider: "longbridge-paper",
+    environment: "paper",
+    accountMode: "paper",
+    symbol: ticket.symbol,
+    assetClass: ticket.assetClass,
+    side: ticket.side,
+    quantity: ticket.quantity,
+    ...(typeof result.limitPrice === "number" ? { limitPrice: result.limitPrice } : {}),
+    brokerStatus: result.brokerStatus ?? "unknown",
+    localStatus: result.status,
+    lifecycleStage: result.brokerOrderStage ?? "unknown",
+    submittedAt: result.submittedAt ?? ticket.submittedAt,
+    lastObservedAt: observedAt,
+    raw: result.rawBrokerPayload ?? toJsonValue(result),
+    notes: result.reasons
+  });
 }

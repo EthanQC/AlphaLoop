@@ -26,7 +26,7 @@ const LONG_BRIDGE_LIMITS = {
 };
 
 export async function runLongbridgeJson(category, args) {
-  return JSON.parse(await runLongbridgeText(category, [...args, "--format", "json"]));
+  return parseLongbridgeJson(await runLongbridgeText(category, [...args, "--format", "json"]));
 }
 
 export async function runLongbridgeText(category, args) {
@@ -43,7 +43,8 @@ export async function runLongbridgeText(category, args) {
     await waitForWindow(statePath, config);
     const cli = resolveLongbridgeCli();
     return execFileSync(cli, args, {
-      encoding: "utf8"
+      encoding: "utf8",
+      env: buildLongbridgeCliEnv()
     }).trim();
   } finally {
     release();
@@ -52,6 +53,102 @@ export async function runLongbridgeText(category, args) {
 
 function resolveLongbridgeCli() {
   return process.env.LONGBRIDGE_CLI_PATH ?? `${process.env.HOME}/.local/bin/longbridge`;
+}
+
+function buildLongbridgeCliEnv() {
+  const env = { ...process.env };
+  for (const key of [
+    "LONGBRIDGE_ACCESS_TOKEN",
+    "LONGPORT_ACCESS_TOKEN"
+  ]) {
+    if (!env[key]?.trim()) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+function parseLongbridgeJson(output) {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const embedded = parseFirstEmbeddedJson(trimmed);
+    if (embedded !== undefined) {
+      return embedded;
+    }
+    throw new Error(`Longbridge CLI did not return parseable JSON: ${trimmed.slice(0, 120)}`);
+  }
+}
+
+function parseFirstEmbeddedJson(text) {
+  for (let index = 0; index < text.length; index += 1) {
+    const marker = text[index];
+    if (marker !== "{" && marker !== "[") {
+      continue;
+    }
+
+    const jsonText = readBalancedJson(text, index);
+    if (!jsonText) {
+      continue;
+    }
+
+    try {
+      return JSON.parse(jsonText);
+    } catch {
+      // Keep scanning; Longbridge progress text can contain bracketed terminal sequences.
+    }
+  }
+
+  return undefined;
+}
+
+function readBalancedJson(text, start) {
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{" || char === "[") {
+      stack.push(char === "{" ? "}" : "]");
+      continue;
+    }
+
+    if (char === "}" || char === "]") {
+      const expected = stack.pop();
+      if (expected !== char) {
+        return undefined;
+      }
+
+      if (stack.length === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return undefined;
 }
 
 async function waitForWindow(statePath, config) {
