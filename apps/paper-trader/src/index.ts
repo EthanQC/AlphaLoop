@@ -1,7 +1,4 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { createServer } from "node:http";
-import { join } from "node:path";
 
 import {
   AuditLogRepository,
@@ -24,7 +21,6 @@ import {
   type OrderTicket
 } from "@packages/shared-types";
 
-const execFileAsync = promisify(execFile);
 const repoRoot = resolveRepoRoot(process.cwd());
 loadLocalEnv(repoRoot);
 const { dbPath } = resolveRuntimePaths(repoRoot);
@@ -120,7 +116,6 @@ async function claimAndTrade(limit = 10): Promise<{ claimed: number; traded: num
     }
   }
 
-  await ensureReports();
   return {
     claimed: body.records.length,
     traded,
@@ -306,77 +301,6 @@ async function submitTicket(ticket: OrderTicket): Promise<{ reasons: string[] }>
   return {
     reasons: body.reasons ?? []
   };
-}
-
-async function ensureReports(): Promise<void> {
-  const todayLabel = getLocalDateLabel(new Date());
-  await execFileAsync(
-    process.execPath,
-    [join(repoRoot, "apps", "openclaw-config", "scripts", "bootstrap-preferences.mjs")],
-    {
-      cwd: repoRoot
-    }
-  );
-
-  await execFileAsync(
-    process.execPath,
-    [join(repoRoot, "apps", "openclaw-config", "scripts", "generate-rule-proposal.mjs")],
-    {
-      cwd: repoRoot
-    }
-  );
-
-  await execFileAsync(
-    process.execPath,
-    [join(repoRoot, "apps", "openclaw-config", "scripts", "generate-daily-report.mjs"), todayLabel],
-    {
-      cwd: repoRoot
-    }
-  );
-
-  const weeklyLabel = getMondayLabel(new Date());
-  await execFileAsync(
-    process.execPath,
-    [join(repoRoot, "apps", "openclaw-config", "scripts", "generate-weekly-report.mjs"), weeklyLabel],
-    {
-      cwd: repoRoot
-    }
-  );
-}
-
-function getMondayLabel(date: Date): string {
-  const currentLabel = getLocalDateLabel(date);
-  const day = getLocalDayOfWeek(date);
-  const [year, month, dayOfMonth] = currentLabel.split("-").map(Number);
-  const monday = new Date(Date.UTC(year ?? 1970, (month ?? 1) - 1, dayOfMonth ?? 1));
-  monday.setUTCDate(monday.getUTCDate() - day + 1);
-  return monday.toISOString().slice(0, 10);
-}
-
-function getLocalDateLabel(date: Date): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: process.env.TRADING_TIMEZONE ?? "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(date);
-}
-
-function getLocalDayOfWeek(date: Date): number {
-  const weekday = new Intl.DateTimeFormat("en-US", {
-    timeZone: process.env.TRADING_TIMEZONE ?? "Asia/Shanghai",
-    weekday: "short"
-  }).format(date);
-
-  return {
-    Mon: 1,
-    Tue: 2,
-    Wed: 3,
-    Thu: 4,
-    Fri: 5,
-    Sat: 6,
-    Sun: 7
-  }[weekday] ?? 7;
 }
 
 async function post(url: string, payload: unknown): Promise<void> {
