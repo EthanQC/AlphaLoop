@@ -33,6 +33,27 @@ openclaw plugins install @honcho-ai/openclaw-honcho
 node apps/openclaw-config/scripts/render-openclaw-config.mjs
 ```
 
+### Feishu user-plugin delivery
+
+Daily/weekly report delivery prefers `feishu-user-plugin` so messages are sent as the authenticated Feishu user. The built-in OpenClaw Feishu bot/app channel remains the fallback and fallback messages are labeled in Chinese as degraded bot delivery.
+
+Install the OpenClaw MCP server without writing secrets into `~/.openclaw/openclaw.json`:
+
+```bash
+openclaw mcp set feishu-user-plugin '{"command":"node","args":["/Users/mashu/Documents/codex/apps/openclaw-config/scripts/run-feishu-user-plugin.mjs"]}'
+```
+
+Keep credentials only in local env files or the user shell. `LARK_APP_ID`/`LARK_APP_SECRET` may mirror `FEISHU_APP_ID`/`FEISHU_APP_SECRET`; `LARK_COOKIE`, `LARK_USER_ACCESS_TOKEN`, and `LARK_USER_REFRESH_TOKEN` must not be committed.
+
+To refresh user auth locally:
+
+```bash
+pnpm feishu:user-plugin:oauth
+pnpm feishu:user-plugin:status
+```
+
+The OAuth flow uses the plugin redirect URI `http://127.0.0.1:9997/callback`. If new user-token scopes are added in Feishu Open Platform, publish the app version and wait for tenant admin approval before rerunning OAuth.
+
 6. Run [scripts/sync-workspaces.sh](/Users/mashu/Documents/codex/apps/openclaw-config/scripts/sync-workspaces.sh) to materialize per-agent workspaces under `~/.openclaw/workspaces/`.
 7. Build the TypeScript services:
 

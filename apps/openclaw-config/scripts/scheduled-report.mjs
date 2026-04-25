@@ -82,6 +82,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
   const chunks = chunkMarkdown(markdown, 5600);
+  const deliveries = [];
   for (const [index, chunk] of chunks.entries()) {
     const suffix = chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : "";
     const result = await sendNotification({
@@ -92,6 +93,15 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     if (!result.sent) {
       throw new Error(result.reason ?? `Report delivery was not sent; target=${result.target}`);
     }
+    deliveries.push({
+      chunk: index + 1,
+      chunks: chunks.length,
+      target: result.target,
+      fallback: Boolean(result.fallback),
+      deliveredAt: new Date().toISOString(),
+      detail: result.detail ?? null,
+      primaryError: result.primaryError ?? null
+    });
   }
 
   updateState(info, {
@@ -99,6 +109,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     path: reportPath,
     kind: reportKind,
     chunks: chunks.length,
+    deliveries,
     regeneratedDuringDelivery: false,
     preparedInSameRun: alreadyPrepared
   });
@@ -108,6 +119,8 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     kind: reportKind,
     label: info.label,
     chunks: chunks.length,
+    targets: deliveries.map((entry) => entry.target),
+    fallbackUsed: deliveries.some((entry) => entry.fallback),
     path: reportPath
   }, null, 2));
 }

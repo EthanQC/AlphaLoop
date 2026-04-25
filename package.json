@@ -23,6 +23,8 @@
     "preferences:bootstrap": "node apps/openclaw-config/scripts/bootstrap-preferences.mjs",
     "proposals:generate": "node apps/openclaw-config/scripts/generate-rule-proposal.mjs",
     "feishu:authorize-user": "node apps/openclaw-config/scripts/authorize-feishu-user.mjs",
+    "feishu:user-plugin:oauth": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs oauth",
+    "feishu:user-plugin:status": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs status",
     "sources:intake": "node apps/openclaw-config/scripts/create-source-request.mjs",
     "sources:update-status": "node apps/openclaw-config/scripts/update-source-request-status.mjs",
     "notes:sync-artifacts": "node apps/openclaw-config/scripts/sync-notes-artifacts.mjs",
