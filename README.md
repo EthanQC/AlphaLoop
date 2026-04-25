@@ -30,8 +30,8 @@ Monorepo for a local, single-node OpenClaw trading control plane on macOS.
 - `knowledge/memory`: Stable memory and daily summaries
 - `rules/live`: Live advisor rule versions
 - `rules/paper`: Paper trading rule versions
-- `reports/daily`: Daily execution reports
-- `reports/weekly`: Weekly evolution reports
+- `reports/daily`: 中文日报
+- `reports/weekly`: 中文周报
 - `reports/proposals`: Rule proposal snapshots generated from local evidence
 
 ## Prerequisites

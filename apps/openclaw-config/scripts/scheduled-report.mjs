@@ -13,7 +13,7 @@ const dbPath = join(runtimeDir, "trading.sqlite");
 const statePath = join(runtimeDir, "report-delivery-state.json");
 const timezone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
 
-const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2);
+const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2).filter((arg) => arg !== "--");
 const kind = assertKind(kindArg);
 const action = assertAction(actionArg);
 const windowInfo = resolveReportWindow(kind, dateArg);
@@ -133,7 +133,7 @@ function renderDailyReport(info, data) {
     "",
     "## 2. 信息检索与分类",
     "",
-    "- 已验证：本报告使用本地 SQLite 交易事实、OpenClaw 执行报告、规则提案和 Longbridge QQQ 行情快照。",
+    `- 已验证：本报告使用本地 SQLite 交易事实、OpenClaw 执行报告、规则提案和 Longbridge QQQ 行情快照（${formatQuoteTimestamp(data.qqqQuote)}）。`,
     "- 待验证：外部宏观/新闻流尚未接入可审计来源，本报告不会把未落库新闻当作事实。",
     "- 噪声过滤：系统心跳、健康检查和已禁用期权影子链路不计入交易判断。",
     "",
@@ -186,7 +186,7 @@ function renderWeeklyReport(info, data) {
     "",
     "## 2. 市场主线回顾",
     "",
-    "- 本地目前没有可审计的外部新闻/宏观数据入库，因此周报只汇总交易事实、执行记录和 QQQ 行情快照。",
+    `- 本地目前没有可审计的外部新闻/宏观数据入库，因此周报只汇总交易事实、执行记录和 QQQ 行情快照（${formatQuoteTimestamp(data.qqqQuote)}）。`,
     "- 后续若接入新闻源/宏观源，会按“已验证、部分验证、未验证”分层纳入。",
     "",
     "## 3. QQQ 与美股风险温度",
@@ -535,10 +535,6 @@ function renderPaperPositions(rows) {
 }
 
 function renderQqqSection(quote) {
-  if (!quote) {
-    return "- QQQ.US 行情暂不可用；报告已保留固定观察位，等待下一次 Longbridge 行情请求成功。";
-  }
-
   const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
   const prevClose = toNumber(quote.prev_close ?? quote.prevClose);
   const open = toNumber(quote.open);
@@ -650,16 +646,33 @@ function selectLatestPreference(db) {
 }
 
 async function fetchQqqQuote() {
-  try {
-    const payload = await runLongbridgeJson("quote", ["quote", "QQQ.US"]);
-    return Array.isArray(payload) ? payload[0] : payload?.quotes?.[0] ?? null;
-  } catch {
-    return null;
+  const payload = await runLongbridgeJson("quote", ["quote", "QQQ.US"]);
+  const quote = Array.isArray(payload) ? payload[0] : payload?.quotes?.[0] ?? null;
+  if (!quote || typeof quote !== "object") {
+    throw new Error("Longbridge QQQ 行情返回为空，停止生成报告。");
   }
+
+  const symbol = String(quote.symbol ?? "").toUpperCase();
+  const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
+  if (symbol !== "QQQ.US" || last === undefined) {
+    throw new Error("Longbridge QQQ 行情格式异常，停止生成报告。");
+  }
+
+  return quote;
+}
+
+function formatQuoteTimestamp(quote) {
+  const timestamps = [
+    quote?.timestamp,
+    quote?.post_market_quote?.timestamp,
+    quote?.pre_market_quote?.timestamp
+  ].filter(Boolean);
+  return timestamps.length > 0 ? `行情时间 ${timestamps[0]}` : "行情时间未提供";
 }
 
 function resolveReportWindow(reportKind, explicitDate) {
   const label = explicitDate ?? formatDateLabel(new Date(), timezone);
+  assertDateLabel(label);
   const startOffsetDays = reportKind === "daily" ? -1 : -4;
   const startLabel = addDays(label, startOffsetDays);
   return {
@@ -747,6 +760,13 @@ function assertAction(value) {
     return value;
   }
   throw new Error("Report action must be prepare, deliver, or run.");
+}
+
+function assertDateLabel(value) {
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(String(value))) {
+    return;
+  }
+  throw new Error(`Report date must use YYYY-MM-DD format; received ${JSON.stringify(value)}.`);
 }
 
 function singleLine(value, maxChars = 260) {

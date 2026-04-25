@@ -5,9 +5,12 @@ import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+import { loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
+
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeRoot = join(repoRoot, "runtime");
 
+loadLocalEnv(repoRoot);
 mkdirSync(runtimeRoot, { recursive: true });
 
 const LONG_BRIDGE_LIMITS = {
