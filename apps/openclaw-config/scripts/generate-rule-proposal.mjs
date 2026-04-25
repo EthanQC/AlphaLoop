@@ -5,7 +5,8 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
+  rmSync,
+  unlinkSync,
   writeFileSync
 } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +16,6 @@ const repoRoot = process.cwd();
 const runtimeDir = join(repoRoot, "runtime");
 const dbPath = join(runtimeDir, "trading.sqlite");
 const proposalDir = join(repoRoot, "reports", "proposals");
-const archiveDir = join(proposalDir, "archive");
 const timeZone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
 const scopeLabels = {
   live: "实盘建议",
@@ -38,13 +38,13 @@ db.exec("PRAGMA busy_timeout = 5000;");
 db.exec("PRAGMA foreign_keys = ON;");
 ensureGovernanceSchema(db);
 
-const archivedFileCount = archiveLegacyProposalFiles();
-const archivedRowCount = archiveLegacyProposalRows(db, nowIso);
-if (archivedFileCount > 0 || archivedRowCount > 0) {
-  writeAudit(db, "rule-governance", "proposal.legacy_archived", {
-    archivedFileCount,
-    archivedRowCount,
-    reason: "旧英文/模板化规则提案已归档，避免继续污染中文报告。"
+const deletedFileCount = deleteLegacyProposalFiles();
+const deletedRowCount = deleteLegacyProposalRows(db);
+if (deletedFileCount > 0 || deletedRowCount > 0) {
+  writeAudit(db, "rule-governance", "proposal.legacy_deleted", {
+    deletedFileCount,
+    deletedRowCount,
+    reason: "旧英文/模板化规则提案已删除，避免继续污染中文报告。"
   });
 }
 
@@ -175,9 +175,8 @@ function ensureColumn(database, table, column, definition) {
   database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
 }
 
-function archiveLegacyProposalFiles() {
-  mkdirSync(archiveDir, { recursive: true });
-  let archived = 0;
+function deleteLegacyProposalFiles() {
+  let deleted = 0;
 
   for (const entry of readdirSync(proposalDir, { withFileTypes: true })) {
     if (!entry.isFile() || !/^\d{4}-\d{2}-\d{2}-(live|paper)\.md$/u.test(entry.name)) {
@@ -190,60 +189,36 @@ function archiveLegacyProposalFiles() {
       continue;
     }
 
-    renameSync(sourcePath, uniqueArchivePath(entry.name));
-    archived += 1;
+    unlinkSync(sourcePath);
+    deleted += 1;
   }
 
-  return archived;
+  const legacyArchiveDir = join(proposalDir, "archive");
+  if (existsSync(legacyArchiveDir)) {
+    for (const entry of readdirSync(legacyArchiveDir, { withFileTypes: true })) {
+      if (entry.isFile() && /^\d{4}-\d{2}-\d{2}-(live|paper)\.md$/u.test(entry.name)) {
+        deleted += 1;
+      }
+    }
+    rmSync(legacyArchiveDir, { recursive: true, force: true });
+  }
+
+  return deleted;
 }
 
-function uniqueArchivePath(fileName) {
-  let targetPath = join(archiveDir, fileName);
-  if (!existsSync(targetPath)) {
-    return targetPath;
-  }
-
-  const stem = fileName.replace(/\.md$/u, "");
-  let index = 2;
-  while (existsSync(targetPath)) {
-    targetPath = join(archiveDir, `${stem}-${index}.md`);
-    index += 1;
-  }
-  return targetPath;
-}
-
-function archiveLegacyProposalRows(database, decidedAt) {
-  const rows = database
+function deleteLegacyProposalRows(database) {
+  const result = database
     .prepare(`
-      SELECT id
+      DELETE
       FROM rule_proposals
-      WHERE COALESCE(status, 'pending_confirmation') != 'archived'
-        AND (
-          COALESCE(title, '') = ''
-          OR summary LIKE 'live rules have enough local evidence%'
-          OR summary LIKE 'paper rules remain on hold%'
-          OR old_vs_new LIKE '%No rule delta recommended yet%'
-          OR old_vs_new LIKE '%Tighten live entry discipline%'
-        )
+      WHERE COALESCE(title, '') = ''
+        OR summary LIKE 'live rules have enough local evidence%'
+        OR summary LIKE 'paper rules remain on hold%'
+        OR old_vs_new LIKE '%No rule delta recommended yet%'
+        OR old_vs_new LIKE '%Tighten live entry discipline%'
     `)
-    .all();
-
-  if (rows.length === 0) {
-    return 0;
-  }
-
-  const update = database.prepare(`
-    UPDATE rule_proposals
-    SET status = 'archived',
-        decided_at = ?,
-        decided_by = 'generate-rule-proposal.mjs',
-        decision_reason = '旧英文/模板化提案已归档；后续只使用中文、可审计、待确认提案。'
-    WHERE id = ?
-  `);
-  for (const row of rows) {
-    update.run(decidedAt, row.id);
-  }
-  return rows.length;
+    .run();
+  return Number(result.changes ?? 0);
 }
 
 function loadActiveRuleSet(scope) {

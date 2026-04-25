@@ -453,7 +453,7 @@ function translateKnownRuleDelta(value) {
 
 function renderChineseProposalText(value) {
   const text = singleLine(value);
-  return containsCjk(text) ? text : "触发原因已入库；旧英文模板不会在报告中展开，需查看归档记录。";
+  return containsCjk(text) ? text : "触发原因已入库；旧英文模板已清理，不会在报告中展开。";
 }
 
 function renderChineseRisks(value) {
@@ -485,7 +485,7 @@ function normalizeComparisonRows(value) {
               field: "旧格式提案",
               oldValue: "旧模板",
               newValue: translated,
-              reason: "历史提案仅供归档参考。"
+              reason: "历史英文模板已清理，不作为可激活提案。"
             }
           : null;
       }
