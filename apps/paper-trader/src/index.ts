@@ -78,7 +78,7 @@ async function claimAndTrade(limit = 10): Promise<{ claimed: number; traded: num
       reports.save({
         id: createId("report"),
         category: "trade",
-        title: `Paper trader summary for ${ticket.symbol}`,
+        title: `模拟盘执行摘要：${ticket.symbol}`,
         body: execution.reasons.join("\n"),
         metadata: {
           eventId: record.payload.id,

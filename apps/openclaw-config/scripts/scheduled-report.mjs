@@ -7,11 +7,11 @@ import { loadLocalEnv, openTradingDatabase, sendNotification } from "../../../pa
 import { runLongbridgeJson } from "./_longbridge.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+loadLocalEnv(repoRoot);
 const runtimeDir = join(repoRoot, "runtime");
 const dbPath = join(runtimeDir, "trading.sqlite");
 const statePath = join(runtimeDir, "report-delivery-state.json");
 const timezone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
-loadLocalEnv(repoRoot);
 
 const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2);
 const kind = assertKind(kindArg);
@@ -77,8 +77,7 @@ async function prepareReport(reportKind, info) {
 async function deliverReport(reportKind, info, alreadyPrepared) {
   let markdown = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
   if (!markdown.trim()) {
-    const report = await prepareReport(reportKind, info);
-    markdown = report.markdown;
+    throw new Error(`报告 ${info.label} 尚未提前生成；deliver 只交付既有报告，不在交付时重新计算。请先运行 ${reportKind} prepare。`);
   }
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
@@ -100,7 +99,8 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     path: reportPath,
     kind: reportKind,
     chunks: chunks.length,
-    regeneratedDuringDelivery: !alreadyPrepared && !existsSync(reportPath)
+    regeneratedDuringDelivery: false,
+    preparedInSameRun: alreadyPrepared
   });
 
   console.log(JSON.stringify({
@@ -141,26 +141,26 @@ function renderDailyReport(info, data) {
     "",
     renderExecutionDigest(data.executionRows),
     "",
-    "## 4. 规则学习与提案",
-    "",
-    renderProposalDigest(data.proposalRows),
-    "",
-    "## 5. 风险与异常",
-    "",
-    "- 实盘：禁止自动提交真实资金订单。",
-    "- 官方模拟盘：只有确认 Longbridge token 属于官方模拟盘后，才允许走官方 paper write 测试。",
-    "- 期权：不生成、不预览、不执行任何期权自动化。",
-    "- 渠道：Feishu app 探测健康；富文本交付由本报告链路直接推送到炒股群。",
-    "",
-    "## 6. QQQ 固定观察",
+    "## 4. QQQ 固定观察",
     "",
     renderQqqSection(data.qqqQuote),
     "",
-    "## 7. 持仓与关注标的",
+    "## 5. 当前持仓",
     "",
     renderPaperPositions(data.paperPositions),
     "",
-    "## 8. 需要你决策",
+    "## 6. 风险与异常",
+    "",
+    "- 实盘：禁止自动提交真实资金订单。",
+    "- 官方模拟盘：只有确认 Longbridge 鉴权令牌属于官方模拟盘后，才允许走官方模拟盘写入测试。",
+    "- 期权：不生成、不预览、不执行任何期权自动化。",
+    "- 渠道：Feishu 应用探测健康；富文本交付由本报告链路直接推送到炒股群。",
+    "",
+    "## 7. 规则提案摘要",
+    "",
+    renderProposalDigest(data.proposalRows),
+    "",
+    "## 8. 需要人工确认事项",
     "",
     "- 是否接受本窗口内的规则提案，需要人工确认；未确认前规则保持未激活。",
     "- 若要临时分析具体个股，直接点名标的即可；日报固定标的保持 QQQ。"
@@ -201,19 +201,17 @@ function renderWeeklyReport(info, data) {
     "",
     renderProposalDigest(data.proposalRows),
     "",
-    "## 6. 偏好快照",
+    "## 6. 偏好/策略变化",
     "",
-    data.latestPreference
-      ? `- 更新时间：${data.latestPreference.created_at}\n- 摘要：${singleLine(data.latestPreference.summary)}`
-      : "- 暂无偏好快照。",
+    renderPreferenceSnapshot(data.latestPreference),
     "",
     "## 7. 下周跟踪",
     "",
     "- 固定观察 QQQ 的趋势、成交量和盘前/盘后偏离。",
-    "- 检查 Longbridge 官方模拟盘 token 状态和 paper write 能力。",
+    "- 检查 Longbridge 官方模拟盘鉴权令牌状态和模拟盘写入能力。",
     "- 检查 OpenClaw 版本、模型目录和 Feishu 交付链路。",
     "",
-    "## 8. 需要你确认",
+    "## 8. 需要人工确认事项",
     "",
     "- 周报中的规则提案只作为策略学习草案，必须人工确认后才会激活。",
     "- 若你要扩展固定跟踪标的，后续可以在日报模板里显式加入。"
@@ -225,13 +223,18 @@ function renderExecutionDigest(rows) {
     return "- 本窗口没有交易执行报告或建议报告。";
   }
 
-  return rows.map((row) => [
-    `### ${row.title}`,
+  return rows.map((row, index) => {
+    const summary = summarizeExecutionRow(row);
+    return [
+    `### 记录 ${index + 1}：${summary.heading}`,
     "",
     `- 时间：${row.created_at}`,
-    `- 类别：${row.category}`,
-    `- 内容：${singleLine(row.body, 420)}`
-  ].join("\n")).join("\n\n");
+    `- 类别：${translateReportCategory(row.category)}`,
+    `- 状态：${summary.status}`,
+    `- 摘要：${summary.summary}`,
+    `- 审计索引：execution_reports.id=${row.id}`
+    ].join("\n");
+  }).join("\n\n");
 }
 
 function renderProposalDigest(rows) {
@@ -240,30 +243,213 @@ function renderProposalDigest(rows) {
   }
 
   return rows.map((row) => [
-    `### ${row.scope} / ${row.recommendation}`,
+    `### ${translateRuleScope(row.scope)}：${translateRuleRecommendation(row.recommendation)}`,
     "",
     `- 时间：${row.created_at}`,
     `- 版本：${row.current_version} -> ${row.candidate_version}`,
-    `- 摘要：${singleLine(row.summary, 420)}`,
-    `- 旧新对比：${singleLine(row.old_vs_new, 420)}`
+    `- 摘要：${renderChineseProposalSummary(row.summary)}`,
+    `- 旧新对比：${renderChineseRuleComparison(row)}`,
+    "- 激活状态：未自动激活，等待人工确认。"
   ].join("\n")).join("\n\n");
+}
+
+function summarizeExecutionRow(row) {
+  const text = `${row.title ?? ""}\n${row.body ?? ""}`;
+  const symbol = extractSymbol(text) ?? "未标明标的";
+  const side = extractSide(text);
+  const quantity = extractQuantity(text);
+  const price = extractPrice(text);
+  const strategy = extractOptionStrategy(text);
+  const facts = [`标的 ${symbol}`];
+
+  if (side) {
+    facts.push(`方向 ${side}`);
+  }
+  if (quantity) {
+    facts.push(`数量 ${quantity}`);
+  }
+  if (price) {
+    facts.push(`参考价格 ${price}`);
+  }
+  if (strategy) {
+    facts.push(`检测到${translateOptionStrategy(strategy)}，期权自动化保持禁用`);
+  }
+  if (/token empty|401001/iu.test(text)) {
+    facts.push("鉴权为空导致官方模拟盘提交失败");
+  }
+  if (/not valid JSON|Unexpected token/iu.test(text)) {
+    facts.push("返回内容不是结构化响应，记录为解析失败");
+  }
+  if (/No real-money order was submitted/iu.test(text)) {
+    facts.push("回查记录声明没有提交真实资金订单");
+  }
+  if (/Status:\s*NotReported/iu.test(text)) {
+    facts.push("订单状态为未上报");
+  }
+  if (facts.length === 1) {
+    facts.push("详细内容保存在 SQLite，中文报告不直接展开旧英文正文");
+  }
+
+  return {
+    heading: side ? `${symbol} ${side}记录` : `${symbol} 记录`,
+    status: classifyExecutionStatus(row, text),
+    summary: `${facts.join("；")}。`
+  };
+}
+
+function classifyExecutionStatus(row, text) {
+  if (/Option trading is disabled|Option strategy .* not allowed|期权/iu.test(text)) {
+    return "期权相关请求已拦截，未执行。";
+  }
+  if (/failed|API error|token empty|not valid JSON|Unexpected token/iu.test(text)) {
+    return "写入或回查失败，未确认为新成交。";
+  }
+  if (/was found in Longbridge order list|reconciliation/iu.test(text)) {
+    return "官方模拟盘回查到记录；不涉及实盘自动下单。";
+  }
+  if (/rejected|not allowed|disabled|未执行|不允许/iu.test(text)) {
+    return "规则或风控拦截，未执行。";
+  }
+  if (row.category === "daily") {
+    return "建议或偏好记录已入库。";
+  }
+  return "执行记录已入库。";
+}
+
+function extractSymbol(text) {
+  const patterns = [
+    /\bSymbol:\s*([A-Z]{1,5}(?:\.US)?)/iu,
+    /\bfor\s+([A-Z]{1,5}(?:\.US)?)/iu,
+    /\border\s+(?:buy|sell)\s+([A-Z]{1,5}(?:\.US)?)/iu,
+    /\b([A-Z]{1,5}\.US)\b/u
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].toUpperCase();
+    }
+  }
+  return null;
+}
+
+function extractSide(text) {
+  const match = text.match(/\b(?:Side:\s*|order\s+)(buy|sell)\b/iu);
+  if (!match?.[1]) {
+    return null;
+  }
+  return match[1].toLowerCase() === "buy" ? "买入" : "卖出";
+}
+
+function extractQuantity(text) {
+  return text.match(/\bQuantity:\s*([0-9.]+)/iu)?.[1] ?? null;
+}
+
+function extractPrice(text) {
+  return text.match(/--price\s+([0-9.]+)/iu)?.[1] ?? text.match(/\bprice[:\s]+([0-9.]+)/iu)?.[1] ?? null;
+}
+
+function extractOptionStrategy(text) {
+  return text.match(/\b(covered_call|cash_secured_put|long_call|long_put)\b/iu)?.[1]?.toLowerCase() ?? null;
+}
+
+function translateOptionStrategy(strategy) {
+  const labels = {
+    covered_call: "备兑看涨策略",
+    cash_secured_put: "现金担保看跌策略",
+    long_call: "买入看涨期权策略",
+    long_put: "买入看跌期权策略"
+  };
+  return labels[strategy] ?? "期权策略";
+}
+
+function translateReportCategory(category) {
+  return category === "trade" ? "交易/执行" : "建议/偏好";
+}
+
+function translateAssetClass(assetClass) {
+  const labels = {
+    stock: "股票",
+    etf: "ETF"
+  };
+  return labels[assetClass] ?? String(assetClass ?? "资产");
+}
+
+function translateRuleScope(scope) {
+  const labels = {
+    live: "实盘规则",
+    paper: "模拟盘规则"
+  };
+  return labels[scope] ?? `规则范围 ${scope}`;
+}
+
+function translateRuleRecommendation(recommendation) {
+  const labels = {
+    promote: "建议形成候选版本",
+    hold: "继续观察",
+    reject: "不建议采用"
+  };
+  return labels[recommendation] ?? `建议 ${recommendation}`;
+}
+
+function renderChineseProposalSummary(value) {
+  const text = String(value ?? "");
+  if (/live rules have enough local evidence/iu.test(text)) {
+    return "本地证据支持生成实盘候选更新，但不会自动激活。";
+  }
+  if (/paper rules remain on hold/iu.test(text)) {
+    return "模拟盘规则继续观察，当前证据仍支持保留现有护栏。";
+  }
+  return "规则提案已入库；人工激活前需要复核证据、旧新差异和影响范围。";
+}
+
+function renderChineseRuleComparison(row) {
+  const delta = translateKnownRuleDelta(row.old_vs_new);
+  const parts = [
+    `旧版本 ${row.current_version ?? "未知"}`,
+    `候选版本 ${row.candidate_version ?? "未知"}`
+  ];
+  parts.push(delta ?? "差异字段已入库，人工激活前需复核原始证据。");
+  return parts.join("；");
+}
+
+function translateKnownRuleDelta(value) {
+  const text = String(value ?? "");
+  if (/Tighten live entry discipline/iu.test(text)) {
+    return "收紧实盘入场纪律：只有确认性更强的表述才可呈现高置信度想法。";
+  }
+  if (/No rule delta recommended yet/iu.test(text)) {
+    return "本窗口暂不推荐修改规则，继续收集执行和审批证据。";
+  }
+  return null;
+}
+
+function renderPreferenceSnapshot(row) {
+  if (!row) {
+    return "- 暂无偏好/策略快照。";
+  }
+
+  return [
+    `- 更新时间：${row.created_at}`,
+    "- 策略偏好：保持有意义的现金缓冲，控制单一标的与行业集中度；优先使用“宏观 -> 行业 -> 个股”的自上而下流程；事件质量不清晰时等待确认。",
+    "- 使用方式：仅作为观察和建议风格输入，不自动改变交易规则。"
+  ].join("\n");
 }
 
 function renderPaperPositions(rows) {
   if (rows.length === 0) {
-    return "- 当前没有本地模拟盘 open 持仓。";
+    return "- 当前没有本地模拟盘未平仓持仓。";
   }
 
   return rows.map((row) => {
     const avg = formatNumber(row.avg_price);
     const pnl = formatNumber(row.realized_pnl);
-    return `- ${row.symbol}：${row.quantity} ${row.asset_class}，均价 ${avg}，已实现 PnL ${pnl}`;
+    return `- ${row.symbol}：${row.quantity} ${translateAssetClass(row.asset_class)}，均价 ${avg}，已实现盈亏 ${pnl}`;
   }).join("\n");
 }
 
 function renderQqqSection(quote) {
   if (!quote) {
-    return "- QQQ.US 行情暂不可用；报告已保留固定观察位，等待下一次 Longbridge quote 成功。";
+    return "- QQQ.US 行情暂不可用；报告已保留固定观察位，等待下一次 Longbridge 行情请求成功。";
   }
 
   const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
@@ -358,9 +544,8 @@ async function fetchQqqQuote() {
 
 function resolveReportWindow(reportKind, explicitDate) {
   const label = explicitDate ?? formatDateLabel(new Date(), timezone);
-  const startLabel = reportKind === "daily"
-    ? addDays(label, -1)
-    : addDays(label, -4);
+  const startOffsetDays = reportKind === "daily" ? -1 : -4;
+  const startLabel = addDays(label, startOffsetDays);
   return {
     kind: reportKind,
     label,
