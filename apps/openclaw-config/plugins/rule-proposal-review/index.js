@@ -46,6 +46,10 @@ const plugin = {
         replyShape: "agent"
       });
     });
+
+    api.on("reply_dispatch", async (event, ctx) => {
+      return handleRuleProposalReplyDispatch(api, event, ctx);
+    }, { priority: 100 });
   }
 };
 
@@ -53,7 +57,7 @@ export default plugin;
 
 async function handleRuleProposalReview(api, { channel, message, actor, replyShape }) {
   const config = resolveConfig(api.pluginConfig);
-  if (String(channel ?? "").toLowerCase() !== config.channel) {
+  if (!isAllowedChannel(channel, config.channel)) {
     return undefined;
   }
 
@@ -87,6 +91,56 @@ async function handleRuleProposalReview(api, { channel, message, actor, replySha
   }
 }
 
+async function handleRuleProposalReplyDispatch(api, event, ctx) {
+  const config = resolveConfig(api.pluginConfig);
+  const inboundCtx = event?.ctx ?? {};
+  const channel = inboundCtx.OriginatingChannel ?? inboundCtx.Provider ?? inboundCtx.Surface;
+  if (!isAllowedChannel(channel, config.channel)) {
+    return undefined;
+  }
+
+  const reviewMessage = extractReviewMessage(
+    inboundCtx.BodyForAgent ?? inboundCtx.Body ?? inboundCtx.CommandBody ?? inboundCtx.RawBody ?? ""
+  );
+  if (!reviewMessage) {
+    return undefined;
+  }
+
+  const text = await runReviewWithRenderedReply(api, {
+    config,
+    message: reviewMessage,
+    actor: inboundCtx.SenderId ?? inboundCtx.From ?? "feishu-operator"
+  });
+  const delivered = Boolean(ctx.dispatcher?.sendFinalReply?.({ text }));
+  ctx.recordProcessed?.("completed", { reason: "rule_proposal_review_handled" });
+  ctx.markIdle?.("message_completed");
+  return {
+    handled: true,
+    queuedFinal: delivered,
+    counts: { tool: 0, block: 0, final: delivered ? 1 : 0 }
+  };
+}
+
+async function runReviewWithRenderedReply(api, { config, message, actor }) {
+  try {
+    const result = await runReviewScript({
+      repoRoot: config.repoRoot,
+      message,
+      actor: String(actor ?? "feishu-operator"),
+      notify: config.notify
+    });
+
+    api.logger.info?.(
+      `rule-proposal-review handled ${result.proposalId ?? "unknown"} action=${result.action ?? "unknown"} status=${result.status ?? "unknown"}`
+    );
+    return renderSuccess(result);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    api.logger.warn?.(`rule-proposal-review failed: ${reason}`);
+    return renderFailure(reason);
+  }
+}
+
 function resolveConfig(rawConfig) {
   const config = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
   return {
@@ -105,6 +159,14 @@ function normalizeMessage(value) {
   return String(value ?? "")
     .replace(/[ \t\r\n]+/gu, " ")
     .trim();
+}
+
+function isAllowedChannel(value, expected) {
+  if (!expected || expected === "*") {
+    return true;
+  }
+  const normalized = String(value ?? "").toLowerCase();
+  return normalized === expected || normalized.startsWith(`${expected}:`) || normalized.startsWith(`${expected}/`);
 }
 
 function extractReviewMessage(value) {
