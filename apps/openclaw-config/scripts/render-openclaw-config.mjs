@@ -9,6 +9,14 @@ const openclawRoot = join(homedir(), ".openclaw");
 const configPath = join(openclawRoot, "openclaw.json");
 const existing = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) : {};
 const existingFeishu = existing.channels?.feishu ?? {};
+const ruleProposalReviewPluginId = "rule-proposal-review";
+const ruleProposalReviewPluginPath = join(
+  repoRoot,
+  "apps",
+  "openclaw-config",
+  "plugins",
+  ruleProposalReviewPluginId
+);
 
 const gatewayPort = Number(env.OPENCLAW_GATEWAY_PORT ?? process.env.OPENCLAW_GATEWAY_PORT ?? 18789);
 const gatewayToken =
@@ -131,9 +139,25 @@ const nextConfig = {
       }
     : {}),
   plugins: {
-    allow: unique([...installedPluginIds, ...(honchoEnabled ? ["openclaw-honcho"] : [])]),
+    allow: unique([
+      ...asStringArray(existing.plugins?.allow),
+      ...installedPluginIds,
+      "acpx",
+      "openai",
+      ...(feishuEnabled ? ["feishu"] : []),
+      ruleProposalReviewPluginId,
+      ...(honchoEnabled ? ["openclaw-honcho"] : [])
+    ]),
+    load: {
+      ...(existing.plugins?.load ?? {}),
+      paths: unique([
+        ...asStringArray(existing.plugins?.load?.paths),
+        ruleProposalReviewPluginPath
+      ])
+    },
     slots: honchoEnabled ? { memory: "openclaw-honcho" } : {},
     entries: {
+      ...(existing.plugins?.entries ?? {}),
       acpx: {
         enabled: true,
         config: {
@@ -156,7 +180,16 @@ const nextConfig = {
             enabled: false
           },
       "memory-core": { enabled: false },
-      "memory-lancedb": { enabled: false }
+      "memory-lancedb": { enabled: false },
+      [ruleProposalReviewPluginId]: {
+        enabled: true,
+        config: {
+          repoRoot,
+          channel: "feishu",
+          notify: true,
+          returnText: false
+        }
+      }
     },
     installs: existing.plugins?.installs ?? {}
   }
