@@ -12,7 +12,11 @@ import {
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { loadLocalEnv, sendNotification } from "../../../packages/shared-types/dist/index.js";
+
 const repoRoot = process.cwd();
+loadLocalEnv(repoRoot);
+
 const runtimeDir = join(repoRoot, "runtime");
 const dbPath = join(runtimeDir, "trading.sqlite");
 const proposalDir = join(repoRoot, "reports", "proposals");
@@ -48,6 +52,7 @@ if (deletedFileCount > 0 || deletedRowCount > 0) {
   });
 }
 
+const generatedProposals = [];
 for (const scope of args.scopes) {
   const ruleFiles = loadActiveRuleSet(scope);
   const evidence = loadEvidence(db, windowStartIso);
@@ -80,12 +85,21 @@ for (const scope of args.scopes) {
 
   writeFileSync(outputPath, `${renderProposalMarkdown(proposal)}\n`, "utf8");
   console.log(outputPath);
+  generatedProposals.push(proposal);
+}
+
+if (generatedProposals.length > 0) {
+  await notifyGeneratedProposals(generatedProposals);
+} else if (args.notifyExisting) {
+  await notifyGeneratedProposals(loadPendingProposalsForNotification(db));
 }
 
 function parseArgs(rawArgs) {
   const scopes = [];
   let mode = "manual";
   let force = false;
+  let notify = true;
+  let notifyExisting = false;
   let windowDays = 7;
 
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -96,6 +110,14 @@ function parseArgs(rawArgs) {
     }
     if (arg === "--force") {
       force = true;
+      continue;
+    }
+    if (arg === "--no-notify") {
+      notify = false;
+      continue;
+    }
+    if (arg === "--notify-existing") {
+      notifyExisting = true;
       continue;
     }
     if (arg === "--mode") {
@@ -122,13 +144,15 @@ function parseArgs(rawArgs) {
     scopes: scopes.length > 0 ? [...new Set(scopes)] : ["live", "paper"],
     mode,
     force,
+    notify,
+    notifyExisting,
     windowDays
   };
 }
 
 function printUsageAndExit(message) {
   console.error(message);
-  console.error("用法：node apps/openclaw-config/scripts/generate-rule-proposal.mjs [live|paper] [--mode manual|weekly] [--window-days 7] [--force]");
+  console.error("用法：node apps/openclaw-config/scripts/generate-rule-proposal.mjs [live|paper] [--mode manual|weekly] [--window-days 7] [--force] [--no-notify] [--notify-existing]");
   process.exit(1);
 }
 
@@ -427,6 +451,142 @@ function saveProposal(database, proposal) {
       proposal.status,
       proposal.proposalPath
     );
+}
+
+function loadPendingProposalsForNotification(database) {
+  const rows = database
+    .prepare(`
+      SELECT id, created_at, scope, current_version, candidate_version, title, summary, trigger_reason,
+             old_vs_new, expected_benefit, risks, recommendation, proposal_path
+      FROM rule_proposals
+      WHERE COALESCE(status, 'pending_confirmation') = 'pending_confirmation'
+      ORDER BY created_at DESC
+      LIMIT 10
+    `)
+    .all();
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    createdAt: String(row.created_at),
+    scope: String(row.scope),
+    currentVersion: String(row.current_version),
+    candidateVersion: String(row.candidate_version),
+    title: String(row.title),
+    summary: String(row.summary),
+    triggerReason: String(row.trigger_reason),
+    oldVsNew: parseJsonArray(row.old_vs_new),
+    expectedBenefit: String(row.expected_benefit),
+    risks: parseJsonArray(row.risks),
+    recommendation: String(row.recommendation),
+    actionLabel: recommendationLabel(String(row.recommendation)),
+    status: "pending_confirmation",
+    proposalPath: row.proposal_path ? String(row.proposal_path) : "未记录"
+  }));
+}
+
+async function notifyGeneratedProposals(proposals) {
+  if (!args.notify || proposals.length === 0) {
+    return;
+  }
+
+  const body = renderProposalReviewNotification(proposals);
+  try {
+    const result = await sendNotification({
+      title: `OpenClaw 规则提案待审核 ${dateLabel}`,
+      body,
+      format: "post"
+    });
+
+    writeAudit(db, "rule-governance", result.sent ? "proposal.review_notification_sent" : "proposal.review_notification_skipped", {
+      proposalIds: proposals.map((proposal) => proposal.id),
+      sent: result.sent,
+      target: result.target,
+      reason: result.reason ?? null,
+      fallback: result.fallback ?? false
+    });
+
+    if (result.sent) {
+      console.log(`飞书审核通知已发送：${result.target}`);
+    } else {
+      console.error(`飞书审核通知未发送：${result.reason ?? result.target}`);
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    writeAudit(db, "rule-governance", "proposal.review_notification_failed", {
+      proposalIds: proposals.map((proposal) => proposal.id),
+      reason
+    });
+    console.error(`飞书审核通知发送失败：${reason}`);
+  }
+}
+
+function renderProposalReviewNotification(proposals) {
+  const lines = [
+    "# OpenClaw 规则提案待人工审核",
+    "",
+    "- 本消息只用于审核，不会自动激活任何规则。",
+    "- 未确认前，live/paper active-version 均保持不变。",
+    "- 实盘仍禁止自动提交真实资金订单；期权策略保持禁用。",
+    "- 你可以直接在群里回复审核意见；需要激活时仍必须由控制流程带确认参数执行激活脚本。",
+    ""
+  ];
+
+  for (const proposal of proposals) {
+    lines.push(
+      `## ${proposal.title}`,
+      "",
+      `- 提案编号：${proposal.id}`,
+      `- 适用范围：${proposal.scope}（${scopeLabels[proposal.scope]}）`,
+      `- 版本：${proposal.currentVersion} -> ${proposal.candidateVersion}`,
+      `- 推荐动作：${proposal.actionLabel}`,
+      `- 生命周期：待人工确认；未确认不生效。`,
+      `- 触发原因：${proposal.triggerReason}`,
+      `- 预期收益：${proposal.expectedBenefit}`,
+      `- 旧新对比：${renderInlineComparisons(proposal.oldVsNew)}`,
+      `- 主要风险：${proposal.risks.slice(0, 3).join("；")}`,
+      `- 本地提案文件：${proposal.proposalPath}`,
+      ""
+    );
+  }
+
+  lines.push(
+    "## 审核动作",
+    "",
+    "- 继续观察：在群里回复“继续观察 + 提案编号”。",
+    "- 拒绝：在群里回复“拒绝 + 提案编号 + 原因”，或运行 reject 命令写入审计。",
+    "- 激活：只有候选规则文件已人工落地，并运行 `activate-rule-version.mjs activate ... --confirm HUMAN_APPROVED` 后才会生效。"
+  );
+
+  return lines.join("\n");
+}
+
+function renderInlineComparisons(comparisons) {
+  return comparisons
+    .map((entry) => {
+      if (entry && typeof entry === "object") {
+        return `${entry.field ?? "规则项"}：${entry.oldValue ?? ""} -> ${entry.newValue ?? ""}`;
+      }
+      return String(entry);
+    })
+    .join("；");
+}
+
+function parseJsonArray(value) {
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function recommendationLabel(value) {
+  const labels = {
+    suggest_activation: "建议激活",
+    continue_observe: "继续观察",
+    reject: "拒绝"
+  };
+  return labels[value] ?? value;
 }
 
 function renderProposalMarkdown(proposal) {

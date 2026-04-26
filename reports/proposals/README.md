@@ -5,7 +5,8 @@
 ## 生命周期
 
 - 生成：`generate-rule-proposal.mjs` 从 SQLite 中的审批编辑、执行报告、偏好快照和当前规则文件生成中文提案。
-- 待确认：新提案默认写入 `pending_confirmation`，未确认不生效。
+- 待确认：新提案默认写入 `pending_confirmation`，并向飞书群推送审核摘要；未确认不生效。
+- 补发审核：如需补发当前待确认提案到飞书群，运行 `generate-rule-proposal.mjs --notify-existing`；如只想本地生成，可加 `--no-notify`。
 - 激活：必须由人工运行 `activate-rule-version.mjs activate <live|paper> <version> --proposal-id <id> --confirm HUMAN_APPROVED`，并写入审计日志。
 - 拒绝：人工运行 `activate-rule-version.mjs reject <proposal-id> --confirm HUMAN_REJECTED --reason "..."`
 - 归档：人工运行 `activate-rule-version.mjs archive <proposal-id> --confirm HUMAN_ARCHIVED --reason "..."`
