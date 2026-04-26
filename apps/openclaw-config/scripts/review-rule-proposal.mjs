@@ -21,6 +21,22 @@ const statusLabels = {
   rejected: "已拒绝",
   archived: "已归档"
 };
+const reviewActions = [
+  "确认激活",
+  "二次确认激活",
+  "人工确认激活",
+  "建议激活",
+  "申请激活",
+  "一审建议激活",
+  "继续观察",
+  "观察",
+  "暂不激活",
+  "拒绝",
+  "归档"
+];
+const reviewActionPattern = reviewActions.join("|");
+const textMentionPattern =
+  new RegExp(`^@\\S+(?:\\s+(?!(?:${reviewActionPattern})(?:\\s|$))\\S+){0,6}\\s*`, "u");
 const actionLabels = {
   observe: "继续观察",
   reject: "拒绝",
@@ -420,11 +436,11 @@ function splitFlags(rawArgs) {
 }
 
 function parseFeishuMessage(message) {
-  const text = message
-    .replace(/[ \t\r\n]+/gu, " ")
-    .trim()
-    .replace(/^(?:@\S+|<at[^>]*>.*?<\/at>)\s*/u, "")
-    .trim();
+  const text = stripLeadingMentions(
+    message
+      .replace(/[ \t\r\n]+/gu, " ")
+      .trim()
+  );
   const proposalPattern = "(proposal_[A-Za-z0-9_:-]+)";
   const patterns = [
     {
@@ -467,6 +483,19 @@ function parseFeishuMessage(message) {
   }
 
   printUsageAndExit(`无法解析飞书审核消息：${message}`);
+}
+
+function stripLeadingMentions(value) {
+  let text = String(value ?? "").trim();
+  let previous = "";
+  while (text && text !== previous) {
+    previous = text;
+    text = text
+      .replace(/^<at[^>]*>.*?<\/at>\s*/u, "")
+      .replace(textMentionPattern, "")
+      .trim();
+  }
+  return text;
 }
 
 function normalizeCommand(command) {

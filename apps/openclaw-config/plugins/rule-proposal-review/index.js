@@ -4,8 +4,24 @@ import { fileURLToPath } from "node:url";
 
 const pluginDir = dirname(fileURLToPath(import.meta.url));
 const defaultRepoRoot = resolve(pluginDir, "..", "..", "..", "..");
+const reviewActions = [
+  "确认激活",
+  "二次确认激活",
+  "人工确认激活",
+  "建议激活",
+  "申请激活",
+  "一审建议激活",
+  "继续观察",
+  "观察",
+  "暂不激活",
+  "拒绝",
+  "归档"
+];
+const reviewActionPattern = reviewActions.join("|");
 const commandPattern =
-  /^(?:@\S+\s+|<at[^>]*>.*?<\/at>\s*)?(?:确认激活|二次确认激活|人工确认激活|建议激活|申请激活|一审建议激活|继续观察|观察|暂不激活|拒绝|归档)\s+proposal_[A-Za-z0-9_:-]+/u;
+  new RegExp(`^(?:${reviewActionPattern})\\s+proposal_[A-Za-z0-9_:-]+`, "u");
+const textMentionPattern =
+  new RegExp(`^@\\S+(?:\\s+(?!(?:${reviewActionPattern})(?:\\s|$))\\S+){0,6}\\s*`, "u");
 
 const plugin = {
   id: "rule-proposal-review",
@@ -41,8 +57,8 @@ async function handleRuleProposalReview(api, { channel, message, actor, replySha
     return undefined;
   }
 
-  const normalizedMessage = normalizeMessage(message ?? "");
-  if (!commandPattern.test(normalizedMessage)) {
+  const reviewMessage = extractReviewMessage(message ?? "");
+  if (!reviewMessage) {
     return undefined;
   }
 
@@ -50,7 +66,7 @@ async function handleRuleProposalReview(api, { channel, message, actor, replySha
   try {
     const result = await runReviewScript({
       repoRoot: config.repoRoot,
-      message: normalizedMessage,
+      message: reviewMessage,
       actor: reviewActor,
       notify: config.notify
     });
@@ -89,6 +105,24 @@ function normalizeMessage(value) {
   return String(value ?? "")
     .replace(/[ \t\r\n]+/gu, " ")
     .trim();
+}
+
+function extractReviewMessage(value) {
+  const stripped = stripLeadingMentions(normalizeMessage(value));
+  return commandPattern.test(stripped) ? stripped : null;
+}
+
+function stripLeadingMentions(value) {
+  let text = String(value ?? "").trim();
+  let previous = "";
+  while (text && text !== previous) {
+    previous = text;
+    text = text
+      .replace(/^<at[^>]*>.*?<\/at>\s*/u, "")
+      .replace(textMentionPattern, "")
+      .trim();
+  }
+  return text;
 }
 
 function runReviewScript({ repoRoot, message, actor, notify }) {
