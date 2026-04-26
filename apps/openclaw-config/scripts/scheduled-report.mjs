@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { loadLocalEnv, openTradingDatabase, sendNotification } from "../../../packages/shared-types/dist/index.js";
+import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJson } from "./_longbridge.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -18,6 +19,7 @@ const kind = assertKind(kindArg);
 const action = assertAction(actionArg);
 const windowInfo = resolveReportWindow(kind, dateArg);
 const reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
+const reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
 
 mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
 mkdirSync(runtimeDir, { recursive: true });
@@ -62,14 +64,17 @@ async function prepareReport(reportKind, info) {
       });
 
   writeFileSync(reportPath, `${report}\n`, "utf8");
+  const pdfPath = writeReportPdf(reportPath, reportPdfPath, report);
   updateState(info, {
     preparedAt: new Date().toISOString(),
     path: reportPath,
+    pdfPath,
     kind: reportKind
   });
 
   return {
     path: reportPath,
+    pdfPath,
     markdown: report
   };
 }
@@ -81,35 +86,32 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   }
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
-  const chunks = chunkMarkdown(markdown, 5600);
-  const deliveries = [];
-  for (const [index, chunk] of chunks.entries()) {
-    const suffix = chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : "";
-    const result = await sendNotification({
-      title: `${titlePrefix} ${info.label}${suffix}`,
-      body: chunk,
-      format: "post"
-    });
-    if (!result.sent) {
-      throw new Error(result.reason ?? `Report delivery was not sent; target=${result.target}`);
-    }
-    deliveries.push({
-      chunk: index + 1,
-      chunks: chunks.length,
-      target: result.target,
-      fallback: Boolean(result.fallback),
-      deliveredAt: new Date().toISOString(),
-      detail: result.detail ?? null,
-      primaryError: result.primaryError ?? null
-    });
+  const pdfPath = existsSync(reportPdfPath)
+    ? reportPdfPath
+    : writeReportPdf(reportPath, reportPdfPath, markdown);
+  const result = await deliverReportToFeishu({
+    title: `${titlePrefix} ${info.label}`,
+    markdown,
+    markdownPath: reportPath,
+    pdfPath
+  });
+  if (!result.sent) {
+    throw new Error(result.reason ?? "Report delivery was not sent.");
   }
+  const deliveries = result.deliveries.map((entry) => ({
+    ...entry,
+    deliveredAt: new Date().toISOString()
+  }));
+  const chapterMessages = deliveries.filter((entry) => entry.kind === "chapter");
 
   updateState(info, {
     deliveredAt: new Date().toISOString(),
     path: reportPath,
+    pdfPath,
     kind: reportKind,
-    chunks: chunks.length,
+    chunks: chapterMessages.length,
     deliveries,
+    pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
     regeneratedDuringDelivery: false,
     preparedInSameRun: alreadyPrepared
   });
@@ -118,10 +120,12 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     delivered: true,
     kind: reportKind,
     label: info.label,
-    chunks: chunks.length,
+    chunks: chapterMessages.length,
     targets: deliveries.map((entry) => entry.target),
     fallbackUsed: deliveries.some((entry) => entry.fallback),
-    path: reportPath
+    pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
+    path: reportPath,
+    pdfPath
   }, null, 2));
 }
 
@@ -723,21 +727,124 @@ function addDays(label, days) {
   return date.toISOString().slice(0, 10);
 }
 
-function chunkMarkdown(markdown, maxChars) {
-  const chunks = [];
-  const sections = markdown.split(/\n(?=##\s)/u);
-  let current = "";
-  for (const section of sections) {
-    if (current && current.length + section.length + 1 > maxChars) {
-      chunks.push(current.trim());
-      current = "";
+function writeReportPdf(markdownPath, pdfPath, markdown) {
+  const htmlPath = join(runtimeDir, "report-html", `${basename(markdownPath, ".md")}.html`);
+  mkdirSync(join(runtimeDir, "report-html"), { recursive: true });
+  writeFileSync(htmlPath, renderReportHtml(markdown), "utf8");
+
+  const chromePath = resolveChromePath();
+  execFileSync(chromePath, [
+    "--headless",
+    "--disable-gpu",
+    "--no-first-run",
+    `--print-to-pdf=${pdfPath}`,
+    `file://${htmlPath}`
+  ], {
+    cwd: repoRoot,
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+
+  if (!existsSync(pdfPath)) {
+    throw new Error(`PDF 生成失败：${pdfPath}`);
+  }
+  return pdfPath;
+}
+
+function resolveChromePath() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+  ].filter(Boolean);
+
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    throw new Error("未找到可用于生成 PDF 的 Chrome/Chromium。请安装 Google Chrome 或设置 CHROME_BIN。");
+  }
+  return found;
+}
+
+function renderReportHtml(markdown) {
+  return [
+    "<!doctype html>",
+    "<html>",
+    "<head>",
+    "<meta charset=\"utf-8\">",
+    "<style>",
+    "@page { size: A4; margin: 18mm 16mm; }",
+    "body { font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; color: #111827; font-size: 13px; line-height: 1.58; }",
+    "h1 { font-size: 24px; margin: 0 0 14px; padding-bottom: 10px; border-bottom: 2px solid #111827; }",
+    "h2 { font-size: 18px; margin: 22px 0 10px; padding-bottom: 4px; border-bottom: 1px solid #d1d5db; }",
+    "h3 { font-size: 15px; margin: 16px 0 8px; }",
+    "p { margin: 7px 0; }",
+    "ul { margin: 7px 0 10px 20px; padding: 0; }",
+    "li { margin: 4px 0; }",
+    "code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: 1px 3px; border-radius: 3px; }",
+    "</style>",
+    "</head>",
+    "<body>",
+    markdownToHtml(markdown),
+    "</body>",
+    "</html>"
+  ].join("\n");
+}
+
+function markdownToHtml(markdown) {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const html = [];
+  let inList = false;
+  const closeList = () => {
+    if (inList) {
+      html.push("</ul>");
+      inList = false;
     }
-    current = current ? `${current}\n${section}` : section;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (!line.trim()) {
+      closeList();
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.+)$/u.exec(line);
+    if (heading) {
+      closeList();
+      const level = Math.min(3, heading[1].length);
+      html.push(`<h${level}>${formatInlineHtml(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    const bullet = /^-\s+(.+)$/u.exec(line);
+    if (bullet) {
+      if (!inList) {
+        html.push("<ul>");
+        inList = true;
+      }
+      html.push(`<li>${formatInlineHtml(bullet[1])}</li>`);
+      continue;
+    }
+
+    closeList();
+    html.push(`<p>${formatInlineHtml(line)}</p>`);
   }
-  if (current.trim()) {
-    chunks.push(current.trim());
-  }
-  return chunks.length > 0 ? chunks : [markdown.trim()];
+  closeList();
+  return html.join("\n");
+}
+
+function formatInlineHtml(value) {
+  return escapeHtml(value)
+    .replace(/\*\*([^*]+)\*\*/gu, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/gu, "<code>$1</code>");
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/"/gu, "&quot;");
 }
 
 function updateState(info, patch) {

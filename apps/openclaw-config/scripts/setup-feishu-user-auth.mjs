@@ -180,8 +180,10 @@ function printStatus(currentEnv) {
     larkAppCredentials: Boolean(currentEnv.LARK_APP_ID && currentEnv.LARK_APP_SECRET),
     userAccessToken: Boolean(currentEnv.LARK_USER_ACCESS_TOKEN),
     userRefreshToken: Boolean(currentEnv.LARK_USER_REFRESH_TOKEN),
+    userTokensRequiredForBotDelivery: false,
     targetGroupName: currentEnv.FEISHU_USER_PLUGIN_GROUP_NAME ?? "炒股这一块",
-    targetChatId: currentEnv.FEISHU_USER_PLUGIN_CHAT_ID ? "configured" : "missing",
+    targetBotChatId: currentEnv.FEISHU_USER_PLUGIN_BOT_CHAT_ID || currentEnv.FEISHU_NOTIFY_CHAT_ID ? "configured" : "missing",
+    targetUserChatId: currentEnv.FEISHU_USER_PLUGIN_CHAT_ID ? "configured" : "missing",
     oauthRedirectUri: redirectUri
   }, null, 2));
 }

@@ -16,8 +16,9 @@ export interface NotificationPayload {
 }
 
 export type NotificationDeliveryTarget =
-  | "feishu-user-plugin-text"
-  | "feishu-user-plugin-post"
+  | "feishu-user-plugin-bot-text"
+  | "feishu-user-plugin-bot-post"
+  | "feishu-user-plugin-bot-file"
   | "feishu-webhook"
   | "feishu-app-open-id"
   | "feishu-app-chat-id"
@@ -38,6 +39,36 @@ export interface NotificationReadiness {
   reason?: string;
 }
 
+export interface ReportDeliveryPayload {
+  title: string;
+  markdown: string;
+  markdownPath?: string;
+  pdfPath?: string;
+  maxSectionChars?: number;
+}
+
+export interface ReportDeliveryEntry {
+  kind: "summary" | "chapter" | "file";
+  title: string;
+  target: NotificationDeliveryTarget;
+  sent: boolean;
+  fallback?: boolean;
+  detail?: string;
+  reason?: string;
+  primaryError?: string;
+  chapter?: number;
+  part?: number;
+  parts?: number;
+}
+
+export interface ReportDeliveryResult {
+  sent: boolean;
+  target: NotificationDeliveryTarget;
+  fallback?: boolean;
+  reason?: string;
+  deliveries: ReportDeliveryEntry[];
+}
+
 interface FeishuAppTarget {
   targetType: "open_id" | "chat_id";
   targetId: string;
@@ -54,9 +85,9 @@ interface FeishuAppCredentials {
 let notificationTargetRepository: NotificationTargetRepository | null = null;
 
 export function getNotificationReadiness(): NotificationReadiness {
-  const userPlugin = resolveFeishuUserPluginReadiness();
-  if (userPlugin.enabled) {
-    return userPlugin;
+  const pluginBot = resolveFeishuUserPluginBotReadiness();
+  if (pluginBot.enabled) {
+    return pluginBot;
   }
 
   const fallback = getFallbackNotificationReadiness();
@@ -64,22 +95,22 @@ export function getNotificationReadiness(): NotificationReadiness {
     return {
       enabled: false,
       target: "none",
-      reason: `${userPlugin.reason ?? "Feishu user plugin is not ready"}; ${fallback.reason ?? "no fallback is ready"}`
+      reason: `${pluginBot.reason ?? "Feishu user plugin bot channel is not ready"}; ${fallback.reason ?? "no fallback is ready"}`
     };
   }
 
   return {
     enabled: true,
     target: fallback.target,
-    reason: `${userPlugin.reason ?? "Feishu user plugin is not ready"}; fallback is available.`
+    reason: `${pluginBot.reason ?? "Feishu user plugin bot channel is not ready"}; fallback is available.`
   };
 }
 
 export async function sendNotification(payload: NotificationPayload): Promise<NotificationResult> {
-  const userPluginReadiness = resolveFeishuUserPluginReadiness();
-  if (userPluginReadiness.enabled) {
+  const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
+  if (pluginBotReadiness.enabled) {
     try {
-      return await sendFeishuUserPluginNotification(payload);
+      return await sendFeishuUserPluginBotNotification(payload);
     } catch (error) {
       const primaryError = sanitizeNotificationError(error);
       const fallbackResult = await sendFallbackNotification(buildDegradedFallbackPayload(payload));
@@ -102,6 +133,67 @@ export async function sendNotification(payload: NotificationPayload): Promise<No
   }
 
   return sendFallbackNotification(payload);
+}
+
+export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
+  const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
+  if (!pluginBotReadiness.enabled) {
+    const fallback = await deliverReportViaFallback(payload, pluginBotReadiness.reason);
+    return fallback;
+  }
+
+  try {
+    const deliveries: ReportDeliveryEntry[] = [];
+    const summaryResult = await sendFeishuUserPluginBotPost({
+      title: `${payload.title} 摘要`,
+      body: buildReportSummaryMarkdown(payload)
+    });
+    deliveries.push({
+      kind: "summary",
+      title: `${payload.title} 摘要`,
+      target: summaryResult.target,
+      sent: summaryResult.sent,
+      ...(summaryResult.detail ? { detail: summaryResult.detail } : {})
+    });
+
+    const sections = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
+    for (const section of sections) {
+      const sectionResult = await sendFeishuUserPluginBotPost({
+        title: section.title,
+        body: section.body
+      });
+      deliveries.push({
+        kind: "chapter",
+        title: section.title,
+        target: sectionResult.target,
+        sent: sectionResult.sent,
+        ...(sectionResult.detail ? { detail: sectionResult.detail } : {}),
+        chapter: section.chapter,
+        part: section.part,
+        parts: section.parts
+      });
+    }
+
+    if (payload.pdfPath) {
+      const fileResult = await trySendFeishuUserPluginBotFile(payload.pdfPath, `${payload.title}.pdf`);
+      deliveries.push({
+        kind: "file",
+        title: `${payload.title}.pdf`,
+        target: fileResult.target,
+        sent: fileResult.sent,
+        ...(fileResult.detail ? { detail: fileResult.detail } : {}),
+        ...(fileResult.reason ? { reason: fileResult.reason } : {})
+      });
+    }
+
+    return {
+      sent: deliveries.some((entry) => entry.kind !== "file" && entry.sent),
+      target: "feishu-user-plugin-bot-post",
+      deliveries
+    };
+  } catch (error) {
+    return deliverReportViaFallback(payload, sanitizeNotificationError(error));
+  }
 }
 
 function getFallbackNotificationReadiness(): NotificationReadiness {
@@ -199,7 +291,63 @@ async function sendFallbackNotification(payload: NotificationPayload): Promise<N
   };
 }
 
-function resolveFeishuUserPluginReadiness(): NotificationReadiness {
+async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryError?: string): Promise<ReportDeliveryResult> {
+  const chunks = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
+  const deliveries: ReportDeliveryEntry[] = [];
+  const summaryResult = await sendFallbackNotification(buildDegradedFallbackPayload({
+    title: `${payload.title} 摘要`,
+    body: buildReportSummaryMarkdown(payload),
+    format: "post"
+  }));
+  deliveries.push({
+    kind: "summary",
+    title: `${payload.title} 摘要`,
+    target: summaryResult.target,
+    sent: summaryResult.sent,
+    fallback: true,
+    ...(summaryResult.reason ? { reason: summaryResult.reason } : {}),
+    ...(primaryError ? { primaryError } : {})
+  });
+
+  if (summaryResult.sent) {
+    for (const section of chunks) {
+      const result = await sendFallbackNotification(buildDegradedFallbackPayload({
+        title: section.title,
+        body: section.body,
+        format: "post"
+      }));
+      deliveries.push({
+        kind: "chapter",
+        title: section.title,
+        target: result.target,
+        sent: result.sent,
+        fallback: true,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(primaryError ? { primaryError } : {}),
+        chapter: section.chapter,
+        part: section.part,
+        parts: section.parts
+      });
+      if (!result.sent) {
+        break;
+      }
+    }
+  }
+
+  const deliveryResult: ReportDeliveryResult = {
+    sent: deliveries.some((entry) => entry.sent),
+    target: summaryResult.target,
+    fallback: true,
+    deliveries
+  };
+  const reason = summaryResult.sent ? undefined : (summaryResult.reason ?? primaryError);
+  if (reason) {
+    deliveryResult.reason = reason;
+  }
+  return deliveryResult;
+}
+
+function resolveFeishuUserPluginBotReadiness(): NotificationReadiness {
   if (process.env.FEISHU_USER_PLUGIN_DISABLED === "1") {
     return {
       enabled: false,
@@ -208,34 +356,48 @@ function resolveFeishuUserPluginReadiness(): NotificationReadiness {
     };
   }
 
-  const cookie = process.env.LARK_COOKIE?.trim();
-  if (!cookie) {
+  const appId = process.env.LARK_APP_ID?.trim() || process.env.FEISHU_APP_ID?.trim();
+  const appSecret = process.env.LARK_APP_SECRET?.trim() || process.env.FEISHU_APP_SECRET?.trim();
+  if (!appId || !appSecret) {
     return {
       enabled: false,
       target: "none",
-      reason: "LARK_COOKIE is not configured."
+      reason: "LARK_APP_ID/LARK_APP_SECRET are not configured."
+    };
+  }
+
+  try {
+    resolveFeishuUserPluginBotChatId();
+  } catch (error) {
+    return {
+      enabled: false,
+      target: "none",
+      reason: error instanceof Error ? error.message : String(error)
     };
   }
 
   return {
     enabled: true,
-    target: "feishu-user-plugin-post"
+    target: "feishu-user-plugin-bot-post"
   };
 }
 
-async function sendFeishuUserPluginNotification(payload: NotificationPayload): Promise<NotificationResult> {
-  const chatId = await resolveFeishuUserPluginChatId();
+async function sendFeishuUserPluginBotNotification(payload: NotificationPayload): Promise<NotificationResult> {
   const post = payload.format === "post";
-  const result = post
-    ? await callFeishuUserPluginTool("send_post_as_user", {
-        chat_id: chatId,
-        title: payload.title,
-        paragraphs: markdownToFeishuPostContent(payload.body)
-      })
-    : await callFeishuUserPluginTool("send_as_user", {
-        chat_id: chatId,
-        text: `${payload.title}\n${payload.body}`
-      });
+  return post
+    ? sendFeishuUserPluginBotPost(payload)
+    : sendFeishuUserPluginBotText(payload);
+}
+
+async function sendFeishuUserPluginBotText(payload: NotificationPayload): Promise<NotificationResult> {
+  const chatId = resolveFeishuUserPluginBotChatId();
+  const result = await callFeishuUserPluginTool("send_message_as_bot", {
+    chat_id: chatId,
+    msg_type: "text",
+    content: {
+      text: `${payload.title}\n${payload.body}`
+    }
+  });
 
   const detail = extractMcpText(result);
   if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
@@ -244,42 +406,116 @@ async function sendFeishuUserPluginNotification(payload: NotificationPayload): P
 
   return {
     sent: true,
-    target: post ? "feishu-user-plugin-post" : "feishu-user-plugin-text",
+    target: "feishu-user-plugin-bot-text",
     ...(detail ? { detail } : {})
   };
 }
 
-async function resolveFeishuUserPluginChatId(): Promise<string> {
+async function sendFeishuUserPluginBotPost(payload: NotificationPayload): Promise<NotificationResult> {
+  const chatId = resolveFeishuUserPluginBotChatId();
+  const result = await callFeishuUserPluginTool("send_message_as_bot", {
+    chat_id: chatId,
+    msg_type: "post",
+    content: {
+      zh_cn: {
+        title: payload.title,
+        content: markdownToFeishuPostContent(payload.body)
+      }
+    }
+  });
+
+  const detail = extractMcpText(result);
+  if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
+    throw new Error(detail || "feishu-user-plugin bot post returned an error response.");
+  }
+
+  return {
+    sent: true,
+    target: "feishu-user-plugin-bot-post",
+    ...(detail ? { detail } : {})
+  };
+}
+
+async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string): Promise<NotificationResult> {
+  if (!existsSync(filePath)) {
+    return {
+      sent: false,
+      target: "feishu-user-plugin-bot-file",
+      reason: `PDF file was not found: ${filePath}`
+    };
+  }
+
+  try {
+    const upload = await callFeishuUserPluginTool("upload_file", {
+      file_path: filePath,
+      file_type: "pdf",
+      file_name: fileName
+    });
+    const uploadText = extractMcpText(upload);
+    const fileKey = uploadText.match(/\bfile_[A-Za-z0-9_-]+\b/u)?.[0];
+    if (upload.isError || !fileKey) {
+      return {
+        sent: false,
+        target: "feishu-user-plugin-bot-file",
+        reason: uploadText || "PDF upload did not return a file key."
+      };
+    }
+
+    const sent = await callFeishuUserPluginTool("send_message_as_bot", {
+      chat_id: resolveFeishuUserPluginBotChatId(),
+      msg_type: "file",
+      content: {
+        file_key: fileKey
+      }
+    });
+    const detail = extractMcpText(sent);
+    if (sent.isError || /^error:/iu.test(detail)) {
+      return {
+        sent: false,
+        target: "feishu-user-plugin-bot-file",
+        reason: detail || "PDF file message failed."
+      };
+    }
+
+    return {
+      sent: true,
+      target: "feishu-user-plugin-bot-file",
+      detail
+    };
+  } catch (error) {
+    return {
+      sent: false,
+      target: "feishu-user-plugin-bot-file",
+      reason: sanitizeNotificationError(error)
+    };
+  }
+}
+
+function resolveFeishuUserPluginBotChatId(): string {
+  const explicitBotChatId = process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID?.trim();
+  if (explicitBotChatId) {
+    return explicitBotChatId;
+  }
+
+  const notifyChatId = process.env.FEISHU_NOTIFY_CHAT_ID?.trim();
+  if (notifyChatId?.startsWith("oc_")) {
+    return notifyChatId;
+  }
+
+  const groupAllowList = (process.env.FEISHU_GROUP_ALLOW_FROM ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("oc_"));
+  if (groupAllowList.length === 1) {
+    return groupAllowList[0]!;
+  }
+
   const explicitChatId = process.env.FEISHU_USER_PLUGIN_CHAT_ID?.trim();
   if (explicitChatId) {
-    return explicitChatId;
+    throw new Error("FEISHU_USER_PLUGIN_CHAT_ID is a user-identity numeric chat id; set FEISHU_USER_PLUGIN_BOT_CHAT_ID or FEISHU_NOTIFY_CHAT_ID to an oc_ chat id for bot delivery.");
   }
 
-  const groupName = process.env.FEISHU_USER_PLUGIN_GROUP_NAME?.trim() || "炒股这一块";
-  const result = await callFeishuUserPluginTool("search_contacts", { query: groupName });
-  const text = extractMcpText(result);
-  if (result.isError || /^error:/iu.test(text)) {
-    throw new Error(text || `Failed to search Feishu group "${groupName}".`);
-  }
-
-  let matches: Array<{ type?: unknown; title?: unknown; id?: unknown }>;
-  try {
-    matches = JSON.parse(text) as Array<{ type?: unknown; title?: unknown; id?: unknown }>;
-  } catch {
-    throw new Error(`Feishu group search returned non-JSON output for "${groupName}".`);
-  }
-
-  const groups = matches.filter((entry) => entry.type === "group");
-  const exact = groups.find((entry) => entry.title === groupName);
-  const selected = exact ?? (groups.length === 1 ? groups[0] : undefined);
-  const chatId = typeof selected?.id === "string" || typeof selected?.id === "number"
-    ? String(selected.id)
-    : "";
-  if (!chatId) {
-    throw new Error(`Feishu group "${groupName}" was not resolved to exactly one chat. Matches=${groups.length}`);
-  }
-
-  return chatId;
+  throw new Error("No bot chat id is configured. Set FEISHU_USER_PLUGIN_BOT_CHAT_ID or FEISHU_NOTIFY_CHAT_ID to the 炒股这一块 oc_ chat id.");
 }
 
 interface McpToolResult {
@@ -467,6 +703,130 @@ function buildDegradedFallbackPayload(payload: NotificationPayload): Notificatio
     title: `已降级为 bot 发送：${payload.title}`,
     body: `【已降级为 bot 发送】\n\n${payload.body}`
   };
+}
+
+function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): string {
+  const lines = payload.markdown.replace(/\r\n/gu, "\n").split("\n");
+  const reportTitle = lines.find((line) => /^#\s+/u.test(line))?.replace(/^#\s+/u, "").trim() ?? payload.title;
+  const windowLine = lines.find((line) => /^窗口：/u.test(line)) ?? "";
+  const firstSection = extractFirstConclusionSection(payload.markdown);
+  const bullets = firstSection
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^-\s+/u.test(line))
+    .slice(0, 6);
+
+  return [
+    `# ${reportTitle}`,
+    "",
+    windowLine,
+    "",
+    "## 摘要",
+    "",
+    ...(bullets.length > 0 ? bullets : ["- 本报告已生成，后续消息将按章节发送全文。"]),
+    "",
+    "## 交付",
+    "",
+    "- 第一条：Trading Copilot bot 富文本摘要卡片。",
+    "- 后续：按章节发送全文；超长章节会自动拆分，保留章节标题。",
+    ...(payload.markdownPath ? [`- 本地 Markdown：${payload.markdownPath}`] : []),
+    ...(payload.pdfPath ? [`- 本地 PDF：${payload.pdfPath}`] : []),
+    "- 若 Feishu 文件上传权限可用，PDF 会作为文件消息发送到群里。"
+  ].filter((line) => line !== "").join("\n");
+}
+
+function extractFirstConclusionSection(markdown: string): string {
+  const normalized = markdown.replace(/\r\n/gu, "\n");
+  const match = normalized.match(/\n##\s+1\.\s+[^\n]+\n([\s\S]*?)(?=\n##\s+\d+\.|\s*$)/u);
+  return match?.[1] ?? "";
+}
+
+interface ChapterMessage {
+  title: string;
+  body: string;
+  chapter: number;
+  part: number;
+  parts: number;
+}
+
+function splitReportIntoChapterMessages(markdown: string, maxChars: number): ChapterMessage[] {
+  const normalized = markdown.replace(/\r\n/gu, "\n").trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const rawSections = normalized.split(/\n(?=##\s+)/u);
+  const sections = rawSections.map((section, index) => ({
+    title: extractSectionTitle(section) ?? (index === 0 ? "报告信息" : `章节 ${index + 1}`),
+    body: section.trim()
+  })).filter((section) => section.body);
+
+  const messages: ChapterMessage[] = [];
+  for (const [sectionIndex, section] of sections.entries()) {
+    const parts = splitMarkdownText(section.body, maxChars);
+    for (const [partIndex, part] of parts.entries()) {
+      const multiPart = parts.length > 1 ? `（${partIndex + 1}/${parts.length}）` : "";
+      messages.push({
+        title: `${section.title}${multiPart}`,
+        body: part,
+        chapter: sectionIndex + 1,
+        part: partIndex + 1,
+        parts: parts.length
+      });
+    }
+  }
+
+  return messages.length > 0
+    ? messages
+    : [{
+        title: "报告全文",
+        body: normalized,
+        chapter: 1,
+        part: 1,
+        parts: 1
+      }];
+}
+
+function extractSectionTitle(section: string): string | null {
+  const heading = section.match(/^(#{1,6})\s+(.+)$/mu)?.[2]?.trim();
+  return heading || null;
+}
+
+function splitMarkdownText(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) {
+    return [text];
+  }
+
+  const paragraphs = text.split(/\n{2,}/u);
+  const chunks: string[] = [];
+  let current = "";
+  for (const paragraph of paragraphs) {
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (candidate.length <= maxChars) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.trim()) {
+      chunks.push(current.trim());
+      current = "";
+    }
+
+    if (paragraph.length <= maxChars) {
+      current = paragraph;
+      continue;
+    }
+
+    for (let index = 0; index < paragraph.length; index += maxChars) {
+      chunks.push(paragraph.slice(index, index + maxChars).trim());
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks.filter(Boolean);
 }
 
 function sanitizeNotificationError(error: unknown): string {
