@@ -1,0 +1,185 @@
+{
+  // Copy to ~/.openclaw/openclaw.json and replace placeholders.
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "loopback",
+    auth: {
+      mode: "token",
+      token: "replace_me"
+    },
+    controlUi: {
+      enabled: true
+    }
+  },
+  acp: {
+    enabled: true,
+    dispatch: { enabled: true },
+    backend: "acpx",
+    defaultAgent: "codex",
+    allowedAgents: ["codex"],
+    maxConcurrentSessions: 8,
+    stream: {
+      coalesceIdleMs: 300,
+      maxChunkChars: 1200
+    },
+    runtime: {
+      ttlMinutes: 120
+    }
+  },
+  agents: {
+    defaults: {
+      userTimezone: "Asia/Shanghai",
+      skipBootstrap: true,
+      sandbox: { mode: "off" },
+      model: { primary: "openai-codex/gpt-5.4" },
+      models: {
+        "openai-codex/gpt-5.4": { alias: "gpt" },
+        "openai-codex/gpt-5.4-mini": { alias: "gpt-mini" }
+      },
+      heartbeat: {
+        every: "30m",
+        model: "openai-codex/gpt-5.4-mini",
+        isolatedSession: true,
+        prompt: "Read HEARTBEAT.md and report auth issues, queue lag, or risk state drift.",
+        target: "none"
+      }
+    },
+    list: [
+      {
+        id: "control",
+        default: true,
+        name: "Trading Control",
+        workspace: "~/.openclaw/workspaces/control",
+        agentDir: "~/.openclaw/agents/control/agent",
+        identity: {
+          name: "Trading Control",
+          theme: "risk-aware operator"
+        },
+        groupChat: {
+          mentionPatterns: ["@control", "@trade-control"]
+        },
+        subagents: {
+          allowAgents: ["*"]
+        },
+        runtime: {
+          type: "acp",
+          acp: {
+            agent: "codex",
+            backend: "acpx",
+            mode: "persistent",
+            cwd: "/Users/mashu/Documents/codex"
+          }
+        }
+      },
+      {
+        id: "live-advisor",
+        name: "Live Advisor",
+        workspace: "~/.openclaw/workspaces/live-advisor",
+        agentDir: "~/.openclaw/agents/live-advisor/agent",
+        identity: {
+          name: "Live Advisor",
+          theme: "structured decision support"
+        },
+        subagents: {
+          allowAgents: ["*"]
+        },
+        runtime: {
+          type: "acp",
+          acp: {
+            agent: "codex",
+            backend: "acpx",
+            mode: "persistent",
+            cwd: "/Users/mashu/Documents/codex"
+          }
+        }
+      },
+      {
+        id: "paper-trader",
+        name: "Paper Trader",
+        workspace: "~/.openclaw/workspaces/paper-trader",
+        agentDir: "~/.openclaw/agents/paper-trader/agent",
+        identity: {
+          name: "Paper Trader",
+          theme: "autonomous simulator"
+        },
+        subagents: {
+          allowAgents: ["*"]
+        },
+        runtime: {
+          type: "acp",
+          acp: {
+            agent: "codex",
+            backend: "acpx",
+            mode: "persistent",
+            cwd: "/Users/mashu/Documents/codex"
+          }
+        }
+      },
+      {
+        id: "evolution",
+        name: "Evolution",
+        workspace: "~/.openclaw/workspaces/evolution",
+        agentDir: "~/.openclaw/agents/evolution/agent",
+        identity: {
+          name: "Evolution",
+          theme: "versioned learning system"
+        },
+        subagents: {
+          allowAgents: ["*"]
+        },
+        runtime: {
+          type: "acp",
+          acp: {
+            agent: "codex",
+            backend: "acpx",
+            mode: "persistent",
+            cwd: "/Users/mashu/Documents/codex"
+          }
+        }
+      }
+    ]
+  },
+  // Optional Feishu channel. Keep disabled until app credentials are ready.
+  channels: {
+    feishu: {
+      enabled: false,
+      connectionMode: "websocket",
+      domain: "feishu",
+      defaultAccount: "main",
+      dmPolicy: "pairing",
+      accounts: {
+        main: {
+          appId: "replace_me",
+          appSecret: "replace_me",
+          domain: "feishu",
+          verificationToken: "replace_me",
+          name: "Trading Copilot"
+        }
+      }
+    }
+  },
+  plugins: {
+    // Keep this list for installed external plugins only. Bundled runtime/channel plugins
+    // are enabled by their own config blocks and should not be added here.
+    allow: [],
+    entries: {
+      acpx: {
+        enabled: true,
+        config: {
+          permissionMode: "approve-all",
+          nonInteractivePermissions: "fail",
+          pluginToolsMcpBridge: true
+        }
+      },
+      "openclaw-honcho": {
+        enabled: false,
+        config: {
+          baseUrl: "https://api.honcho.dev",
+          apiKey: "replace_me",
+          workspaceId: "openclaw-trading-stack"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/shared-types" },
+    { "path": "./packages/context-builder" },
+    { "path": "./apps/event-bus" },
+    { "path": "./apps/event-ingestor" },
+    { "path": "./apps/broker-executor" },
+    { "path": "./apps/options-shadow" }
+  ]
+}
+
