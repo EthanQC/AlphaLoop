@@ -76,8 +76,8 @@ function activateRuleVersion(commandArgs) {
   if (proposal.scope !== scope || proposal.candidate_version !== version) {
     throw new Error("提案范围或候选版本与激活参数不一致，拒绝激活。");
   }
-  if (proposal.status !== "pending_confirmation") {
-    throw new Error(`提案状态不是待确认：${proposal.status}`);
+  if (!["pending_confirmation", "activation_requested"].includes(proposal.status)) {
+    throw new Error(`提案状态不是可激活状态：${proposal.status}`);
   }
   if (!["suggest_activation", "promote"].includes(proposal.recommendation)) {
     throw new Error(`提案推荐动作不是建议激活：${proposal.recommendation}`);
@@ -294,6 +294,7 @@ function printUsageAndExit(message) {
   console.error([
     "用法：",
     "  node apps/openclaw-config/scripts/activate-rule-version.mjs activate <live|paper> <version> --proposal-id <id> --confirm HUMAN_APPROVED [--actor name] [--reason text]",
+    "  # 飞书群内审核建议优先走 review-rule-proposal.mjs；建议激活只进入一审状态，确认激活必须包含 HUMAN_APPROVED。",
     "  node apps/openclaw-config/scripts/activate-rule-version.mjs reject <proposal-id> --confirm HUMAN_REJECTED --reason text [--actor name]",
     "  node apps/openclaw-config/scripts/activate-rule-version.mjs archive <proposal-id> --confirm HUMAN_ARCHIVED --reason text [--actor name]"
   ].join("\n"));

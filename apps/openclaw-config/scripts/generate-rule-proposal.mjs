@@ -527,7 +527,8 @@ function renderProposalReviewNotification(proposals) {
     "- 本消息只用于审核，不会自动激活任何规则。",
     "- 未确认前，live/paper active-version 均保持不变。",
     "- 实盘仍禁止自动提交真实资金订单；期权策略保持禁用。",
-    "- 你可以直接在群里回复审核意见；需要激活时仍必须由控制流程带确认参数执行激活脚本。",
+    "- 你可以直接在群里回复审核意见；继续观察/拒绝/归档会写入状态和审计。",
+    "- 激活必须两步：先“建议激活”，再“确认激活 ... HUMAN_APPROVED”。",
     ""
   ];
 
@@ -552,9 +553,9 @@ function renderProposalReviewNotification(proposals) {
   lines.push(
     "## 审核动作",
     "",
-    "- 继续观察：在群里回复“继续观察 + 提案编号”。",
-    "- 拒绝：在群里回复“拒绝 + 提案编号 + 原因”，或运行 reject 命令写入审计。",
-    "- 激活：只有候选规则文件已人工落地，并运行 `activate-rule-version.mjs activate ... --confirm HUMAN_APPROVED` 后才会生效。"
+    "- 低风险状态变更：回复 `继续观察 <提案编号> [原因]`、`拒绝 <提案编号> <原因>`、`归档 <提案编号> <原因>`。",
+    "- 一审建议激活：回复 `建议激活 <提案编号> <原因>`，只会把状态改为 activation_requested，不会生效。",
+    "- 二次确认激活：回复 `确认激活 <提案编号> HUMAN_APPROVED <原因>`；候选规则文件必须已人工落地，激活脚本会再次校验。"
   );
 
   return lines.join("\n");
@@ -657,8 +658,9 @@ function renderProposalMarkdown(proposal) {
     "",
     "- 当前状态：待确认。",
     "- 未确认前不修改 active-version，不改变实盘或模拟盘行为。",
-    "- 如需激活，必须由人工运行带确认参数的激活脚本，并写入 audit_log。",
-    "- 如需拒绝或归档，也必须由人工给出确认参数和原因。",
+    "- 如需继续观察、拒绝或归档，可由可信操作人在飞书群回复明确动作，系统写入 audit_log。",
+    "- 如需激活，必须先回复“建议激活 <提案编号> <原因>”，再二次回复“确认激活 <提案编号> HUMAN_APPROVED <原因>”。",
+    "- 也可由人工运行带确认参数的激活脚本；没有 HUMAN_APPROVED 不会生效。",
     "",
     "## 安全边界",
     "",

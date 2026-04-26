@@ -265,7 +265,7 @@ function renderProposalDigest(rows) {
     `- 提案编号：${row.id}`,
     `- 时间：${row.created_at}`,
     `- 版本：${row.current_version} -> ${row.candidate_version}`,
-    `- 生命周期：${translateProposalStatus(row.status)}；未确认不生效。`,
+    `- 生命周期：${translateProposalStatus(row.status)}；${renderProposalActivationNotice(row.status)}`,
     `- 推荐动作：${translateRuleRecommendation(row.recommendation)}`,
     `- 触发原因：${renderChineseProposalText(row.trigger_reason || row.summary)}`,
     `- 摘要：${renderChineseProposalSummary(row.summary)}`,
@@ -418,11 +418,25 @@ function translateRuleRecommendation(recommendation) {
 function translateProposalStatus(status) {
   const labels = {
     pending_confirmation: "待人工确认",
+    activation_requested: "已一审建议激活，等待二次确认",
+    continued_observation: "人工确认继续观察",
     activated: "已由人工确认激活",
     rejected: "已由人工拒绝",
     archived: "已归档"
   };
   return labels[status] ?? "待人工确认";
+}
+
+function renderProposalActivationNotice(status) {
+  const notices = {
+    pending_confirmation: "未确认不生效",
+    activation_requested: "尚未生效，必须二次确认 HUMAN_APPROVED",
+    continued_observation: "未激活，不改变规则行为",
+    activated: "已通过人工确认生效",
+    rejected: "已拒绝，不生效",
+    archived: "已归档，不进入本轮应用"
+  };
+  return notices[status] ?? "未确认不生效";
 }
 
 function renderChineseProposalSummary(value) {

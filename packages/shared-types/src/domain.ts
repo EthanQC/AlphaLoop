@@ -163,7 +163,13 @@ export interface RuleSet {
   notes: string[];
 }
 
-export type RuleProposalStatus = "pending_confirmation" | "activated" | "rejected" | "archived";
+export type RuleProposalStatus =
+  | "pending_confirmation"
+  | "activation_requested"
+  | "continued_observation"
+  | "activated"
+  | "rejected"
+  | "archived";
 export type RuleProposalRecommendation =
   | "suggest_activation"
   | "continue_observe"

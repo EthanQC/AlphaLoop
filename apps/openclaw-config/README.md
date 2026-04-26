@@ -10,6 +10,7 @@ This folder contains the OpenClaw-side configuration templates for the local tra
 - `scripts/*.sh`: helper scripts to sync workspaces and install LaunchAgents
 - `scripts/bootstrap-preferences.mjs`: build a baseline preference snapshot from notes and approvals
 - `scripts/generate-rule-proposal.mjs`: 从 SQLite 执行事实、审批编辑和当前规则生成中文、待确认、可审计的规则提案
+- `scripts/review-rule-proposal.mjs`: 解析飞书群审核回复，写入提案状态、审计日志，并在二次确认后调用激活脚本
 
 ## Setup flow
 
@@ -73,7 +74,18 @@ pnpm preferences:bootstrap
 pnpm proposals:generate
 ```
 
-规则提案默认不会激活。若人工确认候选规则已落地，需要显式运行：
+规则提案默认不会激活。飞书群内审核分两档：
+
+- 低风险状态变更：回复 `继续观察 <proposal-id> [原因]`、`拒绝 <proposal-id> <原因>`、`归档 <proposal-id> <原因>`。
+- 激活两步确认：先回复 `建议激活 <proposal-id> <原因>`，再回复 `确认激活 <proposal-id> HUMAN_APPROVED <原因>`。
+
+本地也可手动运行审核入口：
+
+```bash
+pnpm proposals:review from-feishu "继续观察 <proposal-id> 样本还不够" --actor <feishu-open-id>
+```
+
+若人工确认候选规则已落地，也可显式运行底层激活脚本：
 
 ```bash
 node apps/openclaw-config/scripts/activate-rule-version.mjs activate <live|paper> <version> --proposal-id <id> --confirm HUMAN_APPROVED
