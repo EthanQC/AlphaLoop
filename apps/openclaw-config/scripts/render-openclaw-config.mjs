@@ -192,8 +192,8 @@ const nextConfig = {
         config: {
           repoRoot,
           channel: "feishu",
-          notify: true,
-          returnText: false
+          notify: false,
+          returnText: true
         }
       }
     },
