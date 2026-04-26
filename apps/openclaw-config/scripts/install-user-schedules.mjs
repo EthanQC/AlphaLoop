@@ -19,8 +19,15 @@ mkdirSync(launchAgentsDir, { recursive: true });
 mkdirSync(runtimeLogDir, { recursive: true });
 
 const marketWeekdays = [1, 2, 3, 4, 5];
+const catchupMinutes = [7, 22, 37, 52];
 
 const jobs = [
+  {
+    label: "com.openclaw.trading.catchup",
+    command: `${quote(nodeBin)} --no-warnings apps/openclaw-config/scripts/reconcile-user-schedules.mjs run`,
+    schedule: catchupMinutes.map((Minute) => ({ Minute })),
+    runAtLoad: true
+  },
   {
     label: "com.openclaw.trading.report.daily.prepare",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily prepare`,
@@ -71,6 +78,9 @@ for (const job of jobs) {
 function renderPlist(job) {
   const outPath = join(runtimeLogDir, `${job.label}.out.log`);
   const errPath = join(runtimeLogDir, `${job.label}.err.log`);
+  const runAtLoad = job.runAtLoad
+    ? "  <key>RunAtLoad</key>\n  <true/>\n"
+    : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -86,7 +96,7 @@ function renderPlist(job) {
   </array>
   <key>StartCalendarInterval</key>
   ${renderSchedule(job.schedule)}
-  <key>StandardOutPath</key>
+${runAtLoad}  <key>StandardOutPath</key>
   <string>${escapeXml(outPath)}</string>
   <key>StandardErrorPath</key>
   <string>${escapeXml(errPath)}</string>

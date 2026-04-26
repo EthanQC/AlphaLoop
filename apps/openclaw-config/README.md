@@ -101,8 +101,15 @@ apps/openclaw-config/scripts/install-launchd.sh
 - Long-term operating context is kept in local workspace Markdown plus `runtime/openclaw-context.sqlite`; paid Honcho/managed-memory plugins are intentionally not used.
 - Local OpenClaw memory is enabled through bundled `memory-core`, `active-memory`, and the local `local-context` plugin. Feishu group messages are stored redacted in SQLite as they arrive, then compact context is injected before prompt build.
 - Launchd is the source of truth for deterministic local schedules such as daily/weekly report generation and delivery. OpenClaw cron is better reserved for conversational reminders or agent wakeups that depend on the gateway and model auth.
+- `com.openclaw.trading.catchup` runs at login and every 15 minutes. It reconciles missed OpenClaw-managed launchd tasks after sleep, lid close, reboot, or downtime. Report tasks are caught up by report date; maintenance/context tasks are coalesced to the latest useful run.
 - To inspect all automation OpenClaw should report to the operator, run:
 
 ```bash
 node --no-warnings apps/openclaw-config/scripts/context-manager.mjs automation-summary
+```
+
+To inspect the catch-up ledger:
+
+```bash
+pnpm automation:catchup:status
 ```

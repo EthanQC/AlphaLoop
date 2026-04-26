@@ -20,6 +20,8 @@
     "report:weekly:deliver": "node apps/openclaw-config/scripts/scheduled-report.mjs weekly deliver",
     "report:scheduled": "node apps/openclaw-config/scripts/scheduled-report.mjs",
     "maintenance:latest": "node apps/openclaw-config/scripts/maintenance-check.mjs",
+    "automation:catchup": "node apps/openclaw-config/scripts/reconcile-user-schedules.mjs run",
+    "automation:catchup:status": "node apps/openclaw-config/scripts/reconcile-user-schedules.mjs status",
     "preferences:bootstrap": "node apps/openclaw-config/scripts/bootstrap-preferences.mjs",
     "proposals:generate": "node apps/openclaw-config/scripts/generate-rule-proposal.mjs",
     "proposals:review": "node apps/openclaw-config/scripts/review-rule-proposal.mjs",
