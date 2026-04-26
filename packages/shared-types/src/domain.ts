@@ -84,7 +84,7 @@ export interface ExecutionResult {
   ticketId: string;
   environment: Environment;
   status: ExecutionResultStatus;
-  provider: "broker-executor" | "longbridge-paper" | "paper-sim" | "options-shadow";
+  provider: "broker-executor" | "longbridge-paper" | "paper-sim";
   externalOrderId?: string;
   fillPrice?: number;
   limitPrice?: number;

@@ -45,12 +45,6 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-types
 
-  apps/options-shadow:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../../packages/shared-types
-
   apps/paper-trader:
     dependencies:
       '@packages/shared-types':
