@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const repoRoot = process.cwd();
+import { repoRoot } from "./repo-root.mjs";
+
 const dbPath = join(repoRoot, "runtime", "trading.sqlite");
 const notesRoot = join(repoRoot, "knowledge", "notes", "private-repo");
 const reportDir = join(repoRoot, "reports", "daily");

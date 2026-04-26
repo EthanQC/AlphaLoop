@@ -11,6 +11,7 @@ This folder contains the OpenClaw-side configuration templates for the local tra
 - `scripts/bootstrap-preferences.mjs`: build a baseline preference snapshot from notes and approvals
 - `scripts/generate-rule-proposal.mjs`: 从 SQLite 执行事实、审批编辑和当前规则生成中文、待确认、可审计的规则提案
 - `scripts/review-rule-proposal.mjs`: 解析飞书群审核回复，写入提案状态、审计日志，并在二次确认后调用激活脚本
+- `scripts/context-manager.mjs`: SQLite-backed local context, Feishu session memory, managed workspace `MEMORY.md`, and combined OpenClaw cron/launchd automation inventory
 
 ## Setup flow
 
@@ -22,13 +23,7 @@ This folder contains the OpenClaw-side configuration templates for the local tra
 apps/openclaw-config/scripts/sync-private-notes.sh git@github.com:EthanQC/stock-trading-notes.git
 ```
 
-4. Install the Honcho plugin if you plan to use managed long-term memory:
-
-```bash
-openclaw plugins install @honcho-ai/openclaw-honcho
-```
-
-5. Set local secrets in `.env.local`, then render the real gateway config:
+4. Set local secrets in `.env.local`, then render the real gateway config:
 
 ```bash
 node apps/openclaw-config/scripts/render-openclaw-config.mjs
@@ -64,8 +59,9 @@ pnpm feishu:user-plugin:status
 
 The OAuth flow uses the plugin redirect URI `http://127.0.0.1:9997/callback`. If user-token scopes are needed later, publish the app version and wait for tenant admin approval before rerunning OAuth.
 
-6. Run [scripts/sync-workspaces.sh](/Users/mashu/Documents/codex/apps/openclaw-config/scripts/sync-workspaces.sh) to materialize per-agent workspaces under `~/.openclaw/workspaces/`.
-7. Build the TypeScript services:
+5. Run [scripts/sync-workspaces.sh](/Users/mashu/Documents/codex/apps/openclaw-config/scripts/sync-workspaces.sh) to materialize per-agent workspaces under `~/.openclaw/workspaces/`.
+   The sync also refreshes managed `MEMORY.md` files from the local SQLite context database.
+6. Build the TypeScript services:
 
 ```bash
 pnpm install
@@ -91,7 +87,7 @@ pnpm proposals:review from-feishu "继续观察 <proposal-id> 样本还不够" -
 node apps/openclaw-config/scripts/activate-rule-version.mjs activate <live|paper> <version> --proposal-id <id> --confirm HUMAN_APPROVED
 ```
 
-8. Install the sidecar LaunchAgents and the official OpenClaw gateway service:
+7. Install the sidecar LaunchAgents and the official OpenClaw gateway service:
 
 ```bash
 apps/openclaw-config/scripts/install-launchd.sh
@@ -102,4 +98,11 @@ apps/openclaw-config/scripts/install-launchd.sh
 - Keep broker credentials and SSH private keys out of workspace memory files.
 - The gateway config intentionally disables automatic live execution through the local `broker-executor`.
 - Feishu is auto-injected into the rendered config only when `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are present.
-- Honcho is auto-enabled only when `HONCHO_API_KEY` is present in `.env.local`.
+- Long-term operating context is kept in local workspace Markdown plus `runtime/openclaw-context.sqlite`; paid Honcho/managed-memory plugins are intentionally not used.
+- Local OpenClaw memory is enabled through bundled `memory-core`, `active-memory`, and the local `local-context` plugin. Feishu group messages are stored redacted in SQLite as they arrive, then compact context is injected before prompt build.
+- Launchd is the source of truth for deterministic local schedules such as daily/weekly report generation and delivery. OpenClaw cron is better reserved for conversational reminders or agent wakeups that depend on the gateway and model auth.
+- To inspect all automation OpenClaw should report to the operator, run:
+
+```bash
+node --no-warnings apps/openclaw-config/scripts/context-manager.mjs automation-summary
+```

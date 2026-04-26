@@ -2,7 +2,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const repoRoot = process.cwd();
+import { repoRoot } from "./repo-root.mjs";
+
 const rawArgs = process.argv.slice(2);
 
 if (rawArgs.length === 0) {

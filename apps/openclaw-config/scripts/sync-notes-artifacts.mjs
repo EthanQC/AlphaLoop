@@ -2,7 +2,8 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const repoRoot = process.cwd();
+import { repoRoot } from "./repo-root.mjs";
+
 const notesRepo = join(repoRoot, "knowledge", "notes", "private-repo");
 const artifactRoot = join(notesRepo, "openclaw-artifacts");
 

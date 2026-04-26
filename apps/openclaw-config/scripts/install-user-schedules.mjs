@@ -18,24 +18,18 @@ if (uid === undefined) {
 mkdirSync(launchAgentsDir, { recursive: true });
 mkdirSync(runtimeLogDir, { recursive: true });
 
+const marketWeekdays = [1, 2, 3, 4, 5];
+
 const jobs = [
   {
     label: "com.openclaw.trading.report.daily.prepare",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily prepare`,
-    schedule: [
-      { Weekday: 2, Hour: 19, Minute: 0 },
-      { Weekday: 3, Hour: 19, Minute: 0 },
-      { Weekday: 4, Hour: 19, Minute: 0 }
-    ]
+    schedule: marketWeekdays.map((Weekday) => ({ Weekday, Hour: 19, Minute: 0 }))
   },
   {
     label: "com.openclaw.trading.report.daily.deliver",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily deliver`,
-    schedule: [
-      { Weekday: 2, Hour: 20, Minute: 0 },
-      { Weekday: 3, Hour: 20, Minute: 0 },
-      { Weekday: 4, Hour: 20, Minute: 0 }
-    ]
+    schedule: marketWeekdays.map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
   },
   {
     label: "com.openclaw.trading.report.weekly.prepare",
@@ -51,6 +45,11 @@ const jobs = [
     label: "com.openclaw.trading.maintenance.latest",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/maintenance-check.mjs`,
     schedule: [{ Hour: 9, Minute: 10 }]
+  },
+  {
+    label: "com.openclaw.trading.context.maintenance",
+    command: `${quote(nodeBin)} --no-warnings apps/openclaw-config/scripts/context-manager.mjs maintenance`,
+    schedule: [{ Minute: 20 }]
   }
 ];
 

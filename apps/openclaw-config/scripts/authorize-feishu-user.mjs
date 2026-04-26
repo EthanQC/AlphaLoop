@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-const repoRoot = process.cwd();
+import { repoRoot } from "./repo-root.mjs";
+
 const openId = process.argv[2]?.trim();
 
 if (!openId || !openId.startsWith("ou_")) {

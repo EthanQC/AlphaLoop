@@ -32,10 +32,38 @@
       userTimezone: "Asia/Shanghai",
       skipBootstrap: true,
       sandbox: { mode: "off" },
-      model: { primary: "openai-codex/gpt-5.4" },
+      model: { primary: "openai-codex/gpt-5.5" },
       models: {
-        "openai-codex/gpt-5.4": { alias: "gpt" },
+        "openai-codex/gpt-5.5": { alias: "gpt" },
         "openai-codex/gpt-5.4-mini": { alias: "gpt-mini" }
+      },
+      memorySearch: {
+        enabled: true,
+        sources: ["memory"],
+        fallback: "none",
+        store: {
+          driver: "sqlite",
+          fts: {
+            tokenizer: "unicode61"
+          },
+          vector: {
+            enabled: false
+          }
+        },
+        sync: {
+          onSessionStart: true,
+          onSearch: true,
+          watch: true,
+          watchDebounceMs: 1500
+        },
+        query: {
+          maxResults: 8,
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0,
+            textWeight: 1
+          }
+        }
       },
       heartbeat: {
         every: "30m",
@@ -160,9 +188,25 @@
     }
   },
   plugins: {
-    // Keep this list for installed external plugins only. Bundled runtime/channel plugins
-    // are enabled by their own config blocks and should not be added here.
-    allow: [],
+    // The real config is rendered by scripts/render-openclaw-config.mjs.
+    // Memory is local: Honcho and paid managed-memory plugins are intentionally excluded.
+    allow: [
+      "acpx",
+      "openai",
+      "memory-core",
+      "active-memory",
+      "local-context",
+      "rule-proposal-review"
+    ],
+    load: {
+      paths: [
+        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/local-context",
+        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/rule-proposal-review"
+      ]
+    },
+    slots: {
+      memory: "memory-core"
+    },
     entries: {
       acpx: {
         enabled: true,
@@ -172,14 +216,58 @@
           pluginToolsMcpBridge: true
         }
       },
-      "openclaw-honcho": {
-        enabled: false,
+      "memory-core": {
+        enabled: true,
         config: {
-          baseUrl: "https://api.honcho.dev",
-          apiKey: "replace_me",
-          workspaceId: "openclaw-trading-stack"
+          dreaming: {
+            enabled: false,
+            frequency: "15 3 * * *",
+            timezone: "Asia/Shanghai",
+            storage: {
+              mode: "separate",
+              separateReports: true
+            }
+          }
         }
-      }
+      },
+      "active-memory": {
+        enabled: true,
+        config: {
+          enabled: true,
+          agents: ["control"],
+          allowedChatTypes: ["direct", "group"],
+          queryMode: "recent",
+          promptStyle: "contextual",
+          thinking: "off",
+          timeoutMs: 8000,
+          maxSummaryChars: 900,
+          logging: true,
+          persistTranscripts: false,
+          qmd: {
+            searchMode: "search"
+          }
+        }
+      },
+      "local-context": {
+        enabled: true,
+        config: {
+          repoRoot: "/Users/mashu/Documents/codex",
+          agents: ["control"],
+          ingestFeishuMessages: true,
+          injectPromptContext: true,
+          maxPromptChars: 3500,
+          timeoutMs: 8000
+        }
+      },
+      "rule-proposal-review": {
+        enabled: true,
+        config: {
+          repoRoot: "/Users/mashu/Documents/codex",
+          channel: "feishu",
+          notify: false,
+          returnText: true
+        }
+      },
     }
   }
 }

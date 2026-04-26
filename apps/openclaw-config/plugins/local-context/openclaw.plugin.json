@@ -1,0 +1,41 @@
+{
+  "id": "local-context",
+  "name": "Local Context",
+  "description": "Stores Feishu conversation context and local automation inventory in SQLite, then injects compact recall into prompts.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "repoRoot": {
+        "type": "string",
+        "description": "Repository root containing apps/openclaw-config/scripts/context-manager.mjs."
+      },
+      "agents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent ids that should receive SQLite-backed prompt context."
+      },
+      "ingestFeishuMessages": {
+        "type": "boolean",
+        "description": "Persist Feishu inbound message metadata and redacted text into SQLite."
+      },
+      "injectPromptContext": {
+        "type": "boolean",
+        "description": "Prepend compact SQLite context before prompt build."
+      },
+      "maxPromptChars": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 6000
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 250,
+        "maximum": 30000
+      }
+    }
+  }
+}

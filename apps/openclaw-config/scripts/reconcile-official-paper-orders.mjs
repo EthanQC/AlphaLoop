@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { runLongbridgeJson } from "./_longbridge.mjs";
+import { repoRoot } from "./repo-root.mjs";
 
-const repoRoot = process.cwd();
 const dbPath = join(repoRoot, "runtime", "trading.sqlite");
 const symbolFilters = new Set(process.argv.slice(2).map((entry) => entry.toUpperCase()));
 

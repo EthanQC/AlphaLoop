@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,11 @@ import {
   resolveLongbridgeAuthState,
   sendNotification
 } from "../../../packages/shared-types/dist/index.js";
+import {
+  collectKnownModels,
+  findLatestModel,
+  listAvailableModelIds
+} from "./model-selection.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime");
@@ -225,7 +230,10 @@ async function checkAndUpdateModels() {
   const currentDefaults = readOpenClawJson(["config", "get", "agents.defaults", "--json"], { timeoutMs: 15_000 });
   const status = readOpenClawJson(["models", "status", "--agent", "control", "--json"], { timeoutMs: 30_000 });
   const listed = readOpenClawJson(["models", "list", "--agent", "control", "--json"], { timeoutMs: 30_000 });
-  const localModels = readLocalModels(listed);
+  const localModels = collectKnownModels({
+    existingDefaults: currentDefaults ?? {},
+    listedModelIds: listAvailableModelIds(listed)
+  });
   const latestModel = findLatestModel(false, localModels);
   const latestMiniModel = findLatestModel(true, localModels);
   const currentPrimary = currentDefaults?.model?.primary ?? status?.resolvedDefault ?? status?.defaultModel ?? null;
@@ -709,49 +717,6 @@ function listOrNone(values, fallback) {
   return filtered.length > 0 ? filtered.map((entry) => `- ${entry}`) : [`- ${fallback}`];
 }
 
-function findLatestModel(miniOnly, models) {
-  const filtered = models
-    .filter((model) => /^gpt-\d+(?:\.\d+)*(?:-[a-z0-9]+)?$/iu.test(model.id))
-    .filter((model) => miniOnly ? /mini/iu.test(model.id) : !/mini/iu.test(model.id))
-    .sort((left, right) => compareModelIds(right.id, left.id));
-  return filtered[0] ?? null;
-}
-
-function readLocalModels(listed) {
-  const models = new Map();
-  for (const fullId of listAvailableModelIds(listed)) {
-    const id = modelShortId(fullId);
-    if (id) {
-      models.set(fullId, { id, fullId });
-    }
-  }
-
-  const agentsDir = join(homedir(), ".openclaw", "agents");
-  if (existsSync(agentsDir)) {
-    for (const agentId of readdirSync(agentsDir)) {
-      const path = join(agentsDir, agentId, "agent", "models.json");
-      if (!existsSync(path)) {
-        continue;
-      }
-      for (const model of readModelsJson(path)) {
-        models.set(model.fullId, model);
-      }
-    }
-  }
-
-  return Array.from(models.values());
-}
-
-function listAvailableModelIds(listed) {
-  if (!Array.isArray(listed?.models)) {
-    return [];
-  }
-  return listed.models
-    .filter((model) => model?.available !== false && !model?.missing)
-    .map((model) => model.key)
-    .filter((key) => typeof key === "string" && key.length > 0);
-}
-
 function summarizeModelStatus(status) {
   if (!status || typeof status !== "object") {
     return null;
@@ -766,76 +731,6 @@ function summarizeModelStatus(status) {
     allowed: Array.isArray(status.allowed) ? status.allowed : [],
     fallbackCount: Array.isArray(status.fallbacks) ? status.fallbacks.length : null,
     imageModel: status.imageModel ?? null
-  };
-}
-
-function readModelsJson(path) {
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8"));
-    const providers = parsed.providers ?? {};
-    const models = [];
-    for (const [providerId, provider] of Object.entries(providers)) {
-      if (!Array.isArray(provider?.models)) {
-        continue;
-      }
-      for (const model of provider.models) {
-        if (typeof model?.id !== "string") {
-          continue;
-        }
-        const fullId = normalizeModelFullId(providerId, model.id);
-        const id = modelShortId(fullId);
-        if (id) {
-          models.push({ id, fullId });
-        }
-      }
-    }
-    return models;
-  } catch (error) {
-    warnings.push(`读取模型文件失败：${displayPath(path)}；${error instanceof Error ? error.message : String(error)}`);
-    return [];
-  }
-}
-
-function normalizeModelFullId(providerId, id) {
-  if (id.includes("/")) {
-    return id;
-  }
-  const provider = providerId === "codex" ? "openai-codex" : providerId;
-  return `${provider}/${id}`;
-}
-
-function modelShortId(fullId) {
-  const id = String(fullId).split("/").at(-1);
-  return id && /^gpt-/iu.test(id) ? id : null;
-}
-
-function compareModelIds(left, right) {
-  const leftParts = parseModelId(left);
-  const rightParts = parseModelId(right);
-  for (let index = 0; index < Math.max(leftParts.numbers.length, rightParts.numbers.length); index += 1) {
-    const diff = (leftParts.numbers[index] ?? 0) - (rightParts.numbers[index] ?? 0);
-    if (diff !== 0) {
-      return diff;
-    }
-  }
-
-  if (leftParts.suffix === rightParts.suffix) {
-    return 0;
-  }
-  if (!leftParts.suffix) {
-    return 1;
-  }
-  if (!rightParts.suffix) {
-    return -1;
-  }
-  return leftParts.suffix.localeCompare(rightParts.suffix);
-}
-
-function parseModelId(id) {
-  const match = /^gpt-([0-9.]+)(?:-([a-z0-9]+))?$/iu.exec(id);
-  return {
-    numbers: (match?.[1] ?? "0").split(".").map((value) => Number(value) || 0),
-    suffix: match?.[2] ?? ""
   };
 }
 

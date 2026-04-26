@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const repoRoot = process.cwd();
+import { repoRoot } from "./repo-root.mjs";
+
 const runtimeDir = join(repoRoot, "runtime");
 const dbPath = join(runtimeDir, "trading.sqlite");
 const validScopes = new Set(["live", "paper"]);

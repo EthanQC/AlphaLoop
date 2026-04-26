@@ -3,12 +3,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const repoRoot = process.cwd();
+import { selectModelDefaults } from "./model-selection.mjs";
+import { repoRoot } from "./repo-root.mjs";
+
 const env = loadEnv(join(repoRoot, ".env.local"));
 const openclawRoot = join(homedir(), ".openclaw");
 const configPath = join(openclawRoot, "openclaw.json");
 const existing = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) : {};
 const existingFeishu = existing.channels?.feishu ?? {};
+const removedPluginIds = new Set(["memory", "memory-lancedb", "openclaw-honcho"]);
 const ruleProposalReviewPluginId = "rule-proposal-review";
 const ruleProposalReviewPluginPath = join(
   repoRoot,
@@ -17,6 +20,14 @@ const ruleProposalReviewPluginPath = join(
   "plugins",
   ruleProposalReviewPluginId
 );
+const localContextPluginId = "local-context";
+const localContextPluginPath = join(
+  repoRoot,
+  "apps",
+  "openclaw-config",
+  "plugins",
+  localContextPluginId
+);
 
 const gatewayPort = Number(env.OPENCLAW_GATEWAY_PORT ?? process.env.OPENCLAW_GATEWAY_PORT ?? 18789);
 const gatewayToken =
@@ -24,9 +35,6 @@ const gatewayToken =
   process.env.OPENCLAW_GATEWAY_TOKEN ??
   existing.gateway?.auth?.token ??
   crypto.randomUUID().replaceAll("-", "");
-const installedPluginIds = Object.keys(existing.plugins?.installs ?? {});
-const honchoApiKey = env.HONCHO_API_KEY ?? process.env.HONCHO_API_KEY ?? "";
-const honchoEnabled = honchoApiKey.trim().length > 0;
 const feishuAppId = env.FEISHU_APP_ID ?? process.env.FEISHU_APP_ID ?? "";
 const feishuAppSecret = env.FEISHU_APP_SECRET ?? process.env.FEISHU_APP_SECRET ?? "";
 const feishuEnabled = feishuAppId.trim().length > 0 && feishuAppSecret.trim().length > 0;
@@ -54,6 +62,10 @@ const feishuGroups = buildFeishuGroups({
   groupIds: feishuGroupAllowFrom,
   allowFrom: feishuAllowFrom,
   requireMention: feishuRequireMention
+});
+const modelDefaults = selectModelDefaults({
+  existingDefaults: existing.agents?.defaults ?? {},
+  env: { ...process.env, ...env }
 });
 
 const nextConfig = {
@@ -94,14 +106,39 @@ const nextConfig = {
       userTimezone: "Asia/Shanghai",
       skipBootstrap: true,
       sandbox: { mode: "off" },
-      model: { primary: "openai-codex/gpt-5.4" },
-      models: {
-        "openai-codex/gpt-5.4": { alias: "gpt" },
-        "openai-codex/gpt-5.4-mini": { alias: "gpt-mini" }
+      model: { primary: modelDefaults.primaryModel },
+      models: modelDefaults.models,
+      memorySearch: {
+        enabled: true,
+        sources: ["memory"],
+        fallback: "none",
+        store: {
+          driver: "sqlite",
+          fts: {
+            tokenizer: "unicode61"
+          },
+          vector: {
+            enabled: false
+          }
+        },
+        sync: {
+          onSessionStart: true,
+          onSearch: true,
+          watch: true,
+          watchDebounceMs: 1500
+        },
+        query: {
+          maxResults: 8,
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0,
+            textWeight: 1
+          }
+        }
       },
       heartbeat: {
         every: "30m",
-        model: "openai-codex/gpt-5.4-mini",
+        model: modelDefaults.heartbeatModel,
         isolatedSession: true,
         prompt: "Read HEARTBEAT.md and report auth issues, queue lag, or risk state drift.",
         target: "none"
@@ -146,24 +183,30 @@ const nextConfig = {
     : {}),
   plugins: {
     allow: unique([
-      ...asStringArray(existing.plugins?.allow),
-      ...installedPluginIds,
+      ...asStringArray(existing.plugins?.allow).filter(keepPluginId),
+      ...Object.keys(existing.plugins?.installs ?? {}).filter(keepPluginId),
       "acpx",
       "openai",
       ...(feishuEnabled ? ["feishu"] : []),
-      ruleProposalReviewPluginId,
-      ...(honchoEnabled ? ["openclaw-honcho"] : [])
+      "memory-core",
+      "active-memory",
+      localContextPluginId,
+      ruleProposalReviewPluginId
     ]),
     load: {
       ...(existing.plugins?.load ?? {}),
       paths: unique([
         ...asStringArray(existing.plugins?.load?.paths),
+        localContextPluginPath,
         ruleProposalReviewPluginPath
       ])
     },
-    slots: honchoEnabled ? { memory: "openclaw-honcho" } : {},
+    slots: {
+      ...filterPluginSlots(existing.plugins?.slots ?? {}),
+      memory: "memory-core"
+    },
     entries: {
-      ...(existing.plugins?.entries ?? {}),
+      ...filterPluginObject(existing.plugins?.entries ?? {}),
       acpx: {
         enabled: true,
         config: {
@@ -172,21 +215,6 @@ const nextConfig = {
           pluginToolsMcpBridge: true
         }
       },
-      "openclaw-honcho": honchoEnabled
-        ? {
-            enabled: true,
-            config: {
-              baseUrl: env.HONCHO_ENDPOINT ?? process.env.HONCHO_ENDPOINT ?? "https://api.honcho.dev",
-              apiKey: honchoApiKey,
-              workspaceId:
-                env.HONCHO_NAMESPACE ?? process.env.HONCHO_NAMESPACE ?? "openclaw-trading-stack"
-            }
-          }
-        : {
-            enabled: false
-          },
-      "memory-core": { enabled: false },
-      "memory-lancedb": { enabled: false },
       [ruleProposalReviewPluginId]: {
         enabled: true,
         config: {
@@ -195,15 +223,87 @@ const nextConfig = {
           notify: false,
           returnText: true
         }
+      },
+      "memory-core": {
+        enabled: true,
+        config: {
+          dreaming: {
+            enabled: false,
+            frequency: "15 3 * * *",
+            timezone: "Asia/Shanghai",
+            storage: {
+              mode: "separate",
+              separateReports: true
+            },
+            phases: {
+              light: {
+                enabled: true,
+                lookbackDays: 7,
+                limit: 40,
+                dedupeSimilarity: 0.9
+              },
+              rem: {
+                enabled: true,
+                lookbackDays: 14,
+                limit: 30,
+                minPatternStrength: 0.55
+              },
+              deep: {
+                enabled: true,
+                limit: 40,
+                minScore: 0.65,
+                minRecallCount: 2,
+                minUniqueQueries: 2,
+                recencyHalfLifeDays: 30,
+                maxAgeDays: 180
+              }
+            }
+          }
+        }
+      },
+      "active-memory": {
+        enabled: true,
+        config: {
+          enabled: true,
+          agents: ["control"],
+          allowedChatTypes: ["direct", "group"],
+          queryMode: "recent",
+          promptStyle: "contextual",
+          thinking: "off",
+          timeoutMs: 8000,
+          maxSummaryChars: 900,
+          logging: true,
+          persistTranscripts: false,
+          qmd: {
+            searchMode: "search"
+          }
+        }
+      },
+      [localContextPluginId]: {
+        enabled: true,
+        config: {
+          repoRoot,
+          agents: ["control"],
+          ingestFeishuMessages: true,
+          injectPromptContext: true,
+          maxPromptChars: 3500,
+          timeoutMs: 8000
+        }
       }
     },
-    installs: existing.plugins?.installs ?? {}
+    installs: filterPluginObject(existing.plugins?.installs ?? {})
   }
 };
 
 mkdirSync(openclawRoot, { recursive: true });
 writeFileSync(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
-console.log(JSON.stringify({ configPath, gatewayPort, honchoEnabled, feishuEnabled }, null, 2));
+console.log(JSON.stringify({
+  configPath,
+  gatewayPort,
+  primaryModel: modelDefaults.primaryModel,
+  heartbeatModel: modelDefaults.heartbeatModel,
+  feishuEnabled
+}, null, 2));
 
 function buildAgents(repoRootPath) {
   return [
@@ -329,10 +429,45 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function keepPluginId(id) {
+  return typeof id === "string" && id.trim().length > 0 && !removedPluginIds.has(id.trim());
+}
+
+function filterPluginObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (!keepPluginId(key) || removedPluginIds.has(String(entry))) {
+      continue;
+    }
+    result[key] = entry;
+  }
+  return result;
+}
+
+function filterPluginSlots(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+  for (const [slotName, pluginId] of Object.entries(value)) {
+    if (removedPluginIds.has(String(pluginId))) {
+      continue;
+    }
+    result[slotName] = pluginId;
+  }
+  return result;
+}
+
 function collectExistingFeishuUsers(feishuConfig) {
   return unique([
     ...asStringArray(feishuConfig.allowFrom),
     ...asStringArray(feishuConfig.accounts?.default?.allowFrom),
+    ...asStringArray(feishuConfig.accounts?.main?.allowFrom),
     ...Object.values(feishuConfig.groups ?? {}).flatMap((group) => asStringArray(group?.allowFrom))
   ]);
 }
@@ -341,6 +476,7 @@ function collectExistingFeishuGroups(feishuConfig) {
   return unique([
     ...asStringArray(feishuConfig.groupAllowFrom),
     ...asStringArray(feishuConfig.accounts?.default?.groupAllowFrom),
+    ...asStringArray(feishuConfig.accounts?.main?.groupAllowFrom),
     ...Object.keys(feishuConfig.groups ?? {})
   ]);
 }

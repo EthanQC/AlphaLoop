@@ -13,8 +13,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { loadLocalEnv, sendNotification } from "../../../packages/shared-types/dist/index.js";
+import { repoRoot } from "./repo-root.mjs";
 
-const repoRoot = process.cwd();
 loadLocalEnv(repoRoot);
 
 const runtimeDir = join(repoRoot, "runtime");
