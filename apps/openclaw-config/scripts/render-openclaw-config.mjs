@@ -8,6 +8,7 @@ const env = loadEnv(join(repoRoot, ".env.local"));
 const openclawRoot = join(homedir(), ".openclaw");
 const configPath = join(openclawRoot, "openclaw.json");
 const existing = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) : {};
+const existingFeishu = existing.channels?.feishu ?? {};
 
 const gatewayPort = Number(env.OPENCLAW_GATEWAY_PORT ?? process.env.OPENCLAW_GATEWAY_PORT ?? 18789);
 const gatewayToken =
@@ -15,6 +16,7 @@ const gatewayToken =
   process.env.OPENCLAW_GATEWAY_TOKEN ??
   existing.gateway?.auth?.token ??
   crypto.randomUUID().replaceAll("-", "");
+const installedPluginIds = Object.keys(existing.plugins?.installs ?? {});
 const honchoApiKey = env.HONCHO_API_KEY ?? process.env.HONCHO_API_KEY ?? "";
 const honchoEnabled = honchoApiKey.trim().length > 0;
 const feishuAppId = env.FEISHU_APP_ID ?? process.env.FEISHU_APP_ID ?? "";
@@ -24,13 +26,19 @@ const feishuDomain = env.FEISHU_DOMAIN ?? process.env.FEISHU_DOMAIN ?? "feishu";
 const feishuBotName = env.FEISHU_BOT_NAME ?? process.env.FEISHU_BOT_NAME ?? "Trading Copilot";
 const feishuVerificationToken =
   env.FEISHU_VERIFICATION_TOKEN ?? process.env.FEISHU_VERIFICATION_TOKEN ?? "";
-const feishuAllowFrom = parseCsv(env.FEISHU_ALLOW_FROM ?? process.env.FEISHU_ALLOW_FROM ?? "");
+const feishuAllowFrom = unique([
+  ...parseCsv(env.FEISHU_ALLOW_FROM ?? process.env.FEISHU_ALLOW_FROM ?? ""),
+  ...collectExistingFeishuUsers(existingFeishu)
+]);
 const feishuDmPolicy =
   env.FEISHU_DM_POLICY ??
   process.env.FEISHU_DM_POLICY ??
   (feishuAllowFrom.length > 0 ? "allowlist" : "pairing");
-const feishuGroupPolicy = env.FEISHU_GROUP_POLICY ?? process.env.FEISHU_GROUP_POLICY ?? "open";
-const feishuGroupAllowFrom = parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? process.env.FEISHU_GROUP_ALLOW_FROM ?? "");
+const feishuGroupPolicy = "allowlist";
+const feishuGroupAllowFrom = unique([
+  ...parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? process.env.FEISHU_GROUP_ALLOW_FROM ?? ""),
+  ...collectExistingFeishuGroups(existingFeishu)
+]);
 const feishuRequireMention = parseOptionalBoolean(
   env.FEISHU_REQUIRE_MENTION ?? process.env.FEISHU_REQUIRE_MENTION
 );
@@ -123,7 +131,7 @@ const nextConfig = {
       }
     : {}),
   plugins: {
-    allow: ["acpx", "browser", ...(feishuEnabled ? ["feishu"] : []), ...(honchoEnabled ? ["openclaw-honcho"] : [])],
+    allow: unique([...installedPluginIds, ...(honchoEnabled ? ["openclaw-honcho"] : [])]),
     slots: honchoEnabled ? { memory: "openclaw-honcho" } : {},
     entries: {
       acpx: {
@@ -276,6 +284,32 @@ function parseCsv(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function unique(values) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function collectExistingFeishuUsers(feishuConfig) {
+  return unique([
+    ...asStringArray(feishuConfig.allowFrom),
+    ...asStringArray(feishuConfig.accounts?.default?.allowFrom),
+    ...Object.values(feishuConfig.groups ?? {}).flatMap((group) => asStringArray(group?.allowFrom))
+  ]);
+}
+
+function collectExistingFeishuGroups(feishuConfig) {
+  return unique([
+    ...asStringArray(feishuConfig.groupAllowFrom),
+    ...asStringArray(feishuConfig.accounts?.default?.groupAllowFrom),
+    ...Object.keys(feishuConfig.groups ?? {})
+  ]);
+}
+
+function asStringArray(value) {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter(Boolean)
+    : [];
 }
 
 function parseOptionalBoolean(value) {

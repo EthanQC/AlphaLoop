@@ -39,6 +39,31 @@ export function executeLongbridgePaperOrder(
   ticket: OrderTicket,
   longbridgeAuth?: LongbridgeAuthState
 ): ExecutionResult {
+  if (ticket.environment !== "paper") {
+    return {
+      ticketId: ticket.id,
+      environment: ticket.environment,
+      status: "rejected",
+      provider: "longbridge-paper",
+      reasons: [
+        "Official Longbridge paper execution only accepts paper environment tickets."
+      ]
+    };
+  }
+
+  if (ticket.assetClass !== "stock" && ticket.assetClass !== "etf") {
+    return {
+      ticketId: ticket.id,
+      environment: ticket.environment,
+      status: "rejected",
+      provider: "longbridge-paper",
+      reasons: [
+        "Official Longbridge paper execution only accepts stock and ETF tickets.",
+        "Option automation is disabled by operator policy."
+      ]
+    };
+  }
+
   const guardFailure = validateOfficialPaperGuard();
   if (guardFailure) {
     if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {

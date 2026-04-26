@@ -60,3 +60,16 @@ OpenClaw-specific onboarding and launchd setup live in [apps/openclaw-config/REA
 - `GET http://127.0.0.1:4314/v1/preferences/latest`
 - `GET http://127.0.0.1:4312/v1/paper/positions`
 - Option and shadow endpoints are historical only and should not be used for automation.
+
+## Local Trusted-User Mode
+
+This stack intentionally runs directly on the local macOS host with `agents.defaults.sandbox.mode=off`.
+The boundary is documented in [apps/openclaw-config/docs/local-trusted-user-security.md](/Users/mashu/Documents/codex/apps/openclaw-config/docs/local-trusted-user-security.md).
+
+The mandatory execution baseline is:
+
+- `ALLOW_LIVE_EXECUTION=false`; live flow remains advice-only.
+- `LONGBRIDGE_ACCOUNT_MODE=paper` and `LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true` are required for official paper orders.
+- Option automation and shadow execution are disabled.
+- Feishu group access stays on allowlist with trusted operators only.
+- Broker writes are only allowed through local `broker-executor`.

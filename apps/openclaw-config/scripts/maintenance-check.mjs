@@ -15,7 +15,7 @@ import {
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime");
 const statePath = join(runtimeDir, "maintenance-state.json");
-const openclawBin = process.env.OPENCLAW_BIN ?? `${homedir()}/.local/node-v24/bin/openclaw`;
+const openclawBin = resolveOpenClawBin();
 const longbridgeBin = process.env.LONGBRIDGE_CLI_PATH ?? `${homedir()}/.local/bin/longbridge`;
 const maintenanceJobLabel = "com.openclaw.trading.maintenance.latest";
 
@@ -81,11 +81,15 @@ const report = buildChineseReport({
 
 let notificationResult;
 try {
-  notificationResult = await sendNotification({
-    title: "OpenClaw 维护检查",
-    body: report,
-    format: "post"
-  });
+  notificationResult = await withTimeout(
+    sendNotification({
+      title: "OpenClaw 维护检查",
+      body: report,
+      format: "post"
+    }),
+    20_000,
+    "飞书通知发送超时"
+  );
   if (!notificationResult.sent) {
     warnings.push(notificationResult.reason ?? `维护报告未发送；目标=${notificationResult.target}`);
     needsHuman.push("飞书维护报告未送达，请检查 Feishu app/webhook 配置和通知目标。");
@@ -137,6 +141,18 @@ function checkOpenClawVersion() {
     revision: parsed.revision,
     message: result.ok ? null : result.message
   };
+}
+
+function resolveOpenClawBin() {
+  if (process.env.OPENCLAW_BIN) {
+    return process.env.OPENCLAW_BIN;
+  }
+
+  const candidates = [
+    `${homedir()}/.local/node-v24/bin/openclaw`,
+    `${homedir()}/.local/node-v24/bin/openclaw.unproxied`
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
 }
 
 function checkOpenClawUpdate(currentVersion) {
@@ -362,8 +378,9 @@ function checkLongbridge() {
   const latestVersion = parseLongbridgeUpdateVersion(output);
   const tokenStatus = checkJson?.session?.token ?? null;
   const connectivity = checkJson?.connectivity ?? {};
-  const failedRegions = Object.entries(connectivity)
-    .filter(([, value]) => value && value.ok === false)
+  const activeRegion = String(checkJson?.region?.active ?? "").toLowerCase();
+  const failedActiveRegions = Object.entries(connectivity)
+    .filter(([key, value]) => value && value.ok === false && key.toLowerCase() === activeRegion)
     .map(([key]) => key);
 
   if (!versionResult.ok) {
@@ -382,8 +399,9 @@ function checkLongbridge() {
     warnings.push(`Longbridge CLI 发现新版本：${currentVersion} -> ${latestVersion}。`);
     needsHuman.push("Longbridge CLI 更新只生成建议，请人工运行 longbridge update 后复查 token。");
   }
-  if (failedRegions.length > 0) {
-    warnings.push(`Longbridge 部分 API 区域连通性异常：${failedRegions.join(", ")}。`);
+  if (failedActiveRegions.length > 0) {
+    warnings.push(`Longbridge 当前 active API 区域连通性异常：${failedActiveRegions.join(", ")}。`);
+    needsHuman.push("请人工确认 Longbridge active region、网络和 token 状态。");
   }
 
   return {
@@ -403,7 +421,8 @@ function checkLongbridge() {
         key,
         {
           ok: value?.ok ?? null,
-          ms: value?.ms ?? null
+          ms: value?.ms ?? null,
+          active: key.toLowerCase() === activeRegion
         }
       ])
     ),
@@ -447,7 +466,6 @@ async function checkServices() {
     { name: "event-bus", env: "EVENT_BUS_PORT", port: 4310 },
     { name: "event-ingestor", env: "EVENT_INGESTOR_PORT", port: 4311 },
     { name: "broker-executor", env: "BROKER_EXECUTOR_PORT", port: 4312 },
-    { name: "options-shadow", env: "OPTIONS_SHADOW_PORT", port: 4313 },
     { name: "live-advisor", env: "LIVE_ADVISOR_PORT", port: 4314 },
     { name: "paper-trader", env: "PAPER_TRADER_PORT", port: 4315 }
   ];
@@ -477,16 +495,17 @@ function checkSecurity() {
   const openclawAudit = readOpenClawJson(["security", "audit", "--json"], { timeoutMs: 45_000 });
   const pnpmAudit = readCommandJson("pnpm", ["audit", "--prod", "--json"], { timeoutMs: 120_000, allowNonZero: true });
   const openclawFindings = Array.isArray(openclawAudit?.findings) ? openclawAudit.findings : [];
-  const openclawWarnCount = Number(openclawAudit?.summary?.warn ?? 0);
-  const openclawCriticalCount = Number(openclawAudit?.summary?.critical ?? 0);
+  const normalizedOpenClawFindings = openclawFindings.map(normalizeOpenClawSecurityFinding);
+  const actionableOpenClawWarnCount = normalizedOpenClawFindings.filter((finding) => finding.severity === "warn").length;
+  const actionableOpenClawCriticalCount = normalizedOpenClawFindings.filter((finding) => finding.severity === "critical").length;
   const vulnerabilitySummary = pnpmAudit?.metadata?.vulnerabilities ?? null;
   const highDependencyWarnings = Number(vulnerabilitySummary?.high ?? 0) + Number(vulnerabilitySummary?.critical ?? 0);
 
   if (!openclawAudit) {
     warnings.push("OpenClaw security audit 读取失败。");
   }
-  if (openclawWarnCount > 0 || openclawCriticalCount > 0) {
-    warnings.push(`OpenClaw security audit 发现 ${openclawCriticalCount} 个 critical、${openclawWarnCount} 个 warning。`);
+  if (actionableOpenClawWarnCount > 0 || actionableOpenClawCriticalCount > 0) {
+    warnings.push(`OpenClaw security audit 发现 ${actionableOpenClawCriticalCount} 个 critical、${actionableOpenClawWarnCount} 个需处理 warning。`);
   }
   if (highDependencyWarnings > 0) {
     warnings.push(`pnpm audit 发现 high/critical 依赖安全告警：${highDependencyWarnings} 个。`);
@@ -496,19 +515,54 @@ function checkSecurity() {
   return {
     openclaw: {
       ok: Boolean(openclawAudit),
-      summary: openclawAudit?.summary ?? null,
-      findings: openclawFindings.map((finding) => ({
-        checkId: finding.checkId ?? null,
-        severity: finding.severity ?? "unknown",
-        title: finding.title ?? "unknown",
-        remediation: finding.remediation ?? null
-      }))
+      rawSummary: openclawAudit?.summary ?? null,
+      summary: {
+        critical: actionableOpenClawCriticalCount,
+        warn: actionableOpenClawWarnCount,
+        info: normalizedOpenClawFindings.filter((finding) => finding.severity === "info").length
+      },
+      findings: normalizedOpenClawFindings
     },
     dependencies: {
       ok: Boolean(pnpmAudit),
       vulnerabilities: vulnerabilitySummary,
       advisoryCount: pnpmAudit?.advisories ? Object.keys(pnpmAudit.advisories).length : 0
     }
+  };
+}
+
+function normalizeOpenClawSecurityFinding(finding) {
+  const checkId = finding.checkId ?? null;
+  const rawSeverity = finding.severity ?? "unknown";
+  const detail = typeof finding.detail === "string" ? finding.detail : "";
+  let severity = rawSeverity;
+  let status = rawSeverity === "warn" || rawSeverity === "critical" ? "actionable" : "observed";
+  let note = null;
+
+  if (checkId === "security.trust_model.multi_user_heuristic") {
+    note = "本机可信用户模式保留 agents.defaults.sandbox.mode=off；缓解条件是 loopback 网关、Feishu 群 allowlist、实盘执行关闭、期权自动化关闭。";
+    status = "accepted";
+    if (
+      detail.includes("No unguarded runtime/process tools were detected")
+      && detail.includes("No unguarded runtime/filesystem contexts detected")
+    ) {
+      severity = "info";
+      status = "mitigated";
+    }
+  }
+
+  if (checkId === "plugins.allow_phantom_entries") {
+    note = "可修复项：plugins.allow 只应保留已安装外部插件；bundled runtime/channel 插件通过 entries 或 channel config 启用。";
+  }
+
+  return {
+    checkId,
+    severity,
+    rawSeverity,
+    status,
+    title: finding.title ?? "unknown",
+    remediation: finding.remediation ?? null,
+    note
   };
 }
 
@@ -601,6 +655,10 @@ function buildChineseReport({ checkedAt, checks, changes, warnings, needsHuman }
     `- pnpm audit：${dependencySummary}`,
     `- 每日维护任务：${checks.launchd.installed && checks.launchd.loaded ? "已安装并加载" : "需要确认"}（每天 09:10）`,
     "",
+    "## OpenClaw Security Audit 说明",
+    "",
+    ...formatSecurityFindings(checks.security.openclaw.findings),
+    "",
     "## 本次自动动作",
     "",
     ...listOrNone(changes, "没有执行自动变更。"),
@@ -621,6 +679,19 @@ function buildChineseReport({ checkedAt, checks, changes, warnings, needsHuman }
   ];
 
   return lines.join("\n");
+}
+
+function formatSecurityFindings(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) {
+    return ["- 无。"];
+  }
+
+  return findings.map((finding) => {
+    const status = finding.status ?? "observed";
+    const severity = finding.severity ?? finding.rawSeverity ?? "unknown";
+    const note = finding.note ? `；说明：${finding.note}` : "";
+    return `- ${finding.checkId ?? "unknown"}：${severity}/${status}${note}`;
+  });
 }
 
 function formatAuthProviders(auth) {
@@ -770,6 +841,20 @@ function parseModelId(id) {
 
 function readOpenClawJson(args, options = {}) {
   return readCommandJson(openclawBin, args, options, `openclaw ${args.join(" ")}`);
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+  let timeout;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(label)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function readCommandJson(command, args, options = {}, label = `${basename(command)} ${args.join(" ")}`) {

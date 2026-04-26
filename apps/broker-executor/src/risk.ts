@@ -45,9 +45,12 @@ export function evaluateRisk(ticket: OrderTicket, rules: RuleSet): RiskDecision 
     );
   }
 
-  if (ticket.assetClass === "option" && ticket.strategy && !rules.allowedOptionStrategies.includes(ticket.strategy)) {
+  if (ticket.assetClass === "option") {
     status = escalateStatus(status, "block");
-    reasons.push(`Option strategy ${ticket.strategy} is not allowed by active rules.`);
+    reasons.push("Option automation is disabled by operator policy.");
+  } else if (ticket.strategy && !rules.allowedOptionStrategies.includes(ticket.strategy)) {
+    status = escalateStatus(status, "block");
+    reasons.push(`Strategy ${ticket.strategy} is not allowed by active rules.`);
   }
 
   return {

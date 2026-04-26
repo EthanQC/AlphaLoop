@@ -22,8 +22,14 @@ import {
   type LongbridgeAuthState
 } from "@packages/shared-types";
 
+import {
+  LIVE_EXECUTION_ENABLED,
+  OPTION_AUTOMATION_ENABLED,
+  rejectDisabledExecution
+} from "./execution-guards.js";
 import { executeLongbridgePaperOrder } from "./longbridge-paper.js";
 import { PaperExecutionEngine } from "./paper-engine.js";
+import { redactSensitiveJsonValue, redactSensitiveText } from "./redaction.js";
 import { evaluateRisk } from "./risk.js";
 
 const repoRoot = resolveRepoRoot(process.cwd());
@@ -39,9 +45,12 @@ const paperEngine = new PaperExecutionEngine(paperBook);
 const longbridgeAuth = resolveLongbridgeAuthState();
 
 const port = Number(process.env.BROKER_EXECUTOR_PORT ?? 4312);
-const liveExecutionEnabled = process.env.ALLOW_LIVE_EXECUTION === "true";
+const configuredLiveExecutionRequested = process.env.ALLOW_LIVE_EXECUTION === "true";
+const liveExecutionEnabled = LIVE_EXECUTION_ENABLED;
+const optionAutomationEnabled = OPTION_AUTOMATION_ENABLED;
 const officialPaperExecutionEnabled = process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED === "true"
-  && process.env.LONGBRIDGE_ACCOUNT_MODE === "paper";
+  && process.env.LONGBRIDGE_ACCOUNT_MODE === "paper"
+  && !configuredLiveExecutionRequested;
 
 const server = createServer(async (req, res) => {
   try {
@@ -52,9 +61,10 @@ const server = createServer(async (req, res) => {
         ok: true,
         service: "broker-executor",
         liveExecutionEnabled,
+        configuredLiveExecutionRequested,
         officialPaperExecutionEnabled,
         accountMode: process.env.LONGBRIDGE_ACCOUNT_MODE ?? "unset",
-        optionAutomationEnabled: false,
+        optionAutomationEnabled,
         longbridgeAuth: sanitizeLongbridgeAuth(longbridgeAuth),
         paperOpenPositions: paperBook.listOpenPositions().length
       });
@@ -85,29 +95,10 @@ const server = createServer(async (req, res) => {
       const risk = evaluateRisk(body.ticket, activeRuleSet);
 
       let result: ExecutionResult;
+      const boundaryRejection = rejectDisabledExecution(body.ticket);
 
-      if (body.ticket.assetClass === "option" || body.ticket.environment === "shadow") {
-        result = {
-          ticketId: body.ticket.id,
-          environment: body.ticket.environment,
-          status: "rejected" as const,
-          provider: "broker-executor" as const,
-          reasons: [
-            "Option trading is disabled by operator policy.",
-            "The trading stack only accepts stock and ETF tickets."
-          ]
-        };
-      } else if (body.ticket.environment === "live" && !liveExecutionEnabled) {
-        result = {
-          ticketId: body.ticket.id,
-          environment: "live" as const,
-          status: "rejected" as const,
-          provider: "broker-executor" as const,
-          reasons: [
-            "Live execution is disabled by the trading constitution.",
-            ...risk.reasons
-          ]
-        };
+      if (boundaryRejection) {
+        result = boundaryRejection;
       } else if (risk.status === "block") {
         result = {
           ticketId: body.ticket.id,
@@ -132,31 +123,32 @@ const server = createServer(async (req, res) => {
         };
       }
 
+      const safeResult = sanitizeExecutionResult(result);
       const reportId = createId("report");
       reports.save({
         id: reportId,
         category: "trade",
         title: `Execution report for ${body.ticket.symbol}`,
-        body: buildExecutionReportBody(body.ticket.id, result),
+        body: buildExecutionReportBody(body.ticket.id, safeResult),
         metadata: {
           ticketId: body.ticket.id,
           environment: body.ticket.environment,
           assetClass: body.ticket.assetClass,
-          result: toJsonValue(result)
+          result: redactSensitiveJsonValue(toJsonValue(safeResult))
         },
         createdAt: new Date().toISOString()
       });
 
-      saveOfficialPaperLifecycle(body.ticket, result);
+      saveOfficialPaperLifecycle(body.ticket, safeResult);
 
       audit.write("broker-executor", "ticket.processed", {
         ticketId: body.ticket.id,
-        result,
+        result: safeResult,
         reportId
       });
 
       sendJson(res, result.status === "rejected" ? 422 : 200, {
-        ...result,
+        ...safeResult,
         reportId,
         risk
       });
@@ -173,18 +165,22 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`broker-executor listening on http://127.0.0.1:${port}`);
 });
 
+function sanitizeExecutionResult(result: ExecutionResult): ExecutionResult {
+  return redactSensitiveJsonValue(toJsonValue(result)) as unknown as ExecutionResult;
+}
+
 function buildExecutionReportBody(ticketId: string, result: ExecutionResult): string {
   const lines = [
-    `Ticket: ${ticketId}`,
+    `Ticket: ${redactSensitiveText(ticketId)}`,
     `Status: ${result.status}`,
     `Provider: ${result.provider}`
   ];
 
   if (result.externalOrderId) {
-    lines.push(`External order id: ${result.externalOrderId}`);
+    lines.push(`External order id: ${redactSensitiveText(result.externalOrderId)}`);
   }
   if (result.brokerStatus) {
-    lines.push(`Broker status: ${result.brokerStatus}`);
+    lines.push(`Broker status: ${redactSensitiveText(result.brokerStatus)}`);
   }
   if (result.brokerOrderStage) {
     lines.push(`Lifecycle stage: ${result.brokerOrderStage}`);
@@ -195,7 +191,7 @@ function buildExecutionReportBody(ticketId: string, result: ExecutionResult): st
 
   lines.push("", "Reasons:");
   for (const reason of result.reasons) {
-    lines.push(`- ${reason}`);
+    lines.push(`- ${redactSensitiveText(reason)}`);
   }
   return lines.join("\n");
 }

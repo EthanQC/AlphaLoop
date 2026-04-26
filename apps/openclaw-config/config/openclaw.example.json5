@@ -160,7 +160,9 @@
     }
   },
   plugins: {
-    allow: ["acpx", "browser", "feishu", "openclaw-honcho"],
+    // Keep this list for installed external plugins only. Bundled runtime/channel plugins
+    // are enabled by their own config blocks and should not be added here.
+    allow: [],
     entries: {
       acpx: {
         enabled: true,
