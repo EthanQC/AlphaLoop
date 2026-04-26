@@ -1,0 +1,28 @@
+{
+  "id": "rule-proposal-review",
+  "name": "Rule Proposal Review",
+  "description": "Deterministically handles Feishu rule-proposal review replies before model dispatch.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "repoRoot": {
+        "type": "string",
+        "description": "Repository root containing apps/openclaw-config/scripts/review-rule-proposal.mjs."
+      },
+      "channel": {
+        "type": "string",
+        "description": "Channel id to intercept. Defaults to feishu."
+      },
+      "notify": {
+        "type": "boolean",
+        "description": "Let the review script send the Feishu audit notification. Defaults to true."
+      },
+      "returnText": {
+        "type": "boolean",
+        "description": "Return a short direct channel reply in addition to script-side notification. Defaults to false."
+      }
+    }
+  }
+}
