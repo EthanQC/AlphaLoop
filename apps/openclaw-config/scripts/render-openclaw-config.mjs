@@ -131,6 +131,12 @@ const nextConfig = {
                 appSecret: feishuAppSecret,
                 domain: feishuDomain,
                 name: feishuBotName,
+                dmPolicy: feishuDmPolicy,
+                ...(feishuAllowFrom.length > 0 ? { allowFrom: feishuAllowFrom } : {}),
+                groupPolicy: feishuGroupPolicy,
+                ...(feishuGroupAllowFrom.length > 0 ? { groupAllowFrom: feishuGroupAllowFrom } : {}),
+                ...(Object.keys(feishuGroups).length > 0 ? { groups: feishuGroups } : {}),
+                ...(typeof feishuRequireMention === "boolean" ? { requireMention: feishuRequireMention } : {}),
                 ...(feishuVerificationToken ? { verificationToken: feishuVerificationToken } : {})
               }
             }
