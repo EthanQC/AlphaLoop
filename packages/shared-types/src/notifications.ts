@@ -138,61 +138,28 @@ export async function sendNotification(payload: NotificationPayload): Promise<No
 export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
   const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
   if (!pluginBotReadiness.enabled) {
-    const fallback = await deliverReportViaFallback(payload, pluginBotReadiness.reason);
-    return fallback;
+    if (allowReportFallbackDelivery()) {
+      return deliverReportViaFallback(payload, pluginBotReadiness.reason);
+    }
+
+    throw new Error([
+      `Feishu report delivery requires the user-plugin bot channel: ${pluginBotReadiness.reason ?? "not ready"}.`,
+      "Degraded fallback delivery is disabled for reports; set FEISHU_REPORT_ALLOW_FALLBACK=1 only if an operator explicitly accepts degraded report delivery."
+    ].join(" "));
   }
 
   try {
-    const deliveries: ReportDeliveryEntry[] = [];
-    const summaryResult = await sendFeishuUserPluginBotPost({
-      title: `${payload.title} 摘要`,
-      body: buildReportSummaryMarkdown(payload)
-    });
-    deliveries.push({
-      kind: "summary",
-      title: `${payload.title} 摘要`,
-      target: summaryResult.target,
-      sent: summaryResult.sent,
-      ...(summaryResult.detail ? { detail: summaryResult.detail } : {})
-    });
-
-    const sections = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
-    for (const section of sections) {
-      const sectionResult = await sendFeishuUserPluginBotPost({
-        title: section.title,
-        body: section.body
-      });
-      deliveries.push({
-        kind: "chapter",
-        title: section.title,
-        target: sectionResult.target,
-        sent: sectionResult.sent,
-        ...(sectionResult.detail ? { detail: sectionResult.detail } : {}),
-        chapter: section.chapter,
-        part: section.part,
-        parts: section.parts
-      });
-    }
-
-    if (payload.pdfPath) {
-      const fileResult = await trySendFeishuUserPluginBotFile(payload.pdfPath, `${payload.title}.pdf`);
-      deliveries.push({
-        kind: "file",
-        title: `${payload.title}.pdf`,
-        target: fileResult.target,
-        sent: fileResult.sent,
-        ...(fileResult.detail ? { detail: fileResult.detail } : {}),
-        ...(fileResult.reason ? { reason: fileResult.reason } : {})
-      });
-    }
-
-    return {
-      sent: deliveries.some((entry) => entry.kind !== "file" && entry.sent),
-      target: "feishu-user-plugin-bot-post",
-      deliveries
-    };
+    return await deliverReportViaUserPlugin(payload);
   } catch (error) {
-    return deliverReportViaFallback(payload, sanitizeNotificationError(error));
+    const primaryError = sanitizeNotificationError(error);
+    if (allowReportFallbackDelivery()) {
+      return deliverReportViaFallback(payload, primaryError);
+    }
+
+    throw new Error([
+      `Feishu report user-plugin delivery failed after retries: ${primaryError}`,
+      "Degraded fallback delivery is disabled for reports, so this report was not marked delivered."
+    ].join(" "));
   }
 }
 
@@ -309,7 +276,7 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
     ...(primaryError ? { primaryError } : {})
   });
 
-  if (summaryResult.sent) {
+  if (summaryResult.sent && shouldSendFullReportChapters()) {
     for (const section of chunks) {
       const result = await sendFallbackNotification(buildDegradedFallbackPayload({
         title: section.title,
@@ -345,6 +312,123 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
     deliveryResult.reason = reason;
   }
   return deliveryResult;
+}
+
+async function deliverReportViaUserPlugin(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
+  const deliveries: ReportDeliveryEntry[] = [];
+  const summaryResult = await sendFeishuUserPluginBotPost({
+    title: `${payload.title} 摘要`,
+    body: buildReportSummaryMarkdown(payload)
+  });
+  deliveries.push({
+    kind: "summary",
+    title: `${payload.title} 摘要`,
+    target: summaryResult.target,
+    sent: summaryResult.sent,
+    ...(summaryResult.detail ? { detail: summaryResult.detail } : {})
+  });
+
+  if (shouldSendFullReportChapters()) {
+    const sections = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
+    for (const section of sections) {
+      const sectionResult = await sendFeishuUserPluginBotPost({
+        title: section.title,
+        body: section.body
+      });
+      deliveries.push({
+        kind: "chapter",
+        title: section.title,
+        target: sectionResult.target,
+        sent: sectionResult.sent,
+        ...(sectionResult.detail ? { detail: sectionResult.detail } : {}),
+        chapter: section.chapter,
+        part: section.part,
+        parts: section.parts
+      });
+    }
+  }
+
+  if (payload.pdfPath) {
+    const fileResult = await trySendFeishuUserPluginBotFile(payload.pdfPath, `${payload.title}.pdf`);
+    deliveries.push({
+      kind: "file",
+      title: `${payload.title}.pdf`,
+      target: fileResult.target,
+      sent: fileResult.sent,
+      ...(fileResult.detail ? { detail: fileResult.detail } : {}),
+      ...(fileResult.reason ? { reason: fileResult.reason } : {})
+    });
+    if (!fileResult.sent) {
+      throw new Error(`Feishu report PDF delivery failed: ${fileResult.reason ?? fileResult.detail ?? "unknown error"}`);
+    }
+  }
+
+  return {
+    sent: deliveries.some((entry) => entry.kind !== "file" && entry.sent),
+    target: "feishu-user-plugin-bot-post",
+    deliveries
+  };
+}
+
+function allowReportFallbackDelivery(): boolean {
+  return process.env.FEISHU_REPORT_ALLOW_FALLBACK === "1"
+    || process.env.OPENCLAW_REPORT_ALLOW_DEGRADED_FEISHU === "1";
+}
+
+function shouldSendFullReportChapters(): boolean {
+  return process.env.FEISHU_REPORT_DELIVERY_MODE === "full";
+}
+
+async function withNotificationRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {
+  const { attempts, baseDelayMs } = getNotificationRetryConfig();
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isRetryableNotificationError(error)) {
+        throw error;
+      }
+      await sleep(baseDelayMs * attempt);
+    }
+  }
+
+  throw new Error(`${label} failed after ${attempts} attempts: ${sanitizeNotificationError(lastError)}`);
+}
+
+function getNotificationRetryConfig(): { attempts: number; baseDelayMs: number } {
+  return {
+    attempts: clampInteger(
+      process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS ?? process.env.FEISHU_USER_PLUGIN_RETRY_ATTEMPTS,
+      1,
+      6,
+      3
+    ),
+    baseDelayMs: clampInteger(
+      process.env.FEISHU_NOTIFICATION_RETRY_DELAY_MS ?? process.env.FEISHU_USER_PLUGIN_RETRY_DELAY_MS,
+      250,
+      10_000,
+      2_000
+    )
+  };
+}
+
+function isRetryableNotificationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|ENOTFOUND|EAI_AGAIN|fetch failed|network|socket|TLS|temporar|rate limit|429|5\d\d/iu.test(message);
+}
+
+function clampInteger(value: string | undefined, min: number, max: number, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function resolveFeishuUserPluginBotReadiness(): NotificationReadiness {
@@ -390,50 +474,54 @@ async function sendFeishuUserPluginBotNotification(payload: NotificationPayload)
 }
 
 async function sendFeishuUserPluginBotText(payload: NotificationPayload): Promise<NotificationResult> {
-  const chatId = resolveFeishuUserPluginBotChatId();
-  const result = await callFeishuUserPluginTool("send_message_as_bot", {
-    chat_id: chatId,
-    msg_type: "text",
-    content: {
-      text: `${payload.title}\n${payload.body}`
+  return withNotificationRetry(async () => {
+    const chatId = resolveFeishuUserPluginBotChatId();
+    const result = await callFeishuUserPluginTool("send_message_as_bot", {
+      chat_id: chatId,
+      msg_type: "text",
+      content: {
+        text: `${payload.title}\n${payload.body}`
+      }
+    });
+
+    const detail = extractMcpText(result);
+    if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
+      throw new Error(detail || "feishu-user-plugin returned an error response.");
     }
-  });
 
-  const detail = extractMcpText(result);
-  if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
-    throw new Error(detail || "feishu-user-plugin returned an error response.");
-  }
-
-  return {
-    sent: true,
-    target: "feishu-user-plugin-bot-text",
-    ...(detail ? { detail } : {})
-  };
+    return {
+      sent: true,
+      target: "feishu-user-plugin-bot-text",
+      ...(detail ? { detail } : {})
+    };
+  }, "feishu-user-plugin text send");
 }
 
 async function sendFeishuUserPluginBotPost(payload: NotificationPayload): Promise<NotificationResult> {
-  const chatId = resolveFeishuUserPluginBotChatId();
-  const result = await callFeishuUserPluginTool("send_message_as_bot", {
-    chat_id: chatId,
-    msg_type: "post",
-    content: {
-      zh_cn: {
-        title: payload.title,
-        content: markdownToFeishuPostContent(payload.body)
+  return withNotificationRetry(async () => {
+    const chatId = resolveFeishuUserPluginBotChatId();
+    const result = await callFeishuUserPluginTool("send_message_as_bot", {
+      chat_id: chatId,
+      msg_type: "post",
+      content: {
+        zh_cn: {
+          title: payload.title,
+          content: markdownToFeishuPostContent(payload.body)
+        }
       }
+    });
+
+    const detail = extractMcpText(result);
+    if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
+      throw new Error(detail || "feishu-user-plugin bot post returned an error response.");
     }
-  });
 
-  const detail = extractMcpText(result);
-  if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
-    throw new Error(detail || "feishu-user-plugin bot post returned an error response.");
-  }
-
-  return {
-    sent: true,
-    target: "feishu-user-plugin-bot-post",
-    ...(detail ? { detail } : {})
-  };
+    return {
+      sent: true,
+      target: "feishu-user-plugin-bot-post",
+      ...(detail ? { detail } : {})
+    };
+  }, "feishu-user-plugin post send");
 }
 
 async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string): Promise<NotificationResult> {
@@ -446,11 +534,11 @@ async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string
   }
 
   try {
-    const upload = await callFeishuUserPluginTool("upload_file", {
+    const upload = await withNotificationRetry(() => callFeishuUserPluginTool("upload_file", {
       file_path: filePath,
       file_type: "pdf",
       file_name: fileName
-    });
+    }), "feishu-user-plugin file upload");
     const uploadText = extractMcpText(upload);
     const fileKey = uploadText.match(/\bfile_[A-Za-z0-9_-]+\b/u)?.[0];
     if (upload.isError || !fileKey) {
@@ -461,13 +549,13 @@ async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string
       };
     }
 
-    const sent = await callFeishuUserPluginTool("send_message_as_bot", {
+    const sent = await withNotificationRetry(() => callFeishuUserPluginTool("send_message_as_bot", {
       chat_id: resolveFeishuUserPluginBotChatId(),
       msg_type: "file",
       content: {
         file_key: fileKey
       }
-    });
+    }), "feishu-user-plugin file send");
     const detail = extractMcpText(sent);
     if (sent.isError || /^error:/iu.test(detail)) {
       return {
@@ -723,15 +811,15 @@ function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): string {
     "",
     "## 摘要",
     "",
-    ...(bullets.length > 0 ? bullets : ["- 本报告已生成，后续消息将按章节发送全文。"]),
+    ...(bullets.length > 0 ? bullets : ["- 本报告已生成，完整正文见本地报告文件和文本文档。"]),
     "",
     "## 交付",
     "",
-    "- 第一条：Trading Copilot bot 富文本摘要卡片。",
-    "- 后续：按章节发送全文；超长章节会自动拆分，保留章节标题。",
-    ...(payload.markdownPath ? [`- 本地 Markdown：${payload.markdownPath}`] : []),
-    ...(payload.pdfPath ? [`- 本地 PDF：${payload.pdfPath}`] : []),
-    "- 若 Feishu 文件上传权限可用，PDF 会作为文件消息发送到群里。"
+    "- 群里默认只发送这一条中文摘要，避免刷屏。",
+    "- 完整正文以本地报告文件和文本文档留档；需要群内逐章发送时，必须人工明确开启全文模式。",
+    ...(payload.markdownPath ? [`- 本地文本文档：${payload.markdownPath}`] : []),
+    ...(payload.pdfPath ? [`- 本地报告文件：${payload.pdfPath}`] : []),
+    "- 文件上传成功时，报告文件会作为文件消息发送到群里。"
   ].filter((line) => line !== "").join("\n");
 }
 

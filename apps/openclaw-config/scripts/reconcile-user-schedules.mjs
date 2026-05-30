@@ -22,7 +22,10 @@ const options = parseArgs(args);
 try {
   switch (command) {
     case "run":
-      printJson(reconcile(options));
+      {
+        const result = reconcile(options);
+        printJson(options.verbose ? result : compactRunResult(result));
+      }
       break;
     case "status":
       printJson(status());
@@ -37,6 +40,7 @@ Options:
   --lookback-days N         Maximum catch-up lookback window. Defaults to 14.
   --max-attempts N          Retry failed catch-up occurrences up to N times. Defaults to 5.
   --now YYYY-MM-DDTHH:mm:ss Override current time for tests.
+  --verbose                 Print full planned/executed/skipped detail.
 `);
   }
 } catch (error) {
@@ -92,8 +96,18 @@ function reconcile(runOptions = {}) {
     const occurrenceId = getOccurrenceId(occurrence.task.id, occurrence.scheduledAt);
     const existing = getRun(db, occurrenceId);
     if (existing && ["success", "skipped"].includes(existing.status)) {
-      skipped.push(toPlan(occurrence, "ledger-already-complete"));
-      continue;
+      if (occurrence.task.revalidateCompleted) {
+        const done = occurrence.task.done(occurrence.scheduledAt);
+        if (done.done) {
+          skipped.push(toPlan(occurrence, "ledger-already-complete"));
+          continue;
+        }
+        // Older catch-up ledgers predate report completeness markers. Re-run
+        // the occurrence instead of trusting stale success/skipped rows.
+      } else {
+        skipped.push(toPlan(occurrence, "ledger-already-complete"));
+        continue;
+      }
     }
     if (existing?.status === "failed" && existing.attempts >= maxAttempts) {
       skipped.push(toPlan(occurrence, "max-attempts-reached"));
@@ -193,6 +207,22 @@ function status() {
   };
 }
 
+function compactRunResult(result) {
+  const planned = Array.isArray(result.planned) ? result.planned : [];
+  const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+  return {
+    status: result.status,
+    dryRun: result.dryRun,
+    from: result.from,
+    now: result.now,
+    totals: result.totals,
+    executed: result.executed ?? [],
+    failed: result.failed ?? [],
+    planned: result.dryRun ? planned : planned.slice(0, 20),
+    skippedCount: skipped.length
+  };
+}
+
 function buildTasks() {
   const marketWeekdays = new Set([1, 2, 3, 4, 5]);
   return [
@@ -288,6 +318,7 @@ function reportTask({ id, label, kind, action, hour, minute, weekdays, order }) 
     id,
     label,
     order,
+    revalidateCompleted: action === "prepare",
     graceMs: 10 * 60 * 1000,
     timeoutMs: 240000,
     occurrences: (from, now) => calendarOccurrences({ from, now, hour, minute, weekdays }),
@@ -295,9 +326,12 @@ function reportTask({ id, label, kind, action, hour, minute, weekdays, order }) 
       const dateLabel = localDateLabel(scheduledAt);
       const reportState = readJson(reportStatePath);
       const entry = reportState?.[`${kind}:${dateLabel}`] ?? {};
+      if (entry.archivedAt) {
+        return { done: true, reason: "report-archived" };
+      }
       const reportPath = join(repoRoot, "reports", kind, `${dateLabel}.md`);
       if (action === "prepare") {
-        return entry.preparedAt || existsSync(reportPath)
+        return isReportStatePrepared(entry) || isReportPrepared(reportPath)
           ? { done: true, reason: "report-already-prepared" }
           : { done: false };
       }
@@ -315,6 +349,34 @@ function reportTask({ id, label, kind, action, hour, minute, weekdays, order }) 
       };
     }
   };
+}
+
+function isReportStatePrepared(entry) {
+  return Boolean(
+    entry?.preparedAt
+    && entry?.requiredDataSources?.officialPaperSnapshot
+    && entry?.requiredDataSources?.marketNews
+    && entry?.requiredDataSources?.macroCalendar
+    && entry?.requiredDataSources?.qqqQuote
+  );
+}
+
+function isReportPrepared(reportPath) {
+  if (!existsSync(reportPath)) {
+    return false;
+  }
+  try {
+    const markdown = readFileSync(reportPath, "utf8");
+    return [
+      "长桥官方模拟盘",
+      "长桥新闻",
+      "宏观日历",
+      "长桥行情",
+      "QQQ 行情"
+    ].every((marker) => markdown.includes(marker));
+  } catch {
+    return false;
+  }
 }
 
 function calendarOccurrences({ from, now, hour, minute, weekdays = null }) {

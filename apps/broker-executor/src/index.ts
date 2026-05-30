@@ -57,6 +57,7 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/health") {
+      const localPaperSimOpenPositions = paperBook.listOpenPositions().length;
       sendJson(res, 200, {
         ok: true,
         service: "broker-executor",
@@ -66,13 +67,19 @@ const server = createServer(async (req, res) => {
         accountMode: process.env.LONGBRIDGE_ACCOUNT_MODE ?? "unset",
         optionAutomationEnabled,
         longbridgeAuth: sanitizeLongbridgeAuth(longbridgeAuth),
-        paperOpenPositions: paperBook.listOpenPositions().length
+        paperPositionSource: "local-paper-sim",
+        localPaperSimOpenPositions,
+        paperOpenPositions: localPaperSimOpenPositions
       });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/v1/paper/positions") {
       sendJson(res, 200, {
+        source: "local-paper-sim",
+        note: officialPaperExecutionEnabled
+          ? "Official Longbridge paper positions are fetched directly by report/account snapshot scripts; this endpoint shows the local paper-sim history only."
+          : "Local paper-sim positions.",
         positions: paperBook.listOpenPositions()
       });
       return;

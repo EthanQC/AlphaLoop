@@ -5,7 +5,17 @@ import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
-import { runLongbridgeJson } from "./_longbridge.mjs";
+import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import {
+  assertOfficialPaperReportEnvironment,
+  buildTrackedSymbols,
+  normalizeMacroCalendarPayload,
+  normalizeNewsPayload,
+  normalizeOfficialPaperSnapshot,
+  normalizeQuotePayload,
+  selectLocalNewsEvents,
+  toNumber
+} from "./report-data.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
@@ -35,32 +45,36 @@ if (action === "prepare") {
 }
 
 async function prepareReport(reportKind, info) {
+  assertOfficialPaperReportEnvironment();
   const db = openTradingDatabase(dbPath);
-  const [executionRows, approvalRows, proposalRows, paperPositions, latestPreference, qqqQuote] = await Promise.all([
+  const [executionRows, approvalRows, proposalRows, localPaperPositions, latestPreference, localNewsEvents] = await Promise.all([
     Promise.resolve(selectExecutionReports(db, info)),
     Promise.resolve(selectApprovalRows(db, info)),
     Promise.resolve(selectProposalRows(db, info)),
-    Promise.resolve(selectPaperPositions(db)),
+    Promise.resolve(selectLocalPaperPositions(db)),
     Promise.resolve(selectLatestPreference(db)),
-    fetchQqqQuote()
+    Promise.resolve(selectLocalNewsEvents(db, info))
   ]);
+  const marketData = await fetchRequiredReportMarketData(info);
 
   const report = reportKind === "daily"
     ? renderDailyReport(info, {
         executionRows,
         approvalRows,
         proposalRows,
-        paperPositions,
+        localPaperPositions,
         latestPreference,
-        qqqQuote
+        localNewsEvents,
+        ...marketData
       })
     : renderWeeklyReport(info, {
         executionRows,
         approvalRows,
         proposalRows,
-        paperPositions,
+        localPaperPositions,
         latestPreference,
-        qqqQuote
+        localNewsEvents,
+        ...marketData
       });
 
   writeFileSync(reportPath, `${report}\n`, "utf8");
@@ -69,7 +83,20 @@ async function prepareReport(reportKind, info) {
     preparedAt: new Date().toISOString(),
     path: reportPath,
     pdfPath,
-    kind: reportKind
+    kind: reportKind,
+    requiredDataSources: {
+      officialPaperSnapshot: true,
+      marketNews: true,
+      macroCalendar: true,
+      qqqQuote: true
+    },
+    sourceEvidence: marketData.sourceEvidence,
+    deliveredAt: undefined,
+    chunks: undefined,
+    deliveries: undefined,
+    pdfUploaded: undefined,
+    regeneratedDuringDelivery: undefined,
+    preparedInSameRun: undefined
   });
 
   return {
@@ -81,8 +108,12 @@ async function prepareReport(reportKind, info) {
 
 async function deliverReport(reportKind, info, alreadyPrepared) {
   let markdown = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
-  if (!markdown.trim()) {
-    throw new Error(`报告 ${info.label} 尚未提前生成；deliver 只交付既有报告，不在交付时重新计算。请先运行 ${reportKind} prepare。`);
+  let regeneratedDuringDelivery = false;
+  if (!isPreparedReportMarkdownComplete(markdown)) {
+    const prepared = await prepareReport(reportKind, info);
+    markdown = prepared.markdown;
+    alreadyPrepared = true;
+    regeneratedDuringDelivery = true;
   }
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
@@ -112,7 +143,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     chunks: chapterMessages.length,
     deliveries,
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
-    regeneratedDuringDelivery: false,
+    regeneratedDuringDelivery,
     preparedInSameRun: alreadyPrepared
   });
 
@@ -141,18 +172,22 @@ function renderDailyReport(info, data) {
     "",
     "## 1. 今日结论",
     "",
-    `- 交易/执行报告：${tradeRows.length} 条，其中拒绝/未执行 ${rejectedRows.length} 条。`,
-    `- 建议/偏好报告：${dailyRows.length} 条。`,
-    `- 人工审批编辑：${data.approvalRows.length} 条。`,
-    `- 规则提案：${data.proposalRows.length} 条（只摘要，未确认不生效）。`,
-    `- 当前本地模拟盘持仓：${data.paperPositions.length} 个。`,
+    ...renderCoreSummary(data, {
+      period: "今日",
+      tradeCount: tradeRows.length,
+      adviceCount: dailyRows.length,
+      rejectedCount: rejectedRows.length,
+      approvalCount: data.approvalRows.length,
+      proposalCount: data.proposalRows.length
+    }),
     "- 期权自动化：已禁用，不纳入日报生成、建议或执行。",
     "",
-    "## 2. 信息检索与分类",
+    "## 2. 市场资讯与宏观日历",
     "",
-    `- 已验证：本报告使用本地 SQLite 交易事实、OpenClaw 执行报告、规则提案和 Longbridge QQQ 行情快照（${formatQuoteTimestamp(data.qqqQuote)}）。`,
-    "- 待验证：外部宏观/新闻流尚未接入可审计来源，本报告不会把未落库新闻当作事实。",
+    renderDataSourceSummary(data),
     "- 噪声过滤：系统心跳、健康检查和已禁用期权影子链路不计入交易判断。",
+    "",
+    renderMarketIntelligence(data),
     "",
     "## 3. 执行与模拟盘",
     "",
@@ -164,14 +199,18 @@ function renderDailyReport(info, data) {
     "",
     "## 5. 当前持仓",
     "",
-    renderPaperPositions(data.paperPositions),
+    renderOfficialPaperSnapshot(data.officialPaperSnapshot),
+    "",
+    "### 本地模拟盘历史持仓核对",
+    "",
+    renderLocalPaperPositions(data.localPaperPositions),
     "",
     "## 6. 风险与异常",
     "",
     "- 实盘：禁止自动提交真实资金订单。",
-    "- 官方模拟盘：只有确认 Longbridge 鉴权令牌属于官方模拟盘后，才允许走官方模拟盘写入测试。",
+    "- 官方模拟盘：报告以长桥官方模拟盘账户快照为准；本地模拟盘只作为历史审计层。",
     "- 期权：不生成、不预览、不执行任何期权自动化。",
-    "- 渠道：Feishu 应用探测健康；富文本交付由本报告链路直接推送到炒股群。",
+    "- 渠道：飞书交付链路探测健康；报告由现有自动化链路推送到炒股群。",
     "",
     "## 7. 规则提案摘要",
     "",
@@ -195,22 +234,33 @@ function renderWeeklyReport(info, data) {
     "",
     "## 1. 本周结论",
     "",
-    `- 执行/交易报告：${tradeRows.length} 条。`,
-    `- 日常建议/偏好报告：${dailyRows.length} 条。`,
-    `- 规则提案：${data.proposalRows.length} 条（周报只摘要，不自动应用）。`,
-    `- 当前本地模拟盘持仓：${data.paperPositions.length} 个。`,
+    ...renderCoreSummary(data, {
+      period: "本周",
+      tradeCount: tradeRows.length,
+      adviceCount: dailyRows.length,
+      rejectedCount: tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`)).length,
+      approvalCount: data.approvalRows.length,
+      proposalCount: data.proposalRows.length
+    }),
     "- 期权自动化：已禁用，周报只保留历史风险提示，不提供任何期权行动建议。",
     "",
     "## 2. 市场主线回顾",
     "",
-    `- 本地目前没有可审计的外部新闻/宏观数据入库，因此周报只汇总交易事实、执行记录和 QQQ 行情快照（${formatQuoteTimestamp(data.qqqQuote)}）。`,
-    "- 后续若接入新闻源/宏观源，会按“已验证、部分验证、未验证”分层纳入。",
+    renderDataSourceSummary(data),
+    "",
+    renderMarketIntelligence(data),
     "",
     "## 3. QQQ 与美股风险温度",
     "",
     renderQqqSection(data.qqqQuote),
     "",
     "## 4. 模拟盘与执行复盘",
+    "",
+    renderOfficialPaperSnapshot(data.officialPaperSnapshot),
+    "",
+    "### 本地模拟盘历史持仓核对",
+    "",
+    renderLocalPaperPositions(data.localPaperPositions),
     "",
     renderExecutionDigest(data.executionRows),
     "",
@@ -225,8 +275,8 @@ function renderWeeklyReport(info, data) {
     "## 7. 下周跟踪",
     "",
     "- 固定观察 QQQ 的趋势、成交量和盘前/盘后偏离。",
-    "- 检查 Longbridge 官方模拟盘鉴权令牌状态和模拟盘写入能力。",
-    "- 检查 OpenClaw 版本、模型目录和 Feishu 交付链路。",
+    "- 检查长桥官方模拟盘鉴权令牌状态、账户快照、新闻/宏观日历抓取能力。",
+    "- 检查系统版本、模型目录和飞书交付链路。",
     "",
     "## 8. 需要人工确认事项",
     "",
@@ -235,23 +285,60 @@ function renderWeeklyReport(info, data) {
   ].join("\n");
 }
 
+function renderCoreSummary(data, counts) {
+  const officialPositions = data.officialPaperSnapshot.positions;
+  const officialSummary = summarizeOfficialPositions(officialPositions);
+  const accountSummary = summarizeOfficialAccount(data.officialPaperSnapshot);
+  const qqqSummary = summarizeQqqMove(data.qqqQuote);
+  return [
+    `- 核心结论：${counts.period}没有自动提交实盘订单；官方模拟盘当前持仓为 ${officialSummary}。`,
+    `- 账户状态：${accountSummary}。`,
+    `- 市场状态：${qqqSummary}。`,
+    `- 记录状态：交易/执行报告 ${counts.tradeCount} 条，其中拒绝或未执行 ${counts.rejectedCount} 条；建议/偏好报告 ${counts.adviceCount} 条；人工审批编辑 ${counts.approvalCount} 条；规则提案 ${counts.proposalCount} 条。`,
+    `- 数据覆盖：长桥新闻 ${data.marketNews.length} 条；美国宏观日历 ${data.macroEvents.length} 条；本地模拟盘历史持仓 ${data.localPaperPositions.length} 个。`
+  ];
+}
+
+function renderDataSourceSummary(data) {
+  return [
+    "- 已验证来源：本地交易数据库、长桥官方模拟盘账户快照、长桥行情、长桥新闻、长桥美国宏观日历。",
+    "- 本地交易数据库读取：执行/建议报告、人工审批记录、规则提案、本地模拟盘历史持仓、已落库新闻/日历事件。",
+    "- 长桥账户读取：连通性与令牌检查、官方模拟盘资产、官方模拟盘持仓。",
+    "- 长桥行情读取：QQQ 的最新价、前收、日内高低、盘前/盘后价格与时间。",
+    `- 长桥资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条新闻。`,
+    `- 长桥宏观读取：美国二星和三星宏观事件，窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天。`,
+    `- 本次证据：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌状态 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；新闻 ${data.sourceEvidence.newsCount} 条；宏观事件 ${data.sourceEvidence.macroEventsCount} 条；${formatQuoteTimestamp(data.qqqQuote)}。`
+  ].join("\n");
+}
+
 function renderExecutionDigest(rows) {
   if (rows.length === 0) {
     return "- 本窗口没有交易执行报告或建议报告。";
   }
 
-  return rows.map((row, index) => {
+  const shownRows = rows.slice(-8);
+  const omitted = rows.length - shownRows.length;
+  const header = [
+    `- 本窗口共有 ${rows.length} 条执行/建议记录。`,
+    omitted > 0
+      ? `- 下方只列最近 ${shownRows.length} 条用于人工核对；更早 ${omitted} 条保留在本地数据库的执行报告表。`
+      : "- 下方列出全部记录。"
+  ];
+
+  return [
+    ...header,
+    ...shownRows.map((row, index) => {
     const summary = summarizeExecutionRow(row);
     return [
     `### 记录 ${index + 1}：${summary.heading}`,
     "",
-    `- 时间：${row.created_at}`,
+    `- 时间：${formatReportDateTime(row.created_at)}`,
     `- 类别：${translateReportCategory(row.category)}`,
     `- 状态：${summary.status}`,
     `- 摘要：${summary.summary}`,
-    `- 审计索引：execution_reports.id=${row.id}`
+    `- 审计索引：执行报告编号 ${row.id}`
     ].join("\n");
-  }).join("\n\n");
+  })].join("\n\n");
 }
 
 function renderProposalDigest(rows) {
@@ -309,7 +396,7 @@ function summarizeExecutionRow(row) {
     facts.push("订单状态为未上报");
   }
   if (facts.length === 1) {
-    facts.push("详细内容保存在 SQLite，中文报告不直接展开旧英文正文");
+    facts.push("详细内容保存在本地数据库，中文报告不直接展开旧英文正文");
   }
 
   return {
@@ -391,9 +478,110 @@ function translateReportCategory(category) {
 function translateAssetClass(assetClass) {
   const labels = {
     stock: "股票",
-    etf: "ETF"
+    etf: "交易型开放式指数基金"
   };
   return labels[assetClass] ?? String(assetClass ?? "资产");
+}
+
+function translateDataSource(source) {
+  const labels = {
+    "longbridge-official-paper": "长桥官方模拟盘"
+  };
+  return labels[String(source ?? "")] ?? "已验证来源";
+}
+
+function translateAccountMode(mode) {
+  const labels = {
+    paper: "模拟盘",
+    live: "实盘"
+  };
+  return labels[String(mode ?? "").toLowerCase()] ?? "未知模式";
+}
+
+function translateSessionStatus(status) {
+  const labels = {
+    valid: "有效",
+    expired: "过期",
+    unknown: "未知"
+  };
+  return labels[String(status ?? "").toLowerCase()] ?? String(status ?? "未知");
+}
+
+function translateRiskLevel(value) {
+  const labels = {
+    safe: "安全",
+    normal: "正常",
+    warning: "警示",
+    danger: "高风险"
+  };
+  return labels[String(value ?? "").toLowerCase()] ?? "未知";
+}
+
+function translateCurrency(value) {
+  const labels = {
+    USD: "美元",
+    HKD: "港元",
+    CNH: "离岸人民币",
+    CNY: "人民币"
+  };
+  const key = String(value ?? "USD").toUpperCase();
+  return labels[key] ?? key;
+}
+
+function translateQuoteStatus(value) {
+  const labels = {
+    normal: "正常",
+    halted: "停牌",
+    delisted: "退市"
+  };
+  return labels[String(value ?? "").toLowerCase()] ?? "未知";
+}
+
+function translateMarket(value) {
+  const labels = {
+    US: "美国",
+    HK: "香港",
+    CN: "中国内地"
+  };
+  return labels[String(value ?? "").toUpperCase()] ?? String(value ?? "");
+}
+
+function shouldShowMarketPrefix(market, title) {
+  const label = translateMarket(market);
+  return Boolean(label) && !String(title ?? "").startsWith(label);
+}
+
+function translateEventSource(value) {
+  const labels = {
+    "longbridge-news": "长桥新闻",
+    "longbridge-calendar": "长桥日历",
+    "longbridge-quote": "长桥行情"
+  };
+  return labels[String(value ?? "")] ?? "本地事件";
+}
+
+function translateSecurityName(symbol, name) {
+  const labels = {
+    "QQQ.US": "纳指 100 交易型开放式指数基金",
+    AAPL: "苹果公司",
+    MSFT: "微软公司"
+  };
+  return labels[String(symbol ?? "").toUpperCase()] ?? labels[String(name ?? "").toUpperCase()] ?? "持仓标的";
+}
+
+function formatTrackedSymbols(symbols) {
+  return symbols.length ? symbols.join("、") : "未配置";
+}
+
+function formatRegions(regions) {
+  const labels = {
+    cn: "中国区",
+    global: "全球区",
+    hk: "香港区"
+  };
+  return Array.isArray(regions) && regions.length
+    ? regions.map((region) => labels[String(region).toLowerCase()] ?? String(region)).join("、")
+    : "未返回";
 }
 
 function translateRuleScope(scope) {
@@ -547,13 +735,183 @@ function renderPreferenceSnapshot(row) {
   }
 
   return [
-    `- 更新时间：${row.created_at}`,
+    `- 更新时间：${formatReportDateTime(row.created_at)}`,
     "- 策略偏好：保持有意义的现金缓冲，控制单一标的与行业集中度；优先使用“宏观 -> 行业 -> 个股”的自上而下流程；事件质量不清晰时等待确认。",
     "- 使用方式：仅作为观察和建议风格输入，不自动改变交易规则。"
   ].join("\n");
 }
 
-function renderPaperPositions(rows) {
+function summarizeOfficialPositions(rows) {
+  if (!rows.length) {
+    return "空仓";
+  }
+  return rows.map((row) => `${row.symbol} ${formatNumber(row.quantity, 4)} 份`).join("、");
+}
+
+function summarizeOfficialAccount(snapshot) {
+  const asset = snapshot.primaryAsset ?? {};
+  const netAssets = formatOptionalNumber(toNumber(asset.net_assets ?? asset.netAssets));
+  const cash = formatOptionalNumber(toNumber(asset.total_cash ?? asset.totalCash));
+  const risk = translateRiskLevel(asset.risk_level ?? asset.riskLevel);
+  return `净资产 ${netAssets} ${translateCurrency(asset.currency)}，现金 ${cash}，风险等级 ${risk}`;
+}
+
+function summarizeQqqMove(quote) {
+  const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
+  const prevClose = toNumber(quote.prev_close ?? quote.prevClose);
+  if (last === undefined || prevClose === undefined || prevClose === 0) {
+    return "QQQ 行情可读取，但缺少涨跌幅字段";
+  }
+  const change = last - prevClose;
+  const direction = change > 0 ? "上涨" : change < 0 ? "下跌" : "持平";
+  return `QQQ 最新价 ${formatNumber(last)}，较前收${direction} ${formatNumber(Math.abs(change))}（${formatPercent(Math.abs(change) / prevClose)}）`;
+}
+
+function renderChineseNewsLine(article) {
+  const summary = summarizeMarketNewsTitle(article.title);
+  return [
+    `- ${formatReportDateTime(article.publishedAt)} ${article.symbol}：${summary.event}`,
+    `影响：${summary.impact}`,
+    `来源：长桥新闻编号 ${article.id}`
+  ].join("；") + "。";
+}
+
+function summarizeMarketNewsTitle(title) {
+  const text = String(title ?? "");
+  if (/trade representative|ustr|tariff|trade policy/iu.test(text)) {
+    return {
+      event: "美国贸易政策或关税相关消息更新",
+      impact: "关注贸易政策变化对科技股估值和纳指风险偏好的影响"
+    };
+  }
+  if (/wall street extends rally|tech strength|tech leaps|technology/iu.test(text)) {
+    return {
+      event: "美股在科技板块带动下延续上涨",
+      impact: "对 QQQ 偏正面，但需防止短线追高"
+    };
+  }
+  if (/week ahead|monday|what to watch/iu.test(text)) {
+    return {
+      event: "下周市场前瞻更新",
+      impact: "关注周一开盘、宏观数据和科技股消息对 QQQ 的影响"
+    };
+  }
+  if (/global markets|crude|iran|truce|middle east/iu.test(text)) {
+    return {
+      event: "全球市场和地缘风险预期变化",
+      impact: "若避险需求下降，成长股风险偏好可能改善；若反复则波动上升"
+    };
+  }
+  if (/stock market indicator|warning|buffett|2007/iu.test(text)) {
+    return {
+      event: "市场风险指标出现警示信号",
+      impact: "提示不要只看短线上涨，需同时关注回撤和仓位上限"
+    };
+  }
+  if (/nvidia|huang|ai|artificial intelligence/iu.test(text)) {
+    return {
+      event: "人工智能和英伟达增长预期相关消息",
+      impact: "对纳指和 QQQ 的科技权重股情绪有直接影响"
+    };
+  }
+  if (/micron|semiconductor|chip|\bmu\b/iu.test(text)) {
+    return {
+      event: "半导体板块相关消息",
+      impact: "可能影响纳指科技链条情绪，需观察是否扩散到 QQQ"
+    };
+  }
+  if (/linde|nasdaq|underperform/iu.test(text)) {
+    return {
+      event: "个股相对纳指表现偏弱的讨论",
+      impact: "作为市场宽度参考，暂不直接改变 QQQ 持仓判断"
+    };
+  }
+  if (/hedge|shorted|crash/iu.test(text)) {
+    return {
+      event: "市场风险对冲和高空头股票反弹相关消息",
+      impact: "说明风险偏好回升，但也可能放大短期波动"
+    };
+  }
+  if (/market|stocks|wall street|nasdaq|qqq/iu.test(text)) {
+    return {
+      event: "美股市场走势相关消息",
+      impact: "作为 QQQ 趋势和风险偏好的辅助证据"
+    };
+  }
+  if (/earnings|revenue|profit|guidance/iu.test(text)) {
+    return {
+      event: "公司业绩或指引相关消息",
+      impact: "关注是否影响科技股盈利预期"
+    };
+  }
+  return {
+    event: "长桥返回的市场资讯，已归类为一般市场新闻",
+    impact: "原文标题保留在长桥新闻编号对应页面，报告正文不直接展示英文标题"
+  };
+}
+
+function renderMarketIntelligence(data) {
+  const newsLines = data.marketNews.length > 0
+    ? data.marketNews.slice(0, 8).map(renderChineseNewsLine)
+    : ["- 本窗口没有抓取到长桥新闻；报告生成会在抓取失败时直接报错，因此这里为空代表来源返回空列表。"];
+
+  const macroLines = data.macroEvents.length > 0
+    ? data.macroEvents.slice(0, 8).map((entry) => {
+        const values = entry.values
+          .filter((item) => item.key && item.value)
+          .slice(0, 3)
+          .map((item) => `${item.key}${item.value}`)
+          .join(" / ");
+        const market = shouldShowMarketPrefix(entry.market, entry.title) ? `${translateMarket(entry.market)} ` : "";
+        return `- ${entry.date} ${entry.time || ""} ${market}${entry.title}${values ? `（${values}）` : ""}`;
+      })
+    : ["- 未来宏观日历没有返回高重要性事件。"];
+
+  const localLines = data.localNewsEvents.length > 0
+    ? data.localNewsEvents.slice(0, 5).map((event) => {
+        const title = event.payload?.title ?? event.payload?.content ?? event.payload?.note ?? event.dedupe_key;
+        return `- ${formatReportDateTime(event.ts)} ${translateEventSource(event.source)}：${summarizeMarketNewsTitle(title).event}；来源索引 ${event.dedupe_key ?? event.id}。`;
+      })
+    : ["- 本地事件库暂无额外新闻/日历事件。"];
+
+  return [
+    "### 长桥新闻（中文摘要）",
+    "",
+    ...newsLines,
+    "",
+    "### 宏观日历",
+    "",
+    ...macroLines,
+    "",
+    "### 本地事件库补充",
+    "",
+    ...localLines
+  ].join("\n");
+}
+
+function renderOfficialPaperSnapshot(snapshot) {
+  const asset = snapshot.primaryAsset ?? {};
+  const header = [
+    `- 来源：${translateDataSource(snapshot.source)}；账户模式：${translateAccountMode(snapshot.accountMode)}；抓取时间：${formatReportDateTime(snapshot.fetchedAt)}`,
+    `- 净资产：${formatOptionalNumber(toNumber(asset.net_assets ?? asset.netAssets))} ${translateCurrency(asset.currency)}；现金：${formatOptionalNumber(toNumber(asset.total_cash ?? asset.totalCash))}；购买力：${formatOptionalNumber(toNumber(asset.buy_power ?? asset.buyPower))}`,
+    `- 风险等级：${translateRiskLevel(asset.risk_level ?? asset.riskLevel)}`
+  ];
+
+  if (snapshot.positions.length === 0) {
+    return [...header, "- 当前长桥官方模拟盘没有持仓。"].join("\n");
+  }
+
+  return [
+    ...header,
+    ...snapshot.positions.map((row) => {
+      const available = row.available === undefined ? "" : `，可用 ${formatNumber(row.available, 4)}`;
+      const cost = row.costPrice === undefined ? "成本不可用" : `成本 ${formatNumber(row.costPrice, 3)}`;
+      return `- ${row.symbol}（${translateSecurityName(row.symbol, row.name)}）：${formatNumber(row.quantity, 4)} ${translateAssetClass(row.assetClass)}${available}，${cost}，币种 ${translateCurrency(row.currency)}`;
+    })
+  ].join("\n");
+}
+
+function renderLocalPaperPositions(rows) {
   if (rows.length === 0) {
     return "- 当前没有本地模拟盘未平仓持仓。";
   }
@@ -580,17 +938,17 @@ function renderQqqSection(quote) {
     `- 标的：${quote.symbol ?? "QQQ.US"}`,
     `- 最新价：${formatOptionalNumber(last)}；前收：${formatOptionalNumber(prevClose)}；区间涨跌：${change}`,
     `- 日内：开 ${formatOptionalNumber(open)} / 高 ${formatOptionalNumber(high)} / 低 ${formatOptionalNumber(low)} / 量 ${formatOptionalNumber(volume, 0)}`,
-    `- 状态：${quote.status ?? "unknown"}`
+    `- 状态：${translateQuoteStatus(quote.status)}`
   ];
 
   const post = quote.post_market_quote;
   if (post && typeof post === "object") {
-    lines.push(`- 盘后：${formatOptionalNumber(toNumber(post.last))}，时间 ${post.timestamp ?? "unknown"}`);
+    lines.push(`- 盘后：${formatOptionalNumber(toNumber(post.last))}，时间 ${formatReportDateTime(post.timestamp)}`);
   }
 
   const pre = quote.pre_market_quote;
   if (pre && typeof pre === "object") {
-    lines.push(`- 盘前：${formatOptionalNumber(toNumber(pre.last))}，时间 ${pre.timestamp ?? "unknown"}`);
+    lines.push(`- 盘前：${formatOptionalNumber(toNumber(pre.last))}，时间 ${formatReportDateTime(pre.timestamp)}`);
   }
 
   return lines.join("\n");
@@ -659,7 +1017,7 @@ function ensureReportColumn(db, table, column, definition) {
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
 }
 
-function selectPaperPositions(db) {
+function selectLocalPaperPositions(db) {
   return db
     .prepare(`
       SELECT symbol, asset_class, quantity, avg_price, realized_pnl
@@ -676,20 +1034,88 @@ function selectLatestPreference(db) {
     .get();
 }
 
-async function fetchQqqQuote() {
-  const payload = await runLongbridgeJson("quote", ["quote", "QQQ.US"]);
-  const quote = Array.isArray(payload) ? payload[0] : payload?.quotes?.[0] ?? null;
-  if (!quote || typeof quote !== "object") {
-    throw new Error("Longbridge QQQ 行情返回为空，停止生成报告。");
-  }
+async function fetchRequiredReportMarketData(info) {
+  const fetchedAt = new Date().toISOString();
+  const check = await fetchRequiredLongbridgeJson("trade", ["check"], "Longbridge 连通性/令牌检查");
+  const [assets, positions, quotePayload] = await Promise.all([
+    fetchRequiredLongbridgeJson("trade", ["assets"], "Longbridge 官方模拟盘资产"),
+    fetchRequiredLongbridgeJson("trade", ["positions"], "Longbridge 官方模拟盘持仓"),
+    fetchRequiredLongbridgeJson("quote", ["quote", "QQQ.US"], "Longbridge QQQ 行情")
+  ]);
+  const officialPaperSnapshot = normalizeOfficialPaperSnapshot({ check, assets, positions, fetchedAt });
+  const qqqQuote = normalizeQuotePayload(quotePayload, "QQQ.US");
+  const trackedSymbols = buildTrackedSymbols(
+    officialPaperSnapshot.positions,
+    splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
+  ).slice(0, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
+  const [marketNews, macroEvents] = await Promise.all([
+    fetchMarketNews(trackedSymbols),
+    fetchMacroCalendar(info)
+  ]);
 
-  const symbol = String(quote.symbol ?? "").toUpperCase();
-  const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
-  if (symbol !== "QQQ.US" || last === undefined) {
-    throw new Error("Longbridge QQQ 行情格式异常，停止生成报告。");
-  }
+  return {
+    officialPaperSnapshot,
+    qqqQuote,
+    trackedSymbols,
+    marketNews,
+    macroEvents,
+    sourceEvidence: {
+      fetchedAt,
+      accountMode: officialPaperSnapshot.accountMode,
+      longbridgeSessionStatus: officialPaperSnapshot.check.sessionStatus,
+      longbridgeOkRegions: officialPaperSnapshot.check.okRegions,
+      assetRows: officialPaperSnapshot.assets.length,
+      officialPositions: officialPaperSnapshot.positions.length,
+      trackedSymbols,
+      newsCount: marketNews.length,
+      macroEventsCount: macroEvents.length,
+      quoteSymbol: qqqQuote.symbol ?? "QQQ.US",
+      quoteTimestamp: qqqQuote.timestamp ?? qqqQuote.post_market_quote?.timestamp ?? qqqQuote.pre_market_quote?.timestamp ?? null
+    }
+  };
+}
 
-  return quote;
+async function fetchRequiredLongbridgeJson(category, args, label) {
+  return runLongbridgeJsonWithRetry(category, args, { label });
+}
+
+async function fetchMarketNews(symbols) {
+  const count = Math.max(1, Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5));
+  const batches = await Promise.all(symbols.map(async (symbol) => {
+    const payload = await fetchRequiredLongbridgeJson("quote", ["news", symbol, "--count", String(count)], `Longbridge 新闻 ${symbol}`);
+    return normalizeNewsPayload(symbol, payload);
+  }));
+  const articles = batches.flat().sort((a, b) => b.publishedAtMs - a.publishedAtMs);
+  if (articles.length === 0) {
+    throw new Error("Longbridge 新闻返回为空；报告需要至少一条已验证新闻。");
+  }
+  return articles;
+}
+
+async function fetchMacroCalendar(info) {
+  const start = info.label;
+  const end = addDays(info.label, Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14));
+  const payload = await fetchRequiredLongbridgeJson("quote", [
+    "finance-calendar",
+    "macrodata",
+    "--market",
+    "US",
+    "--star",
+    "2",
+    "--star",
+    "3",
+    "--start",
+    start,
+    "--end",
+    end,
+    "--count",
+    String(Number(process.env.REPORT_MACRO_COUNT ?? 20))
+  ], "Longbridge 美国宏观日历");
+  const entries = normalizeMacroCalendarPayload(payload);
+  if (entries.length === 0) {
+    throw new Error("Longbridge 美国宏观日历返回为空；报告需要至少一条已验证宏观事件。");
+  }
+  return entries;
 }
 
 function formatQuoteTimestamp(quote) {
@@ -698,13 +1124,24 @@ function formatQuoteTimestamp(quote) {
     quote?.post_market_quote?.timestamp,
     quote?.pre_market_quote?.timestamp
   ].filter(Boolean);
-  return timestamps.length > 0 ? `行情时间 ${timestamps[0]}` : "行情时间未提供";
+  return timestamps.length > 0 ? `行情时间 ${formatReportDateTime(timestamps[0])}` : "行情时间未提供";
+}
+
+function isPreparedReportMarkdownComplete(markdown) {
+  const text = String(markdown ?? "");
+  return [
+    "长桥官方模拟盘",
+    "长桥新闻",
+    "宏观日历",
+    "长桥行情",
+    "QQQ 行情"
+  ].every((marker) => text.includes(marker));
 }
 
 function resolveReportWindow(reportKind, explicitDate) {
   const label = explicitDate ?? formatDateLabel(new Date(), timezone);
   assertDateLabel(label);
-  const startOffsetDays = reportKind === "daily" ? -1 : -4;
+  const startOffsetDays = reportKind === "daily" ? -1 : -7;
   const startLabel = addDays(label, startOffsetDays);
   return {
     kind: reportKind,
@@ -722,7 +1159,25 @@ function isWithinWindow(value, info) {
 }
 
 function formatWindow(info) {
-  return `${info.startLabel} 20:00 - ${info.endLabel} 20:00 (${timezone})`;
+  return `${info.startLabel} 20:00 - ${info.endLabel} 20:00（北京时间）`;
+}
+
+function formatReportDateTime(value) {
+  const ts = new Date(String(value ?? "")).getTime();
+  if (!Number.isFinite(ts)) {
+    return "时间不可用";
+  }
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date(ts));
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}`;
 }
 
 function formatDateLabel(date, timeZone) {
@@ -908,9 +1363,11 @@ function singleLine(value, maxChars = 260) {
   return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
 }
 
-function toNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
+function splitCsv(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function formatOptionalNumber(value, digits = 2) {

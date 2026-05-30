@@ -324,12 +324,15 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/health") {
       const notification = getNotificationReadiness();
+      const localPaperSimOpenPositions = paperBook.listOpenPositions().length;
       sendJson(res, 200, {
         ok: true,
         service: "paper-trader",
         eventBusUrl,
         brokerExecutorUrl,
-        openPositions: paperBook.listOpenPositions().length,
+        positionSource: "local-paper-sim",
+        localPaperSimOpenPositions,
+        openPositions: localPaperSimOpenPositions,
         deadLetters: queue.listDeadLetters("paper-events").length,
         notificationEnabled: notification.enabled,
         notificationTarget: notification.target,

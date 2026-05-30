@@ -5,8 +5,6 @@
     { "path": "./packages/context-builder" },
     { "path": "./apps/event-bus" },
     { "path": "./apps/event-ingestor" },
-    { "path": "./apps/broker-executor" },
-    { "path": "./apps/options-shadow" }
+    { "path": "./apps/broker-executor" }
   ]
 }
-
