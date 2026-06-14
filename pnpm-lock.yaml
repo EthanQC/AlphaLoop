@@ -30,36 +30,6 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-types
 
-  apps/event-bus:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../../packages/shared-types
-
-  apps/event-ingestor:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../../packages/shared-types
-
-  apps/live-advisor:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../../packages/shared-types
-
-  apps/paper-trader:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../../packages/shared-types
-
-  packages/context-builder:
-    dependencies:
-      '@packages/shared-types':
-        specifier: workspace:*
-        version: link:../shared-types
-
   packages/shared-types: {}
 
 packages:

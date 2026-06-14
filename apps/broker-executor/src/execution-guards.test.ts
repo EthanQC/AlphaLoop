@@ -13,7 +13,7 @@ describe("execution boundary guards", () => {
     });
 
     expect(result?.status).toBe("rejected");
-    expect(result?.reasons.join(" ")).toMatch(/Option automation is disabled/u);
+    expect(result?.reasons.join(" ")).toMatch(/期权自动化/u);
   });
 
   it("rejects live tickets before any broker write path", () => {
@@ -23,7 +23,7 @@ describe("execution boundary guards", () => {
     });
 
     expect(result?.status).toBe("rejected");
-    expect(result?.reasons.join(" ")).toMatch(/Live execution is disabled/u);
+    expect(result?.reasons.join(" ")).toMatch(/实盘自动执行/u);
   });
 
   it("rejects shadow tickets before any broker write path", () => {
@@ -33,7 +33,7 @@ describe("execution boundary guards", () => {
     });
 
     expect(result?.status).toBe("rejected");
-    expect(result?.reasons.join(" ")).toMatch(/Shadow execution is disabled/u);
+    expect(result?.reasons.join(" ")).toMatch(/影子执行/u);
   });
 });
 

@@ -101,7 +101,7 @@ function isFeishuContext(event, ctx) {
 
 function runContextManager(api, config, command, args, input) {
   return new Promise((resolvePromise) => {
-    const scriptPath = join(config.repoRoot, "apps", "openclaw-config", "scripts", "context-manager.mjs");
+    const scriptPath = join(config.repoRoot, "apps", "openclaw-config", "scripts", "feishu-context.mjs");
     const child = spawn(process.execPath, [scriptPath, command, ...args], {
       cwd: config.repoRoot,
       env: { ...process.env, NODE_NO_WARNINGS: "1" },

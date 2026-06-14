@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 const helpers = await import("./report-data.mjs");
 
 describe("report data normalization", () => {
-  it("normalizes official Longbridge paper positions without local paper-sim rows", () => {
+  it("normalizes official Longbridge paper positions without local rows", () => {
     const snapshot = helpers.normalizeOfficialPaperSnapshot({
       fetchedAt: "2026-05-30T08:00:00.000Z",
       check: {
@@ -137,39 +137,4 @@ describe("report data normalization", () => {
     expect(() => helpers.normalizeMacroCalendarPayload({ rows: [] })).toThrow(/宏观日历返回格式异常/u);
   });
 
-  it("deduplicates local news events by dedupe key", () => {
-    const db = {
-      prepare: () => ({
-        all: () => [
-          {
-            id: "event-a",
-            type: "news",
-            source: "longbridge-news",
-            symbols: "[\"QQQ.US\"]",
-            ts: "2026-05-29T10:00:00.000Z",
-            payload: "{\"title\":\"same\"}",
-            importance: 0.7,
-            dedupe_key: "longbridge-news:1"
-          },
-          {
-            id: "event-b",
-            type: "news",
-            source: "longbridge-news",
-            symbols: "[\"QQQ.US\"]",
-            ts: "2026-05-29T09:00:00.000Z",
-            payload: "{\"title\":\"same duplicate\"}",
-            importance: 0.7,
-            dedupe_key: "longbridge-news:1"
-          }
-        ]
-      })
-    };
-    const rows = helpers.selectLocalNewsEvents(db, {
-      start: new Date("2026-05-29T00:00:00.000Z"),
-      end: new Date("2026-05-30T00:00:00.000Z")
-    });
-
-    expect(rows).toHaveLength(1);
-    expect(rows[0].id).toBe("event-a");
-  });
 });

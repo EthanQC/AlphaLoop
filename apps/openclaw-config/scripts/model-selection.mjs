@@ -2,8 +2,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const DEFAULT_PRIMARY_MODEL = "openai-codex/gpt-5.5";
-export const DEFAULT_HEARTBEAT_MODEL = "openai-codex/gpt-5.4-mini";
+export const DEFAULT_PRIMARY_MODEL = "codex/gpt-5.5";
+export const DEFAULT_HEARTBEAT_MODEL = "codex/gpt-5.4-mini";
 
 export function selectModelDefaults({ existingDefaults = {}, env = process.env, listedModelIds = [] } = {}) {
   const catalog = collectKnownModels({
@@ -78,6 +78,7 @@ export function collectKnownModels({ existingDefaults = {}, listedModelIds = [],
 
 export function findLatestModel(miniOnly, models) {
   const filtered = models
+    .filter((model) => model.fullId.startsWith("codex/"))
     .filter((model) => /^gpt-\d+(?:\.\d+)*(?:-[a-z0-9]+)?$/iu.test(model.id))
     .filter((model) => miniOnly ? /mini/iu.test(model.id) : !/mini/iu.test(model.id))
     .sort((left, right) => compareModelIds(right.id, left.id));
@@ -101,7 +102,7 @@ export function normalizeModelFullId(providerId, id) {
   if (String(id).includes("/")) {
     return String(id);
   }
-  const provider = providerId === "codex" || !providerId ? "openai-codex" : providerId;
+  const provider = providerId === "codex" || !providerId ? "codex" : providerId;
   return `${provider}/${id}`;
 }
 

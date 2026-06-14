@@ -40,6 +40,49 @@ describe("Longbridge paper output parsing", () => {
       "rejected"
     );
   });
+
+  it("rejects paper tickets instead of falling back to a local simulator when official paper is not enabled", () => {
+    const previousMode = process.env.LONGBRIDGE_ACCOUNT_MODE;
+    const previousEnabled = process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED;
+    const previousLive = process.env.ALLOW_LIVE_EXECUTION;
+    delete process.env.LONGBRIDGE_ACCOUNT_MODE;
+    delete process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED;
+    process.env.ALLOW_LIVE_EXECUTION = "false";
+
+    try {
+      const result = executeLongbridgePaperOrder(baseTicket());
+
+      expect(result.status).toBe("rejected");
+      expect(result.provider).toBe("longbridge-paper");
+      expect(result.reasons.join(" ")).toMatch(/官方|Official Longbridge paper/u);
+    } finally {
+      restoreEnv("LONGBRIDGE_ACCOUNT_MODE", previousMode);
+      restoreEnv("LONGBRIDGE_OFFICIAL_PAPER_ENABLED", previousEnabled);
+      restoreEnv("ALLOW_LIVE_EXECUTION", previousLive);
+    }
+  });
+
+  it("requires ALLOW_LIVE_EXECUTION to be exactly false before paper order writes", () => {
+    const previousMode = process.env.LONGBRIDGE_ACCOUNT_MODE;
+    const previousEnabled = process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED;
+    const previousLive = process.env.ALLOW_LIVE_EXECUTION;
+    process.env.LONGBRIDGE_ACCOUNT_MODE = "paper";
+    process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED = "true";
+
+    try {
+      for (const unsafeValue of [undefined, "", "0", "False"]) {
+        restoreEnv("ALLOW_LIVE_EXECUTION", unsafeValue);
+        const result = executeLongbridgePaperOrder(baseTicket());
+
+        expect(result.status).toBe("rejected");
+        expect(result.reasons.join(" ")).toMatch(/ALLOW_LIVE_EXECUTION=false/u);
+      }
+    } finally {
+      restoreEnv("LONGBRIDGE_ACCOUNT_MODE", previousMode);
+      restoreEnv("LONGBRIDGE_OFFICIAL_PAPER_ENABLED", previousEnabled);
+      restoreEnv("ALLOW_LIVE_EXECUTION", previousLive);
+    }
+  });
 });
 
 function baseTicket() {
@@ -59,4 +102,12 @@ function baseTicket() {
       timestamp: new Date().toISOString()
     }
   };
+}
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
 }

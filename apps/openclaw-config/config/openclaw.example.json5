@@ -32,10 +32,10 @@
       userTimezone: "Asia/Shanghai",
       skipBootstrap: true,
       sandbox: { mode: "off" },
-      model: { primary: "openai-codex/gpt-5.5" },
+      model: { primary: "codex/gpt-5.5" },
       models: {
-        "openai-codex/gpt-5.5": { alias: "gpt" },
-        "openai-codex/gpt-5.4-mini": { alias: "gpt-mini" }
+        "codex/gpt-5.5": { alias: "gpt" },
+        "codex/gpt-5.4-mini": { alias: "gpt-mini" }
       },
       memorySearch: {
         enabled: true,
@@ -50,12 +50,6 @@
             enabled: false
           }
         },
-        sync: {
-          onSessionStart: true,
-          onSearch: true,
-          watch: true,
-          watchDebounceMs: 1500
-        },
         query: {
           maxResults: 8,
           hybrid: {
@@ -64,13 +58,6 @@
             textWeight: 1
           }
         }
-      },
-      heartbeat: {
-        every: "30m",
-        model: "openai-codex/gpt-5.4-mini",
-        isolatedSession: true,
-        prompt: "Read HEARTBEAT.md and report auth issues, queue lag, or risk state drift.",
-        target: "none"
       }
     },
     list: [
@@ -85,76 +72,7 @@
           theme: "risk-aware operator"
         },
         groupChat: {
-          mentionPatterns: ["@control", "@trade-control"]
-        },
-        subagents: {
-          allowAgents: ["*"]
-        },
-        runtime: {
-          type: "acp",
-          acp: {
-            agent: "codex",
-            backend: "acpx",
-            mode: "persistent",
-            cwd: "/Users/mashu/Documents/codex"
-          }
-        }
-      },
-      {
-        id: "live-advisor",
-        name: "Live Advisor",
-        workspace: "~/.openclaw/workspaces/live-advisor",
-        agentDir: "~/.openclaw/agents/live-advisor/agent",
-        identity: {
-          name: "Live Advisor",
-          theme: "structured decision support"
-        },
-        subagents: {
-          allowAgents: ["*"]
-        },
-        runtime: {
-          type: "acp",
-          acp: {
-            agent: "codex",
-            backend: "acpx",
-            mode: "persistent",
-            cwd: "/Users/mashu/Documents/codex"
-          }
-        }
-      },
-      {
-        id: "paper-trader",
-        name: "Paper Trader",
-        workspace: "~/.openclaw/workspaces/paper-trader",
-        agentDir: "~/.openclaw/agents/paper-trader/agent",
-        identity: {
-          name: "Paper Trader",
-          theme: "autonomous simulator"
-        },
-        subagents: {
-          allowAgents: ["*"]
-        },
-        runtime: {
-          type: "acp",
-          acp: {
-            agent: "codex",
-            backend: "acpx",
-            mode: "persistent",
-            cwd: "/Users/mashu/Documents/codex"
-          }
-        }
-      },
-      {
-        id: "evolution",
-        name: "Evolution",
-        workspace: "~/.openclaw/workspaces/evolution",
-        agentDir: "~/.openclaw/agents/evolution/agent",
-        identity: {
-          name: "Evolution",
-          theme: "versioned learning system"
-        },
-        subagents: {
-          allowAgents: ["*"]
+          mentionPatterns: ["@openclaw", "@OpenClaw", "@Trading Copilot", "@control", "@trade-control"]
         },
         runtime: {
           type: "acp",
@@ -168,14 +86,15 @@
       }
     ]
   },
-  // Optional Feishu channel. Keep disabled until app credentials are ready.
   channels: {
     feishu: {
-      enabled: false,
+      enabled: true,
       connectionMode: "websocket",
       domain: "feishu",
       defaultAccount: "main",
-      dmPolicy: "pairing",
+      dmPolicy: "allowlist",
+      groupPolicy: "allowlist",
+      requireMention: true,
       accounts: {
         main: {
           appId: "replace_me",
@@ -188,20 +107,16 @@
     }
   },
   plugins: {
-    // The real config is rendered by scripts/render-openclaw-config.mjs.
-    // Memory is local: Honcho and paid managed-memory plugins are intentionally excluded.
     allow: [
       "acpx",
       "openai",
+      "feishu",
       "memory-core",
-      "active-memory",
-      "local-context",
-      "rule-proposal-review"
+      "local-context"
     ],
     load: {
       paths: [
-        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/local-context",
-        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/rule-proposal-review"
+        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/local-context"
       ]
     },
     slots: {
@@ -221,30 +136,11 @@
         config: {
           dreaming: {
             enabled: false,
-            frequency: "15 3 * * *",
             timezone: "Asia/Shanghai",
             storage: {
               mode: "separate",
               separateReports: true
             }
-          }
-        }
-      },
-      "active-memory": {
-        enabled: true,
-        config: {
-          enabled: true,
-          agents: ["control"],
-          allowedChatTypes: ["direct", "group"],
-          queryMode: "recent",
-          promptStyle: "contextual",
-          thinking: "off",
-          timeoutMs: 8000,
-          maxSummaryChars: 900,
-          logging: true,
-          persistTranscripts: false,
-          qmd: {
-            searchMode: "search"
           }
         }
       },
@@ -258,16 +154,7 @@
           maxPromptChars: 3500,
           timeoutMs: 8000
         }
-      },
-      "rule-proposal-review": {
-        enabled: true,
-        config: {
-          repoRoot: "/Users/mashu/Documents/codex",
-          channel: "feishu",
-          notify: false,
-          returnText: true
-        }
-      },
+      }
     }
   }
 }

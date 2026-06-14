@@ -18,8 +18,8 @@ if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
   process.exit(1);
 }
 
-if (process.env.ALLOW_LIVE_EXECUTION === "true") {
-  console.error("Refusing to submit: ALLOW_LIVE_EXECUTION must remain false for official paper automation.");
+if (process.env.ALLOW_LIVE_EXECUTION !== "false") {
+  console.error("Refusing to submit: ALLOW_LIVE_EXECUTION=false is required for official paper automation.");
   process.exit(1);
 }
 
@@ -37,12 +37,26 @@ if (!Number.isInteger(quantity) || quantity <= 0) {
 
 const quotePayload = await runLongbridgeJson("quote", ["quote", symbolArg]);
 const quote = Array.isArray(quotePayload) ? quotePayload[0] : quotePayload?.quotes?.[0];
+const [assetsPayload, positionsPayload] = await Promise.all([
+  runLongbridgeJson("trade", ["assets"]),
+  runLongbridgeJson("trade", ["positions"])
+]);
+const accountNetLiq = extractNetAssets(assetsPayload);
+const officialPaperCurrentExposureUsd = estimateCurrentExposure(positionsPayload);
 const price = side === "buy"
   ? toNumber(quote?.ask_price ?? quote?.askPrice ?? quote?.ask ?? quote?.last_done ?? quote?.last)
   : toNumber(quote?.bid_price ?? quote?.bidPrice ?? quote?.bid ?? quote?.last_done ?? quote?.last);
 
 if (!price) {
   throw new Error(`No usable limit price returned for ${symbolArg}`);
+}
+
+if (side === "buy" && accountNetLiq > 0) {
+  const projectedExposure = officialPaperCurrentExposureUsd + price * quantity;
+  const budget = accountNetLiq * 0.1;
+  if (projectedExposure > budget) {
+    throw new Error(`Refusing to submit: projected OpenClaw official paper exposure ${projectedExposure.toFixed(2)} exceeds 10% budget ${budget.toFixed(2)}.`);
+  }
 }
 
 const brokerExecutorUrl = process.env.BROKER_EXECUTOR_URL ?? "http://127.0.0.1:4312";
@@ -68,7 +82,9 @@ const ticket = {
     accountMode: "paper",
     officialPaper: true,
     demoAccountGuard: "Longbridge Demo A/C plus LONGBRIDGE_ACCOUNT_MODE=paper required.",
-    accountNetLiq: 100000,
+    accountNetLiq,
+    officialPaperCurrentExposureUsd,
+    openclawPaperBudgetPercent: 10,
     currentOpenIdeas: 0,
     currentHighConvictionIdeas: 0,
     dailyNewRiskPercent: 0
@@ -107,4 +123,26 @@ function guessAssetClass(symbol, quoteValue) {
     return "etf";
   }
   return "stock";
+}
+
+function extractNetAssets(payload) {
+  const rows = Array.isArray(payload) ? payload : payload?.assets ?? [];
+  const first = rows[0] ?? {};
+  const value = toNumber(first.net_assets ?? first.netAssets);
+  if (!value) {
+    throw new Error("Unable to read official paper net assets from Longbridge assets.");
+  }
+  return value;
+}
+
+function estimateCurrentExposure(payload) {
+  const rows = Array.isArray(payload) ? payload : payload?.positions ?? [];
+  return rows.reduce((sum, row) => {
+    const quantity = toNumber(row?.quantity);
+    if (!quantity) {
+      return sum;
+    }
+    const price = toNumber(row?.market_price ?? row?.marketPrice ?? row?.last_price ?? row?.lastPrice ?? row?.cost_price ?? row?.costPrice);
+    return sum + quantity * (price ?? 0);
+  }, 0);
 }

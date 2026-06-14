@@ -5,39 +5,12 @@ import type {
   ExecutionResult,
   ExecutionResultStatus,
   JsonValue,
-  LongbridgeAuthState,
   OfficialPaperOrderLifecycleStage,
   OrderTicket
 } from "@packages/shared-types";
 
-export function simulateLongbridgePaperExecution(
-  ticket: OrderTicket,
-  longbridgeAuth?: LongbridgeAuthState
-): ExecutionResult {
-  const marketPrice =
-    ticket.side === "buy"
-      ? ticket.marketSnapshot?.ask ?? ticket.marketSnapshot?.last ?? ticket.marketSnapshot?.bid
-      : ticket.marketSnapshot?.bid ?? ticket.marketSnapshot?.last ?? ticket.marketSnapshot?.ask;
-
-  return {
-    ticketId: ticket.id,
-    environment: "paper",
-    status: "accepted",
-    provider: "longbridge-paper",
-    externalOrderId: `paper_${ticket.id}`,
-    ...(typeof marketPrice === "number" ? { fillPrice: marketPrice } : {}),
-    reasons: [
-      "Paper execution accepted by local broker-executor stub.",
-      longbridgeAuth?.configured
-        ? `Longbridge OpenAPI auth is available via ${longbridgeAuth.source}, but the paper write path is still routed through the local execution stub.`
-        : "Longbridge OpenAPI auth was not detected; execution remains fully local."
-    ]
-  };
-}
-
 export function executeLongbridgePaperOrder(
-  ticket: OrderTicket,
-  longbridgeAuth?: LongbridgeAuthState
+  ticket: OrderTicket
 ): ExecutionResult {
   if (ticket.environment !== "paper") {
     return {
@@ -46,7 +19,7 @@ export function executeLongbridgePaperOrder(
       status: "rejected",
       provider: "longbridge-paper",
       reasons: [
-        "Official Longbridge paper execution only accepts paper environment tickets."
+        "长桥官方模拟盘执行只接受 paper 环境工单。"
       ]
     };
   }
@@ -58,18 +31,14 @@ export function executeLongbridgePaperOrder(
       status: "rejected",
       provider: "longbridge-paper",
       reasons: [
-        "Official Longbridge paper execution only accepts stock and ETF tickets.",
-        "Option automation is disabled by operator policy."
+        "长桥官方模拟盘执行只接受股票和 ETF 工单。",
+        "期权自动化已按操作策略禁用。"
       ]
     };
   }
 
   const guardFailure = validateOfficialPaperGuard();
   if (guardFailure) {
-    if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
-      return simulateLongbridgePaperExecution(ticket, longbridgeAuth);
-    }
-
     return {
       ticketId: ticket.id,
       environment: "paper",
@@ -77,10 +46,6 @@ export function executeLongbridgePaperOrder(
       provider: "longbridge-paper",
       reasons: guardFailure
     };
-  }
-
-  if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
-    return simulateLongbridgePaperExecution(ticket, longbridgeAuth);
   }
 
   const price = ticket.side === "buy"
@@ -94,7 +59,7 @@ export function executeLongbridgePaperOrder(
       status: "rejected",
       provider: "longbridge-paper",
       reasons: [
-        "Official Longbridge paper execution requires a positive limit price from the ticket market snapshot."
+        "长桥官方模拟盘执行需要工单行情快照提供正数限价。"
       ]
     };
   }
@@ -150,12 +115,12 @@ export function executeLongbridgePaperOrder(
       }),
       reasons: [
         externalOrderId
-          ? `Official Longbridge paper order was submitted through the local broker-executor with order_id ${externalOrderId}.`
-          : "Official Longbridge paper order command completed, but no order_id was found in CLI output.",
+          ? `长桥官方模拟盘订单已通过本地 broker-executor 提交，order_id 为 ${externalOrderId}。`
+          : "长桥官方模拟盘订单命令已完成，但 CLI 输出中没有找到 order_id。",
         brokerStatus
-          ? `Longbridge broker status is ${brokerStatus}; local status is ${status}.`
-          : `Longbridge broker status was not present; local status is ${status}.`,
-        "This path is gated by LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true and LONGBRIDGE_ACCOUNT_MODE=paper."
+          ? `长桥券商状态为 ${brokerStatus}；本地状态为 ${status}。`
+          : `长桥券商状态未返回；本地状态为 ${status}。`,
+        "该路径受 LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true、LONGBRIDGE_ACCOUNT_MODE=paper、ALLOW_LIVE_EXECUTION=false 共同保护。"
       ]
     });
   } catch (error) {
@@ -182,10 +147,10 @@ export function executeLongbridgePaperOrder(
         observedAt,
         rawBrokerPayload: toJsonValue(payload),
         reasons: [
-          `Official Longbridge paper order returned a non-zero CLI exit, but order_id ${externalOrderId} was found in CLI output.`,
+          `长桥官方模拟盘订单 CLI 返回非零退出码，但输出中找到了 order_id ${externalOrderId}。`,
           brokerStatus
-            ? `Longbridge broker status is ${brokerStatus}; local status is ${status}.`
-            : `Longbridge broker status was not present; local status is ${status}.`
+            ? `长桥券商状态为 ${brokerStatus}；本地状态为 ${status}。`
+            : `长桥券商状态未返回；本地状态为 ${status}。`
         ]
       });
     }
@@ -199,7 +164,7 @@ export function executeLongbridgePaperOrder(
       observedAt,
       rawBrokerPayload: toJsonValue(payload),
       reasons: [
-        `Official Longbridge paper order submission failed: ${(error as Error).message}`
+        `长桥官方模拟盘订单提交失败：${(error as Error).message}`
       ]
     });
   }
@@ -285,12 +250,16 @@ function resolveLongbridgeCli(): string {
 function validateOfficialPaperGuard(): string[] | undefined {
   const reasons: string[] = [];
 
-  if (process.env.LONGBRIDGE_ACCOUNT_MODE !== "paper") {
-    reasons.push("Official Longbridge paper execution requires LONGBRIDGE_ACCOUNT_MODE=paper.");
+  if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
+    reasons.push("长桥官方模拟盘执行要求 LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true。");
   }
 
-  if (process.env.ALLOW_LIVE_EXECUTION === "true") {
-    reasons.push("Official paper execution is refused while ALLOW_LIVE_EXECUTION=true; live-money flows must remain off.");
+  if (process.env.LONGBRIDGE_ACCOUNT_MODE !== "paper") {
+    reasons.push("长桥官方模拟盘执行要求 LONGBRIDGE_ACCOUNT_MODE=paper。");
+  }
+
+  if (process.env.ALLOW_LIVE_EXECUTION !== "false") {
+    reasons.push("长桥官方模拟盘执行要求 ALLOW_LIVE_EXECUTION=false。");
   }
 
   return reasons.length > 0 ? reasons : undefined;

@@ -6,22 +6,22 @@ export const OPTION_AUTOMATION_ENABLED = false;
 export function rejectDisabledExecution(ticket: OrderTicket): ExecutionResult | null {
   if (ticket.environment === "live") {
     return rejected(ticket, [
-      "Live execution is disabled by the trading constitution.",
-      "Real-money flows stop at structured advice cards and explicit human review."
+      "实盘自动执行已被交易宪法禁用。",
+      "真实资金流程只能停在结构化建议卡和人工复核。"
     ]);
   }
 
   if (ticket.assetClass === "option") {
     return rejected(ticket, [
-      "Option automation is disabled by operator policy.",
-      "The trading stack only accepts stock and ETF tickets for automated execution."
+      "期权自动化已按操作策略禁用。",
+      "自动执行只接受股票和 ETF 工单。"
     ]);
   }
 
   if (ticket.environment === "shadow") {
     return rejected(ticket, [
-      "Shadow execution is disabled by operator policy.",
-      "Historical option simulation records are read-only and must not create new automated tickets."
+      "影子执行已按操作策略禁用。",
+      "历史期权模拟记录只读，不能创建新的自动化工单。"
     ]);
   }
 

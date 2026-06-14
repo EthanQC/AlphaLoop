@@ -163,38 +163,6 @@ export function normalizeMacroCalendarEntry(groupDate, row) {
   };
 }
 
-export function selectLocalNewsEvents(db, info, limit = 12) {
-  return db
-    .prepare(`
-      SELECT id, type, source, symbols, ts, payload, importance, dedupe_key
-      FROM events
-      WHERE type IN ('news', 'calendar')
-      ORDER BY ts DESC
-      LIMIT 200
-    `)
-    .all()
-    .filter((row) => isWithinReportWindow(row.ts, info))
-    .filter(uniqueByDedupeKey())
-    .slice(0, limit)
-    .map((row) => ({
-      ...row,
-      symbols: parseJson(row.symbols, []),
-      payload: parseJson(row.payload, {})
-    }));
-}
-
-function uniqueByDedupeKey() {
-  const seen = new Set();
-  return (row) => {
-    const key = String(row.dedupe_key ?? row.id ?? "");
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  };
-}
-
 export function normalizeSymbol(value) {
   const symbol = String(value ?? "").trim().toUpperCase();
   if (!symbol) {
@@ -286,17 +254,4 @@ function normalizeEpochMs(value, fallbackDate) {
   }
   const fallback = new Date(String(fallbackDate ?? Date.now())).getTime();
   return Number.isFinite(fallback) ? fallback : Date.now();
-}
-
-function isWithinReportWindow(value, info) {
-  const ts = new Date(String(value)).getTime();
-  return Number.isFinite(ts) && ts > info.start.getTime() && ts <= info.end.getTime();
-}
-
-function parseJson(value, fallback) {
-  try {
-    return JSON.parse(String(value ?? ""));
-  } catch {
-    return fallback;
-  }
 }

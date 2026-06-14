@@ -3,19 +3,11 @@ import { randomUUID } from "node:crypto";
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
-export type EventType =
-  | "news"
-  | "price_pulse"
-  | "calendar"
-  | "manual_note"
-  | "system_health";
-
 export type AssetClass = "stock" | "etf" | "option";
 export type Environment = "live" | "paper" | "shadow";
 export type OrderSide = "buy" | "sell";
 export type RiskDecisionStatus = "allow" | "block" | "require_review";
-export type QueueStatus = "pending" | "inflight" | "acked" | "dead_letter";
-export type ExecutionResultStatus = "accepted" | "rejected" | "simulated" | "submitted" | "pending";
+export type ExecutionResultStatus = "accepted" | "rejected" | "submitted" | "pending";
 export type OfficialPaperOrderLifecycleStage =
   | "submitted"
   | "pending"
@@ -29,17 +21,6 @@ export type OptionStrategy =
   | "covered_call"
   | "cash_secured_put";
 export type EquityAssetClass = "stock" | "etf";
-
-export interface Event {
-  id: string;
-  type: EventType;
-  source: string;
-  symbols: string[];
-  ts: string;
-  payload: JsonValue;
-  importance: number;
-  dedupeKey: string;
-}
 
 export interface OptionContract {
   underlying: string;
@@ -84,7 +65,7 @@ export interface ExecutionResult {
   ticketId: string;
   environment: Environment;
   status: ExecutionResultStatus;
-  provider: "broker-executor" | "longbridge-paper" | "paper-sim";
+  provider: "broker-executor" | "longbridge-paper";
   externalOrderId?: string;
   fillPrice?: number;
   limitPrice?: number;
@@ -118,39 +99,6 @@ export interface OfficialPaperOrderLifecycle {
   notes: string[];
 }
 
-export interface AdviceCard {
-  id: string;
-  createdAt: string;
-  symbol: string;
-  direction: "bullish" | "bearish" | "neutral";
-  assetClass: AssetClass;
-  thesis: string;
-  entryCondition: string;
-  suggestedSizePercent: number;
-  invalidation: string;
-  exitPlan: string;
-  riskNotes: string[];
-  preferenceAlignment: string;
-  ruleDelta?: string;
-}
-
-export interface ApprovalEdit {
-  id: string;
-  adviceCardId: string;
-  createdAt: string;
-  editor: string;
-  summary: string;
-  diff: JsonValue;
-}
-
-export interface PreferenceSnapshot {
-  id: string;
-  createdAt: string;
-  source: string;
-  summary: string;
-  traits: string[];
-}
-
 export interface RuleSet {
   version: string;
   scope: "live" | "paper";
@@ -163,49 +111,6 @@ export interface RuleSet {
   notes: string[];
 }
 
-export type RuleProposalStatus =
-  | "pending_confirmation"
-  | "activation_requested"
-  | "continued_observation"
-  | "activated"
-  | "rejected"
-  | "archived";
-export type RuleProposalRecommendation =
-  | "suggest_activation"
-  | "continue_observe"
-  | "reject"
-  | "promote"
-  | "hold";
-
-export interface RuleProposalComparison {
-  field: string;
-  oldValue: string;
-  newValue: string;
-  reason: string;
-}
-
-export interface RuleProposal {
-  id: string;
-  createdAt: string;
-  scope: "live" | "paper";
-  currentVersion: string;
-  candidateVersion: string;
-  title: string;
-  summary: string;
-  triggerReason: string;
-  oldVsNew: RuleProposalComparison[];
-  evidence: string[];
-  expectedBenefit: string;
-  risks: string[];
-  rollbackPlan: string;
-  recommendation: RuleProposalRecommendation;
-  status: RuleProposalStatus;
-  proposalPath?: string;
-  decidedAt?: string;
-  decidedBy?: string;
-  decisionReason?: string;
-}
-
 export interface ExecutionReport {
   id: string;
   category: "trade" | "daily" | "weekly";
@@ -213,54 +118,6 @@ export interface ExecutionReport {
   body: string;
   metadata: Record<string, JsonValue>;
   createdAt: string;
-}
-
-export interface QueueRecord<T = JsonValue> {
-  id: number;
-  topic: string;
-  payload: T;
-  status: QueueStatus;
-  consumer?: string;
-  leaseUntil?: number;
-  attempts: number;
-  availableAt: number;
-  createdAt: number;
-  updatedAt: number;
-  dedupeKey?: string;
-  lastError?: string;
-}
-
-export interface ShadowPosition {
-  id: string;
-  strategy: OptionStrategy;
-  symbol: string;
-  contract: OptionContract;
-  quantity: number;
-  avgPrice: number;
-  status: "open" | "closed" | "assigned" | "expired";
-  realizedPnl: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PaperPosition {
-  id: string;
-  symbol: string;
-  assetClass: EquityAssetClass;
-  quantity: number;
-  avgPrice: number;
-  status: "open" | "closed";
-  realizedPnl: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface HonchoMemoryDocument {
-  namespace: string;
-  category: "preference" | "approval_pattern" | "style" | "watchlist";
-  content: string;
-  createdAt: string;
-  tags: string[];
 }
 
 export function createId(prefix: string): string {
@@ -273,21 +130,6 @@ export function nowIso(): string {
 
 export function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
-}
-
-export function assertEvent(value: unknown): asserts value is Event {
-  if (typeof value !== "object" || value === null) {
-    throw new Error("Event payload must be an object.");
-  }
-
-  const candidate = value as Partial<Event>;
-  if (typeof candidate.id !== "string" || typeof candidate.type !== "string") {
-    throw new Error("Event must include string id and type.");
-  }
-
-  if (!Array.isArray(candidate.symbols)) {
-    throw new Error("Event symbols must be an array.");
-  }
 }
 
 export function assertOrderTicket(value: unknown): asserts value is OrderTicket {

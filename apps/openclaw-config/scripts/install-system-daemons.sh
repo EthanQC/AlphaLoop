@@ -115,39 +115,11 @@ write_plist \
   "${OPENCLAW_LOG_DIR}/gateway.system.err.log"
 
 write_plist \
-  "${TMP_DIR}/com.openclaw.system.trading.event-bus.plist" \
-  "com.openclaw.system.trading.event-bus" \
-  "export PATH='${PATH_ENV}'; export HOME='${TARGET_HOME}'; cd '${REPO_ROOT}' && exec pnpm --filter @apps/event-bus start" \
-  "${LOG_DIR}/event-bus.system.log" \
-  "${LOG_DIR}/event-bus.system.err.log"
-
-write_plist \
-  "${TMP_DIR}/com.openclaw.system.trading.event-ingestor.plist" \
-  "com.openclaw.system.trading.event-ingestor" \
-  "export PATH='${PATH_ENV}'; export HOME='${TARGET_HOME}'; cd '${REPO_ROOT}' && exec pnpm --filter @apps/event-ingestor start" \
-  "${LOG_DIR}/event-ingestor.system.log" \
-  "${LOG_DIR}/event-ingestor.system.err.log"
-
-write_plist \
   "${TMP_DIR}/com.openclaw.system.trading.broker-executor.plist" \
   "com.openclaw.system.trading.broker-executor" \
   "export PATH='${PATH_ENV}'; export HOME='${TARGET_HOME}'; cd '${REPO_ROOT}' && exec pnpm --filter @apps/broker-executor start" \
   "${LOG_DIR}/broker-executor.system.log" \
   "${LOG_DIR}/broker-executor.system.err.log"
-
-write_plist \
-  "${TMP_DIR}/com.openclaw.system.trading.live-advisor.plist" \
-  "com.openclaw.system.trading.live-advisor" \
-  "export PATH='${PATH_ENV}'; export HOME='${TARGET_HOME}'; cd '${REPO_ROOT}' && exec pnpm --filter @apps/live-advisor start" \
-  "${LOG_DIR}/live-advisor.system.log" \
-  "${LOG_DIR}/live-advisor.system.err.log"
-
-write_plist \
-  "${TMP_DIR}/com.openclaw.system.trading.paper-trader.plist" \
-  "com.openclaw.system.trading.paper-trader" \
-  "export PATH='${PATH_ENV}'; export HOME='${TARGET_HOME}'; cd '${REPO_ROOT}' && exec pnpm --filter @apps/paper-trader start" \
-  "${LOG_DIR}/paper-trader.system.log" \
-  "${LOG_DIR}/paper-trader.system.err.log"
 
 mkdir -p "${SYSTEM_DIR}"
 
@@ -155,13 +127,20 @@ for plist in "${TMP_DIR}"/*.plist; do
   install -m 644 -o root -g wheel "${plist}" "${SYSTEM_DIR}/$(basename "${plist}")"
 done
 
+for retired_label in \
+  com.openclaw.system.trading.event-bus \
+  com.openclaw.system.trading.event-ingestor \
+  com.openclaw.system.trading.live-advisor \
+  com.openclaw.system.trading.options-shadow \
+  com.openclaw.system.trading.paper-trader; do
+  launchctl bootout "system/${retired_label}" >/dev/null 2>&1 || true
+  launchctl disable "system/${retired_label}" >/dev/null 2>&1 || true
+  rm -f "${SYSTEM_DIR}/${retired_label}.plist"
+done
+
 for system_plist in \
   "${SYSTEM_DIR}/ai.openclaw.system.gateway.plist" \
-  "${SYSTEM_DIR}/com.openclaw.system.trading.event-bus.plist" \
-  "${SYSTEM_DIR}/com.openclaw.system.trading.event-ingestor.plist" \
-  "${SYSTEM_DIR}/com.openclaw.system.trading.broker-executor.plist" \
-  "${SYSTEM_DIR}/com.openclaw.system.trading.live-advisor.plist" \
-  "${SYSTEM_DIR}/com.openclaw.system.trading.paper-trader.plist"; do
+  "${SYSTEM_DIR}/com.openclaw.system.trading.broker-executor.plist"; do
   system_label="$(basename "${system_plist}" .plist)"
   launchctl bootout "system/${system_label}" >/dev/null 2>&1 || true
   for attempt in {1..20}; do
@@ -178,21 +157,13 @@ done
 
 for user_label in \
   ai.openclaw.gateway \
-  com.openclaw.trading.event-bus \
-  com.openclaw.trading.event-ingestor \
-  com.openclaw.trading.broker-executor \
-  com.openclaw.trading.live-advisor \
-  com.openclaw.trading.paper-trader; do
+  com.openclaw.trading.broker-executor; do
   launchctl bootout "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1 || true
 done
 
 for user_plist in \
   "${TARGET_HOME}/Library/LaunchAgents/ai.openclaw.gateway.plist" \
-  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.event-bus.plist" \
-  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.event-ingestor.plist" \
-  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.broker-executor.plist" \
-  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.live-advisor.plist" \
-  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.paper-trader.plist"; do
+  "${TARGET_HOME}/Library/LaunchAgents/com.openclaw.trading.broker-executor.plist"; do
   if [ -f "${user_plist}" ]; then
     mv "${user_plist}" "${BACKUP_DIR}/"
   fi

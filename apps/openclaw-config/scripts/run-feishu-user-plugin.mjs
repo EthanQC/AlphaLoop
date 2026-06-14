@@ -16,10 +16,23 @@ const child = spawn("npx", ["-y", "feishu-user-plugin", ...process.argv.slice(2)
   stdio: ["inherit", "inherit", "inherit"]
 });
 
+let forwardingSignal = false;
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    forwardingSignal = true;
+    if (!child.killed) {
+      child.kill(signal);
+    }
+  });
+}
+
 child.on("exit", (code, signal) => {
   if (signal) {
-    process.kill(process.pid, signal);
-    return;
+    process.exit(signalExitCode(signal));
+  }
+  if (forwardingSignal) {
+    process.exit(code ?? 0);
   }
   process.exit(code ?? 0);
 });
@@ -69,4 +82,13 @@ function copyEnv(source, target) {
   if (!process.env[target] && process.env[source]) {
     process.env[target] = process.env[source];
   }
+}
+
+function signalExitCode(signal) {
+  const numbers = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGTERM: 15
+  };
+  return 128 + (numbers[signal] ?? 0);
 }

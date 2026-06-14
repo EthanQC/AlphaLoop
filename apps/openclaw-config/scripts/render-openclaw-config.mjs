@@ -11,15 +11,7 @@ const openclawRoot = join(homedir(), ".openclaw");
 const configPath = join(openclawRoot, "openclaw.json");
 const existing = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) : {};
 const existingFeishu = existing.channels?.feishu ?? {};
-const removedPluginIds = new Set(["memory", "memory-lancedb", "openclaw-honcho"]);
-const ruleProposalReviewPluginId = "rule-proposal-review";
-const ruleProposalReviewPluginPath = join(
-  repoRoot,
-  "apps",
-  "openclaw-config",
-  "plugins",
-  ruleProposalReviewPluginId
-);
+const removedPluginIds = new Set(["memory", "memory-lancedb", "openclaw-honcho", "active-memory", "rule-proposal-review"]);
 const localContextPluginId = "local-context";
 const localContextPluginPath = join(
   repoRoot,
@@ -57,7 +49,7 @@ const feishuGroupAllowFrom = unique([
 ]);
 const feishuRequireMention = parseOptionalBoolean(
   env.FEISHU_REQUIRE_MENTION ?? process.env.FEISHU_REQUIRE_MENTION
-);
+) ?? true;
 const feishuGroups = buildFeishuGroups({
   groupIds: feishuGroupAllowFrom,
   allowFrom: feishuAllowFrom,
@@ -121,12 +113,6 @@ const nextConfig = {
             enabled: false
           }
         },
-        sync: {
-          onSessionStart: true,
-          onSearch: true,
-          watch: true,
-          watchDebounceMs: 1500
-        },
         query: {
           maxResults: 8,
           hybrid: {
@@ -135,13 +121,6 @@ const nextConfig = {
             textWeight: 1
           }
         }
-      },
-      heartbeat: {
-        every: "30m",
-        model: modelDefaults.heartbeatModel,
-        isolatedSession: true,
-        prompt: "Read HEARTBEAT.md and report auth issues, queue lag, or risk state drift.",
-        target: "none"
       }
     },
     list: buildAgents(repoRoot)
@@ -189,16 +168,13 @@ const nextConfig = {
       "openai",
       ...(feishuEnabled ? ["feishu"] : []),
       "memory-core",
-      "active-memory",
-      localContextPluginId,
-      ruleProposalReviewPluginId
+      localContextPluginId
     ]),
     load: {
       ...(existing.plugins?.load ?? {}),
       paths: unique([
         ...asStringArray(existing.plugins?.load?.paths),
-        localContextPluginPath,
-        ruleProposalReviewPluginPath
+        localContextPluginPath
       ])
     },
     slots: {
@@ -213,15 +189,6 @@ const nextConfig = {
           permissionMode: "approve-all",
           nonInteractivePermissions: "fail",
           pluginToolsMcpBridge: true
-        }
-      },
-      [ruleProposalReviewPluginId]: {
-        enabled: true,
-        config: {
-          repoRoot,
-          channel: "feishu",
-          notify: false,
-          returnText: true
         }
       },
       "memory-core": {
@@ -261,24 +228,6 @@ const nextConfig = {
           }
         }
       },
-      "active-memory": {
-        enabled: true,
-        config: {
-          enabled: true,
-          agents: ["control"],
-          allowedChatTypes: ["direct", "group"],
-          queryMode: "recent",
-          promptStyle: "contextual",
-          thinking: "off",
-          timeoutMs: 8000,
-          maxSummaryChars: 900,
-          logging: true,
-          persistTranscripts: false,
-          qmd: {
-            searchMode: "search"
-          }
-        }
-      },
       [localContextPluginId]: {
         enabled: true,
         config: {
@@ -301,7 +250,6 @@ console.log(JSON.stringify({
   configPath,
   gatewayPort,
   primaryModel: modelDefaults.primaryModel,
-  heartbeatModel: modelDefaults.heartbeatModel,
   feishuEnabled
 }, null, 2));
 
@@ -318,52 +266,7 @@ function buildAgents(repoRootPath) {
         theme: "risk-aware operator"
       },
       groupChat: {
-        mentionPatterns: ["@control", "@trade-control"]
-      },
-      subagents: {
-        allowAgents: ["*"]
-      },
-      runtime: buildRuntime(repoRootPath)
-    },
-    {
-      id: "live-advisor",
-      name: "Live Advisor",
-      workspace: "~/.openclaw/workspaces/live-advisor",
-      agentDir: "~/.openclaw/agents/live-advisor/agent",
-      identity: {
-        name: "Live Advisor",
-        theme: "structured decision support"
-      },
-      subagents: {
-        allowAgents: ["*"]
-      },
-      runtime: buildRuntime(repoRootPath)
-    },
-    {
-      id: "paper-trader",
-      name: "Paper Trader",
-      workspace: "~/.openclaw/workspaces/paper-trader",
-      agentDir: "~/.openclaw/agents/paper-trader/agent",
-      identity: {
-        name: "Paper Trader",
-        theme: "autonomous simulator"
-      },
-      subagents: {
-        allowAgents: ["*"]
-      },
-      runtime: buildRuntime(repoRootPath)
-    },
-    {
-      id: "evolution",
-      name: "Evolution",
-      workspace: "~/.openclaw/workspaces/evolution",
-      agentDir: "~/.openclaw/agents/evolution/agent",
-      identity: {
-        name: "Evolution",
-        theme: "versioned learning system"
-      },
-      subagents: {
-        allowAgents: ["*"]
+        mentionPatterns: ["@openclaw", "@OpenClaw", "@Trading Copilot", "@control", "@trade-control"]
       },
       runtime: buildRuntime(repoRootPath)
     }

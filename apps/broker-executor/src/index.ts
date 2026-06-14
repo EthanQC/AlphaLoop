@@ -4,10 +4,9 @@ import {
   AuditLogRepository,
   ExecutionReportRepository,
   OfficialPaperOrderLifecycleRepository,
-  PaperBookRepository,
-  RuleRegistry,
   type ExecutionResult,
   type OrderTicket,
+  type RuleSet,
   assertOrderTicket,
   createId,
   loadLocalEnv,
@@ -28,9 +27,8 @@ import {
   rejectDisabledExecution
 } from "./execution-guards.js";
 import { executeLongbridgePaperOrder } from "./longbridge-paper.js";
-import { PaperExecutionEngine } from "./paper-engine.js";
 import { redactSensitiveJsonValue, redactSensitiveText } from "./redaction.js";
-import { evaluateRisk } from "./risk.js";
+import { evaluateRisk, type OfficialPaperRiskFacts } from "./risk.js";
 
 const repoRoot = resolveRepoRoot(process.cwd());
 loadLocalEnv(repoRoot);
@@ -39,9 +37,6 @@ const db = openTradingDatabase(dbPath);
 const audit = new AuditLogRepository(db);
 const reports = new ExecutionReportRepository(db);
 const officialPaperOrders = new OfficialPaperOrderLifecycleRepository(db);
-const rules = new RuleRegistry(repoRoot);
-const paperBook = new PaperBookRepository(db);
-const paperEngine = new PaperExecutionEngine(paperBook);
 const longbridgeAuth = resolveLongbridgeAuthState();
 
 const port = Number(process.env.BROKER_EXECUTOR_PORT ?? 4312);
@@ -50,14 +45,36 @@ const liveExecutionEnabled = LIVE_EXECUTION_ENABLED;
 const optionAutomationEnabled = OPTION_AUTOMATION_ENABLED;
 const officialPaperExecutionEnabled = process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED === "true"
   && process.env.LONGBRIDGE_ACCOUNT_MODE === "paper"
-  && !configuredLiveExecutionRequested;
+  && process.env.ALLOW_LIVE_EXECUTION === "false";
+const PAPER_RULES: RuleSet = {
+  version: "v1.0.0",
+  scope: "paper",
+  maxIdeaExposurePercent: 10,
+  maxHighConvictionExposurePercent: 10,
+  maxConcurrentIdeas: 8,
+  maxHighConvictionIdeas: 2,
+  maxDailyNewRiskPercent: 10,
+  allowedOptionStrategies: ["covered_call", "cash_secured_put", "long_call", "long_put"],
+    notes: [
+    "只允许长桥官方模拟盘。",
+    "OpenClaw 最多使用总仓 10%；剩余 90% 必须不动。",
+    "期权自动化禁用；允许策略名只用于人工分析文档。"
+  ]
+};
+const LIVE_RULES: RuleSet = {
+  ...PAPER_RULES,
+  scope: "live",
+  notes: [
+    "实盘执行已被交易宪法禁用。",
+    "真实资金流程只能停在结构化建议卡和人工复核。"
+  ]
+};
 
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/health") {
-      const localPaperSimOpenPositions = paperBook.listOpenPositions().length;
       sendJson(res, 200, {
         ok: true,
         service: "broker-executor",
@@ -67,28 +84,25 @@ const server = createServer(async (req, res) => {
         accountMode: process.env.LONGBRIDGE_ACCOUNT_MODE ?? "unset",
         optionAutomationEnabled,
         longbridgeAuth: sanitizeLongbridgeAuth(longbridgeAuth),
-        paperPositionSource: "local-paper-sim",
-        localPaperSimOpenPositions,
-        paperOpenPositions: localPaperSimOpenPositions
+        paperPositionSource: "longbridge-official-paper",
+        paperOpenPositions: null
       });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/v1/paper/positions") {
       sendJson(res, 200, {
-        source: "local-paper-sim",
-        note: officialPaperExecutionEnabled
-          ? "Official Longbridge paper positions are fetched directly by report/account snapshot scripts; this endpoint shows the local paper-sim history only."
-          : "Local paper-sim positions.",
-        positions: paperBook.listOpenPositions()
+        source: "longbridge-official-paper",
+        note: "长桥官方模拟盘持仓由报告/账户快照脚本直接读取，避免通过 broker-executor 暴露券商凭据。",
+        positions: []
       });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/v1/rules/active") {
       sendJson(res, 200, {
-        live: rules.load("live"),
-        paper: rules.load("paper")
+        live: LIVE_RULES,
+        paper: PAPER_RULES
       });
       return;
     }
@@ -98,8 +112,12 @@ const server = createServer(async (req, res) => {
       assertOrderTicket(body.ticket);
 
       const scope = body.ticket.environment === "live" ? "live" : "paper";
-      const activeRuleSet = rules.load(scope);
-      const risk = evaluateRisk(body.ticket, activeRuleSet);
+      const activeRuleSet = scope === "paper" ? PAPER_RULES : LIVE_RULES;
+      const risk = evaluateRisk(
+        body.ticket,
+        activeRuleSet,
+        body.ticket.environment === "paper" ? readLatestOfficialPaperRiskFacts() : undefined
+      );
 
       let result: ExecutionResult;
       const boundaryRejection = rejectDisabledExecution(body.ticket);
@@ -115,9 +133,7 @@ const server = createServer(async (req, res) => {
           reasons: risk.reasons
         };
       } else if (body.ticket.environment === "paper") {
-        result = officialPaperExecutionEnabled
-          ? executeLongbridgePaperOrder(body.ticket, longbridgeAuth)
-          : paperEngine.execute(body.ticket);
+        result = executeLongbridgePaperOrder(body.ticket);
       } else {
         result = {
           ticketId: body.ticket.id,
@@ -125,7 +141,7 @@ const server = createServer(async (req, res) => {
           status: "rejected" as const,
           provider: "broker-executor" as const,
           reasons: [
-            "Unsupported execution path for this environment and asset class combination."
+            "该环境和资产类别组合没有受支持的执行路径。"
           ]
         };
       }
@@ -135,7 +151,7 @@ const server = createServer(async (req, res) => {
       reports.save({
         id: reportId,
         category: "trade",
-        title: `Execution report for ${body.ticket.symbol}`,
+        title: `${body.ticket.symbol} 执行报告`,
         body: buildExecutionReportBody(body.ticket.id, safeResult),
         metadata: {
           ticketId: body.ticket.id,
@@ -178,29 +194,55 @@ function sanitizeExecutionResult(result: ExecutionResult): ExecutionResult {
 
 function buildExecutionReportBody(ticketId: string, result: ExecutionResult): string {
   const lines = [
-    `Ticket: ${redactSensitiveText(ticketId)}`,
-    `Status: ${result.status}`,
-    `Provider: ${result.provider}`
+    `工单：${redactSensitiveText(ticketId)}`,
+    `状态：${translateExecutionStatus(result.status)}`,
+    `执行方：${translateProvider(result.provider)}`
   ];
 
   if (result.externalOrderId) {
-    lines.push(`External order id: ${redactSensitiveText(result.externalOrderId)}`);
+    lines.push(`外部订单号：${redactSensitiveText(result.externalOrderId)}`);
   }
   if (result.brokerStatus) {
-    lines.push(`Broker status: ${redactSensitiveText(result.brokerStatus)}`);
+    lines.push(`券商状态：${redactSensitiveText(result.brokerStatus)}`);
   }
   if (result.brokerOrderStage) {
-    lines.push(`Lifecycle stage: ${result.brokerOrderStage}`);
+    lines.push(`生命周期阶段：${translateLifecycleStage(result.brokerOrderStage)}`);
   }
   if (typeof result.limitPrice === "number") {
-    lines.push(`Limit price: ${result.limitPrice.toFixed(2)}`);
+    lines.push(`限价：${result.limitPrice.toFixed(2)}`);
   }
 
-  lines.push("", "Reasons:");
+  lines.push("", "原因：");
   for (const reason of result.reasons) {
     lines.push(`- ${redactSensitiveText(reason)}`);
   }
   return lines.join("\n");
+}
+
+function translateExecutionStatus(status: ExecutionResult["status"]): string {
+  const labels: Record<ExecutionResult["status"], string> = {
+    accepted: "已接受",
+    rejected: "已拒绝",
+    submitted: "已提交",
+    pending: "等待中"
+  };
+  return labels[status] ?? status;
+}
+
+function translateProvider(provider: ExecutionResult["provider"]): string {
+  return provider === "longbridge-paper" ? "长桥官方模拟盘" : "本地 broker-executor";
+}
+
+function translateLifecycleStage(stage: NonNullable<ExecutionResult["brokerOrderStage"]>): string {
+  const labels: Record<NonNullable<ExecutionResult["brokerOrderStage"]>, string> = {
+    submitted: "已提交",
+    pending: "等待中",
+    filled: "已成交",
+    cancelled: "已取消",
+    rejected: "已拒绝",
+    unknown: "未知"
+  };
+  return labels[stage] ?? stage;
 }
 
 function sanitizeLongbridgeAuth(state: LongbridgeAuthState): Omit<LongbridgeAuthState, "tokenPath"> {
@@ -239,4 +281,32 @@ function saveOfficialPaperLifecycle(ticket: OrderTicket, result: ExecutionResult
     raw: result.rawBrokerPayload ?? toJsonValue(result),
     notes: result.reasons
   });
+}
+
+function readLatestOfficialPaperRiskFacts(): OfficialPaperRiskFacts | undefined {
+  const row = db
+    .prepare(`
+      SELECT fetched_at, net_assets, market_value
+      FROM official_paper_snapshots
+      ORDER BY fetched_at DESC
+      LIMIT 1
+    `)
+    .get() as Record<string, unknown> | undefined;
+
+  if (!row) {
+    return undefined;
+  }
+
+  const accountNetLiq = Number(row.net_assets);
+  const currentExposureUsd = Number(row.market_value);
+  const fetchedAt = String(row.fetched_at ?? "");
+  if (!Number.isFinite(accountNetLiq) || !Number.isFinite(currentExposureUsd)) {
+    return undefined;
+  }
+
+  return {
+    accountNetLiq,
+    currentExposureUsd,
+    fetchedAt
+  };
 }

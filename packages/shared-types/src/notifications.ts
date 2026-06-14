@@ -370,13 +370,12 @@ async function deliverReportViaUserPlugin(payload: ReportDeliveryPayload): Promi
   };
 }
 
-function allowReportFallbackDelivery(): boolean {
-  return process.env.FEISHU_REPORT_ALLOW_FALLBACK === "1"
-    || process.env.OPENCLAW_REPORT_ALLOW_DEGRADED_FEISHU === "1";
+export function allowReportFallbackDelivery(): boolean {
+  return false;
 }
 
-function shouldSendFullReportChapters(): boolean {
-  return process.env.FEISHU_REPORT_DELIVERY_MODE === "full";
+export function shouldSendFullReportChapters(): boolean {
+  return false;
 }
 
 async function withNotificationRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {
@@ -704,6 +703,14 @@ async function callFeishuUserPluginTool(name: string, args: Record<string, unkno
     rejectAll(new Error(`feishu-user-plugin exited before responding (${signal ?? code ?? "unknown"}). ${stderrBuffer.trim()}`.trim()));
   });
 
+  let childClosed = false;
+  const childClosedPromise = new Promise<void>((resolve) => {
+    child.on("close", () => {
+      childClosed = true;
+      resolve();
+    });
+  });
+
   const request = async (method: string, params?: Record<string, unknown>): Promise<McpResponse> => {
     const id = nextId;
     nextId += 1;
@@ -754,9 +761,16 @@ async function callFeishuUserPluginTool(name: string, args: Record<string, unkno
     });
     return (response.result ?? {}) as McpToolResult;
   } finally {
-    child.stdin.end();
-    if (!child.killed) {
+    if (!child.stdin.destroyed) {
+      child.stdin.end();
+    }
+    if (!childClosed) {
       child.kill("SIGTERM");
+    }
+    await Promise.race([childClosedPromise, sleep(2_000)]);
+    if (!childClosed) {
+      child.kill("SIGKILL");
+      await Promise.race([childClosedPromise, sleep(1_000)]);
     }
   }
 }
@@ -793,16 +807,11 @@ function buildDegradedFallbackPayload(payload: NotificationPayload): Notificatio
   };
 }
 
-function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): string {
+export function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): string {
   const lines = payload.markdown.replace(/\r\n/gu, "\n").split("\n");
   const reportTitle = lines.find((line) => /^#\s+/u.test(line))?.replace(/^#\s+/u, "").trim() ?? payload.title;
   const windowLine = lines.find((line) => /^窗口：/u.test(line)) ?? "";
-  const firstSection = extractFirstConclusionSection(payload.markdown);
-  const bullets = firstSection
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => /^-\s+/u.test(line))
-    .slice(0, 6);
+  const bullets = extractActionableSummaryBullets(payload.markdown).slice(0, 8);
 
   return [
     `# ${reportTitle}`,
@@ -811,22 +820,86 @@ function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): string {
     "",
     "## 摘要",
     "",
-    ...(bullets.length > 0 ? bullets : ["- 本报告已生成，完整正文见本地报告文件和文本文档。"]),
-    "",
-    "## 交付",
-    "",
-    "- 群里默认只发送这一条中文摘要，避免刷屏。",
-    "- 完整正文以本地报告文件和文本文档留档；需要群内逐章发送时，必须人工明确开启全文模式。",
-    ...(payload.markdownPath ? [`- 本地文本文档：${payload.markdownPath}`] : []),
-    ...(payload.pdfPath ? [`- 本地报告文件：${payload.pdfPath}`] : []),
-    "- 文件上传成功时，报告文件会作为文件消息发送到群里。"
+    ...(bullets.length > 0 ? bullets : ["- 报告没有提取到可行动摘要，请打开 PDF 查看正文并人工复核。"])
   ].filter((line) => line !== "").join("\n");
 }
 
-function extractFirstConclusionSection(markdown: string): string {
+function extractActionableSummaryBullets(markdown: string): string[] {
+  const bullets: string[] = [];
+  const conclusion = extractSection(markdown, [
+    /^##\s+\d+\.\s+.*结论/u,
+    /^##\s+本批次结论/u,
+    /^##\s+收支变化表/u
+  ]);
+  bullets.push(...extractUsefulBullets(conclusion));
+
+  const news = extractSection(markdown, [/^###\s+长桥新闻/u]);
+  bullets.push(...extractUsefulBullets(news).slice(0, 2));
+
+  const macro = extractSection(markdown, [/^###\s+宏观日历/u]);
+  bullets.push(...extractUsefulBullets(macro).slice(0, 1));
+
+  const positions = extractSection(markdown, [/^##\s+持仓/u, /^##\s+\d+\.\s+官方模拟盘/u, /^##\s+\d+\.\s+模拟盘/u]);
+  bullets.push(...extractUsefulBullets(positions).slice(0, 2));
+
+  const reflection = extractSection(markdown, [/^##\s+策略反思/u, /^###\s+结论与复盘标签/u]);
+  bullets.push(...extractUsefulBullets(reflection).slice(0, 2));
+
+  return dedupeBullets(bullets).filter(isActionableSummaryLine);
+}
+
+function extractSection(markdown: string, headingPatterns: RegExp[]): string {
   const normalized = markdown.replace(/\r\n/gu, "\n");
-  const match = normalized.match(/\n##\s+1\.\s+[^\n]+\n([\s\S]*?)(?=\n##\s+\d+\.|\s*$)/u);
-  return match?.[1] ?? "";
+  const lines = normalized.split("\n");
+  const start = lines.findIndex((line) => headingPatterns.some((pattern) => pattern.test(line.trim())));
+  if (start < 0) {
+    return "";
+  }
+  const startLine = lines[start] ?? "";
+  const startLevel = countHeadingLevel(startLine);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const level = countHeadingLevel(lines[index] ?? "");
+    if (level > 0 && level <= startLevel) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start + 1, end).join("\n");
+}
+
+function countHeadingLevel(line: string): number {
+  const match = /^(#{1,6})\s+/u.exec(line.trim());
+  return match?.[1] ? match[1].length : 0;
+}
+
+function extractUsefulBullets(section: string): string[] {
+  return section
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^-\s+/u.test(line));
+}
+
+function dedupeBullets(lines: string[]): string[] {
+  const seen = new Set<string>();
+  return lines.filter((line) => {
+    const key = line.replace(/\s+/gu, " ");
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function isActionableSummaryLine(line: string): boolean {
+  return ![
+    /本地文本文档|本地报告文件|文件上传成功|完整正文|群里默认|交付|投递：|语言：/u,
+    /^-\s*数据覆盖：/u,
+    /^-\s*记录状态：/u,
+    /^-\s*期权自动化：/u,
+    /^-\s*实盘：禁止自动提交/u
+  ].some((pattern) => pattern.test(line));
 }
 
 interface ChapterMessage {

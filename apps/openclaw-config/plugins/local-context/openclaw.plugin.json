@@ -1,7 +1,7 @@
 {
   "id": "local-context",
   "name": "Local Context",
-  "description": "Stores Feishu conversation context and local automation inventory in SQLite, then injects compact recall into prompts.",
+  "description": "Stores Feishu conversation context in SQLite, then injects compact recall into prompts.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
@@ -9,7 +9,7 @@
     "properties": {
       "repoRoot": {
         "type": "string",
-        "description": "Repository root containing apps/openclaw-config/scripts/context-manager.mjs."
+        "description": "Repository root containing apps/openclaw-config/scripts/feishu-context.mjs."
       },
       "agents": {
         "type": "array",

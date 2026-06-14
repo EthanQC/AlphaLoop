@@ -1,11 +1,17 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import {
+  mergeNewsArticles,
+  normalizeYahooSearchNews,
+  renderDetailedNewsLine,
+  summarizeNewsSourceBreakdown
+} from "./report-news.mjs";
 import {
   assertOfficialPaperReportEnvironment,
   buildTrackedSymbols,
@@ -13,9 +19,9 @@ import {
   normalizeNewsPayload,
   normalizeOfficialPaperSnapshot,
   normalizeQuotePayload,
-  selectLocalNewsEvents,
   toNumber
 } from "./report-data.mjs";
+import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
@@ -47,38 +53,21 @@ if (action === "prepare") {
 async function prepareReport(reportKind, info) {
   assertOfficialPaperReportEnvironment();
   const db = openTradingDatabase(dbPath);
-  const [executionRows, approvalRows, proposalRows, localPaperPositions, latestPreference, localNewsEvents] = await Promise.all([
-    Promise.resolve(selectExecutionReports(db, info)),
-    Promise.resolve(selectApprovalRows(db, info)),
-    Promise.resolve(selectProposalRows(db, info)),
-    Promise.resolve(selectLocalPaperPositions(db)),
-    Promise.resolve(selectLatestPreference(db)),
-    Promise.resolve(selectLocalNewsEvents(db, info))
-  ]);
+  const executionRows = selectExecutionReports(db, info);
   const marketData = await fetchRequiredReportMarketData(info);
 
   const report = reportKind === "daily"
     ? renderDailyReport(info, {
         executionRows,
-        approvalRows,
-        proposalRows,
-        localPaperPositions,
-        latestPreference,
-        localNewsEvents,
         ...marketData
       })
     : renderWeeklyReport(info, {
         executionRows,
-        approvalRows,
-        proposalRows,
-        localPaperPositions,
-        latestPreference,
-        localNewsEvents,
         ...marketData
       });
 
   writeFileSync(reportPath, `${report}\n`, "utf8");
-  const pdfPath = writeReportPdf(reportPath, reportPdfPath, report);
+  const pdfPath = writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
   updateState(info, {
     preparedAt: new Date().toISOString(),
     path: reportPath,
@@ -119,7 +108,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
-    : writeReportPdf(reportPath, reportPdfPath, markdown);
+    : writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
   const result = await deliverReportToFeishu({
     title: `${titlePrefix} ${info.label}`,
     markdown,
@@ -170,56 +159,56 @@ function renderDailyReport(info, data) {
     "",
     `窗口：${formatWindow(info)}`,
     "",
+    "- 语言：中文。",
+    "- 投递：飞书摘要卡片 + PDF。",
+    "",
     "## 1. 今日结论",
     "",
     ...renderCoreSummary(data, {
       period: "今日",
       tradeCount: tradeRows.length,
       adviceCount: dailyRows.length,
-      rejectedCount: rejectedRows.length,
-      approvalCount: data.approvalRows.length,
-      proposalCount: data.proposalRows.length
+      rejectedCount: rejectedRows.length
     }),
-    "- 期权自动化：已禁用，不纳入日报生成、建议或执行。",
     "",
-    "## 2. 市场资讯与宏观日历",
+    "## 2. 信息收集与分类",
+    "",
+    renderDailyRoutineCompliance(),
     "",
     renderDataSourceSummary(data),
-    "- 噪声过滤：系统心跳、健康检查和已禁用期权影子链路不计入交易判断。",
+    "",
+    renderDailyRoutineClassification(data),
     "",
     renderMarketIntelligence(data),
     "",
-    "## 3. 执行与模拟盘",
+    "## 3. 大盘 -> 板块 -> 个股影响判断",
     "",
-    renderExecutionDigest(data.executionRows),
+    "- 大盘：以 QQQ、宏观日历、多源市场新闻和风险情绪为主线，先判断风险偏好。",
+    "- 板块：优先关注科技、半导体、AI、金融条件、能源/黄金/汇率等对美股估值的传导。",
+    "- 个股：仅把信息分类为利好、利空或待验证；必须说明是否可能改变企业基本面。",
+    "- 行动含义：如果只是情绪噪声，不提高仓位；如果改变基本面或流动性，再进入个股分析模板。",
     "",
     "## 4. QQQ 固定观察",
     "",
     renderQqqSection(data.qqqQuote),
     "",
-    "## 5. 当前持仓",
+    "## 5. 官方模拟盘",
     "",
     renderOfficialPaperSnapshot(data.officialPaperSnapshot),
     "",
-    "### 本地模拟盘历史持仓核对",
-    "",
-    renderLocalPaperPositions(data.localPaperPositions),
+    renderExecutionDigest(data.executionRows),
     "",
     "## 6. 风险与异常",
     "",
     "- 实盘：禁止自动提交真实资金订单。",
-    "- 官方模拟盘：报告以长桥官方模拟盘账户快照为准；本地模拟盘只作为历史审计层。",
+    "- 官方模拟盘：只使用长桥官方模拟盘，OpenClaw 最多使用总仓 10%。",
     "- 期权：不生成、不预览、不执行任何期权自动化。",
-    "- 渠道：飞书交付链路探测健康；报告由现有自动化链路推送到炒股群。",
+    "- 渠道：飞书只发送摘要卡片 + PDF。",
     "",
-    "## 7. 规则提案摘要",
+    "## 7. 明日跟踪",
     "",
-    renderProposalDigest(data.proposalRows),
-    "",
-    "## 8. 需要人工确认事项",
-    "",
-    "- 是否接受本窗口内的规则提案，需要人工确认；未确认前规则保持未激活。",
-    "- 若要临时分析具体个股，直接点名标的即可；日报固定标的保持 QQQ。"
+    "- 继续按 daily-routine.md 分类新闻、企业近况、科研/技术成果、大宗商品、汇率、情绪、经济指标和市场涨跌。",
+    "- 如需要扩展到具体标的，进入三日一次的个股分析流程。"
   ].join("\n");
 }
 
@@ -232,21 +221,25 @@ function renderWeeklyReport(info, data) {
     "",
     `窗口：${formatWindow(info)}`,
     "",
+    "- 语言：中文。",
+    "- 投递：飞书摘要卡片 + PDF。",
+    "",
     "## 1. 本周结论",
     "",
     ...renderCoreSummary(data, {
       period: "本周",
       tradeCount: tradeRows.length,
       adviceCount: dailyRows.length,
-      rejectedCount: tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`)).length,
-      approvalCount: data.approvalRows.length,
-      proposalCount: data.proposalRows.length
+      rejectedCount: tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`)).length
     }),
-    "- 期权自动化：已禁用，周报只保留历史风险提示，不提供任何期权行动建议。",
     "",
-    "## 2. 市场主线回顾",
+    "## 2. 市场主线回顾与分类",
+    "",
+    renderDailyRoutineCompliance(),
     "",
     renderDataSourceSummary(data),
+    "",
+    renderDailyRoutineClassification(data),
     "",
     renderMarketIntelligence(data),
     "",
@@ -258,30 +251,20 @@ function renderWeeklyReport(info, data) {
     "",
     renderOfficialPaperSnapshot(data.officialPaperSnapshot),
     "",
-    "### 本地模拟盘历史持仓核对",
-    "",
-    renderLocalPaperPositions(data.localPaperPositions),
-    "",
     renderExecutionDigest(data.executionRows),
     "",
-    "## 5. 规则提案与策略学习",
+    "## 5. 风险与异常",
     "",
-    renderProposalDigest(data.proposalRows),
+    "- 实盘：禁止自动提交真实资金订单。",
+    "- 官方模拟盘：只使用长桥官方模拟盘，OpenClaw 最多使用总仓 10%。",
+    "- 期权：不生成、不预览、不执行任何期权自动化。",
+    "- 渠道：飞书只发送摘要卡片 + PDF。",
     "",
-    "## 6. 偏好/策略变化",
+    "## 6. 下周跟踪",
     "",
-    renderPreferenceSnapshot(data.latestPreference),
-    "",
-    "## 7. 下周跟踪",
-    "",
-    "- 固定观察 QQQ 的趋势、成交量和盘前/盘后偏离。",
-    "- 检查长桥官方模拟盘鉴权令牌状态、账户快照、新闻/宏观日历抓取能力。",
-    "- 检查系统版本、模型目录和飞书交付链路。",
-    "",
-    "## 8. 需要人工确认事项",
-    "",
-    "- 周报中的规则提案只作为策略学习草案，必须人工确认后才会激活。",
-    "- 若你要扩展固定跟踪标的，后续可以在日报模板里显式加入。"
+    "- 固定观察 QQQ 的趋势、成交量、盘前/盘后偏离和 VIX/利率/汇率联动。",
+    "- 对本周高频出现的行业主题，进入大盘 -> 板块 -> 个股的拆解。",
+    "- 对用户指定的一批股票，按个股分析模板每三天复盘一次。"
   ].join("\n");
 }
 
@@ -290,36 +273,79 @@ function renderCoreSummary(data, counts) {
   const officialSummary = summarizeOfficialPositions(officialPositions);
   const accountSummary = summarizeOfficialAccount(data.officialPaperSnapshot);
   const qqqSummary = summarizeQqqMove(data.qqqQuote);
+  const newsSignal = summarizeNewsSignals(data.marketNews);
+  const macroSignal = summarizeMacroSignal(data.macroEvents);
+  const paperBudget = summarizePaperBudget(data.officialPaperSnapshot, data.qqqQuote);
   return [
-    `- 核心结论：${counts.period}没有自动提交实盘订单；官方模拟盘当前持仓为 ${officialSummary}。`,
-    `- 账户状态：${accountSummary}。`,
-    `- 市场状态：${qqqSummary}。`,
-    `- 记录状态：交易/执行报告 ${counts.tradeCount} 条，其中拒绝或未执行 ${counts.rejectedCount} 条；建议/偏好报告 ${counts.adviceCount} 条；人工审批编辑 ${counts.approvalCount} 条；规则提案 ${counts.proposalCount} 条。`,
-    `- 数据覆盖：长桥新闻 ${data.marketNews.length} 条；美国宏观日历 ${data.macroEvents.length} 条；本地模拟盘历史持仓 ${data.localPaperPositions.length} 个。`
+    `- 市场信号：${qqqSummary}；新闻主线：${newsSignal.summary}。`,
+    `- 宏观信号：${macroSignal}。`,
+    `- 模拟盘：当前持仓 ${officialSummary}；${accountSummary}；${paperBudget}。`,
+    `- 操作含义：${newsSignal.action}；新增模拟盘仓位仍必须通过总仓 10% 预算检查。`,
+    `- 执行边界：${counts.period}没有自动提交实盘订单；交易/执行报告 ${counts.tradeCount} 条，其中拒绝或未执行 ${counts.rejectedCount} 条；期权自动化保持禁用。`
   ];
 }
 
 function renderDataSourceSummary(data) {
   return [
-    "- 已验证来源：本地交易数据库、长桥官方模拟盘账户快照、长桥行情、长桥新闻、长桥美国宏观日历。",
-    "- 本地交易数据库读取：执行/建议报告、人工审批记录、规则提案、本地模拟盘历史持仓、已落库新闻/日历事件。",
+    "- 已验证来源：本地交易数据库、长桥官方模拟盘账户快照、长桥行情、多源新闻检索、长桥美国宏观日历。",
+    "- 本地交易数据库读取：执行报告、日报/周报记录、官方模拟盘订单生命周期。",
     "- 长桥账户读取：连通性与令牌检查、官方模拟盘资产、官方模拟盘持仓。",
     "- 长桥行情读取：QQQ 的最新价、前收、日内高低、盘前/盘后价格与时间。",
-    `- 长桥资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条新闻。`,
+    `- 多源资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索新闻。`,
+    `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
+    ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
     `- 长桥宏观读取：美国二星和三星宏观事件，窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天。`,
     `- 本次证据：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌状态 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；新闻 ${data.sourceEvidence.newsCount} 条；宏观事件 ${data.sourceEvidence.macroEventsCount} 条；${formatQuoteTimestamp(data.qqqQuote)}。`
   ].join("\n");
 }
 
+function renderDailyRoutineCompliance() {
+  return [
+    "### daily-routine.md 检查清单",
+    "",
+    "本报告按以下信息检索与分类框架组织，若某项当天没有高置信来源，仍保留为待跟踪项：",
+    "",
+    renderDailyRoutineChecklist()
+  ].join("\n");
+}
+
+function renderDailyRoutineClassification(data) {
+  const qqqSummary = summarizeQqqMove(data.qqqQuote);
+  const newsSignal = summarizeNewsSignals(data.marketNews);
+  const macroSignal = summarizeMacroSignal(data.macroEvents);
+  const commodityNews = data.marketNews.find((article) => /crude|oil|gold|commodity|能源|黄金|原油/iu.test(article.title));
+  const currencyNews = data.marketNews.find((article) => /dollar|yuan|currency|fx|汇率|美元/iu.test(article.title));
+  const technologyNews = data.marketNews.find((article) => /ai|nvidia|semiconductor|chip|technology|人工智能|半导体/iu.test(article.title));
+  const companyNews = data.marketNews.find((article) => /earnings|revenue|profit|guidance|shares|acquires|公司|财报|指引/iu.test(article.title));
+
+  return [
+    "### 信息源完整性与分类结论",
+    "",
+    `- 新闻：已读取 ${data.marketNews.length} 条多源新闻；来源分布 ${summarizeNewsSourceBreakdown(data.marketNews)}；主线为 ${newsSignal.summary}。`,
+    `- 企业近况：${companyNews ? `${newsEvent(companyNews)}，基本面影响需等公司公告/财报验证。` : "本窗口没有读到可直接改变单一公司基本面的高置信更新。"}`,
+    `- 最新科研/技术成果：${technologyNews ? `${newsEvent(technologyNews)}，对科技权重和 QQQ 情绪有传导。` : "本窗口没有读到可审计的科研/技术突破类更新。"}`,
+    `- 大宗商品价格变动：${commodityNews ? `${newsEvent(commodityNews)}，作为通胀和风险偏好的辅助变量。` : "未读到足以进入结论的大宗商品变动。"}`,
+    `- 货币汇率变化：${currencyNews ? `${newsEvent(currencyNews)}，需观察美元和利率对成长股估值的影响。` : "未读到足以进入结论的汇率变动。"}`,
+    `- 市场情绪：${newsSignal.bias}；${newsSignal.action}`,
+    "- 行业淡旺季：本窗口没有足以改变行业季节性判断的新证据。",
+    `- 经济指标：${macroSignal}`,
+    `- 大盘走势：${qqqSummary}。`,
+    "",
+    "### 利好/利空/基本面影响",
+    "",
+    ...data.marketNews.slice(0, 6).map(renderClassifiedNewsLine)
+  ].join("\n");
+}
+
 function renderExecutionDigest(rows) {
   if (rows.length === 0) {
-    return "- 本窗口没有交易执行报告或建议报告。";
+    return "- 本窗口没有交易执行报告。";
   }
 
   const shownRows = rows.slice(-8);
   const omitted = rows.length - shownRows.length;
   const header = [
-    `- 本窗口共有 ${rows.length} 条执行/建议记录。`,
+    `- 本窗口共有 ${rows.length} 条执行记录。`,
     omitted > 0
       ? `- 下方只列最近 ${shownRows.length} 条用于人工核对；更早 ${omitted} 条保留在本地数据库的执行报告表。`
       : "- 下方列出全部记录。"
@@ -339,27 +365,6 @@ function renderExecutionDigest(rows) {
     `- 审计索引：执行报告编号 ${row.id}`
     ].join("\n");
   })].join("\n\n");
-}
-
-function renderProposalDigest(rows) {
-  if (rows.length === 0) {
-    return "- 本窗口没有新的规则提案。";
-  }
-
-  return rows.map((row) => [
-    `### ${singleLine(row.title) || `${translateRuleScope(row.scope)}：${translateRuleRecommendation(row.recommendation)}`}`,
-    "",
-    `- 提案编号：${row.id}`,
-    `- 时间：${row.created_at}`,
-    `- 版本：${row.current_version} -> ${row.candidate_version}`,
-    `- 生命周期：${translateProposalStatus(row.status)}；${renderProposalActivationNotice(row.status)}`,
-    `- 推荐动作：${translateRuleRecommendation(row.recommendation)}`,
-    `- 触发原因：${renderChineseProposalText(row.trigger_reason || row.summary)}`,
-    `- 摘要：${renderChineseProposalSummary(row.summary)}`,
-    `- 旧新对比：${renderChineseRuleComparison(row)}`,
-    `- 风险：${renderChineseRisks(row.risks)}`,
-    "- 激活状态：报告只做摘要；必须人工运行带确认参数的激活脚本后才会生效。"
-  ].join("\n")).join("\n\n");
 }
 
 function summarizeExecutionRow(row) {
@@ -420,7 +425,7 @@ function classifyExecutionStatus(row, text) {
     return "规则或风控拦截，未执行。";
   }
   if (row.category === "daily") {
-    return "建议或偏好记录已入库。";
+    return "报告记录已入库。";
   }
   return "执行记录已入库。";
 }
@@ -472,7 +477,7 @@ function translateOptionStrategy(strategy) {
 }
 
 function translateReportCategory(category) {
-  return category === "trade" ? "交易/执行" : "建议/偏好";
+  return category === "trade" ? "交易/执行" : "报告";
 }
 
 function translateAssetClass(assetClass) {
@@ -551,15 +556,6 @@ function shouldShowMarketPrefix(market, title) {
   return Boolean(label) && !String(title ?? "").startsWith(label);
 }
 
-function translateEventSource(value) {
-  const labels = {
-    "longbridge-news": "长桥新闻",
-    "longbridge-calendar": "长桥日历",
-    "longbridge-quote": "长桥行情"
-  };
-  return labels[String(value ?? "")] ?? "本地事件";
-}
-
 function translateSecurityName(symbol, name) {
   const labels = {
     "QQQ.US": "纳指 100 交易型开放式指数基金",
@@ -582,163 +578,6 @@ function formatRegions(regions) {
   return Array.isArray(regions) && regions.length
     ? regions.map((region) => labels[String(region).toLowerCase()] ?? String(region)).join("、")
     : "未返回";
-}
-
-function translateRuleScope(scope) {
-  const labels = {
-    live: "实盘规则",
-    paper: "模拟盘规则"
-  };
-  return labels[scope] ?? `规则范围 ${scope}`;
-}
-
-function translateRuleRecommendation(recommendation) {
-  const labels = {
-    suggest_activation: "建议激活（仍需人工确认）",
-    continue_observe: "继续观察",
-    promote: "建议形成候选版本",
-    hold: "继续观察",
-    reject: "不建议采用"
-  };
-  return labels[recommendation] ?? `建议 ${recommendation}`;
-}
-
-function translateProposalStatus(status) {
-  const labels = {
-    pending_confirmation: "待人工确认",
-    activation_requested: "已一审建议激活，等待二次确认",
-    continued_observation: "人工确认继续观察",
-    activated: "已由人工确认激活",
-    rejected: "已由人工拒绝",
-    archived: "已归档"
-  };
-  return labels[status] ?? "待人工确认";
-}
-
-function renderProposalActivationNotice(status) {
-  const notices = {
-    pending_confirmation: "未确认不生效",
-    activation_requested: "尚未生效，必须二次确认 HUMAN_APPROVED",
-    continued_observation: "未激活，不改变规则行为",
-    activated: "已通过人工确认生效",
-    rejected: "已拒绝，不生效",
-    archived: "已归档，不进入本轮应用"
-  };
-  return notices[status] ?? "未确认不生效";
-}
-
-function renderChineseProposalSummary(value) {
-  const text = String(value ?? "");
-  if (containsCjk(text)) {
-    return singleLine(text);
-  }
-  if (/live rules have enough local evidence/iu.test(text)) {
-    return "本地证据支持生成实盘候选更新，但不会自动激活。";
-  }
-  if (/paper rules remain on hold/iu.test(text)) {
-    return "模拟盘规则继续观察，当前证据仍支持保留现有护栏。";
-  }
-  return "规则提案已入库；人工激活前需要复核证据、旧新差异和影响范围。";
-}
-
-function renderChineseRuleComparison(row) {
-  const comparisons = normalizeComparisonRows(row.old_vs_new);
-  if (comparisons.length > 0) {
-    return comparisons
-      .slice(0, 4)
-      .map((entry) => `${entry.field}：${entry.oldValue} -> ${entry.newValue}（${entry.reason}）`)
-      .join("；");
-  }
-
-  const delta = translateKnownRuleDelta(row.old_vs_new);
-  const parts = [
-    `旧版本 ${row.current_version ?? "未知"}`,
-    `候选版本 ${row.candidate_version ?? "未知"}`
-  ];
-  parts.push(delta ?? "差异字段已入库，人工激活前需复核原始证据。");
-  return parts.join("；");
-}
-
-function translateKnownRuleDelta(value) {
-  const text = String(value ?? "");
-  if (/Tighten live entry discipline/iu.test(text)) {
-    return "收紧实盘入场纪律：只有确认性更强的表述才可呈现高置信度想法。";
-  }
-  if (/No rule delta recommended yet/iu.test(text)) {
-    return "本窗口暂不推荐修改规则，继续收集执行和审批证据。";
-  }
-  return null;
-}
-
-function renderChineseProposalText(value) {
-  const text = singleLine(value);
-  return containsCjk(text) ? text : "触发原因已入库；旧英文模板已清理，不会在报告中展开。";
-}
-
-function renderChineseRisks(value) {
-  const risks = parseJsonArray(value)
-    .filter((entry) => typeof entry === "string" && entry.trim().length > 0)
-    .map((entry) => singleLine(entry, 100));
-  if (risks.length === 0) {
-    return "风险已入库；人工确认前必须复核完整提案。";
-  }
-  return risks.slice(0, 3).join("；");
-}
-
-function normalizeComparisonRows(value) {
-  const parsed = parseJsonArray(value);
-  return parsed
-    .map((entry) => {
-      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-        return {
-          field: singleLine(entry.field ?? "规则项", 60),
-          oldValue: singleLine(entry.oldValue ?? "", 80),
-          newValue: singleLine(entry.newValue ?? "", 80),
-          reason: singleLine(entry.reason ?? "人工确认前复核。", 100)
-        };
-      }
-      if (typeof entry === "string") {
-        const translated = translateKnownRuleDelta(entry);
-        return translated
-          ? {
-              field: "旧格式提案",
-              oldValue: "旧模板",
-              newValue: translated,
-              reason: "历史英文模板已清理，不作为可激活提案。"
-            }
-          : null;
-      }
-      return null;
-    })
-    .filter(Boolean);
-}
-
-function parseJsonArray(value) {
-  if (Array.isArray(value)) {
-    return value;
-  }
-  try {
-    const parsed = JSON.parse(String(value ?? "[]"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function containsCjk(value) {
-  return /[\u3400-\u9fff]/u.test(String(value ?? ""));
-}
-
-function renderPreferenceSnapshot(row) {
-  if (!row) {
-    return "- 暂无偏好/策略快照。";
-  }
-
-  return [
-    `- 更新时间：${formatReportDateTime(row.created_at)}`,
-    "- 策略偏好：保持有意义的现金缓冲，控制单一标的与行业集中度；优先使用“宏观 -> 行业 -> 个股”的自上而下流程；事件质量不清晰时等待确认。",
-    "- 使用方式：仅作为观察和建议风格输入，不自动改变交易规则。"
-  ].join("\n");
 }
 
 function summarizeOfficialPositions(rows) {
@@ -768,12 +607,7 @@ function summarizeQqqMove(quote) {
 }
 
 function renderChineseNewsLine(article) {
-  const summary = summarizeMarketNewsTitle(article.title);
-  return [
-    `- ${formatReportDateTime(article.publishedAt)} ${article.symbol}：${summary.event}`,
-    `影响：${summary.impact}`,
-    `来源：长桥新闻编号 ${article.id}`
-  ].join("；") + "。";
+  return renderDetailedNewsLine(article, formatReportDateTime);
 }
 
 function summarizeMarketNewsTitle(title) {
@@ -844,16 +678,108 @@ function summarizeMarketNewsTitle(title) {
       impact: "关注是否影响科技股盈利预期"
     };
   }
+  if (/[\u3400-\u9fff]/u.test(text)) {
+    return {
+      event: singleLine(text, 120),
+      impact: "媒体、渠道和链接已列在新闻明细中；先作为可核对线索，不单独触发加仓"
+    };
+  }
   return {
-    event: "长桥返回的市场资讯，已归类为一般市场新闻",
-    impact: "原文标题保留在长桥新闻编号对应页面，报告正文不直接展示英文标题"
+    event: "多源检索返回的一般市场新闻",
+    impact: "媒体、渠道和链接已列在新闻明细中；先作为可核对线索，不单独触发加仓"
   };
+}
+
+function summarizeNewsSignals(articles) {
+  const classified = articles.map(classifyMarketNews);
+  const positive = classified.filter((item) => item.bias === "利好").length;
+  const negative = classified.filter((item) => item.bias === "利空").length;
+  const watch = classified.length - positive - negative;
+  const concreteThemes = classified
+    .filter((item) => !/一般市场新闻/u.test(item.event))
+    .slice(0, 3)
+    .map((item) => item.event);
+  const topThemes = (concreteThemes.length ? concreteThemes : classified.slice(0, 3).map((item) => item.event)).join("；") || "暂无可用新闻主线";
+  const bias = positive > negative
+    ? "中性偏多"
+    : negative > positive
+      ? "中性偏谨慎"
+      : "中性，等待更多确认";
+  const action = negative > positive
+    ? "不追高，优先观察风险事件是否扩散"
+    : positive > negative
+      ? "可以继续观察强势延续，但不因单日新闻直接加仓"
+      : "保持轻仓观察，把新闻作为验证项而不是交易触发器";
+  return {
+    summary: `${topThemes}；分类 ${positive} 条偏利好、${negative} 条偏利空、${watch} 条待验证`,
+    bias,
+    action
+  };
+}
+
+function summarizeMacroSignal(entries) {
+  if (entries.length === 0) {
+    return "未来窗口没有返回二星/三星美国宏观事件，宏观项暂不提供新增交易触发";
+  }
+  const next = entries[0];
+  const values = next.values
+    .filter((item) => item.key && item.value)
+    .slice(0, 3)
+    .map((item) => `${item.key}${item.value}`)
+    .join(" / ");
+  return `${next.date} ${next.time || ""} ${next.title}${values ? `（${values}）` : ""}；关注是否改变利率、通胀或制造业景气预期`;
+}
+
+function summarizePaperBudget(snapshot, qqqQuote) {
+  const asset = snapshot.primaryAsset ?? {};
+  const netAssets = toNumber(asset.net_assets ?? asset.netAssets) ?? 0;
+  const marketValue = snapshot.positions.reduce((sum, row) => {
+    const quote = row.symbol === "QQQ.US" ? qqqQuote : snapshot.quotes?.find((item) => item.symbol === row.symbol);
+    const last = toNumber(quote?.last ?? quote?.last_done ?? quote?.lastDone) ?? row.costPrice ?? 0;
+    return sum + row.quantity * last;
+  }, 0);
+  if (netAssets <= 0) {
+    return "无法计算模拟盘暴露比例";
+  }
+  const exposure = marketValue / netAssets * 100;
+  const remaining = Math.max(0, netAssets * 0.1 - marketValue);
+  return `模拟盘暴露 ${exposure.toFixed(2)}%，剩余自由发挥预算约 ${formatNumber(remaining)} 美元`;
+}
+
+function classifyMarketNews(article) {
+  const summary = summarizeMarketNewsTitle(article.titleZh ?? article.title);
+  const text = `${article.title ?? ""} ${article.titleZh ?? ""} ${summary.event} ${summary.impact}`;
+  let bias = "待验证";
+  if (/rally|strength|leaps|growth|truce|improve|上行|上涨|改善|正面|增长|缓和/iu.test(text)) {
+    bias = "利好";
+  }
+  if (/warning|tariff|crude|iran|crash|underperform|risk event|geopolitical risk|下跌|警示|关税|风险事件|地缘风险|偏弱/iu.test(text)) {
+    bias = bias === "利好" ? "待验证" : "利空";
+  }
+  const fundamentalImpact = /earnings|revenue|profit|guidance|ai|semiconductor|chip|财报|营收|利润|指引|人工智能|半导体/iu.test(text)
+    ? "可能影响基本面，需原始公告确认"
+    : "更多影响情绪/风险偏好，暂不视为基本面变化";
+  return {
+    ...summary,
+    bias,
+    fundamentalImpact,
+    article
+  };
+}
+
+function newsEvent(article) {
+  return article.titleZh ?? summarizeMarketNewsTitle(article.title).event;
+}
+
+function renderClassifiedNewsLine(article) {
+  const item = classifyMarketNews(article);
+  return `- ${formatReportDateTime(article.publishedAt)} ${article.symbol}：${newsEvent(article)}；媒体：${article.publisher ?? article.sourceName ?? article.source}；分类：${item.bias}；基本面：${item.fundamentalImpact}；影响：${item.impact}。`;
 }
 
 function renderMarketIntelligence(data) {
   const newsLines = data.marketNews.length > 0
     ? data.marketNews.slice(0, 8).map(renderChineseNewsLine)
-    : ["- 本窗口没有抓取到长桥新闻；报告生成会在抓取失败时直接报错，因此这里为空代表来源返回空列表。"];
+    : ["- 本窗口没有抓取到可用新闻；报告生成会在所有新闻来源同时为空时直接报错。"];
 
   const macroLines = data.macroEvents.length > 0
     ? data.macroEvents.slice(0, 8).map((entry) => {
@@ -867,25 +793,14 @@ function renderMarketIntelligence(data) {
       })
     : ["- 未来宏观日历没有返回高重要性事件。"];
 
-  const localLines = data.localNewsEvents.length > 0
-    ? data.localNewsEvents.slice(0, 5).map((event) => {
-        const title = event.payload?.title ?? event.payload?.content ?? event.payload?.note ?? event.dedupe_key;
-        return `- ${formatReportDateTime(event.ts)} ${translateEventSource(event.source)}：${summarizeMarketNewsTitle(title).event}；来源索引 ${event.dedupe_key ?? event.id}。`;
-      })
-    : ["- 本地事件库暂无额外新闻/日历事件。"];
-
   return [
-    "### 长桥新闻（中文摘要）",
+    "### 多源新闻（中文摘要与来源）",
     "",
     ...newsLines,
     "",
     "### 宏观日历",
     "",
-    ...macroLines,
-    "",
-    "### 本地事件库补充",
-    "",
-    ...localLines
+    ...macroLines
   ].join("\n");
 }
 
@@ -909,18 +824,6 @@ function renderOfficialPaperSnapshot(snapshot) {
       return `- ${row.symbol}（${translateSecurityName(row.symbol, row.name)}）：${formatNumber(row.quantity, 4)} ${translateAssetClass(row.assetClass)}${available}，${cost}，币种 ${translateCurrency(row.currency)}`;
     })
   ].join("\n");
-}
-
-function renderLocalPaperPositions(rows) {
-  if (rows.length === 0) {
-    return "- 当前没有本地模拟盘未平仓持仓。";
-  }
-
-  return rows.map((row) => {
-    const avg = formatNumber(row.avg_price);
-    const pnl = formatNumber(row.realized_pnl);
-    return `- ${row.symbol}：${row.quantity} ${translateAssetClass(row.asset_class)}，均价 ${avg}，已实现盈亏 ${pnl}`;
-  }).join("\n");
 }
 
 function renderQqqSection(quote) {
@@ -966,73 +869,6 @@ function selectExecutionReports(db, info) {
     .filter((row) => isWithinWindow(row.created_at, info));
 }
 
-function selectApprovalRows(db, info) {
-  return db
-    .prepare(`
-      SELECT advice_card_id, editor, summary, created_at
-      FROM approval_edits
-      ORDER BY created_at ASC
-    `)
-    .all()
-    .filter((row) => isWithinWindow(row.created_at, info));
-}
-
-function selectProposalRows(db, info) {
-  ensureProposalReportColumns(db);
-  return db
-    .prepare(`
-      SELECT id, title, scope, summary, trigger_reason, old_vs_new, evidence, expected_benefit,
-             risks, rollback_plan, recommendation, status, current_version, candidate_version, created_at
-      FROM rule_proposals
-      WHERE COALESCE(status, 'pending_confirmation') != 'archived'
-        AND NOT (
-          COALESCE(title, '') = ''
-          AND (
-            summary LIKE 'live rules have enough local evidence%'
-            OR summary LIKE 'paper rules remain on hold%'
-            OR old_vs_new LIKE '%No rule delta recommended yet%'
-            OR old_vs_new LIKE '%Tighten live entry discipline%'
-          )
-        )
-      ORDER BY created_at ASC
-    `)
-    .all()
-    .filter((row) => isWithinWindow(row.created_at, info));
-}
-
-function ensureProposalReportColumns(db) {
-  ensureReportColumn(db, "rule_proposals", "title", "TEXT NOT NULL DEFAULT ''");
-  ensureReportColumn(db, "rule_proposals", "trigger_reason", "TEXT NOT NULL DEFAULT ''");
-  ensureReportColumn(db, "rule_proposals", "expected_benefit", "TEXT NOT NULL DEFAULT ''");
-  ensureReportColumn(db, "rule_proposals", "risks", "TEXT NOT NULL DEFAULT '[]'");
-  ensureReportColumn(db, "rule_proposals", "rollback_plan", "TEXT NOT NULL DEFAULT ''");
-  ensureReportColumn(db, "rule_proposals", "status", "TEXT NOT NULL DEFAULT 'pending_confirmation'");
-}
-
-function ensureReportColumn(db, table, column, definition) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (columns.some((entry) => entry.name === column)) {
-    return;
-  }
-  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
-}
-
-function selectLocalPaperPositions(db) {
-  return db
-    .prepare(`
-      SELECT symbol, asset_class, quantity, avg_price, realized_pnl
-      FROM paper_positions
-      WHERE status = 'open'
-      ORDER BY symbol ASC, created_at ASC
-    `)
-    .all();
-}
-
-function selectLatestPreference(db) {
-  return db
-    .prepare(`SELECT summary, traits, created_at FROM preference_snapshots ORDER BY created_at DESC LIMIT 1`)
-    .get();
-}
 
 async function fetchRequiredReportMarketData(info) {
   const fetchedAt = new Date().toISOString();
@@ -1048,16 +884,18 @@ async function fetchRequiredReportMarketData(info) {
     officialPaperSnapshot.positions,
     splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
   ).slice(0, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
-  const [marketNews, macroEvents] = await Promise.all([
+  const [marketNewsResult, macroEvents] = await Promise.all([
     fetchMarketNews(trackedSymbols),
     fetchMacroCalendar(info)
   ]);
+  const marketNews = marketNewsResult.articles;
 
   return {
     officialPaperSnapshot,
     qqqQuote,
     trackedSymbols,
     marketNews,
+    newsWarnings: marketNewsResult.warnings,
     macroEvents,
     sourceEvidence: {
       fetchedAt,
@@ -1068,6 +906,8 @@ async function fetchRequiredReportMarketData(info) {
       officialPositions: officialPaperSnapshot.positions.length,
       trackedSymbols,
       newsCount: marketNews.length,
+      newsSourceBreakdown: summarizeNewsSourceBreakdown(marketNews),
+      newsWarnings: marketNewsResult.warnings,
       macroEventsCount: macroEvents.length,
       quoteSymbol: qqqQuote.symbol ?? "QQQ.US",
       quoteTimestamp: qqqQuote.timestamp ?? qqqQuote.post_market_quote?.timestamp ?? qqqQuote.pre_market_quote?.timestamp ?? null
@@ -1081,15 +921,43 @@ async function fetchRequiredLongbridgeJson(category, args, label) {
 
 async function fetchMarketNews(symbols) {
   const count = Math.max(1, Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5));
+  const warnings = [];
   const batches = await Promise.all(symbols.map(async (symbol) => {
-    const payload = await fetchRequiredLongbridgeJson("quote", ["news", symbol, "--count", String(count)], `Longbridge 新闻 ${symbol}`);
-    return normalizeNewsPayload(symbol, payload);
+    const [longbridgeResult, yahooResult] = await Promise.allSettled([
+      fetchRequiredLongbridgeJson("quote", ["news", symbol, "--count", String(count)], `Longbridge 新闻 ${symbol}`)
+        .then((payload) => normalizeNewsPayload(symbol, payload)),
+      fetchYahooSearchNews(symbol, count)
+    ]);
+
+    const rows = [];
+    if (longbridgeResult.status === "fulfilled") {
+      rows.push(...longbridgeResult.value);
+    } else {
+      warnings.push(`${symbol} 长桥新闻读取失败：${singleLine(longbridgeResult.reason?.message ?? longbridgeResult.reason, 120)}`);
+    }
+    if (yahooResult.status === "fulfilled") {
+      rows.push(...yahooResult.value);
+    } else {
+      warnings.push(`${symbol} Yahoo Finance 新闻读取失败：${singleLine(yahooResult.reason?.message ?? yahooResult.reason, 120)}`);
+    }
+    return rows;
   }));
-  const articles = batches.flat().sort((a, b) => b.publishedAtMs - a.publishedAtMs);
+  const articles = mergeNewsArticles(batches.flat());
   if (articles.length === 0) {
-    throw new Error("Longbridge 新闻返回为空；报告需要至少一条已验证新闻。");
+    throw new Error("多源新闻返回为空；报告需要至少一条已验证新闻。");
   }
-  return articles;
+  return { articles, warnings };
+}
+
+async function fetchYahooSearchNews(symbol, count) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const url = new URL("https://query2.finance.yahoo.com/v1/finance/search");
+  url.searchParams.set("q", yahooSymbol);
+  url.searchParams.set("quotesCount", "0");
+  url.searchParams.set("newsCount", String(count));
+  url.searchParams.set("enableFuzzyQuery", "false");
+  const payload = await fetchJsonWithTimeout(url);
+  return normalizeYahooSearchNews(symbol, payload);
 }
 
 async function fetchMacroCalendar(info) {
@@ -1131,7 +999,7 @@ function isPreparedReportMarkdownComplete(markdown) {
   const text = String(markdown ?? "");
   return [
     "长桥官方模拟盘",
-    "长桥新闻",
+    "多源新闻",
     "宏观日历",
     "长桥行情",
     "QQQ 行情"
@@ -1196,126 +1064,6 @@ function addDays(label, days) {
   return date.toISOString().slice(0, 10);
 }
 
-function writeReportPdf(markdownPath, pdfPath, markdown) {
-  const htmlPath = join(runtimeDir, "report-html", `${basename(markdownPath, ".md")}.html`);
-  mkdirSync(join(runtimeDir, "report-html"), { recursive: true });
-  writeFileSync(htmlPath, renderReportHtml(markdown), "utf8");
-
-  const chromePath = resolveChromePath();
-  execFileSync(chromePath, [
-    "--headless",
-    "--disable-gpu",
-    "--no-first-run",
-    `--print-to-pdf=${pdfPath}`,
-    `file://${htmlPath}`
-  ], {
-    cwd: repoRoot,
-    stdio: ["ignore", "ignore", "pipe"]
-  });
-
-  if (!existsSync(pdfPath)) {
-    throw new Error(`PDF 生成失败：${pdfPath}`);
-  }
-  return pdfPath;
-}
-
-function resolveChromePath() {
-  const candidates = [
-    process.env.CHROME_BIN,
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-  ].filter(Boolean);
-
-  const found = candidates.find((candidate) => existsSync(candidate));
-  if (!found) {
-    throw new Error("未找到可用于生成 PDF 的 Chrome/Chromium。请安装 Google Chrome 或设置 CHROME_BIN。");
-  }
-  return found;
-}
-
-function renderReportHtml(markdown) {
-  return [
-    "<!doctype html>",
-    "<html>",
-    "<head>",
-    "<meta charset=\"utf-8\">",
-    "<style>",
-    "@page { size: A4; margin: 18mm 16mm; }",
-    "body { font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; color: #111827; font-size: 13px; line-height: 1.58; }",
-    "h1 { font-size: 24px; margin: 0 0 14px; padding-bottom: 10px; border-bottom: 2px solid #111827; }",
-    "h2 { font-size: 18px; margin: 22px 0 10px; padding-bottom: 4px; border-bottom: 1px solid #d1d5db; }",
-    "h3 { font-size: 15px; margin: 16px 0 8px; }",
-    "p { margin: 7px 0; }",
-    "ul { margin: 7px 0 10px 20px; padding: 0; }",
-    "li { margin: 4px 0; }",
-    "code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: 1px 3px; border-radius: 3px; }",
-    "</style>",
-    "</head>",
-    "<body>",
-    markdownToHtml(markdown),
-    "</body>",
-    "</html>"
-  ].join("\n");
-}
-
-function markdownToHtml(markdown) {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  const html = [];
-  let inList = false;
-  const closeList = () => {
-    if (inList) {
-      html.push("</ul>");
-      inList = false;
-    }
-  };
-
-  for (const rawLine of lines) {
-    const line = rawLine.trimEnd();
-    if (!line.trim()) {
-      closeList();
-      continue;
-    }
-
-    const heading = /^(#{1,6})\s+(.+)$/u.exec(line);
-    if (heading) {
-      closeList();
-      const level = Math.min(3, heading[1].length);
-      html.push(`<h${level}>${formatInlineHtml(heading[2])}</h${level}>`);
-      continue;
-    }
-
-    const bullet = /^-\s+(.+)$/u.exec(line);
-    if (bullet) {
-      if (!inList) {
-        html.push("<ul>");
-        inList = true;
-      }
-      html.push(`<li>${formatInlineHtml(bullet[1])}</li>`);
-      continue;
-    }
-
-    closeList();
-    html.push(`<p>${formatInlineHtml(line)}</p>`);
-  }
-  closeList();
-  return html.join("\n");
-}
-
-function formatInlineHtml(value) {
-  return escapeHtml(value)
-    .replace(/\*\*([^*]+)\*\*/gu, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/gu, "<code>$1</code>");
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/gu, "&amp;")
-    .replace(/</gu, "&lt;")
-    .replace(/>/gu, "&gt;")
-    .replace(/"/gu, "&quot;");
-}
-
 function updateState(info, patch) {
   let state = {};
   try {
@@ -1368,6 +1116,29 @@ function splitCsv(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function toYahooSymbol(symbol) {
+  return String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
+}
+
+async function fetchJsonWithTimeout(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.REPORT_NEWS_FETCH_TIMEOUT_MS ?? 8000));
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "OpenClaw report read-only news fetch"
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function formatOptionalNumber(value, digits = 2) {

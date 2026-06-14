@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,30 +18,21 @@ if (uid === undefined) {
 mkdirSync(launchAgentsDir, { recursive: true });
 mkdirSync(runtimeLogDir, { recursive: true });
 
-const marketWeekdays = [1, 2, 3, 4, 5];
-const catchupMinutes = [7, 22, 37, 52];
-
 const jobs = [
-  {
-    label: "com.openclaw.trading.catchup",
-    command: `${quote(nodeBin)} --no-warnings apps/openclaw-config/scripts/reconcile-user-schedules.mjs run`,
-    schedule: catchupMinutes.map((Minute) => ({ Minute })),
-    runAtLoad: true
-  },
   {
     label: "com.openclaw.trading.report.daily.prepare",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily prepare`,
-    schedule: marketWeekdays.map((Weekday) => ({ Weekday, Hour: 19, Minute: 0 }))
+    schedule: [2, 3, 4, 5].map((Weekday) => ({ Weekday, Hour: 19, Minute: 45 }))
   },
   {
     label: "com.openclaw.trading.report.daily.deliver",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily deliver`,
-    schedule: marketWeekdays.map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
+    schedule: [2, 3, 4, 5].map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
   },
   {
     label: "com.openclaw.trading.report.weekly.prepare",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs weekly prepare`,
-    schedule: [{ Weekday: 1, Hour: 19, Minute: 0 }]
+    schedule: [{ Weekday: 1, Hour: 19, Minute: 45 }]
   },
   {
     label: "com.openclaw.trading.report.weekly.deliver",
@@ -49,16 +40,43 @@ const jobs = [
     schedule: [{ Weekday: 1, Hour: 20, Minute: 0 }]
   },
   {
-    label: "com.openclaw.trading.maintenance.latest",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/maintenance-check.mjs`,
-    schedule: [{ Hour: 9, Minute: 10 }]
+    label: "com.openclaw.trading.stock-analysis",
+    command: `${quote(nodeBin)} apps/openclaw-config/scripts/stock-analysis.mjs scheduled`,
+    schedule: [{ Hour: 21, Minute: 0 }]
   },
   {
-    label: "com.openclaw.trading.context.maintenance",
-    command: `${quote(nodeBin)} --no-warnings apps/openclaw-config/scripts/context-manager.mjs maintenance`,
-    schedule: [{ Minute: 20 }]
+    label: "com.openclaw.trading.official-paper.poll",
+    command: `${quote(nodeBin)} apps/openclaw-config/scripts/official-paper-monitor.mjs poll`,
+    schedule: [{ Minute: 30 }]
+  },
+  {
+    label: "com.openclaw.trading.official-paper.pnl",
+    command: `${quote(nodeBin)} apps/openclaw-config/scripts/official-paper-monitor.mjs pnl`,
+    schedule: [{ Minute: 0 }]
   }
 ];
+
+const retiredLabels = [
+  "com.openclaw.trading.event-bus",
+  "com.openclaw.trading.event-ingestor",
+  "com.openclaw.trading.live-advisor",
+  "com.openclaw.trading.paper-trader",
+  "com.openclaw.trading.catchup",
+  "com.openclaw.trading.maintenance.latest",
+  "com.openclaw.trading.context.maintenance"
+];
+
+for (const label of retiredLabels) {
+  const plistPath = join(launchAgentsDir, `${label}.plist`);
+  try {
+    execFileSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "ignore" });
+  } catch {
+    // It may not be loaded on a fresh machine.
+  }
+  if (existsSync(plistPath)) {
+    rmSync(plistPath);
+  }
+}
 
 for (const job of jobs) {
   const plistPath = join(launchAgentsDir, `${job.label}.plist`);
@@ -78,9 +96,6 @@ for (const job of jobs) {
 function renderPlist(job) {
   const outPath = join(runtimeLogDir, `${job.label}.out.log`);
   const errPath = join(runtimeLogDir, `${job.label}.err.log`);
-  const runAtLoad = job.runAtLoad
-    ? "  <key>RunAtLoad</key>\n  <true/>\n"
-    : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,7 +111,7 @@ function renderPlist(job) {
   </array>
   <key>StartCalendarInterval</key>
   ${renderSchedule(job.schedule)}
-${runAtLoad}  <key>StandardOutPath</key>
+  <key>StandardOutPath</key>
   <string>${escapeXml(outPath)}</string>
   <key>StandardErrorPath</key>
   <string>${escapeXml(errPath)}</string>
