@@ -27,6 +27,23 @@ describe("trading schedule policy", () => {
     )).toBe(true);
   });
 
+  it("allows OpenClaw-owned cron triggers to run stock analysis when the interval is due", () => {
+    expect(schedule.shouldRunStockAnalysis(
+      new Date("2026-06-14T11:45:00.000Z"),
+      "2026-05-31T11:05:07.180Z",
+      { cronTriggered: true }
+    )).toBe(true);
+    expect(schedule.shouldRunStockAnalysis(
+      new Date("2026-06-03T11:45:00.000Z"),
+      "2026-06-01T13:00:00.000Z",
+      { cronTriggered: true }
+    )).toBe(false);
+    expect(schedule.shouldRunStockAnalysis(
+      new Date("2026-06-14T11:45:00.000Z"),
+      "2026-05-31T11:05:07.180Z"
+    )).toBe(false);
+  });
+
   it("recognizes US regular market hours across daylight saving time", () => {
     expect(schedule.isUsRegularMarketHours(new Date("2026-07-01T14:00:00.000Z"))).toBe(true);
     expect(schedule.isUsRegularMarketHours(new Date("2026-01-05T15:00:00.000Z"))).toBe(true);

@@ -43,9 +43,9 @@ export function shouldRunReportDelivery(kind, date = new Date()) {
   throw new Error(`Unsupported report kind: ${kind}`);
 }
 
-export function shouldRunStockAnalysis(date = new Date(), lastRunAt) {
+export function shouldRunStockAnalysis(date = new Date(), lastRunAt, options = {}) {
   const parts = getZonedParts(date, SHANGHAI_TIMEZONE);
-  if (parts.hour !== 21 || parts.minute !== 0) {
+  if (!options.cronTriggered && (parts.hour !== 21 || parts.minute !== 0)) {
     return false;
   }
 

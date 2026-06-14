@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const rendering = await import("./report-rendering.mjs");
@@ -18,5 +21,35 @@ describe("report rendering", () => {
       timeout: 120_000,
       killSignal: "SIGTERM"
     });
+  });
+
+  it("runs Chrome with an isolated profile and deterministic headless flags for launchd jobs", () => {
+    const args = rendering.buildChromePdfArgs({
+      htmlPath: "/tmp/report.html",
+      pdfPath: "/tmp/report.pdf",
+      profileDir: "/tmp/openclaw-chrome-profile"
+    });
+
+    expect(args).toContain("--headless=new");
+    expect(args).toContain("--disable-background-networking");
+    expect(args).toContain("--disable-extensions");
+    expect(args).toContain("--disable-dev-shm-usage");
+    expect(args).toContain("--user-data-dir=/tmp/openclaw-chrome-profile");
+    expect(args).toContain("--print-to-pdf=/tmp/report.pdf");
+    expect(args).toContain("file:///tmp/report.html");
+  });
+
+  it("accepts a Chrome timeout when the PDF was already written", () => {
+    const dir = mkdtempSync(join(tmpdir(), "openclaw-rendering-test-"));
+    try {
+      const pdfPath = join(dir, "report.pdf");
+      writeFileSync(pdfPath, "%PDF-1.7\nbody\n", "utf8");
+
+      expect(rendering.isUsablePdfAfterChromeError({ code: "ETIMEDOUT" }, pdfPath)).toBe(true);
+      expect(rendering.isUsablePdfAfterChromeError({ code: "EACCES" }, pdfPath)).toBe(false);
+      expect(rendering.isUsablePdfAfterChromeError({ code: "ETIMEDOUT" }, join(dir, "missing.pdf"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

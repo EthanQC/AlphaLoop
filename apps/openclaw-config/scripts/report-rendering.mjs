@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 export const REPORT_FONT_STACK = "'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', 'Hiragino Sans GB', 'Heiti SC', -apple-system, BlinkMacSystemFont, sans-serif";
@@ -10,14 +11,18 @@ export function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, 
   writeFileSync(htmlPath, renderReportHtml(markdown), "utf8");
 
   const chromePath = resolveChromePath();
-  execFileSync(chromePath, [
-    "--headless",
-    "--disable-gpu",
-    "--no-first-run",
-    "--no-pdf-header-footer",
-    `--print-to-pdf=${pdfPath}`,
-    `file://${htmlPath}`
-  ], buildChromePdfExecOptions(repoRoot));
+  const profileDir = mkdtempSync(join(tmpdir(), "openclaw-report-chrome-"));
+  try {
+    try {
+      execFileSync(chromePath, buildChromePdfArgs({ htmlPath, pdfPath, profileDir }), buildChromePdfExecOptions(repoRoot));
+    } catch (error) {
+      if (!isUsablePdfAfterChromeError(error, pdfPath)) {
+        throw error;
+      }
+    }
+  } finally {
+    rmSync(profileDir, { recursive: true, force: true });
+  }
 
   if (!existsSync(pdfPath)) {
     throw new Error(`PDF 生成失败：${pdfPath}`);
@@ -33,6 +38,33 @@ export function buildChromePdfExecOptions(repoRoot) {
     timeout: Number(process.env.REPORT_PDF_TIMEOUT_MS ?? 120_000),
     killSignal: "SIGTERM"
   };
+}
+
+export function buildChromePdfArgs({ htmlPath, pdfPath, profileDir }) {
+  return [
+    "--headless=new",
+    "--disable-gpu",
+    "--disable-background-networking",
+    "--disable-extensions",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-pdf-header-footer",
+    `--user-data-dir=${profileDir}`,
+    `--print-to-pdf=${pdfPath}`,
+    `file://${htmlPath}`
+  ];
+}
+
+export function isUsablePdfAfterChromeError(error, pdfPath) {
+  if (String(error?.code ?? "") !== "ETIMEDOUT") {
+    return false;
+  }
+  try {
+    return statSync(pdfPath).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 function resolveChromePath() {

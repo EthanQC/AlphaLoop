@@ -98,7 +98,8 @@ async function runScheduled(force = false) {
     console.log(JSON.stringify({ skipped: true, reason: "no_targets", lastRunAt: state.lastRunAt ?? null }, null, 2));
     return;
   }
-  if (!force && !shouldRunStockAnalysis(new Date(), state.lastRunAt)) {
+  const cronTriggered = process.env.OPENCLAW_CRON_TRIGGERED === "1";
+  if (!force && !shouldRunStockAnalysis(new Date(), state.lastRunAt, { cronTriggered })) {
     console.log(JSON.stringify({ skipped: true, reason: "not_due", lastRunAt: state.lastRunAt ?? null }, null, 2));
     return;
   }

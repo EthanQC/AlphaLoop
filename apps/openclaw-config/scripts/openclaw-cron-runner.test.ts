@@ -23,4 +23,9 @@ describe("OpenClaw cron runner", () => {
     expect(script).toContain("openclaw-cron-run-log");
     expect(script).toContain("readCronRunEntries");
   });
+
+  it("marks OpenClaw run-log jobs so stock analysis does not re-check the exact wall-clock minute", () => {
+    expect(script).toContain("OPENCLAW_CRON_TRIGGERED");
+    expect(script).toContain("context.trigger === \"openclaw-cron-run-log\"");
+  });
 });

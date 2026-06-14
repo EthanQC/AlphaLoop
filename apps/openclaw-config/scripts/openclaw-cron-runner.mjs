@@ -110,7 +110,10 @@ async function runAllowedJob(job, context = {}) {
   const [cmd, ...args] = job.command;
   const child = spawn(cmd, args, {
     cwd: repoRoot,
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(context.trigger === "openclaw-cron-run-log" ? { OPENCLAW_CRON_TRIGGERED: "1" } : {})
+    },
     stdio: ["ignore", "pipe", "pipe"]
   });
   const chunks = { stdout: [], stderr: [] };
