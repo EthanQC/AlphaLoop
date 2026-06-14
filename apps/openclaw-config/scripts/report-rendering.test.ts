@@ -14,6 +14,13 @@ describe("report rendering", () => {
     expect(html).not.toContain("Songti SC");
   });
 
+  it("renders markdown links as readable anchors instead of long raw URLs", () => {
+    const html = rendering.renderReportHtml("- 链接：[原文](https://example.com/news?id=123)");
+
+    expect(html).toContain("<a href=\"https://example.com/news?id=123\">原文</a>");
+    expect(html).not.toContain("[原文](");
+  });
+
   it("limits Chrome PDF rendering time so scheduled jobs cannot hang forever", () => {
     expect(rendering.buildChromePdfExecOptions("/repo")).toEqual({
       cwd: "/repo",

@@ -178,20 +178,15 @@ function renderDailyReport(info, data) {
     "",
     "## 2. 信息收集与分类",
     "",
-    renderDailyRoutineCompliance(),
-    "",
     renderDataSourceSummary(data),
     "",
     renderDailyRoutineClassification(data),
     "",
     renderMarketIntelligence(data),
     "",
-    "## 3. 大盘 -> 板块 -> 个股影响判断",
+    "## 3. 影响路径",
     "",
-    "- 大盘：以 QQQ、宏观日历、多源市场新闻和风险情绪为主线，先判断风险偏好。",
-    "- 板块：优先关注科技、半导体、AI、金融条件、能源/黄金/汇率等对美股估值的传导。",
-    "- 个股：仅把信息分类为利好、利空或待验证；必须说明是否可能改变企业基本面。",
-    "- 行动含义：如果只是情绪噪声，不提高仓位；如果改变基本面或流动性，再进入个股分析模板。",
+    renderImpactPath(data),
     "",
     "## 4. QQQ 固定观察",
     "",
@@ -212,8 +207,7 @@ function renderDailyReport(info, data) {
     "",
     "## 7. 明日跟踪",
     "",
-    "- 继续按 daily-routine.md 分类新闻、企业近况、科研/技术成果、大宗商品、汇率、情绪、经济指标和市场涨跌。",
-    "- 如需要扩展到具体标的，进入三日一次的个股分析流程。"
+    renderNextTracking(data, "明日")
   ].join("\n");
 }
 
@@ -240,8 +234,6 @@ function renderWeeklyReport(info, data) {
     "",
     "## 2. 市场主线回顾与分类",
     "",
-    renderDailyRoutineCompliance(),
-    "",
     renderDataSourceSummary(data),
     "",
     renderDailyRoutineClassification(data),
@@ -267,9 +259,7 @@ function renderWeeklyReport(info, data) {
     "",
     "## 6. 下周跟踪",
     "",
-    "- 固定观察 QQQ 的趋势、成交量、盘前/盘后偏离和 VIX/利率/汇率联动。",
-    "- 对本周高频出现的行业主题，进入大盘 -> 板块 -> 个股的拆解。",
-    "- 对用户指定的一批股票，按个股分析模板每三天复盘一次。"
+    renderNextTracking(data, "下周")
   ].join("\n");
 }
 
@@ -290,18 +280,51 @@ function renderCoreSummary(data, counts) {
   ];
 }
 
+function renderImpactPath(data) {
+  const newsSignal = summarizeNewsSignals(data.marketNews);
+  const macroSignal = summarizeMacroSignal(data.macroEvents);
+  const qqqSummary = summarizeQqqMove(data.qqqQuote);
+  const technologyNews = data.marketNews.find((article) => /ai|nvidia|semiconductor|chip|technology|人工智能|半导体/iu.test(article.title));
+  const companyNews = data.marketNews.find((article) => /earnings|revenue|profit|guidance|shares|acquires|公司|财报|指引/iu.test(article.title));
+
+  return [
+    `- 大盘：${qqqSummary}；新闻分类为 ${newsSignal.bias}，但操作上仍按“新闻验证，不直接加仓”处理。`,
+    `- 宏观：${macroSignal}；如果后续利率或制造业数据反向变化，需要重新评估成长股估值压力。`,
+    `- 板块：${technologyNews ? `${newsEvent(technologyNews)}是本窗口最明确的科技线索。` : "没有读到足以单独驱动板块的高置信科技线索。"}半导体、AI、利率和美元仍是 QQQ 的主要传导变量。`,
+    `- 个股：${companyNews ? `${newsEvent(companyNews)}需要进入个股模板复核。` : "没有读到足以直接触发个股模板的新公司基本面事件。"}实盘动作继续停在人工复核前。`
+  ].join("\n");
+}
+
+function renderNextTracking(data, label) {
+  const qqq = data.qqqQuote;
+  const last = toNumber(qqq.last ?? qqq.last_done ?? qqq.lastDone);
+  const high = toNumber(qqq.high);
+  const low = toNumber(qqq.low);
+  const post = toNumber(qqq.post_market_quote?.last);
+  const nextMacro = data.macroEvents[0];
+  const newsThemes = selectDiverseNewsArticles(data.marketNews, 3)
+    .map((article) => newsEvent(article))
+    .join("；") || "暂无高置信新闻主线";
+
+  return [
+    `- QQQ：${label}先看 ${formatOptionalNumber(low)} - ${formatOptionalNumber(high)} 区间是否被放量突破；最新价 ${formatOptionalNumber(last)}，盘后 ${formatOptionalNumber(post)}。`,
+    `- 新闻：复核 ${newsThemes}；只有当新闻能落到收入、利润、指引、订单或监管约束时，才升级为个股基本面事件。`,
+    `- 宏观：${nextMacro ? `${nextMacro.date} ${nextMacro.time || ""} ${nextMacro.title}` : "未来窗口没有高重要性宏观事件"}；关注是否改变利率、通胀或制造业景气预期。`,
+    `- 仓位：${summarizePaperBudget(data.officialPaperSnapshot, data.qqqQuote)}；任何新增模拟盘动作仍需通过人工复核和 10% 总仓上限。`
+  ].join("\n");
+}
+
 function renderDataSourceSummary(data) {
   return [
-    "- 已验证来源：本地交易数据库、长桥官方模拟盘账户快照、长桥行情、多源新闻检索、长桥美国宏观日历。",
-    "- 本地交易数据库读取：执行报告、日报/周报记录、官方模拟盘订单生命周期。",
-    "- 长桥账户读取：连通性与令牌检查、官方模拟盘资产、官方模拟盘持仓。",
-    "- 长桥行情读取：QQQ 的最新价、前收、日内高低、盘前/盘后价格与时间。",
-    `- 多源资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS。`,
+    "### 证据与来源",
+    "",
+    `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥 QQQ 行情、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}。`,
+    `- 新闻检索：每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS；本次共读取 ${data.marketNews.length} 条。`,
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
-    `- 长桥宏观读取：美国二星和三星宏观事件，窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天。`,
+    `- 宏观与行情：美国二星/三星宏观事件窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天；${formatQuoteTimestamp(data.qqqQuote)}。`,
     ...(data.macroWarnings?.length ? [`- 宏观日历降级：${data.macroWarnings.join("；")}。`] : []),
-    `- 本次证据：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌状态 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；新闻 ${data.sourceEvidence.newsCount} 条；宏观事件 ${data.sourceEvidence.macroEventsCount} 条；${formatQuoteTimestamp(data.qqqQuote)}。`
+    `- 审计状态：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；宏观事件 ${data.sourceEvidence.macroEventsCount} 条。`
   ].join("\n");
 }
 
@@ -325,21 +348,12 @@ function renderDailyRoutineClassification(data) {
   const companyNews = data.marketNews.find((article) => /earnings|revenue|profit|guidance|shares|acquires|公司|财报|指引/iu.test(article.title));
 
   return [
-    "### 信息源完整性与分类结论",
+    "### 市场叙事与分类结论",
     "",
-    `- 新闻：已读取 ${data.marketNews.length} 条多源新闻；来源分布 ${summarizeNewsSourceBreakdown(data.marketNews)}；主线为 ${newsSignal.summary}。`,
-    `- 企业近况：${companyNews ? `${newsEvent(companyNews)}，基本面影响需等公司公告/财报验证。` : "本窗口没有读到可直接改变单一公司基本面的高置信更新。"}`,
-    `- 最新科研/技术成果：${technologyNews ? `${newsEvent(technologyNews)}，对科技权重和 QQQ 情绪有传导。` : "本窗口没有读到可审计的科研/技术突破类更新。"}`,
-    `- 大宗商品价格变动：${commodityNews ? `${newsEvent(commodityNews)}，作为通胀和风险偏好的辅助变量。` : "未读到足以进入结论的大宗商品变动。"}`,
-    `- 货币汇率变化：${currencyNews ? `${newsEvent(currencyNews)}，需观察美元和利率对成长股估值的影响。` : "未读到足以进入结论的汇率变动。"}`,
-    `- 市场情绪：${newsSignal.bias}；${newsSignal.action}`,
-    "- 行业淡旺季：本窗口没有足以改变行业季节性判断的新证据。",
-    `- 经济指标：${macroSignal}`,
-    `- 大盘走势：${qqqSummary}。`,
-    "",
-    "### 利好/利空/基本面影响",
-    "",
-    ...selectDiverseNewsArticles(data.marketNews, 6).map(renderClassifiedNewsLine)
+    `- 主线：${newsSignal.summary}；整体情绪 ${newsSignal.bias}。`,
+    `- 基本面：${companyNews ? `${newsEvent(companyNews)}需要等公司公告或财报验证。` : "没有读到足以直接改变单一公司基本面的高置信更新。"}${technologyNews ? `技术线索集中在${newsEvent(technologyNews)}，主要传导到科技权重和 QQQ 情绪。` : "技术/科研突破项没有形成可审计的新证据。"}`,
+    `- 宏观与资产联动：${macroSignal}；${commodityNews ? `商品线索为${newsEvent(commodityNews)}。` : "商品端没有足以进入结论的新增压力。"}${currencyNews ? ` 汇率线索为${newsEvent(currencyNews)}。` : "汇率端没有足以进入结论的新增压力。"}`,
+    `- 大盘确认：${qqqSummary}；${newsSignal.action}`
   ].join("\n");
 }
 
@@ -613,7 +627,20 @@ function summarizeQqqMove(quote) {
 }
 
 function renderChineseNewsLine(article) {
-  return renderDetailedNewsLine(article, formatReportDateTime);
+  const classification = classifyMarketNews(article);
+  const line = compactReportNewsLink(renderDetailedNewsLine(article, formatReportDateTime));
+  const linkSeparator = line.lastIndexOf("；链接：");
+  const sourceSeparator = line.lastIndexOf("；来源索引：");
+  const separator = Math.max(linkSeparator, sourceSeparator);
+  const extra = `；分类：${classification.bias}；基本面：${classification.fundamentalImpact}`;
+  if (separator === -1) {
+    return line.replace(/。$/u, `${extra}。`);
+  }
+  return `${line.slice(0, separator)}${extra}${line.slice(separator)}`;
+}
+
+function compactReportNewsLink(line) {
+  return String(line ?? "").replace(/链接：(https?:\/\/\S+?)(?=。$|；)/gu, "链接：[原文]($1)");
 }
 
 function summarizeMarketNewsTitle(title) {

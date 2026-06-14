@@ -14,6 +14,12 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
   if (!text.includes("### 多源新闻")) {
     failures.push("news.section_missing");
   }
+  if (/daily-routine\.md|###\s+信息检索|###\s+信息分类与处理/u.test(text)) {
+    failures.push("readability.template_checklist");
+  }
+  if (/###\s+利好\/利空\/基本面影响/u.test(text)) {
+    failures.push("readability.duplicate_news_classification");
+  }
   if (newsLines.length < minimumNewsLines(kind)) {
     failures.push("news.detail_depth");
   }
@@ -151,6 +157,8 @@ function isDetailedNewsLine(line) {
   return [
     /媒体：/u,
     /渠道：/u,
+    /分类：/u,
+    /基本面：/u,
     /影响：/u,
     /(?:链接：|来源索引：)/u,
     /(?:标题要点：|原始标题：)/u

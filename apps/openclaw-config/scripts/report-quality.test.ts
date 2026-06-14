@@ -42,11 +42,16 @@ describe("report quality gate", () => {
       "",
       "- 新闻来源分布：Longbridge 2 条；Yahoo Finance/Investor's Business Daily 1 条；Yahoo Finance/Barchart 1 条；Reuters 1 条。",
       "",
+      "### 市场叙事与分类结论",
+      "",
+      "- 主线：小盘股、利率和科技股轮动共同影响风险偏好；当前偏中性观察。",
+      "- 基本面：半导体和 AI 资本开支可能影响盈利预期，其他新闻主要影响情绪。",
+      "",
       "### 多源新闻（中文摘要与来源）",
       "",
-      "- 2026-06-13 21:55 QQQ.US：美股下周需要关注小盘股和利率信号；媒体：Investor's Business Daily；渠道：Yahoo Finance；标题要点：中文摘要说明小盘股、利率和科技股轮动；原始标题：Stock Market Week Ahead: Keep An Eye On The Little Things；影响：作为风险偏好和板块轮动线索；链接：https://finance.yahoo.com/example-ibd。",
-      "- 2026-06-13 04:39 QQQ.US：美股在停火预期和科技股支撑下反弹；媒体：Barchart；渠道：Yahoo Finance；标题要点：中文摘要说明指数反弹、科技股和风险情绪改善；原始标题：Stocks Rally on Hopes for a Truce；影响：偏利好风险偏好但需成交量确认；链接：https://finance.yahoo.com/example-barchart。",
-      "- 2026-06-12 22:10 QQQ.US：半导体需求和 AI 资本开支继续支撑纳指权重；媒体：Reuters；渠道：Reuters；标题要点：中文摘要说明 AI 投资、芯片需求和盈利预期；原始标题：Chip demand supports Nasdaq leaders；影响：可能影响盈利预期，需要核对公司公告；链接：https://www.reuters.com/example-chip-demand。",
+      "- 2026-06-13 21:55 QQQ.US：美股下周需要关注小盘股和利率信号；媒体：Investor's Business Daily；渠道：Yahoo Finance；标题要点：中文摘要说明小盘股、利率和科技股轮动；原始标题：Stock Market Week Ahead: Keep An Eye On The Little Things；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：作为风险偏好和板块轮动线索；链接：[原文](https://finance.yahoo.com/example-ibd)。",
+      "- 2026-06-13 04:39 QQQ.US：美股在停火预期和科技股支撑下反弹；媒体：Barchart；渠道：Yahoo Finance；标题要点：中文摘要说明指数反弹、科技股和风险情绪改善；原始标题：Stocks Rally on Hopes for a Truce；分类：利好；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：偏利好风险偏好但需成交量确认；链接：[原文](https://finance.yahoo.com/example-barchart)。",
+      "- 2026-06-12 22:10 QQQ.US：半导体需求和 AI 资本开支继续支撑纳指权重；媒体：Reuters；渠道：Reuters；标题要点：中文摘要说明 AI 投资、芯片需求和盈利预期；原始标题：Chip demand supports Nasdaq leaders；分类：利好；基本面：可能影响基本面，需原始公告确认；影响：可能影响盈利预期，需要核对公司公告；链接：[原文](https://www.reuters.com/example-chip-demand)。",
       "",
       "### 宏观日历",
       "",
@@ -63,6 +68,47 @@ describe("report quality gate", () => {
       ok: true,
       failures: []
     });
+  });
+
+  it("rejects reports that repeat template checklists or duplicate news classification blocks", () => {
+    const markdown = [
+      "# OpenClaw 日报 2026-06-14",
+      "",
+      "## 1. 今日结论",
+      "",
+      "- 市场信号：QQQ 最新价 721.34。",
+      "",
+      "## 2. 信息收集与分类",
+      "",
+      "### daily-routine.md 检查清单",
+      "",
+      "- 新闻",
+      "- 企业近况",
+      "",
+      "### 利好/利空/基本面影响",
+      "",
+      "- 2026-06-13 QQQ.US：重复的新闻分类。",
+      "",
+      "### 多源新闻（中文摘要与来源）",
+      "",
+      "- 2026-06-13 21:55 QQQ.US：美股下周需要关注小盘股和利率信号；媒体：Investor's Business Daily；渠道：Yahoo Finance；标题要点：中文摘要说明小盘股、利率和科技股轮动；原始标题：Stock Market Week Ahead: Keep An Eye On The Little Things；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：作为风险偏好和板块轮动线索；链接：[原文](https://finance.yahoo.com/example-ibd)。",
+      "- 2026-06-13 04:39 QQQ.US：美股在停火预期和科技股支撑下反弹；媒体：Barchart；渠道：Yahoo Finance；标题要点：中文摘要说明指数反弹、科技股和风险情绪改善；原始标题：Stocks Rally on Hopes for a Truce；分类：利好；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：偏利好风险偏好但需成交量确认；链接：[原文](https://finance.yahoo.com/example-barchart)。",
+      "- 2026-06-12 22:10 QQQ.US：半导体需求和 AI 资本开支继续支撑纳指权重；媒体：Reuters；渠道：Reuters；标题要点：中文摘要说明 AI 投资、芯片需求和盈利预期；原始标题：Chip demand supports Nasdaq leaders；分类：利好；基本面：可能影响基本面，需原始公告确认；影响：可能影响盈利预期，需要核对公司公告；链接：[原文](https://www.reuters.com/example-chip-demand)。",
+      "",
+      "### 宏观日历",
+      "",
+      "- 2026-06-18 20:30 美国费城联储制造业指数（前值-- / 预测12 / 公告--）",
+      "",
+      "## 4. QQQ 固定观察",
+      "",
+      "- 最新价：721.34；前收：717.12；区间涨跌：4.22 / 0.59%"
+    ].join("\n");
+
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("readability.template_checklist");
+    expect(result.failures).toContain("readability.duplicate_news_classification");
   });
 
   it("requires stock analysis to combine valuation, upside, trend, and option-chain evidence", () => {

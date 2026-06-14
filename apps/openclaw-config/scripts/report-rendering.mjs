@@ -188,6 +188,7 @@ function parseTableLine(line) {
 
 function formatInlineHtml(value) {
   return escapeHtml(value)
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gu, "<a href=\"$2\">$1</a>")
     .replace(/\*\*([^*]+)\*\*/gu, "<strong>$1</strong>")
     .replace(/`([^`]+)`/gu, "<code>$1</code>");
 }
