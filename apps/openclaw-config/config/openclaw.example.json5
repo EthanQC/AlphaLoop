@@ -72,7 +72,7 @@
           theme: "risk-aware operator"
         },
         groupChat: {
-          mentionPatterns: ["@openclaw", "@OpenClaw", "@Trading Copilot", "@control", "@trade-control"]
+          mentionPatterns: ["@openclaw", "@OpenClaw", "@Trading Copilot", "@机器人", "@交易机器人", "@炒股机器人", "@control", "@trade-control"]
         },
         runtime: {
           type: "acp",

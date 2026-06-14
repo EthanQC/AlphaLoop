@@ -12,12 +12,15 @@ import {
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import { normalizeNewsPayload, normalizeQuotePayload, normalizeSymbol, toNumber } from "./report-data.mjs";
 import {
+  normalizeExternalRssNews,
   mergeNewsArticles,
   normalizeYahooSearchNews,
   renderDetailedNewsLine,
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
+import { assertStockAnalysisQuality } from "./report-quality.mjs";
+import { buildYahooOptionChainUrls } from "./stock-analysis-sources.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
   extractStockAnalysisStatistics,
@@ -118,6 +121,7 @@ async function runAnalysis({ deliver = true, targetsOverride = null } = {}) {
 
   const label = generatedAt.slice(0, 10);
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records });
+  assertStockAnalysisQuality(markdown);
   const markdownPath = join(reportsDir, `${label}.md`);
   const pdfPath = join(reportsDir, `${label}.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
@@ -467,22 +471,25 @@ async function fetchStockAnalysisStatistics(symbol) {
 }
 
 async function fetchYahooOptionChain(symbol) {
-  const yahooSymbol = toYahooSymbol(symbol);
-  try {
-    const payload = await fetchJsonWithTimeout(
-      `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(yahooSymbol)}`
-    );
-    return payload?.optionChain?.result?.[0] ?? {};
-  } catch (error) {
-    return { error: formatFetchError(error, "Yahoo options 期权链接口") };
+  const failures = [];
+  for (const url of buildYahooOptionChainUrls(symbol)) {
+    try {
+      const payload = await fetchJsonWithTimeout(url);
+      return payload?.optionChain?.result?.[0] ?? {};
+    } catch (error) {
+      failures.push(formatFetchError(error, `Yahoo options ${url.hostname}`));
+    }
   }
+  return { error: failures.join("；") || "Yahoo options 期权链接口读取失败" };
 }
 
 async function fetchStockNews(symbol) {
-  const [longbridgeResult, yahooResult] = await Promise.allSettled([
+  const [longbridgeResult, yahooResult, yahooRssResult, googleRssResult] = await Promise.allSettled([
     runLongbridgeJsonWithRetry("quote", ["news", symbol, "--count", "8"], { label: `Longbridge ${symbol} 新闻` })
       .then((payload) => normalizeNewsPayload(symbol, payload)),
-    fetchYahooSearchNews(symbol, 8)
+    fetchYahooSearchNews(symbol, 8),
+    fetchYahooRssNews(symbol, 8),
+    fetchGoogleNewsRss(symbol, 8)
   ]);
   const news = [];
   const failures = [];
@@ -495,6 +502,16 @@ async function fetchStockNews(symbol) {
     news.push(...yahooResult.value);
   } else {
     failures.push(formatFetchError(yahooResult.reason, "Yahoo Finance 新闻接口"));
+  }
+  if (yahooRssResult.status === "fulfilled") {
+    news.push(...yahooRssResult.value);
+  } else {
+    failures.push(formatFetchError(yahooRssResult.reason, "Yahoo Finance RSS"));
+  }
+  if (googleRssResult.status === "fulfilled") {
+    news.push(...googleRssResult.value);
+  } else {
+    failures.push(formatFetchError(googleRssResult.reason, "Google News RSS"));
   }
   if (news.length === 0 && failures.length > 0) {
     news.push({
@@ -519,6 +536,33 @@ async function fetchYahooSearchNews(symbol, count) {
   url.searchParams.set("enableFuzzyQuery", "false");
   const payload = await fetchJsonWithTimeout(url);
   return normalizeYahooSearchNews(symbol, payload);
+}
+
+async function fetchYahooRssNews(symbol, count) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const url = new URL("https://feeds.finance.yahoo.com/rss/2.0/headline");
+  url.searchParams.set("s", yahooSymbol);
+  url.searchParams.set("region", "US");
+  url.searchParams.set("lang", "en-US");
+  const xml = await fetchTextWithTimeout(url);
+  return normalizeExternalRssNews(symbol, xml, {
+    source: "yahoo-finance-rss",
+    sourceName: "Yahoo Finance"
+  }).slice(0, count);
+}
+
+async function fetchGoogleNewsRss(symbol, count) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const url = new URL("https://news.google.com/rss/search");
+  url.searchParams.set("q", `${yahooSymbol} stock earnings valuation analyst when:14d`);
+  url.searchParams.set("hl", "en-US");
+  url.searchParams.set("gl", "US");
+  url.searchParams.set("ceid", "US:en");
+  const xml = await fetchTextWithTimeout(url);
+  return normalizeExternalRssNews(symbol, xml, {
+    source: "google-news-rss",
+    sourceName: "Google News"
+  }).slice(0, count);
 }
 
 async function fetchJsonWithTimeout(url, extraHeaders = {}) {

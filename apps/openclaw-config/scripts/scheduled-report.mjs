@@ -7,9 +7,11 @@ import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import {
+  normalizeExternalRssNews,
   mergeNewsArticles,
   normalizeYahooSearchNews,
   renderDetailedNewsLine,
+  selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
 import {
@@ -21,6 +23,7 @@ import {
   toNumber
 } from "./report-data.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
+import { assertReportQuality } from "./report-quality.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -66,6 +69,7 @@ async function prepareReport(reportKind, info) {
         ...marketData
       });
 
+  assertReportQuality(report, { kind: reportKind });
   writeFileSync(reportPath, `${report}\n`, "utf8");
   const pdfPath = writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
   updateState(info, {
@@ -106,6 +110,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   }
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
+  assertReportQuality(markdown, { kind: reportKind });
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
     : writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
@@ -291,7 +296,7 @@ function renderDataSourceSummary(data) {
     "- 本地交易数据库读取：执行报告、日报/周报记录、官方模拟盘订单生命周期。",
     "- 长桥账户读取：连通性与令牌检查、官方模拟盘资产、官方模拟盘持仓。",
     "- 长桥行情读取：QQQ 的最新价、前收、日内高低、盘前/盘后价格与时间。",
-    `- 多源资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索新闻。`,
+    `- 多源资讯读取：跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}；每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS。`,
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
     `- 长桥宏观读取：美国二星和三星宏观事件，窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天。`,
@@ -334,7 +339,7 @@ function renderDailyRoutineClassification(data) {
     "",
     "### 利好/利空/基本面影响",
     "",
-    ...data.marketNews.slice(0, 6).map(renderClassifiedNewsLine)
+    ...selectDiverseNewsArticles(data.marketNews, 6).map(renderClassifiedNewsLine)
   ].join("\n");
 }
 
@@ -779,7 +784,7 @@ function renderClassifiedNewsLine(article) {
 
 function renderMarketIntelligence(data) {
   const newsLines = data.marketNews.length > 0
-    ? data.marketNews.slice(0, 8).map(renderChineseNewsLine)
+    ? selectDiverseNewsArticles(data.marketNews, 8).map(renderChineseNewsLine)
     : ["- 本窗口没有抓取到可用新闻；报告生成会在所有新闻来源同时为空时直接报错。"];
 
   const macroLines = data.macroEvents.length > 0
@@ -927,10 +932,12 @@ async function fetchMarketNews(symbols) {
   const count = Math.max(1, Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5));
   const warnings = [];
   const batches = await Promise.all(symbols.map(async (symbol) => {
-    const [longbridgeResult, yahooResult] = await Promise.allSettled([
+    const [longbridgeResult, yahooResult, yahooRssResult, googleRssResult] = await Promise.allSettled([
       fetchRequiredLongbridgeJson("quote", ["news", symbol, "--count", String(count)], `Longbridge 新闻 ${symbol}`)
         .then((payload) => normalizeNewsPayload(symbol, payload)),
-      fetchYahooSearchNews(symbol, count)
+      fetchYahooSearchNews(symbol, count),
+      fetchYahooRssNews(symbol, count),
+      fetchGoogleNewsRss(symbol, count)
     ]);
 
     const rows = [];
@@ -943,6 +950,16 @@ async function fetchMarketNews(symbols) {
       rows.push(...yahooResult.value);
     } else {
       warnings.push(`${symbol} Yahoo Finance 新闻读取失败：${singleLine(yahooResult.reason?.message ?? yahooResult.reason, 120)}`);
+    }
+    if (yahooRssResult.status === "fulfilled") {
+      rows.push(...yahooRssResult.value);
+    } else {
+      warnings.push(`${symbol} Yahoo Finance RSS 读取失败：${singleLine(yahooRssResult.reason?.message ?? yahooRssResult.reason, 120)}`);
+    }
+    if (googleRssResult.status === "fulfilled") {
+      rows.push(...googleRssResult.value);
+    } else {
+      warnings.push(`${symbol} Google News RSS 读取失败：${singleLine(googleRssResult.reason?.message ?? googleRssResult.reason, 120)}`);
     }
     return rows;
   }));
@@ -962,6 +979,33 @@ async function fetchYahooSearchNews(symbol, count) {
   url.searchParams.set("enableFuzzyQuery", "false");
   const payload = await fetchJsonWithTimeout(url);
   return normalizeYahooSearchNews(symbol, payload);
+}
+
+async function fetchYahooRssNews(symbol, count) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const url = new URL("https://feeds.finance.yahoo.com/rss/2.0/headline");
+  url.searchParams.set("s", yahooSymbol);
+  url.searchParams.set("region", "US");
+  url.searchParams.set("lang", "en-US");
+  const xml = await fetchTextWithTimeout(url);
+  return normalizeExternalRssNews(symbol, xml, {
+    source: "yahoo-finance-rss",
+    sourceName: "Yahoo Finance"
+  }).slice(0, count);
+}
+
+async function fetchGoogleNewsRss(symbol, count) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const url = new URL("https://news.google.com/rss/search");
+  url.searchParams.set("q", `${yahooSymbol} stock OR Nasdaq 100 ETF when:7d`);
+  url.searchParams.set("hl", "en-US");
+  url.searchParams.set("gl", "US");
+  url.searchParams.set("ceid", "US:en");
+  const xml = await fetchTextWithTimeout(url);
+  return normalizeExternalRssNews(symbol, xml, {
+    source: "google-news-rss",
+    sourceName: "Google News"
+  }).slice(0, count);
 }
 
 async function fetchMacroCalendar(info) {
@@ -1123,22 +1167,42 @@ function toYahooSymbol(symbol) {
 }
 
 async function fetchJsonWithTimeout(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.REPORT_NEWS_FETCH_TIMEOUT_MS ?? 8000));
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "user-agent": "OpenClaw report read-only news fetch"
+  return JSON.parse(await fetchTextWithTimeout(url));
+}
+
+async function fetchTextWithTimeout(url) {
+  const attempts = Math.max(1, Number(process.env.REPORT_NEWS_FETCH_ATTEMPTS ?? 2));
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Number(process.env.REPORT_NEWS_FETCH_TIMEOUT_MS ?? 12000));
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/125 Safari/537.36 OpenClaw",
+          "accept": "application/rss+xml,application/json,text/xml,text/plain,*/*",
+          "accept-language": "en-US,en;q=0.9"
+        }
+      });
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
       }
-    });
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
+      return await response.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await sleep(500 * attempt);
+      }
+    } finally {
+      clearTimeout(timeout);
     }
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
   }
+  throw lastError;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatOptionalNumber(value, digits = 2) {

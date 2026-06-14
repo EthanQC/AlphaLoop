@@ -30,7 +30,7 @@ describe("report news aggregation", () => {
     expect(news.renderDetailedNewsLine(articles[0])).toContain("媒体：Simply Wall St.");
     expect(news.renderDetailedNewsLine(articles[0])).toContain("链接：https://finance.yahoo.com/news/aapl-1.html");
     expect(news.renderDetailedNewsLine(articles[0])).toContain("新建或增持苹果公司持仓");
-    expect(news.renderDetailedNewsLine(articles[0])).not.toContain("Acquires New Shares");
+    expect(news.renderDetailedNewsLine(articles[0])).toContain("原始标题：Northbridge Financial Group LLC Acquires New Shares in Apple Inc. $AAPL");
   });
 
   it("merges and ranks cross-source articles without duplicating the same link", () => {
@@ -125,7 +125,7 @@ describe("report news aggregation", () => {
     expect(line).toContain("原始标题：Wall Street’s Top Analysts Raise Apple Price Target");
   });
 
-  it("keeps original article titles when translation falls back to a generic Chinese label", () => {
+  it("turns broad market English headlines into specific Chinese labels instead of generic filler", () => {
     const line = news.renderDetailedNewsLine({
       id: "yahoo-3",
       symbol: "QQQ.US",
@@ -138,7 +138,36 @@ describe("report news aggregation", () => {
       publishedAtMs: Date.parse("2026-06-14T10:00:00.000Z")
     });
 
-    expect(line).toContain("媒体报道与纳指 100 ETF相关的公司新闻");
+    expect(line).toContain("美股下周关注美联储、利率和风险偏好变化");
+    expect(line).not.toContain("媒体报道与纳指 100 ETF相关的公司新闻");
     expect(line).toContain("原始标题：Stock Market Week Ahead: Keep Your Eyes on the Fed");
+  });
+
+  it("normalizes external RSS news into auditable source evidence", () => {
+    const articles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>Nasdaq rallies as chip demand supports AI leaders</title>
+          <link>https://www.reuters.com/markets/example</link>
+          <pubDate>Sat, 13 Jun 2026 14:30:00 GMT</pubDate>
+          <source>Reuters</source>
+          <description>Chip demand and AI capital spending supported Nasdaq leaders.</description>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0]).toMatchObject({
+      symbol: "QQQ.US",
+      source: "google-news-rss",
+      sourceName: "Google News",
+      publisher: "Reuters",
+      url: "https://www.reuters.com/markets/example"
+    });
+    expect(news.renderDetailedNewsLine(articles[0])).toContain("渠道：Google News");
+    expect(news.renderDetailedNewsLine(articles[0])).toContain("标题要点：摘要提到 AI 产品、美股风险偏好、资本开支、需求变化");
   });
 });

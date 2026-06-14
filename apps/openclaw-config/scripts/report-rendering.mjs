@@ -17,16 +17,22 @@ export function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, 
     "--no-pdf-header-footer",
     `--print-to-pdf=${pdfPath}`,
     `file://${htmlPath}`
-  ], {
-    cwd: repoRoot,
-    stdio: ["ignore", "ignore", "pipe"]
-  });
+  ], buildChromePdfExecOptions(repoRoot));
 
   if (!existsSync(pdfPath)) {
     throw new Error(`PDF 生成失败：${pdfPath}`);
   }
 
   return pdfPath;
+}
+
+export function buildChromePdfExecOptions(repoRoot) {
+  return {
+    cwd: repoRoot,
+    stdio: ["ignore", "ignore", "pipe"],
+    timeout: Number(process.env.REPORT_PDF_TIMEOUT_MS ?? 120_000),
+    killSignal: "SIGTERM"
+  };
 }
 
 function resolveChromePath() {

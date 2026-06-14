@@ -10,4 +10,13 @@ describe("report rendering", () => {
     expect(html).toContain("Noto Sans CJK SC");
     expect(html).not.toContain("Songti SC");
   });
+
+  it("limits Chrome PDF rendering time so scheduled jobs cannot hang forever", () => {
+    expect(rendering.buildChromePdfExecOptions("/repo")).toEqual({
+      cwd: "/repo",
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 120_000,
+      killSignal: "SIGTERM"
+    });
+  });
 });

@@ -3,7 +3,9 @@ import { normalizeSymbol, toNumber } from "./report-data.mjs";
 const SOURCE_NAMES = {
   "longbridge-news": "Longbridge",
   "yahoo-finance-search": "Yahoo Finance",
-  "yahoo-finance-rss": "Yahoo Finance"
+  "yahoo-finance-rss": "Yahoo Finance",
+  "google-news-rss": "Google News",
+  "bing-news-rss": "Bing News"
 };
 
 const COMPANY_NAMES = new Map([
@@ -25,6 +27,37 @@ export function normalizeYahooSearchNews(symbol, payload) {
   const rows = Array.isArray(payload?.news) ? payload.news : [];
   return rows
     .map((row) => normalizeYahooSearchArticle(symbol, row))
+    .filter(Boolean);
+}
+
+export function normalizeExternalRssNews(symbol, xml, options = {}) {
+  const source = String(options.source ?? "external-rss").trim();
+  const sourceName = String(options.sourceName ?? SOURCE_NAMES[source] ?? source).trim();
+  return Array.from(String(xml ?? "").matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/giu))
+    .map((match, index) => {
+      const item = match[1];
+      const title = xmlText(extractXmlTag(item, "title"));
+      const url = xmlText(extractXmlTag(item, "link"));
+      const publisher = xmlText(extractXmlTag(item, "source") || extractXmlTag(item, "dc:creator")) || sourceName;
+      const summary = xmlText(extractXmlTag(item, "description"));
+      const publishedAtRaw = xmlText(extractXmlTag(item, "pubDate") || extractXmlTag(item, "published"));
+      const publishedAtMs = normalizeEpochMs(publishedAtRaw);
+      if (!title || !url) {
+        return null;
+      }
+      return decorateNewsArticle({
+        id: `${source}:${url || title}:${index}`,
+        symbol,
+        title,
+        url,
+        publishedAt: new Date(publishedAtMs).toISOString(),
+        publishedAtMs,
+        publisher,
+        summary,
+        source,
+        sourceName
+      });
+    })
     .filter(Boolean);
 }
 
@@ -118,18 +151,27 @@ export function decorateNewsArticle(article) {
 export function renderDetailedNewsLine(article, formatTime = defaultFormatTime) {
   const normalized = decorateNewsArticle(article);
   const impact = summarizeNewsImpact(normalized);
-  const shouldShowOriginalTitle = !hasCjk(normalized.title)
-    && (normalized.summary || /媒体报道与/u.test(normalized.titleZh));
+  const shouldShowOriginalTitle = !hasCjk(normalized.title);
+  const titlePoint = summarizeDetailedNewsPoint(normalized);
   const pieces = [
     `- ${formatTime(normalized.publishedAt)} ${normalized.symbol || "市场"}：${normalized.titleZh}`,
     `媒体：${normalized.publisher || normalized.sourceName}`,
     `渠道：${normalized.sourceName}`,
-    normalized.summary ? `标题要点：${summarizeNewsSnippetToChinese(normalized.summary)}` : null,
+    `标题要点：${titlePoint}`,
     shouldShowOriginalTitle ? `原始标题：${normalized.title}` : null,
     `影响：${impact}`,
     normalized.url ? `链接：${normalized.url}` : `来源索引：${normalized.source}:${normalized.id}`
   ].filter(Boolean);
   return `${pieces.join("；")}。`;
+}
+
+function summarizeDetailedNewsPoint(article) {
+  const combined = `${article.summary ?? ""} ${article.title ?? ""}`.trim();
+  const firstPass = summarizeNewsSnippetToChinese(combined);
+  if (firstPass && !/英文摘要已读取|需回到原文核对具体细节/u.test(firstPass)) {
+    return firstPass;
+  }
+  return summarizeNewsSnippetToChinese(article.title);
 }
 
 export function summarizeNewsSourceBreakdown(articles) {
@@ -163,6 +205,11 @@ export function translateFinancialHeadlineToChinese(title, symbol = "") {
     return `${cleanEntity(acquirer[1])} 新建或增持${resolveCompanyName(acquirer[2], cleaned)}持仓`;
   }
 
+  const positionIncrease = cleaned.match(/^(.+?)\s+(?:Increases?|Raises?|Boosts?)\s+Position\s+in\s+(.+?)(?:\s+\$[A-Z.]+)?$/iu);
+  if (positionIncrease) {
+    return `${cleanEntity(positionIncrease[1])} 增持${resolveCompanyName(positionIncrease[2], cleaned)}持仓`;
+  }
+
   const largestPosition = cleaned.match(/^(.+?)\s+is\s+(.+?)'s\s+\d*(?:st|nd|rd|th)?\s*Largest\s+Position/iu);
   if (largestPosition) {
     return `${resolveCompanyName(largestPosition[1], cleaned)} 成为 ${cleanEntity(largestPosition[2])} 的重要持仓`;
@@ -189,6 +236,42 @@ export function translateFinancialHeadlineToChinese(title, symbol = "") {
   if (/stock performance|compared to|technology stocks/iu.test(cleaned)) {
     return `${company} 相对科技板块表现对比`;
   }
+  if (/week in review|marketbeat/iu.test(cleaned)) {
+    return "美股周度复盘和风险偏好变化";
+  }
+  if (/productive conversation|council president|president costa|officials?/iu.test(cleaned)) {
+    return "政策官员沟通和地缘风险线索";
+  }
+  if (/iphone parts factory|contaminated|pollution|farmland water/iu.test(cleaned)) {
+    return `${company}供应链环保与监管风险`;
+  }
+  if (/stock double|double to|\$\d+|5 years?/iu.test(cleaned) && /stock|shares?/iu.test(cleaned)) {
+    return `${company}长期上涨空间和估值讨论`;
+  }
+  if (/stock market week ahead|week ahead/iu.test(cleaned) && /fed|rate|rates|inflation/iu.test(cleaned)) {
+    return "美股下周关注美联储、利率和风险偏好变化";
+  }
+  if (/stock market week ahead|week ahead/iu.test(cleaned)) {
+    return "美股下周关注财报、宏观数据和板块轮动";
+  }
+  if (/nasdaq|s&p 500|dow|stocks?/iu.test(cleaned) && /rall(?:y|ies)|gains?|higher|blast off/iu.test(cleaned)) {
+    return "美股和纳指上涨，风险偏好改善";
+  }
+  if (/fed/iu.test(cleaned) && /tech.*sell-off|sell-off.*tech|sharp.*sell-off/iu.test(cleaned)) {
+    return "美联储相关利率预期引发科技板块调整讨论";
+  }
+  if (/chip|semiconductor/iu.test(cleaned) && /\bai\b|artificial intelligence/iu.test(cleaned)) {
+    return "芯片需求和 AI 资本开支支撑科技龙头";
+  }
+  if (/tokeni[sz]ed|on-chain|uniswap|crypto/iu.test(cleaned)) {
+    return "科技股代币化交易与链上化讨论";
+  }
+  if (/anthropic|claude/iu.test(cleaned)) {
+    return "Anthropic/Claude 模型访问调整影响 AI 生态线索";
+  }
+  if (/peace signals?|truce|iran|middle east/iu.test(cleaned) && /s&p|nasdaq|dow|stocks?/iu.test(cleaned)) {
+    return "美股上涨与地缘风险缓和信号";
+  }
   if (/launch|plans to launch|roll out|unveil/iu.test(cleaned)) {
     return `${company} 产品、交易机制或业务计划更新`;
   }
@@ -202,7 +285,7 @@ export function translateFinancialHeadlineToChinese(title, symbol = "") {
     return `${company} 分析师观点更新`;
   }
 
-  return `媒体报道与${company}相关的公司新闻`;
+  return `${company}新闻：${summarizeEnglishHeadlineTopics(cleaned)}`;
 }
 
 function normalizeYahooSearchArticle(symbol, row) {
@@ -318,8 +401,41 @@ function summarizeNewsSnippetToChinese(value) {
   if (/\bai\b|artificial intelligence|siri/iu.test(text)) {
     topics.push("AI 产品");
   }
+  if (/anthropic|claude/iu.test(text) && !topics.includes("AI 产品")) {
+    topics.push("AI 产品");
+  }
+  if (/stock market|stocks?|nasdaq|s&p 500|dow|week ahead|blast off|rall(?:y|ies)|higher/iu.test(text)) {
+    topics.push("美股风险偏好");
+  }
   if (/revenue|sales/iu.test(text)) {
     topics.push("收入");
+  }
+  if (/record high|all-time high|valuation|expensive|buy/iu.test(text)) {
+    topics.push("估值位置和追高风险");
+  }
+  if (/qqq|nasdaq-100|nasdaq 100|etf|expense ratio|fee|17%\s+less/iu.test(text)) {
+    topics.push("QQQ 或纳指 100 ETF");
+  }
+  if (/spacex|ipo/iu.test(text)) {
+    topics.push("SpaceX 或 IPO 曝光");
+  }
+  if (/week in review|marketbeat/iu.test(text)) {
+    topics.push("市场周度复盘");
+  }
+  if (/productive conversation|council president|president costa|officials?/iu.test(text)) {
+    topics.push("政策官员沟通");
+  }
+  if (/increases? position|raises? position|boosts? position|stake|holdings?/iu.test(text)) {
+    topics.push("机构持仓变化");
+  }
+  if (/iphone parts factory|contaminated|pollution|farmland water|factory/iu.test(text)) {
+    topics.push("供应链环保或监管风险");
+  }
+  if (/stock double|double to|\$\d+|5 years?/iu.test(text)) {
+    topics.push("长期上涨空间和估值讨论");
+  }
+  if (/capital spending|capex/iu.test(text)) {
+    topics.push("资本开支");
   }
   if (/growth|stronger|improve|boost/iu.test(text)) {
     topics.push("增长或改善");
@@ -332,8 +448,73 @@ function summarizeNewsSnippetToChinese(value) {
   }
 
   return topics.length > 0
-    ? `摘要提到${Array.from(new Set(topics)).join("、")}`
+    ? `摘要提到 ${Array.from(new Set(topics)).join("、")}`
     : "英文摘要已读取，需回到原文核对具体细节";
+}
+
+function summarizeEnglishHeadlineTopics(value) {
+  const text = String(value ?? "");
+  const topics = [];
+  if (/fed|fomc|rate|rates|yield|inflation/iu.test(text)) {
+    topics.push("利率和通胀预期");
+  }
+  if (/nasdaq|s&p|dow|stocks?|market/iu.test(text)) {
+    topics.push("美股风险偏好");
+  }
+  if (/ai|artificial intelligence|anthropic|claude|chip|semiconductor/iu.test(text)) {
+    topics.push("AI 与半导体");
+  }
+  if (/earnings|revenue|profit|guidance/iu.test(text)) {
+    topics.push("业绩和指引");
+  }
+  if (/target|analyst|upgrade|downgrade/iu.test(text)) {
+    topics.push("分析师预期");
+  }
+  if (/crypto|token|uniswap|on-chain/iu.test(text)) {
+    topics.push("加密资产和代币化交易");
+  }
+  if (/productive conversation|council president|president costa|officials?/iu.test(text)) {
+    topics.push("政策官员沟通");
+  }
+  if (/increases? position|raises? position|boosts? position|stake|holdings?/iu.test(text)) {
+    topics.push("机构持仓变化");
+  }
+  if (/iphone parts factory|contaminated|pollution|farmland water|factory/iu.test(text)) {
+    topics.push("供应链环保或监管风险");
+  }
+  if (/week in review|marketbeat/iu.test(text)) {
+    topics.push("市场周度复盘");
+  }
+  if (/stock double|double to|\$\d+|5 years?/iu.test(text)) {
+    topics.push("长期上涨空间和估值讨论");
+  }
+  if (/oil|crude|gold|dollar|currency|fx/iu.test(text)) {
+    topics.push("大宗商品或汇率");
+  }
+  return topics.length ? `${Array.from(new Set(topics)).join("、")}线索` : "事件细节待核对";
+}
+
+function extractXmlTag(xml, tagName) {
+  const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const pattern = new RegExp(`<${escaped}\\b[^>]*>([\\s\\S]*?)<\\/${escaped}>`, "iu");
+  return String(xml ?? "").match(pattern)?.[1] ?? "";
+}
+
+function xmlText(value) {
+  return decodeXmlEntities(String(value ?? "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gu, "$1")
+    .replace(/<[^>]+>/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim());
+}
+
+function decodeXmlEntities(value) {
+  return String(value ?? "")
+    .replace(/&amp;/gu, "&")
+    .replace(/&lt;/gu, "<")
+    .replace(/&gt;/gu, ">")
+    .replace(/&quot;/gu, "\"")
+    .replace(/&#39;|&apos;/gu, "'");
 }
 
 function resolveCompanyName(symbolOrName, text = "") {
