@@ -15,12 +15,12 @@ import {
 import {
   assertOfficialPaperReportEnvironment,
   buildTrackedSymbols,
-  normalizeMacroCalendarPayload,
   normalizeNewsPayload,
   normalizeOfficialPaperSnapshot,
   normalizeQuotePayload,
   toNumber
 } from "./report-data.mjs";
+import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -295,6 +295,7 @@ function renderDataSourceSummary(data) {
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
     `- 长桥宏观读取：美国二星和三星宏观事件，窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天。`,
+    ...(data.macroWarnings?.length ? [`- 宏观日历降级：${data.macroWarnings.join("；")}。`] : []),
     `- 本次证据：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌状态 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；新闻 ${data.sourceEvidence.newsCount} 条；宏观事件 ${data.sourceEvidence.macroEventsCount} 条；${formatQuoteTimestamp(data.qqqQuote)}。`
   ].join("\n");
 }
@@ -884,11 +885,12 @@ async function fetchRequiredReportMarketData(info) {
     officialPaperSnapshot.positions,
     splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
   ).slice(0, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
-  const [marketNewsResult, macroEvents] = await Promise.all([
+  const [marketNewsResult, macroCalendarResult] = await Promise.all([
     fetchMarketNews(trackedSymbols),
     fetchMacroCalendar(info)
   ]);
   const marketNews = marketNewsResult.articles;
+  const macroEvents = macroCalendarResult.entries;
 
   return {
     officialPaperSnapshot,
@@ -897,6 +899,7 @@ async function fetchRequiredReportMarketData(info) {
     marketNews,
     newsWarnings: marketNewsResult.warnings,
     macroEvents,
+    macroWarnings: macroCalendarResult.warnings,
     sourceEvidence: {
       fetchedAt,
       accountMode: officialPaperSnapshot.accountMode,
@@ -909,6 +912,7 @@ async function fetchRequiredReportMarketData(info) {
       newsSourceBreakdown: summarizeNewsSourceBreakdown(marketNews),
       newsWarnings: marketNewsResult.warnings,
       macroEventsCount: macroEvents.length,
+      macroWarnings: macroCalendarResult.warnings,
       quoteSymbol: qqqQuote.symbol ?? "QQQ.US",
       quoteTimestamp: qqqQuote.timestamp ?? qqqQuote.post_market_quote?.timestamp ?? qqqQuote.pre_market_quote?.timestamp ?? null
     }
@@ -979,11 +983,7 @@ async function fetchMacroCalendar(info) {
     "--count",
     String(Number(process.env.REPORT_MACRO_COUNT ?? 20))
   ], "Longbridge 美国宏观日历");
-  const entries = normalizeMacroCalendarPayload(payload);
-  if (entries.length === 0) {
-    throw new Error("Longbridge 美国宏观日历返回为空；报告需要至少一条已验证宏观事件。");
-  }
-  return entries;
+  return normalizeReportMacroCalendarPayload(payload);
 }
 
 function formatQuoteTimestamp(quote) {

@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 const schedule = await import("./trading-schedule.mjs");
 
 describe("trading schedule policy", () => {
-  it("delivers daily reports only Tuesday through Friday at 20:00 Asia/Shanghai", () => {
+  it("delivers daily reports Tuesday through Saturday at 20:00 Asia/Shanghai for each US trading day", () => {
     expect(schedule.shouldRunReportDelivery("daily", new Date("2026-06-02T12:00:00.000Z"))).toBe(true);
+    expect(schedule.shouldRunReportDelivery("daily", new Date("2026-06-06T12:00:00.000Z"))).toBe(true);
     expect(schedule.shouldRunReportDelivery("daily", new Date("2026-06-01T12:00:00.000Z"))).toBe(false);
     expect(schedule.shouldRunReportDelivery("daily", new Date("2026-06-02T11:59:00.000Z"))).toBe(false);
   });

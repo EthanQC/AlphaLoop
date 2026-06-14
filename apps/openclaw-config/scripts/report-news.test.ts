@@ -74,4 +74,71 @@ describe("report news aggregation", () => {
     });
     expect(merged[1].sourceEvidence).toEqual(["longbridge-news", "yahoo-finance-search"]);
   });
+
+  it("keeps non-Longbridge articles visible when rendering a short stock-analysis news list", () => {
+    const articles = news.selectDiverseNewsArticles([
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: `lb-${index}`,
+        symbol: "AAPL.US",
+        title: `Longbridge Apple market update ${index}`,
+        url: `https://longbridge.com/news/${index}`,
+        publishedAt: new Date(Date.UTC(2026, 5, 14, 16, index)).toISOString(),
+        publishedAtMs: Date.UTC(2026, 5, 14, 16, index),
+        source: "longbridge-news",
+        publisher: "Longbridge"
+      })),
+      {
+        id: "yahoo-important",
+        symbol: "AAPL.US",
+        title: "Apple’s Agentic AI Plans Could Be Its Biggest Growth Story Yet",
+        summary: "Analysts said new AI features could support future services revenue.",
+        url: "https://finance.yahoo.com/news/aapl-ai.html",
+        publishedAt: "2026-06-13T12:00:00.000Z",
+        publishedAtMs: Date.parse("2026-06-13T12:00:00.000Z"),
+        source: "yahoo-finance-search",
+        sourceName: "Yahoo Finance",
+        publisher: "Benzinga"
+      }
+    ], 6);
+
+    expect(articles).toHaveLength(6);
+    expect(articles.some((article) => article.source === "yahoo-finance-search")).toBe(true);
+    expect(articles.filter((article) => article.source === "longbridge-news")).toHaveLength(5);
+  });
+
+  it("renders detailed Chinese news lines with article identity and available snippets", () => {
+    const line = news.renderDetailedNewsLine({
+      id: "yahoo-2",
+      symbol: "AAPL.US",
+      title: "Wall Street’s Top Analysts Raise Apple Price Target",
+      summary: "Analysts cited stronger iPhone demand and services growth.",
+      publisher: "The Motley Fool",
+      source: "yahoo-finance-search",
+      sourceName: "Yahoo Finance",
+      url: "https://finance.yahoo.com/news/aapl-target.html",
+      publishedAt: "2026-06-14T10:00:00.000Z",
+      publishedAtMs: Date.parse("2026-06-14T10:00:00.000Z")
+    });
+
+    expect(line).toContain("华尔街分析师上调苹果公司目标价");
+    expect(line).toContain("标题要点：分析师提到 iPhone 需求和服务业务增长");
+    expect(line).toContain("原始标题：Wall Street’s Top Analysts Raise Apple Price Target");
+  });
+
+  it("keeps original article titles when translation falls back to a generic Chinese label", () => {
+    const line = news.renderDetailedNewsLine({
+      id: "yahoo-3",
+      symbol: "QQQ.US",
+      title: "Stock Market Week Ahead: Keep Your Eyes on the Fed",
+      publisher: "Investor's Business Daily",
+      source: "yahoo-finance-search",
+      sourceName: "Yahoo Finance",
+      url: "https://finance.yahoo.com/news/stock-market-week-ahead.html",
+      publishedAt: "2026-06-14T10:00:00.000Z",
+      publishedAtMs: Date.parse("2026-06-14T10:00:00.000Z")
+    });
+
+    expect(line).toContain("媒体报道与纳指 100 ETF相关的公司新闻");
+    expect(line).toContain("原始标题：Stock Market Week Ahead: Keep Your Eyes on the Fed");
+  });
 });

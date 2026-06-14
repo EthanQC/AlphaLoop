@@ -14,7 +14,9 @@ import { normalizeNewsPayload, normalizeQuotePayload, normalizeSymbol, toNumber 
 import {
   mergeNewsArticles,
   normalizeYahooSearchNews,
-  renderDetailedNewsLine
+  renderDetailedNewsLine,
+  selectDiverseNewsArticles,
+  summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
@@ -186,7 +188,7 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
     historyStats,
     optionStats
   });
-  const newsTitles = news.slice(0, 6).map((entry) => entry.titleZh ?? entry.title).join("；");
+  const newsTitles = selectDiverseNewsArticles(news, 6).map((entry) => entry.titleZh ?? entry.title).join("；");
   const nextMonthlyExpiry = nextUsMonthlyOptionExpiry(new Date());
   const trendBias = historyStats.trendScore;
   const bullishProbability = Math.round(Math.min(60, Math.max(20, 35 + (pct ?? 0) + trendBias)));
@@ -272,13 +274,25 @@ function renderBatchStockAnalysis({ label, generatedAt, records }) {
       lines.push("");
     }
     lines.push("### 近期新闻", "");
-    for (const entry of record.news.slice(0, 6)) {
+    const visibleNews = selectDiverseNewsArticles(record.news, 6);
+    lines.push(`- 来源分布：${summarizeNewsSourceBreakdown(record.news)}。`);
+    if (!visibleNews.some(hasNonLongbridgeNewsSource)) {
+      lines.push("- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。");
+    }
+    for (const entry of visibleNews) {
       lines.push(renderDetailedNewsLine(entry, formatShanghaiTime));
     }
     lines.push("");
   }
 
   return lines.join("\n").trimEnd();
+}
+
+function hasNonLongbridgeNewsSource(article) {
+  const sources = Array.isArray(article?.sourceEvidence)
+    ? article.sourceEvidence
+    : [article?.source];
+  return sources.some((source) => source && source !== "longbridge-news");
 }
 
 function sectionValues(analysis, title) {

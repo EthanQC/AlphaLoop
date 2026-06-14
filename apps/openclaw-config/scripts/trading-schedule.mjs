@@ -33,7 +33,7 @@ export function shouldRunReportDelivery(kind, date = new Date()) {
   }
 
   if (kind === "daily") {
-    return parts.weekday >= 2 && parts.weekday <= 5;
+    return parts.weekday >= 2 && parts.weekday <= 6;
   }
 
   if (kind === "weekly") {

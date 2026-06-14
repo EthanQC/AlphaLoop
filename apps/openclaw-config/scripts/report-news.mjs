@@ -62,11 +62,38 @@ export function mergeNewsArticles(articles) {
     .sort((left, right) => (right.publishedAtMs ?? 0) - (left.publishedAtMs ?? 0));
 }
 
+export function selectDiverseNewsArticles(articles, limit = 6) {
+  const max = Math.max(0, Number(limit) || 0);
+  if (max === 0) {
+    return [];
+  }
+
+  const ranked = mergeNewsArticles(Array.isArray(articles) ? articles : []);
+  const selected = ranked.slice(0, max);
+  if (selected.length === 0 || selected.some(hasNonLongbridgeEvidence)) {
+    return selected;
+  }
+
+  const externalCandidate = ranked.find(hasNonLongbridgeEvidence);
+  if (!externalCandidate) {
+    return selected;
+  }
+
+  const externalKey = newsIdentity(externalCandidate);
+  const withoutDuplicate = selected.filter((article) => newsIdentity(article) !== externalKey);
+  const replacementIndex = withoutDuplicate.length >= max ? withoutDuplicate.length - 1 : withoutDuplicate.length;
+  withoutDuplicate.splice(replacementIndex, withoutDuplicate.length >= max ? 1 : 0, externalCandidate);
+  return withoutDuplicate
+    .slice(0, max)
+    .sort((left, right) => (right.publishedAtMs ?? 0) - (left.publishedAtMs ?? 0));
+}
+
 export function decorateNewsArticle(article) {
   const source = String(article?.source ?? "unknown-news").trim() || "unknown-news";
   const sourceName = article?.sourceName ?? SOURCE_NAMES[source] ?? source;
   const publisher = String(article?.publisher ?? article?.provider ?? article?.media ?? sourceName).trim();
   const title = singleLine(article?.title, 360);
+  const summary = singleLine(article?.summary ?? article?.description ?? article?.contentSnippet ?? article?.content, 420);
   const publishedAtMs = Number.isFinite(article?.publishedAtMs)
     ? article.publishedAtMs
     : normalizeEpochMs(article?.publishedAt ?? article?.providerPublishTime ?? article?.time);
@@ -76,6 +103,7 @@ export function decorateNewsArticle(article) {
     id: String(article?.id ?? article?.uuid ?? article?.url ?? title).trim(),
     symbol: normalizeSymbol(article?.symbol),
     title,
+    summary,
     titleZh: article?.titleZh ?? translateFinancialHeadlineToChinese(title, article?.symbol),
     source,
     sourceName,
@@ -90,13 +118,17 @@ export function decorateNewsArticle(article) {
 export function renderDetailedNewsLine(article, formatTime = defaultFormatTime) {
   const normalized = decorateNewsArticle(article);
   const impact = summarizeNewsImpact(normalized);
+  const shouldShowOriginalTitle = !hasCjk(normalized.title)
+    && (normalized.summary || /媒体报道与/u.test(normalized.titleZh));
   const pieces = [
     `- ${formatTime(normalized.publishedAt)} ${normalized.symbol || "市场"}：${normalized.titleZh}`,
     `媒体：${normalized.publisher || normalized.sourceName}`,
     `渠道：${normalized.sourceName}`,
+    normalized.summary ? `标题要点：${summarizeNewsSnippetToChinese(normalized.summary)}` : null,
+    shouldShowOriginalTitle ? `原始标题：${normalized.title}` : null,
     `影响：${impact}`,
     normalized.url ? `链接：${normalized.url}` : `来源索引：${normalized.source}:${normalized.id}`
-  ];
+  ].filter(Boolean);
   return `${pieces.join("；")}。`;
 }
 
@@ -191,6 +223,7 @@ function normalizeYahooSearchArticle(symbol, row) {
     publishedAt: new Date(publishedAtMs).toISOString(),
     publishedAtMs,
     publisher: String(row.publisher ?? "Yahoo Finance").trim(),
+    summary: singleLine(row.summary ?? row.description ?? "", 420),
     source: "yahoo-finance-search",
     sourceName: "Yahoo Finance",
     relatedTickers: Array.isArray(row.relatedTickers) ? row.relatedTickers.map(String) : []
@@ -225,6 +258,10 @@ function collectSourceEvidence(article) {
   ].filter(Boolean)));
 }
 
+function hasNonLongbridgeEvidence(article) {
+  return collectSourceEvidence(article).some((source) => source !== "longbridge-news");
+}
+
 function newsIdentity(article) {
   if (article.url) {
     return `url:${article.url.toLowerCase()}`;
@@ -253,6 +290,50 @@ function summarizeNewsImpact(article) {
     return "偏谨慎，观察是否扩散为基本面或行业风险";
   }
   return "作为新闻线索纳入观察，先不直接提高仓位";
+}
+
+function summarizeNewsSnippetToChinese(value) {
+  const text = singleLine(value, 220);
+  if (!text || hasCjk(text)) {
+    return text;
+  }
+
+  if (/analysts?\s+cited\s+stronger\s+iphone\s+demand\s+and\s+services\s+growth/iu.test(text)) {
+    return "分析师提到 iPhone 需求和服务业务增长";
+  }
+  if (/analysts?\s+said.+ai.+support.+services\s+revenue/iu.test(text)) {
+    return "分析师认为新的 AI 功能可能支撑未来服务收入";
+  }
+
+  const topics = [];
+  if (/analyst|wall street/iu.test(text)) {
+    topics.push("分析师观点");
+  }
+  if (/iphone/iu.test(text)) {
+    topics.push("iPhone 需求");
+  }
+  if (/services?/iu.test(text)) {
+    topics.push("服务业务");
+  }
+  if (/\bai\b|artificial intelligence|siri/iu.test(text)) {
+    topics.push("AI 产品");
+  }
+  if (/revenue|sales/iu.test(text)) {
+    topics.push("收入");
+  }
+  if (/growth|stronger|improve|boost/iu.test(text)) {
+    topics.push("增长或改善");
+  }
+  if (/demand/iu.test(text) && !topics.includes("iPhone 需求")) {
+    topics.push("需求变化");
+  }
+  if (/price target|target price/iu.test(text)) {
+    topics.push("目标价变化");
+  }
+
+  return topics.length > 0
+    ? `摘要提到${Array.from(new Set(topics)).join("、")}`
+    : "英文摘要已读取，需回到原文核对具体细节";
 }
 
 function resolveCompanyName(symbolOrName, text = "") {

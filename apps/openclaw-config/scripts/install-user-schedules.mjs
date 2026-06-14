@@ -22,12 +22,12 @@ const jobs = [
   {
     label: "com.openclaw.trading.report.daily.prepare",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily prepare`,
-    schedule: [2, 3, 4, 5].map((Weekday) => ({ Weekday, Hour: 19, Minute: 45 }))
+    schedule: [2, 3, 4, 5, 6].map((Weekday) => ({ Weekday, Hour: 19, Minute: 45 }))
   },
   {
     label: "com.openclaw.trading.report.daily.deliver",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily deliver`,
-    schedule: [2, 3, 4, 5].map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
+    schedule: [2, 3, 4, 5, 6].map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
   },
   {
     label: "com.openclaw.trading.report.weekly.prepare",
