@@ -6,6 +6,17 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
+import { buildCronFailureAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
+import {
+  normalizeRunnerState,
+  recordFailureAlerted,
+  recordRunResult,
+  serializeRunnerState,
+  shouldAlertFailure,
+  shouldAttemptRun
+} from "./openclaw-cron-runner-state.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const port = Number(process.env.OPENCLAW_CRON_RUNNER_PORT ?? 18792);
 const host = "127.0.0.1";
@@ -14,7 +25,10 @@ const processedRunsPath = join(runtimeDir, "processed-runs.json");
 const openclawCronDir = process.env.OPENCLAW_CRON_DIR ?? join(homedir(), ".openclaw", "cron");
 const pollMs = Number(process.env.OPENCLAW_CRON_RUNNER_POLL_MS ?? 5000);
 const pnpmBin = process.env.PNPM_BIN ?? "pnpm";
+const retryBaseMs = Number(process.env.OPENCLAW_CRON_RUNNER_RETRY_BASE_MS ?? 60_000);
+const retryMaxMs = Number(process.env.OPENCLAW_CRON_RUNNER_RETRY_MAX_MS ?? 30 * 60_000);
 mkdirSync(runtimeDir, { recursive: true });
+loadLocalEnv(repoRoot);
 
 const allowedJobs = {
   "/run/daily": { name: "daily", command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
@@ -27,7 +41,7 @@ const cronJobNames = {
   "openclaw-trading-weekly-report": allowedJobs["/run/weekly"],
   "openclaw-trading-stock-analysis": allowedJobs["/run/stock-analysis"]
 };
-const processedRunKeys = loadProcessedRunKeys();
+let runnerState = loadRunnerState();
 const inFlightRunKeys = new Set();
 
 if (!existsSync(processedRunsPath)) {
@@ -84,22 +98,38 @@ async function pollOpenClawRunLogs() {
         continue;
       }
       const runKey = buildOpenClawRunKey(runEntry);
-      if (processedRunKeys.has(runKey) || inFlightRunKeys.has(runKey)) {
+      if (!shouldAttemptRun(runnerState, runKey) || inFlightRunKeys.has(runKey)) {
         continue;
       }
       inFlightRunKeys.add(runKey);
       try {
-        await runAllowedJob(entry.job, {
+        const result = await runAllowedJob(entry.job, {
           trigger: "openclaw-cron-run-log",
           openclawJobId: entry.id,
           openclawJobName: entry.name,
           openclawRunId: runEntry.runId ?? null,
           openclawRunAtMs: runEntry.runAtMs ?? null
         });
+        runnerState = recordRunResult(runnerState, runKey, result, Date.now(), { retryBaseMs, retryMaxMs });
+        saveRunnerState();
+        if (!result.ok && shouldAlertFailure(runnerState, runKey)) {
+          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey])
+            .then(() => {
+              runnerState = recordFailureAlerted(runnerState, runKey);
+              saveRunnerState();
+            })
+            .catch((error) => {
+              console.error(JSON.stringify({
+                ok: false,
+                service: "openclaw-cron-runner",
+                action: "failure-alert",
+                job: result.job,
+                error: String(error?.message ?? error)
+              }));
+            });
+        }
       } finally {
         inFlightRunKeys.delete(runKey);
-        processedRunKeys.add(runKey);
-        saveProcessedRunKeys();
       }
     }
   }
@@ -132,6 +162,7 @@ async function runAllowedJob(job, context = {}) {
 
   const stdout = Buffer.concat(chunks.stdout).toString("utf8");
   const stderr = Buffer.concat(chunks.stderr).toString("utf8");
+  const resultPath = join(runtimeDir, `${Date.now()}-${job.name}.json`);
   const result = {
     ok: !exit.error && exit.code === 0,
     job: job.name,
@@ -146,20 +177,26 @@ async function runAllowedJob(job, context = {}) {
     code: exit.code,
     signal: exit.signal,
     error: exit.error ? String(exit.error?.message ?? exit.error) : null,
+    resultPath,
     stdoutTail: tail(stdout),
     stderrTail: tail(stderr)
   };
-  writeFileSync(join(runtimeDir, `${Date.now()}-${job.name}.json`), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
   return result;
 }
 
 function seedExistingOpenClawRuns() {
+  const keys = new Set(runnerState.processedRunKeys);
   for (const entry of readManagedCronJobs()) {
     for (const runEntry of readCronRunEntries(entry.id)) {
-      processedRunKeys.add(buildOpenClawRunKey(runEntry));
+      keys.add(buildOpenClawRunKey(runEntry));
     }
   }
-  saveProcessedRunKeys();
+  runnerState = normalizeRunnerState({
+    ...runnerState,
+    processedRunKeys: Array.from(keys)
+  });
+  saveRunnerState();
 }
 
 function readManagedCronJobs() {
@@ -203,14 +240,27 @@ function buildOpenClawRunKey(entry) {
   ].join(":");
 }
 
-function loadProcessedRunKeys() {
-  const data = readJsonFile(processedRunsPath, { processedRunKeys: [] });
-  return new Set(Array.isArray(data.processedRunKeys) ? data.processedRunKeys.map(String) : []);
+function loadRunnerState() {
+  return normalizeRunnerState(readJsonFile(processedRunsPath, { processedRunKeys: [] }));
 }
 
-function saveProcessedRunKeys() {
-  const values = Array.from(processedRunKeys).slice(-1000);
-  writeFileSync(processedRunsPath, `${JSON.stringify({ processedRunKeys: values }, null, 2)}\n`, "utf8");
+function saveRunnerState() {
+  writeFileSync(processedRunsPath, `${JSON.stringify(serializeRunnerState(runnerState), null, 2)}\n`, "utf8");
+}
+
+async function sendCronFailureAlert(result, attempt) {
+  if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
+    return;
+  }
+  const markdown = buildCronFailureAlertMarkdown(result, attempt);
+  const delivery = await deliverReportToFeishu({
+    title: `OpenClaw 自动报告失败告警：${result.job}`,
+    markdown,
+    maxSectionChars: 3600
+  });
+  if (!delivery.sent) {
+    throw new Error(delivery.reason ?? "Failure alert was not sent.");
+  }
 }
 
 function readJsonFile(path, fallback) {

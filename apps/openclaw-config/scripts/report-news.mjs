@@ -168,10 +168,10 @@ export function renderDetailedNewsLine(article, formatTime = defaultFormatTime) 
 function summarizeDetailedNewsPoint(article) {
   const combined = `${article.summary ?? ""} ${article.title ?? ""}`.trim();
   const firstPass = summarizeNewsSnippetToChinese(combined);
-  if (firstPass && !/英文摘要已读取|需回到原文核对具体细节/u.test(firstPass)) {
+  if (firstPass && !/英文摘要已读取|需回到原文核对具体细节|英文来源摘要未提供可抽取细节/u.test(firstPass)) {
     return firstPass;
   }
-  return summarizeNewsSnippetToChinese(article.title);
+  return summarizeNewsSnippetToChinese(article.title) || firstPass;
 }
 
 export function summarizeNewsSourceBreakdown(articles) {
@@ -230,7 +230,7 @@ export function translateFinancialHeadlineToChinese(title, symbol = "") {
   if (/earnings|revenue|profit|guidance/iu.test(cleaned)) {
     return `${company} 业绩、收入或指引相关更新`;
   }
-  if (/agentic ai|artificial intelligence|system-level ai|siri|ai\b/iu.test(cleaned)) {
+  if (/agentic ai|artificial intelligence|system-level ai|siri|\bai\b/iu.test(cleaned)) {
     return `${company} 人工智能产品与增长叙事更新`;
   }
   if (/stock performance|compared to|technology stocks/iu.test(cleaned)) {
@@ -449,7 +449,7 @@ function summarizeNewsSnippetToChinese(value) {
 
   return topics.length > 0
     ? `摘要提到 ${Array.from(new Set(topics)).join("、")}`
-    : "英文摘要已读取，需回到原文核对具体细节";
+    : `英文来源摘要未提供可抽取细节；标题关键词：${extractEnglishKeywords(text).join("、") || "待人工复核"}`;
 }
 
 function summarizeEnglishHeadlineTopics(value) {
@@ -461,7 +461,7 @@ function summarizeEnglishHeadlineTopics(value) {
   if (/nasdaq|s&p|dow|stocks?|market/iu.test(text)) {
     topics.push("美股风险偏好");
   }
-  if (/ai|artificial intelligence|anthropic|claude|chip|semiconductor/iu.test(text)) {
+  if (/\bai\b|artificial intelligence|anthropic|claude|chip|semiconductor/iu.test(text)) {
     topics.push("AI 与半导体");
   }
   if (/earnings|revenue|profit|guidance/iu.test(text)) {
@@ -491,7 +491,43 @@ function summarizeEnglishHeadlineTopics(value) {
   if (/oil|crude|gold|dollar|currency|fx/iu.test(text)) {
     topics.push("大宗商品或汇率");
   }
-  return topics.length ? `${Array.from(new Set(topics)).join("、")}线索` : "事件细节待核对";
+  return topics.length ? `${Array.from(new Set(topics)).join("、")}线索` : `英文新闻线索，关键词：${extractEnglishKeywords(text).join("、") || "待人工复核"}`;
+}
+
+function extractEnglishKeywords(value) {
+  const stopWords = new Set([
+    "after",
+    "again",
+    "articles",
+    "could",
+    "color",
+    "font",
+    "from",
+    "google",
+    "href",
+    "html",
+    "http",
+    "https",
+    "into",
+    "news",
+    "rss",
+    "said",
+    "says",
+    "that",
+    "the",
+    "their",
+    "this",
+    "will",
+    "with"
+  ]);
+  const cleaned = String(value ?? "")
+    .replace(/https?:\/\/\S+/giu, " ")
+    .replace(/\b(?:href|src|color|style|class|target|rel)=["']?[^"'\s>]+/giu, " ")
+    .replace(/&[a-z0-9#]+;/giu, " ");
+  return Array.from(cleaned.toLowerCase().matchAll(/\b[a-z][a-z-]{3,}\b/gu))
+    .map((match) => match[0])
+    .filter((word) => !stopWords.has(word))
+    .slice(0, 4);
 }
 
 function extractXmlTag(xml, tagName) {

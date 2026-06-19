@@ -16,6 +16,8 @@ import {
 } from "./report-news.mjs";
 import {
   assertOfficialPaperReportEnvironment,
+  buildDegradedOfficialPaperSnapshot,
+  buildDegradedQuoteSnapshot,
   buildTrackedSymbols,
   normalizeNewsPayload,
   normalizeOfficialPaperSnapshot,
@@ -71,7 +73,7 @@ async function prepareReport(reportKind, info) {
 
   assertReportQuality(report, { kind: reportKind });
   writeFileSync(reportPath, `${report}\n`, "utf8");
-  const pdfPath = writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
+  const pdfPath = await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
   updateState(info, {
     preparedAt: new Date().toISOString(),
     path: reportPath,
@@ -113,7 +115,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   assertReportQuality(markdown, { kind: reportKind });
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
-    : writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
+    : await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
   const result = await deliverReportToFeishu({
     title: `${titlePrefix} ${info.label}`,
     markdown,
@@ -321,6 +323,7 @@ function renderDataSourceSummary(data) {
     `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥 QQQ 行情、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}。`,
     `- 新闻检索：每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS；本次共读取 ${data.marketNews.length} 条。`,
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
+    ...(data.longbridgeWarnings?.length ? [`- 长桥降级：${data.longbridgeWarnings.join("；")}；报告继续生成，但任何新增动作必须人工复核。`] : []),
     ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
     `- 宏观与行情：美国二星/三星宏观事件窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天；${formatQuoteTimestamp(data.qqqQuote)}。`,
     ...(data.macroWarnings?.length ? [`- 宏观日历降级：${data.macroWarnings.join("；")}。`] : []),
@@ -608,6 +611,9 @@ function summarizeOfficialPositions(rows) {
 }
 
 function summarizeOfficialAccount(snapshot) {
+  if (snapshot.degraded) {
+    return `官方模拟盘读取降级：${snapshot.degradedReason ?? "原因未返回"}；本报告不据此提出新增仓位`;
+  }
   const asset = snapshot.primaryAsset ?? {};
   const netAssets = formatOptionalNumber(toNumber(asset.net_assets ?? asset.netAssets));
   const cash = formatOptionalNumber(toNumber(asset.total_cash ?? asset.totalCash));
@@ -838,6 +844,14 @@ function renderMarketIntelligence(data) {
 }
 
 function renderOfficialPaperSnapshot(snapshot) {
+  if (snapshot.degraded) {
+    return [
+      `- 来源：${translateDataSource(snapshot.source)}；账户模式：${translateAccountMode(snapshot.accountMode)}；抓取时间：${formatReportDateTime(snapshot.fetchedAt)}`,
+      `- 状态：读取降级；原因：${snapshot.degradedReason ?? "原因未返回"}`,
+      "- 净资产/现金/购买力：本次不可用，禁止据此扩大模拟盘仓位。",
+      "- 当前长桥官方模拟盘持仓：本次不可核验；以最近成功报告和人工复核为准。"
+    ].join("\n");
+  }
   const asset = snapshot.primaryAsset ?? {};
   const header = [
     `- 来源：${translateDataSource(snapshot.source)}；账户模式：${translateAccountMode(snapshot.accountMode)}；抓取时间：${formatReportDateTime(snapshot.fetchedAt)}`,
@@ -860,6 +874,14 @@ function renderOfficialPaperSnapshot(snapshot) {
 }
 
 function renderQqqSection(quote) {
+  if (quote?.degraded) {
+    return [
+      `- 标的：${quote.symbol ?? "QQQ.US"}`,
+      `- 状态：行情读取降级；原因：${quote.degradedReason ?? "原因未返回"}`,
+      `- 时间：${formatReportDateTime(quote.timestamp)}`,
+      "- 操作含义：不能用本次行情判断突破或加仓，只保留新闻/宏观观察。"
+    ].join("\n");
+  }
   const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
   const prevClose = toNumber(quote.prev_close ?? quote.prevClose);
   const open = toNumber(quote.open);
@@ -905,14 +927,25 @@ function selectExecutionReports(db, info) {
 
 async function fetchRequiredReportMarketData(info) {
   const fetchedAt = new Date().toISOString();
-  const check = await fetchRequiredLongbridgeJson("trade", ["check"], "Longbridge 连通性/令牌检查");
-  const [assets, positions, quotePayload] = await Promise.all([
+  const longbridgeWarnings = [];
+  const [checkResult, assetsResult, positionsResult, quoteResult] = await Promise.allSettled([
+    fetchRequiredLongbridgeJson("trade", ["check"], "Longbridge 连通性/令牌检查"),
     fetchRequiredLongbridgeJson("trade", ["assets"], "Longbridge 官方模拟盘资产"),
     fetchRequiredLongbridgeJson("trade", ["positions"], "Longbridge 官方模拟盘持仓"),
     fetchRequiredLongbridgeJson("quote", ["quote", "QQQ.US"], "Longbridge QQQ 行情")
   ]);
-  const officialPaperSnapshot = normalizeOfficialPaperSnapshot({ check, assets, positions, fetchedAt });
-  const qqqQuote = normalizeQuotePayload(quotePayload, "QQQ.US");
+  const officialPaperSnapshot = buildOfficialPaperSnapshotFromSettled({
+    checkResult,
+    assetsResult,
+    positionsResult,
+    fetchedAt,
+    warnings: longbridgeWarnings
+  });
+  const qqqQuote = buildQqqQuoteFromSettled({
+    quoteResult,
+    fetchedAt,
+    warnings: longbridgeWarnings
+  });
   const trackedSymbols = buildTrackedSymbols(
     officialPaperSnapshot.positions,
     splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
@@ -930,6 +963,7 @@ async function fetchRequiredReportMarketData(info) {
     trackedSymbols,
     marketNews,
     newsWarnings: marketNewsResult.warnings,
+    longbridgeWarnings,
     macroEvents,
     macroWarnings: macroCalendarResult.warnings,
     sourceEvidence: {
@@ -943,6 +977,7 @@ async function fetchRequiredReportMarketData(info) {
       newsCount: marketNews.length,
       newsSourceBreakdown: summarizeNewsSourceBreakdown(marketNews),
       newsWarnings: marketNewsResult.warnings,
+      longbridgeWarnings,
       macroEventsCount: macroEvents.length,
       macroWarnings: macroCalendarResult.warnings,
       quoteSymbol: qqqQuote.symbol ?? "QQQ.US",
@@ -953,6 +988,57 @@ async function fetchRequiredReportMarketData(info) {
 
 async function fetchRequiredLongbridgeJson(category, args, label) {
   return runLongbridgeJsonWithRetry(category, args, { label });
+}
+
+function buildOfficialPaperSnapshotFromSettled({ checkResult, assetsResult, positionsResult, fetchedAt, warnings }) {
+  const failures = [
+    settledFailureLabel(checkResult, "连通性/令牌"),
+    settledFailureLabel(assetsResult, "资产"),
+    settledFailureLabel(positionsResult, "持仓")
+  ].filter(Boolean);
+  if (failures.length > 0) {
+    warnings.push(`官方模拟盘读取降级：${failures.join("；")}`);
+    return buildDegradedOfficialPaperSnapshot({
+      fetchedAt,
+      reason: failures.join("；")
+    });
+  }
+
+  try {
+    return normalizeOfficialPaperSnapshot({
+      check: checkResult.value,
+      assets: assetsResult.value,
+      positions: positionsResult.value,
+      fetchedAt
+    });
+  } catch (error) {
+    const reason = singleLine(error?.message ?? error, 180);
+    warnings.push(`官方模拟盘格式降级：${reason}`);
+    return buildDegradedOfficialPaperSnapshot({ fetchedAt, reason });
+  }
+}
+
+function buildQqqQuoteFromSettled({ quoteResult, fetchedAt, warnings }) {
+  if (quoteResult.status === "rejected") {
+    const reason = singleLine(quoteResult.reason?.message ?? quoteResult.reason, 180);
+    warnings.push(`QQQ 行情读取降级：${reason}`);
+    return buildDegradedQuoteSnapshot("QQQ.US", { fetchedAt, reason });
+  }
+
+  try {
+    return normalizeQuotePayload(quoteResult.value, "QQQ.US");
+  } catch (error) {
+    const reason = singleLine(error?.message ?? error, 180);
+    warnings.push(`QQQ 行情格式降级：${reason}`);
+    return buildDegradedQuoteSnapshot("QQQ.US", { fetchedAt, reason });
+  }
+}
+
+function settledFailureLabel(result, label) {
+  if (result.status !== "rejected") {
+    return "";
+  }
+  return `${label}失败：${singleLine(result.reason?.message ?? result.reason, 140)}`;
 }
 
 async function fetchMarketNews(symbols) {

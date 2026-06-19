@@ -79,7 +79,7 @@ async function sendPnlReport(forceRun = false) {
   const markdownPath = join(reportsDir, `${label}-post-open.md`);
   const pdfPath = join(reportsDir, `${label}-post-open.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
-  writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
+  await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
   const delivery = await deliverReportToFeishu({
     title: `OpenClaw 模拟盘收支变化 ${label}`,

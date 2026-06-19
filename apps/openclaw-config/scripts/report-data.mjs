@@ -40,6 +40,41 @@ export function normalizeOfficialPaperSnapshot({ check, assets, positions, fetch
   };
 }
 
+export function buildDegradedOfficialPaperSnapshot({ fetchedAt = new Date().toISOString(), reason = "Longbridge 数据暂不可用" } = {}) {
+  return {
+    source: "longbridge-official-paper",
+    degraded: true,
+    degradedReason: String(reason ?? "Longbridge 数据暂不可用").trim(),
+    fetchedAt,
+    accountMode: "paper",
+    check: {
+      sessionStatus: "unknown",
+      activeRegion: "",
+      cachedRegion: "",
+      okRegions: []
+    },
+    assets: [],
+    primaryAsset: {
+      net_assets: "0",
+      total_cash: "0",
+      buy_power: "0",
+      currency: "USD",
+      risk_level: "unknown"
+    },
+    positions: []
+  };
+}
+
+export function buildDegradedQuoteSnapshot(symbol, { fetchedAt = new Date().toISOString(), reason = "行情数据暂不可用" } = {}) {
+  return {
+    symbol: normalizeSymbol(symbol),
+    status: "degraded",
+    degraded: true,
+    degradedReason: String(reason ?? "行情数据暂不可用").trim(),
+    timestamp: fetchedAt
+  };
+}
+
 export function normalizeOfficialPosition(row) {
   if (!row || typeof row !== "object") {
     return null;

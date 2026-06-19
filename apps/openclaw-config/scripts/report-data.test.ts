@@ -72,6 +72,46 @@ describe("report data normalization", () => {
     })).toThrow(/资产缺少/u);
   });
 
+  it("builds a safe degraded official paper snapshot when Longbridge is temporarily unavailable", () => {
+    const snapshot = helpers.buildDegradedOfficialPaperSnapshot({
+      fetchedAt: "2026-06-19T12:00:00.000Z",
+      reason: "Longbridge connect failed"
+    });
+
+    expect(snapshot).toMatchObject({
+      source: "longbridge-official-paper",
+      degraded: true,
+      accountMode: "paper",
+      primaryAsset: {
+        net_assets: "0",
+        total_cash: "0",
+        currency: "USD",
+        risk_level: "unknown"
+      },
+      check: {
+        sessionStatus: "unknown",
+        okRegions: []
+      },
+      positions: []
+    });
+    expect(snapshot.degradedReason).toContain("Longbridge connect failed");
+  });
+
+  it("builds a degraded quote snapshot that keeps QQQ reporting auditable", () => {
+    const quote = helpers.buildDegradedQuoteSnapshot("QQQ.US", {
+      fetchedAt: "2026-06-19T12:00:00.000Z",
+      reason: "quote unavailable"
+    });
+
+    expect(quote).toMatchObject({
+      symbol: "QQQ.US",
+      status: "degraded",
+      degraded: true,
+      degradedReason: "quote unavailable",
+      timestamp: "2026-06-19T12:00:00.000Z"
+    });
+  });
+
   it("builds a de-duplicated Longbridge watch/news symbol set", () => {
     const symbols = helpers.buildTrackedSymbols(
       [{ symbol: "QQQ.US" }, { symbol: "AAPL.US" }],

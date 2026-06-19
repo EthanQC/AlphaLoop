@@ -126,7 +126,7 @@ async function runAnalysis({ deliver = true, targetsOverride = null } = {}) {
   const markdownPath = join(reportsDir, `${label}.md`);
   const pdfPath = join(reportsDir, `${label}.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
-  writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
+  await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
   if (!deliver) {
     console.log(JSON.stringify({ prepared: true, delivered: false, symbols: targets, markdownPath, pdfPath }, null, 2));

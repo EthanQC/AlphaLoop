@@ -170,4 +170,46 @@ describe("report news aggregation", () => {
     expect(news.renderDetailedNewsLine(articles[0])).toContain("渠道：Google News");
     expect(news.renderDetailedNewsLine(articles[0])).toContain("标题要点：摘要提到 AI 产品、美股风险偏好、资本开支、需求变化");
   });
+
+  it("renders unknown English news as a Chinese degraded summary instead of banned filler", () => {
+    const line = news.renderDetailedNewsLine({
+      id: "opaque-english",
+      symbol: "AMBA.US",
+      title: "Unexpected management transition raises questions",
+      summary: "The company said updates will follow after the close.",
+      publisher: "Example Wire",
+      source: "google-news-rss",
+      sourceName: "Google News",
+      url: "https://example.com/amba-management",
+      publishedAt: "2026-06-19T10:00:00.000Z",
+      publishedAtMs: Date.parse("2026-06-19T10:00:00.000Z")
+    });
+
+    expect(line).toContain("媒体：Example Wire");
+    expect(line).toContain("渠道：Google News");
+    expect(line).toContain("标题要点：英文来源摘要未提供可抽取细节");
+    expect(line).not.toContain("英文摘要已读取");
+    expect(line).not.toContain("事件细节待核对");
+  });
+
+  it("does not let encoded RSS link markup become degraded-summary keywords", () => {
+    const articles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>An opaque filing update arrives after the close</title>
+          <link>https://news.google.com/rss/articles/example</link>
+          <pubDate>Tue, 16 Jun 2026 12:47:00 GMT</pubDate>
+          <source>Yahoo Finance</source>
+          <description>&lt;a href="https://news.google.com/rss/articles/example"&gt;Opaque filing update&lt;/a&gt;&amp;nbsp;&lt;font color="#6f6f6f"&gt;Yahoo Finance&lt;/font&gt;</description>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+
+    const line = news.renderDetailedNewsLine(articles[0]);
+    expect(line).toContain("标题要点：英文来源摘要未提供可抽取细节");
+    expect(line).not.toContain("href、https、news、google");
+  });
 });

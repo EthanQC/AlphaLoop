@@ -46,6 +46,14 @@ describe("report rendering", () => {
     expect(args).toContain("file:///tmp/report.html");
   });
 
+  it("starts Chrome in a detached process group so helper processes can be stopped", () => {
+    expect(rendering.buildChromePdfSpawnOptions("/repo")).toEqual({
+      cwd: "/repo",
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true
+    });
+  });
+
   it("accepts a Chrome timeout when the PDF was already written", () => {
     const dir = mkdtempSync(join(tmpdir(), "openclaw-rendering-test-"));
     try {
@@ -58,5 +66,19 @@ describe("report rendering", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("detects a stable non-empty PDF so Chrome can be stopped early", () => {
+    let state = rendering.updatePdfStabilityState(undefined, { exists: true, size: 1200 }, { requiredStableChecks: 2 });
+    expect(state.ready).toBe(false);
+    expect(state.stableChecks).toBe(1);
+
+    state = rendering.updatePdfStabilityState(state, { exists: true, size: 1200 }, { requiredStableChecks: 2 });
+    expect(state.ready).toBe(true);
+    expect(state.stableChecks).toBe(2);
+
+    state = rendering.updatePdfStabilityState(state, { exists: true, size: 1300 }, { requiredStableChecks: 2 });
+    expect(state.ready).toBe(false);
+    expect(state.stableChecks).toBe(1);
   });
 });

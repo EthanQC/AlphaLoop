@@ -1,11 +1,12 @@
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export const REPORT_FONT_STACK = "'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', 'Hiragino Sans GB', 'Heiti SC', -apple-system, BlinkMacSystemFont, sans-serif";
 
-export function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown }) {
+export async function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown }) {
   const htmlPath = join(runtimeDir, "report-html", `${basename(markdownPath, ".md")}.html`);
   mkdirSync(join(runtimeDir, "report-html"), { recursive: true });
   writeFileSync(htmlPath, renderReportHtml(markdown), "utf8");
@@ -13,13 +14,12 @@ export function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, 
   const chromePath = resolveChromePath();
   const profileDir = mkdtempSync(join(tmpdir(), "openclaw-report-chrome-"));
   try {
-    try {
-      execFileSync(chromePath, buildChromePdfArgs({ htmlPath, pdfPath, profileDir }), buildChromePdfExecOptions(repoRoot));
-    } catch (error) {
-      if (!isUsablePdfAfterChromeError(error, pdfPath)) {
-        throw error;
-      }
-    }
+    await runChromePdf({
+      chromePath,
+      args: buildChromePdfArgs({ htmlPath, pdfPath, profileDir }),
+      repoRoot,
+      pdfPath
+    });
   } finally {
     rmSync(profileDir, { recursive: true, force: true });
   }
@@ -29,6 +29,125 @@ export function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, 
   }
 
   return pdfPath;
+}
+
+export async function runChromePdf({ chromePath, args, repoRoot, pdfPath }) {
+  const timeoutMs = Number(process.env.REPORT_PDF_TIMEOUT_MS ?? 120_000);
+  const pollMs = Number(process.env.REPORT_PDF_POLL_MS ?? 1000);
+  const requiredStableChecks = Math.max(1, Number(process.env.REPORT_PDF_STABLE_CHECKS ?? 2));
+  const startedAt = Date.now();
+  const child = spawn(chromePath, args, {
+    ...buildChromePdfSpawnOptions(repoRoot)
+  });
+  let stderr = "";
+  let exit = null;
+  child.stderr?.on("data", (chunk) => {
+    stderr += Buffer.from(chunk).toString("utf8");
+    stderr = stderr.slice(-4000);
+  });
+  child.on("error", (error) => {
+    exit = { error };
+  });
+  child.on("exit", (code, signal) => {
+    exit = { code, signal };
+  });
+
+  let stability;
+  while (!exit) {
+    stability = updatePdfStabilityState(stability, readPdfFileState(pdfPath), { requiredStableChecks });
+    if (stability.ready) {
+      terminateChromeProcessGroup(child, "SIGTERM");
+      await waitForChromeExit(child, 2500);
+      terminateChromeProcessGroup(child, "SIGKILL");
+      return;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      terminateChromeProcessGroup(child, "SIGTERM");
+      await waitForChromeExit(child, 2500);
+      terminateChromeProcessGroup(child, "SIGKILL");
+      const error = new Error(`Chrome PDF rendering timed out after ${timeoutMs} ms.`);
+      error.code = "ETIMEDOUT";
+      if (isUsablePdfAfterChromeError(error, pdfPath)) {
+        return;
+      }
+      throw error;
+    }
+    await sleep(Math.max(100, pollMs));
+  }
+
+  if (exit.error) {
+    throw exit.error;
+  }
+  if (exit.code !== 0 && !existsSync(pdfPath)) {
+    throw new Error(`Chrome PDF rendering failed with code ${exit.code ?? "null"} signal ${exit.signal ?? "null"}: ${stderr.trim()}`);
+  }
+}
+
+export function buildChromePdfSpawnOptions(repoRoot) {
+  return {
+    cwd: repoRoot,
+    stdio: ["ignore", "ignore", "pipe"],
+    detached: true
+  };
+}
+
+export function updatePdfStabilityState(previous, fileState, options = {}) {
+  const requiredStableChecks = Math.max(1, Number(options.requiredStableChecks ?? 2));
+  const exists = Boolean(fileState?.exists);
+  const size = Number(fileState?.size ?? 0);
+  const lastSize = Number(previous?.size ?? -1);
+  const stableChecks = exists && size > 0 && size === lastSize
+    ? Number(previous?.stableChecks ?? 0) + 1
+    : exists && size > 0 ? 1 : 0;
+  return {
+    exists,
+    size,
+    stableChecks,
+    ready: stableChecks >= requiredStableChecks
+  };
+}
+
+function readPdfFileState(pdfPath) {
+  try {
+    return {
+      exists: true,
+      size: statSync(pdfPath).size
+    };
+  } catch {
+    return {
+      exists: false,
+      size: 0
+    };
+  }
+}
+
+function waitForChromeExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function terminateChromeProcessGroup(child, signal) {
+  if (!child?.pid) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // The process already exited.
+    }
+  }
 }
 
 export function buildChromePdfExecOptions(repoRoot) {
