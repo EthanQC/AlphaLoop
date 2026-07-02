@@ -80,7 +80,7 @@
             agent: "codex",
             backend: "acpx",
             mode: "persistent",
-            cwd: "/Users/mashu/Documents/codex"
+            cwd: "/Users/abble/AlphaLoop"
           }
         }
       }
@@ -116,7 +116,7 @@
     ],
     load: {
       paths: [
-        "/Users/mashu/Documents/codex/apps/openclaw-config/plugins/local-context"
+        "/Users/abble/AlphaLoop/apps/openclaw-config/plugins/local-context"
       ]
     },
     slots: {
@@ -147,7 +147,7 @@
       "local-context": {
         enabled: true,
         config: {
-          repoRoot: "/Users/mashu/Documents/codex",
+          repoRoot: "/Users/abble/AlphaLoop",
           agents: ["control"],
           ingestFeishuMessages: true,
           injectPromptContext: true,

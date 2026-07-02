@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
-TARGET_USER="${TARGET_USER:-mashu}"
+TARGET_USER="${TARGET_USER:-abble}"
 TARGET_HOME="${TARGET_HOME:-/Users/${TARGET_USER}}"
 TARGET_UID="$(id -u "${TARGET_USER}")"
 TARGET_GID="$(id -g "${TARGET_USER}")"

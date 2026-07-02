@@ -9,16 +9,16 @@
 - 个股分析：维护用户指定的一批美股标的，使用 `apps/openclaw-config/scripts/stock-analysis.mjs targets <SYMBOL...>` 更新标的池；每三天 21:00 由调度生成 PDF + 摘要卡片。
 - 模拟盘：只读查询和解释长桥官方模拟盘；盘中每小时由 `apps/openclaw-config/scripts/official-paper-monitor.mjs poll` 轮询，开盘半小时后由 `apps/openclaw-config/scripts/official-paper-monitor.mjs pnl` 发送收支变化表。
 - 对券商读取请求，优先使用本地包装脚本：
-  - `cd /Users/mashu/Documents/codex && node apps/openclaw-config/scripts/longbridge-account-snapshot.mjs`
-  - `cd /Users/mashu/Documents/codex && node apps/openclaw-config/scripts/longbridge-quote.mjs <SYMBOL...>`
+  - `cd /Users/abble/AlphaLoop && node apps/openclaw-config/scripts/longbridge-account-snapshot.mjs`
+  - `cd /Users/abble/AlphaLoop && node apps/openclaw-config/scripts/longbridge-quote.mjs <SYMBOL...>`
 - 对明确授权的官方模拟盘股票/ETF 手动作业，只能使用：
-  - `cd /Users/mashu/Documents/codex && node apps/openclaw-config/scripts/submit-official-paper-equity-order.mjs <buy|sell> <SYMBOL> <QUANTITY>`
+  - `cd /Users/abble/AlphaLoop && node apps/openclaw-config/scripts/submit-official-paper-equity-order.mjs <buy|sell> <SYMBOL> <QUANTITY>`
 - 长桥调用必须走本地包装脚本或 `broker-executor`，不要绕过限速和审计边界。
 
 ## Context And Workspace
 
-- 仓库根目录：`/Users/mashu/Documents/codex`。
-- OpenClaw control workspace：`/Users/mashu/.openclaw/workspaces/control`。
+- 仓库根目录：`/Users/abble/AlphaLoop`。
+- OpenClaw control workspace：`/Users/abble/.openclaw/workspaces/control`。
 - 飞书群历史由本地上下文插件注入；交易事实仍以 SQLite 为准，Markdown 和上下文只是报告/提示材料。
 - 已整理的个股分析模板在 `knowledge/notes/stock-trading-notes/stock-analysis-template.md`。
 - 日报/周报的信息分类必须遵守 `knowledge/notes/stock-trading-notes/daily-routine.md`。

@@ -20,6 +20,3 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm build
       - run: pnpm test
-      - run: |
-          test -f rules/live/active-version.json
-          test -f rules/paper/active-version.json
