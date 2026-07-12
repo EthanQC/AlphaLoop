@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -241,6 +241,40 @@ describe("same-day re-runs", () => {
     const row = snapshotDb.prepare("SELECT id FROM audit_log WHERE id = ?").get("audit_seed") as { id: string } | undefined;
     expect(row?.id).toBe("audit_seed");
     snapshotDb.close();
+  });
+
+  it("preserves the existing good same-day backup and leaves no .tmp file when a re-run's VACUUM INTO fails", () => {
+    const dbDir = makeTempDir("alphaloop-rerun-fail-db-");
+    const destDir = makeTempDir("alphaloop-rerun-fail-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+    const now = new Date("2026-07-12T01:00:00.000Z");
+
+    const first = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now });
+    expect(first.ok).toBe(true);
+    const backupPath = first.files[0];
+    const tmpPath = `${backupPath}.tmp`;
+    const goodBytesBefore = readFileSync(backupPath);
+
+    // Truncate the live trading db so its header is intact but its page data is not, forcing
+    // VACUUM INTO to fail partway through on the re-run (standing in for disk-full / busy-timeout
+    // mid-backup) instead of succeeding, without ever making dbPath disappear.
+    const liveBytes = readFileSync(dbPath);
+    writeFileSync(dbPath, liveBytes.subarray(0, Math.floor(liveBytes.length / 3)));
+
+    expect(() => backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now })).toThrow();
+
+    // The previously-good same-day backup must survive untouched, byte-for-byte.
+    expect(existsSync(backupPath)).toBe(true);
+    expect(readFileSync(backupPath).equals(goodBytesBefore)).toBe(true);
+
+    const snapshotDb = new DatabaseSync(backupPath);
+    const row = snapshotDb.prepare("SELECT id FROM audit_log WHERE id = ?").get("audit_seed") as { id: string } | undefined;
+    expect(row?.id).toBe("audit_seed");
+    snapshotDb.close();
+
+    // No leftover tmp file from the failed re-run.
+    expect(existsSync(tmpPath)).toBe(false);
   });
 });
 

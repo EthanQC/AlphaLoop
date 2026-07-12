@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,19 +85,36 @@ export function backupTradingDatabase(dbPath, destPath) {
     throw new Error(`Refusing to back up to an invalid path: ${destPath}`);
   }
 
-  // VACUUM INTO refuses to run if the destination file already exists. Backups are stamped by
-  // calendar date, so re-running the job later the same day (manual retry, launchd catching up
-  // a missed run after sleep/wake) must overwrite today's snapshot rather than fail outright.
-  if (existsSync(destPath)) {
-    rmSync(destPath, { force: true });
+  // VACUUM INTO refuses to run if its output file already exists, so write to a sibling `.tmp`
+  // path and atomically rename it over `destPath` once VACUUM INTO succeeds. This keeps same-day
+  // re-runs idempotent (rename overwrites today's existing snapshot) without ever deleting a
+  // previously-good same-day backup up front: if a re-run's VACUUM INTO fails partway through
+  // (disk full, busy timeout), `destPath` is never touched, so the last good backup survives.
+  const tmpPath = `${destPath}.tmp`;
+
+  // Clean up any stale tmp file left behind by a previous crashed/interrupted run.
+  if (existsSync(tmpPath)) {
+    rmSync(tmpPath, { force: true });
   }
 
   const sourceDb = new DatabaseSync(dbPath, { readOnly: true, timeout: 5000 });
   try {
-    sourceDb.exec(`VACUUM INTO '${escapeSqliteLiteral(destPath)}'`);
-  } finally {
-    sourceDb.close();
+    try {
+      sourceDb.exec(`VACUUM INTO '${escapeSqliteLiteral(tmpPath)}'`);
+    } finally {
+      sourceDb.close();
+    }
+  } catch (error) {
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // Best-effort cleanup only; the VACUUM failure below is the error that actually matters.
+    }
+    throw error;
   }
+
+  // VACUUM INTO succeeded; atomically replace the destination with the finished snapshot.
+  renameSync(tmpPath, destPath);
 }
 
 /** Archives `memorydRoot` into a gzip tarball at `destPath`. */
