@@ -58,4 +58,30 @@ describe("trading schedule policy", () => {
     expect(schedule.shouldRunOfficialPaperPnlReport(new Date("2026-07-01T14:30:00.000Z"))).toBe(false);
     expect(schedule.shouldRunOfficialPaperPnlReport(new Date("2026-12-25T15:00:00.000Z"))).toBe(false);
   });
+
+  it("derives CALENDAR_COVERED_YEARS from the NYSE close date tables", () => {
+    expect(schedule.CALENDAR_COVERED_YEARS).toContain(2026);
+    expect(schedule.CALENDAR_COVERED_YEARS).not.toContain(2027);
+  });
+
+  it("fails loud when a date's year has no trading calendar data", () => {
+    expect(() => schedule.assertCalendarCoverage(new Date("2027-01-01T15:00:00.000Z"))).toThrow(
+      /trading calendar has no data for year 2027/
+    );
+    expect(() => schedule.assertCalendarCoverage(new Date("2027-01-01T15:00:00.000Z"))).toThrow(
+      /update NYSE_FULL_CLOSE_DATES\/NYSE_EARLY_CLOSE_DATES for year 2027 in trading-schedule\.mjs/
+    );
+    expect(() => schedule.assertCalendarCoverage(new Date("2026-06-01T12:00:00.000Z"))).not.toThrow();
+  });
+
+  it("propagates the calendar-coverage guard from isUsRegularMarketHours for out-of-range years", () => {
+    expect(() => schedule.isUsRegularMarketHours(new Date("2027-01-01T15:00:00.000Z"))).toThrow(
+      /trading calendar has no data for year 2027/
+    );
+    expect(() => schedule.isUsRegularMarketHours(new Date("2026-07-01T14:00:00.000Z"))).not.toThrow();
+  });
+
+  it("computes the current US Eastern trading day, crossing midnight from Beijing time", () => {
+    expect(schedule.currentUsEasternTradingDay(new Date("2026-07-13T04:00:00+08:00"))).toBe("2026-07-12");
+  });
 });
