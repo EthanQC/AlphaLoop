@@ -2,8 +2,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
+import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJson } from "./_longbridge.mjs";
 import { repoRoot } from "./repo-root.mjs";
 
@@ -21,8 +21,7 @@ if (process.env.ALLOW_LIVE_EXECUTION === "true") {
 }
 
 mkdirSync(join(repoRoot, "runtime"), { recursive: true });
-const db = new DatabaseSync(dbPath);
-ensureLifecycleSchema(db);
+const db = openTradingDatabase(dbPath);
 
 const ordersPayload = await runLongbridgeJson("trade", ["order"]);
 const executionsPayload = await runLongbridgeJson("trade", ["order", "executions"]);
@@ -141,43 +140,6 @@ console.log(JSON.stringify({
   observedAt,
   orders: saved
 }, null, 2));
-
-function ensureLifecycleSchema(database) {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS official_paper_order_lifecycle (
-      id TEXT PRIMARY KEY,
-      ticket_id TEXT,
-      external_order_id TEXT NOT NULL UNIQUE,
-      provider TEXT NOT NULL,
-      environment TEXT NOT NULL,
-      account_mode TEXT NOT NULL,
-      symbol TEXT NOT NULL,
-      asset_class TEXT NOT NULL,
-      side TEXT NOT NULL,
-      quantity REAL NOT NULL,
-      limit_price REAL,
-      broker_status TEXT NOT NULL,
-      local_status TEXT NOT NULL,
-      lifecycle_stage TEXT NOT NULL,
-      submitted_at TEXT NOT NULL,
-      last_observed_at TEXT NOT NULL,
-      raw TEXT NOT NULL,
-      notes TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
-      ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
-
-    CREATE TABLE IF NOT EXISTS execution_reports (
-      id TEXT PRIMARY KEY,
-      category TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL,
-      metadata TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-  `);
-}
 
 function findRecentTicketId(database, symbol) {
   const row = database

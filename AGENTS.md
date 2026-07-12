@@ -5,13 +5,15 @@
 - Never auto-submit real-money orders.
 - Real-money flows stop at structured advice cards and explicit human review.
 - Do not write broker credentials, OAuth tokens, or SSH private keys into memory or reports.
-- Keep trading facts in SQLite. Workspace Markdown and Honcho are context layers, not ledgers.
+- Keep trading facts in SQLite. Workspace Markdown is a context layer, not a ledger.
 - Only the local `broker-executor` may translate order tickets into broker writes.
-- Option strategies are restricted to `covered_call`, `cash_secured_put`, `long_call`, and `long_put` in v1.
+- Options are analysis-only inputs. Option execution stays disabled permanently.
 - OpenClaw may run with `agents.defaults.sandbox.mode=off` only inside the local trusted-user boundary.
 - Live execution and option automation remain disabled even if an environment variable is misconfigured.
 - Official Longbridge paper execution requires `LONGBRIDGE_ACCOUNT_MODE=paper`, `LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true`, and `ALLOW_LIVE_EXECUTION=false`.
 - Feishu group access must stay allowlisted; untrusted group members must not trigger high-risk tools.
+- OpenClaw paper budget stays <= 10% of total assets, enforced server-side against a fresh snapshot.
+- Exactly one process holds the Feishu event connection; callbacks are acknowledged within seconds and processed asynchronously.
 
 ## Reporting
 

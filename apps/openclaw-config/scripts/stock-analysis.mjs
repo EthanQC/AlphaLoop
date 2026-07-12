@@ -45,7 +45,6 @@ mkdirSync(reportsDir, { recursive: true });
 
 const [command = "scheduled", ...args] = process.argv.slice(2);
 const db = openTradingDatabase(dbPath);
-ensureStockAnalysisTables(db);
 
 if (command === "targets") {
   setTargets(args);
@@ -327,26 +326,6 @@ function listTargets() {
     WHERE active = 1
     ORDER BY updated_at ASC, symbol ASC
   `).all().map((row) => String(row.symbol));
-}
-
-function ensureStockAnalysisTables(database) {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS stock_analysis_targets (
-      symbol TEXT PRIMARY KEY,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS stock_analysis_runs (
-      id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      symbols TEXT NOT NULL,
-      markdown_path TEXT NOT NULL,
-      pdf_path TEXT NOT NULL,
-      delivery TEXT NOT NULL
-    );
-  `);
 }
 
 function readState() {

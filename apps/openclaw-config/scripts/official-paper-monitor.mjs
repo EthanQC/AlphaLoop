@@ -27,7 +27,6 @@ mkdirSync(runtimeDir, { recursive: true });
 mkdirSync(reportsDir, { recursive: true });
 
 const db = openTradingDatabase(dbPath);
-ensureOfficialPaperTables(db);
 
 const [command = "poll", ...args] = process.argv.slice(2);
 const force = args.includes("--force");
@@ -246,32 +245,6 @@ function findComparisonSnapshot(fetchedAt, mode) {
     return null;
   }
   return JSON.parse(String(target.raw));
-}
-
-function ensureOfficialPaperTables(database) {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS official_paper_snapshots (
-      id TEXT PRIMARY KEY,
-      fetched_at TEXT NOT NULL,
-      reason TEXT NOT NULL,
-      net_assets REAL,
-      total_cash REAL,
-      market_value REAL NOT NULL,
-      positions TEXT NOT NULL,
-      raw TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS official_paper_snapshots_time_idx
-      ON official_paper_snapshots(fetched_at);
-
-    CREATE TABLE IF NOT EXISTS paper_strategy_reflections (
-      id TEXT PRIMARY KEY,
-      snapshot_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      payload TEXT NOT NULL
-    );
-  `);
 }
 
 function formatMoney(value) {

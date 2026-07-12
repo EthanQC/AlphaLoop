@@ -7,8 +7,11 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
-import { buildCronFailureAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
+import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
 import {
+  clearEscalationPending,
+  getFailureAlertLevel,
+  getPendingEscalationJobs,
   normalizeRunnerState,
   recordFailureAlerted,
   recordRunResult,
@@ -20,7 +23,9 @@ import {
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const port = Number(process.env.OPENCLAW_CRON_RUNNER_PORT ?? 18792);
 const host = "127.0.0.1";
-const runtimeDir = join(repoRoot, "runtime", "openclaw-cron-runner");
+// Overridable so tests can sandbox the state file / per-run result files in a temp dir instead of
+// the real repo's runtime directory.
+const runtimeDir = process.env.OPENCLAW_CRON_RUNNER_RUNTIME_DIR ?? join(repoRoot, "runtime", "openclaw-cron-runner");
 const processedRunsPath = join(runtimeDir, "processed-runs.json");
 const openclawCronDir = process.env.OPENCLAW_CRON_DIR ?? join(homedir(), ".openclaw", "cron");
 const pollMs = Number(process.env.OPENCLAW_CRON_RUNNER_POLL_MS ?? 5000);
@@ -70,26 +75,46 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, host, () => {
-  console.log(JSON.stringify({
-    ok: true,
-    service: "openclaw-cron-runner",
-    host,
-    port,
-    repoRoot,
-    openclawCronDir,
-    pollMs
-  }));
-});
+// Only actually bind the port / start polling when this file is run directly (`node
+// openclaw-cron-runner.mjs`), not when it's imported (e.g. by tests) — importing it should be
+// side-effect-free beyond the harmless state load/seed above, which tests sandbox via
+// OPENCLAW_CRON_RUNNER_RUNTIME_DIR / OPENCLAW_CRON_DIR.
+const isMainModule = process.argv[1]
+  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
 
-await pollOpenClawRunLogs();
-setInterval(() => {
-  pollOpenClawRunLogs().catch((error) => {
-    console.error(JSON.stringify({ ok: false, service: "openclaw-cron-runner", error: String(error?.message ?? error) }));
+if (isMainModule) {
+  server.listen(port, host, () => {
+    console.log(JSON.stringify({
+      ok: true,
+      service: "openclaw-cron-runner",
+      host,
+      port,
+      repoRoot,
+      openclawCronDir,
+      pollMs
+    }));
   });
-}, Math.max(1000, pollMs));
+
+  await pollOpenClawRunLogs();
+  setInterval(() => {
+    pollOpenClawRunLogs().catch((error) => {
+      console.error(JSON.stringify({ ok: false, service: "openclaw-cron-runner", error: String(error?.message ?? error) }));
+    });
+  }, Math.max(1000, pollMs));
+}
 
 async function pollOpenClawRunLogs() {
+  // Disk is authoritative between poll cycles: an operator's `cron-runner-reset.mjs <job>` run
+  // while this process is alive writes straight to this file, not to this process's memory.
+  // Reloading here means that write is visible within one poll cycle instead of this process's
+  // stale in-memory state (still halted) silently overwriting it on the next saveRunnerState().
+  runnerState = loadRunnerState();
+
+  // A halted job produces no new run results to piggyback an alert retry on, so a still-pending
+  // escalation (send failed, or the process died mid-send) needs its own retry point each cycle.
+  await retryPendingEscalationAlerts();
+
   const managedJobs = readManagedCronJobs();
   for (const entry of managedJobs) {
     const runEntries = readCronRunEntries(entry.id);
@@ -98,7 +123,7 @@ async function pollOpenClawRunLogs() {
         continue;
       }
       const runKey = buildOpenClawRunKey(runEntry);
-      if (!shouldAttemptRun(runnerState, runKey) || inFlightRunKeys.has(runKey)) {
+      if (!shouldAttemptRun(runnerState, runKey, Date.now(), { jobName: entry.job.name }) || inFlightRunKeys.has(runKey)) {
         continue;
       }
       inFlightRunKeys.add(runKey);
@@ -112,8 +137,12 @@ async function pollOpenClawRunLogs() {
         });
         runnerState = recordRunResult(runnerState, runKey, result, Date.now(), { retryBaseMs, retryMaxMs });
         saveRunnerState();
-        if (!result.ok && shouldAlertFailure(runnerState, runKey)) {
-          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey])
+        // Same-class failure count reaching 3 halts the job (see openclaw-cron-runner-state.mjs);
+        // that halting failure always gets an escalation alert regardless of the per-runKey
+        // dedupe below, since a halt can happen on a retry of a runKey already alerted once.
+        const alertLevel = getFailureAlertLevel(runnerState, entry.job.name);
+        if (!result.ok && shouldAlertFailure(runnerState, runKey) && alertLevel === "notice") {
+          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey], "notice")
             .then(() => {
               runnerState = recordFailureAlerted(runnerState, runKey);
               saveRunnerState();
@@ -128,9 +157,50 @@ async function pollOpenClawRunLogs() {
               }));
             });
         }
+        if (!result.ok && alertLevel === "escalation") {
+          await sendCronFailureAlert(result, runnerState.jobFailureState[entry.job.name], "escalation")
+            .then(() => {
+              runnerState = clearEscalationPending(runnerState, entry.job.name);
+              saveRunnerState();
+            })
+            .catch((error) => {
+              // Leave escalationPending set (recordRunResult above already set it true on this
+              // halt transition): retryPendingEscalationAlerts() will retry it on the next poll
+              // cycle instead of this halt going silently unreported.
+              console.error(JSON.stringify({
+                ok: false,
+                service: "openclaw-cron-runner",
+                action: "halt-escalation-alert",
+                job: result.job,
+                error: String(error?.message ?? error)
+              }));
+            });
+        }
       } finally {
         inFlightRunKeys.delete(runKey);
       }
+    }
+  }
+}
+
+// Retries the escalation alert for every halted job whose escalationPending flag is still set
+// (initial send failed, or the process died mid-send) — the existing per-runKey alertedRunKeys
+// dedupe never applies here, since a halted job produces no new runKey for that dedupe to gate.
+async function retryPendingEscalationAlerts() {
+  for (const { jobName, jobFailure } of getPendingEscalationJobs(runnerState)) {
+    const result = (jobFailure.lastResultPath ? readJsonFile(jobFailure.lastResultPath, null) : null) ?? { job: jobName };
+    try {
+      await sendCronFailureAlert(result, jobFailure, "escalation");
+      runnerState = clearEscalationPending(runnerState, jobName);
+      saveRunnerState();
+    } catch (error) {
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "halt-escalation-alert-retry",
+        job: jobName,
+        error: String(error?.message ?? error)
+      }));
     }
   }
 }
@@ -248,13 +318,18 @@ function saveRunnerState() {
   writeFileSync(processedRunsPath, `${JSON.stringify(serializeRunnerState(runnerState), null, 2)}\n`, "utf8");
 }
 
-async function sendCronFailureAlert(result, attempt) {
+async function sendCronFailureAlert(result, attempt, alertLevel = "notice") {
   if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
     return;
   }
-  const markdown = buildCronFailureAlertMarkdown(result, attempt);
+  const isEscalation = alertLevel === "escalation";
+  const markdown = isEscalation
+    ? buildCronHaltAlertMarkdown(result, attempt)
+    : buildCronFailureAlertMarkdown(result, attempt);
   const delivery = await deliverReportToFeishu({
-    title: `OpenClaw 自动报告失败告警：${result.job}`,
+    title: isEscalation
+      ? `OpenClaw 自动报告已停机：${result.job}`
+      : `OpenClaw 自动报告失败告警：${result.job}`,
     markdown,
     maxSectionChars: 3600
   });
@@ -289,4 +364,12 @@ function sendJson(response, statusCode, value) {
 
 function tail(value) {
   return String(value ?? "").split(/\r?\n/u).slice(-30).join("\n").trim();
+}
+
+// Exported for tests only: importing this module never starts the HTTP server or the poll
+// interval (both gated behind isMainModule above), so tests drive a poll cycle directly and
+// inspect the in-memory state it produced.
+export { pollOpenClawRunLogs };
+export function __getRunnerStateForTest() {
+  return runnerState;
 }

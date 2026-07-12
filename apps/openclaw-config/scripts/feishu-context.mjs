@@ -12,7 +12,6 @@ const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
 
 const db = openTradingDatabase(join(repoRoot, "runtime", "trading.sqlite"));
-ensureFeishuContextTables(db);
 
 const [command = "build-prompt-context", ...args] = process.argv.slice(2);
 
@@ -96,22 +95,6 @@ function readInsights() {
     return "- 已读取飞书历史，但本地提炼文件暂缺。";
   }
   return readFileSync(path, "utf8").trim();
-}
-
-function ensureFeishuContextTables(database) {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS feishu_context_messages (
-      id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      chat_id TEXT NOT NULL,
-      sender_id TEXT NOT NULL,
-      sender_name TEXT NOT NULL,
-      text TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS feishu_context_messages_time_idx
-      ON feishu_context_messages(created_at);
-  `);
 }
 
 async function readStdinJson() {
