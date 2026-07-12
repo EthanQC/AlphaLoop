@@ -34,6 +34,14 @@ export function resetCronRunnerJob(jobName, options = {}) {
   }
 
   const statePath = options.statePath ?? defaultStatePath;
+  if (!existsSync(statePath)) {
+    // The runner writes this file on first boot (seeding history) and after every recorded run.
+    // If it doesn't exist yet, there is no halted job to clear — and pre-creating an empty one
+    // here would make the runner's next boot skip its first-boot run-log seeding. Refuse instead.
+    throw new Error(
+      `No cron runner state file found at "${statePath}"; nothing to reset.`
+    );
+  }
   const beforeState = normalizeRunnerState(readJsonFile(statePath, {}));
   const previousJobFailure = beforeState.jobFailureState[name];
   const wasHalted = Boolean(previousJobFailure?.halted);

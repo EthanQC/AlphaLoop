@@ -66,7 +66,7 @@ export function buildCronHaltAlertMarkdown(result, jobFailure = {}) {
     `- 连续失败次数：${Number(jobFailure?.consecutiveCount ?? 0)}`,
     "- 状态：该任务已停机等待复位，runner 不会再自动重试，避免无意义空转。",
     "",
-    `- 复位命令：\`${resetCommand}\``,
+    `- 复位命令：\`${resetCommand}\`（复位后最迟一个轮询周期内自动恢复）`,
     "- 请先确认问题已解决，再执行以上命令恢复该任务的自动重试。",
     "",
     "## 证据",

@@ -64,10 +64,17 @@ export function recordRunResult(state, runKey, result, nowMs = Date.now(), optio
   const previousJobFailure = normalized.jobFailureState[jobName] ?? createEmptyJobFailureState();
   const sameClass = previousJobFailure.failureClass === failureClass;
   const consecutiveCount = sameClass ? previousJobFailure.consecutiveCount + 1 : 1;
+  const halted = previousJobFailure.halted || consecutiveCount >= HALT_THRESHOLD;
+  // The escalation alert is only ever sent once, right when a job transitions into halted; mark
+  // it pending here (rather than after a successful send) so a crash/restart between "halted" and
+  // "alert delivered" still leaves a durable pending flag for the next poll cycle to retry.
+  const justHalted = !previousJobFailure.halted && halted;
   normalized.jobFailureState[jobName] = {
     failureClass,
     consecutiveCount,
-    halted: previousJobFailure.halted || consecutiveCount >= HALT_THRESHOLD
+    halted,
+    escalationPending: justHalted ? true : previousJobFailure.escalationPending,
+    lastResultPath: stringOrUndefined(result?.resultPath) ?? previousJobFailure.lastResultPath
   };
 
   normalized.failedRunAttempts[key] = {
@@ -102,6 +109,29 @@ export function resetJobFailureState(state, jobName) {
   const normalized = normalizeRunnerState(state);
   normalized.jobFailureState[String(jobName)] = createEmptyJobFailureState();
   return normalized;
+}
+
+// Called by the runner after an escalation alert (the halting failure, or a retry of it) is
+// delivered successfully, so the poll-cycle retry loop stops retrying it.
+export function clearEscalationPending(state, jobName) {
+  const normalized = normalizeRunnerState(state);
+  const name = String(jobName);
+  const existing = normalized.jobFailureState[name];
+  if (existing) {
+    normalized.jobFailureState[name] = { ...existing, escalationPending: false };
+  }
+  return normalized;
+}
+
+// Jobs that are halted and whose escalation alert has not yet been confirmed delivered. The
+// runner calls this once per poll cycle (independent of any new run-log activity, since a halted
+// job's shouldAttemptRun gate means it produces no new run results to piggyback a retry on) and
+// retries sending the escalation for each one.
+export function getPendingEscalationJobs(state) {
+  const normalized = normalizeRunnerState(state);
+  return Object.entries(normalized.jobFailureState)
+    .filter(([, jobFailure]) => jobFailure.halted && jobFailure.escalationPending)
+    .map(([jobName, jobFailure]) => ({ jobName, jobFailure }));
 }
 
 export function shouldAlertFailure(state, runKey) {
@@ -157,13 +187,17 @@ function normalizeJobFailureState(value) {
     return [[String(jobName), {
       failureClass: stringOrUndefined(raw.failureClass),
       consecutiveCount: Math.max(0, Number(raw.consecutiveCount ?? 0)),
-      halted: Boolean(raw.halted)
+      halted: Boolean(raw.halted),
+      // Missing on state files written before the escalation-retry machine existed: treat as
+      // false (no pending escalation) rather than crashing.
+      escalationPending: Boolean(raw.escalationPending),
+      lastResultPath: stringOrUndefined(raw.lastResultPath)
     }]];
   }));
 }
 
 function createEmptyJobFailureState() {
-  return { failureClass: undefined, consecutiveCount: 0, halted: false };
+  return { failureClass: undefined, consecutiveCount: 0, halted: false, escalationPending: false, lastResultPath: undefined };
 }
 
 // The runner always passes the job's stable label via result.job; fall back to the options hint

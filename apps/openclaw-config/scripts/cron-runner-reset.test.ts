@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -89,14 +89,29 @@ describe("cron-runner-reset", () => {
     expect(() => reset.resetCronRunnerJob(undefined, { statePath, dbPath })).toThrow();
   });
 
-  it("succeeds as a no-op when the job was never halted", () => {
+  it("succeeds as a no-op when the job was never halted (state file exists, just no failure history for it)", () => {
     const runtimeDir = makeTempDir("alphaloop-cron-reset-state-");
     const dbDir = makeTempDir("alphaloop-cron-reset-db-");
     const statePath = join(runtimeDir, "processed-runs.json");
     const dbPath = join(dbDir, "trading.sqlite");
 
+    const runnerState = state.normalizeRunnerState({ processedRunKeys: ["daily:run-0:finished"] });
+    writeFileSync(statePath, `${JSON.stringify(state.serializeRunnerState(runnerState), null, 2)}\n`, "utf8");
+
     const result = reset.resetCronRunnerJob("weekly", { statePath, dbPath });
     expect(result.ok).toBe(true);
     expect(result.wasHalted).toBe(false);
+  });
+
+  it("refuses to reset when no state file exists yet, instead of creating one (nothing to reset)", () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-reset-state-");
+    const dbDir = makeTempDir("alphaloop-cron-reset-db-");
+    const statePath = join(runtimeDir, "processed-runs.json");
+    const dbPath = join(dbDir, "trading.sqlite");
+
+    expect(() => reset.resetCronRunnerJob("daily", { statePath, dbPath })).toThrow(/nothing to reset/i);
+    // Refusing must not create the file — pre-creating an empty state file would make the
+    // runner's next boot skip its first-boot run-log seeding.
+    expect(existsSync(statePath)).toBe(false);
   });
 });

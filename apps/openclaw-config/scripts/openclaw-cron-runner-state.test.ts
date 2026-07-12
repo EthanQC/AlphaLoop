@@ -178,6 +178,88 @@ describe("halt-after-3-same-class-failures state machine", () => {
   });
 });
 
+describe("escalation alert retry (escalationPending)", () => {
+  const baseNowMs = Date.parse("2026-07-01T00:00:00.000Z");
+
+  function haltedDailyState() {
+    let runnerState = state.normalizeRunnerState({});
+    for (let i = 0; i < 3; i += 1) {
+      runnerState = state.recordRunResult(
+        runnerState,
+        `daily:run-${i}:finished`,
+        { ok: false, job: "daily", error: "Longbridge unavailable", resultPath: `/tmp/daily-${i}.json` },
+        baseNowMs + i * 60_000
+      );
+    }
+    return runnerState;
+  }
+
+  it("marks escalationPending true the moment a job transitions into halted, recording the halting failure's resultPath", () => {
+    const runnerState = haltedDailyState();
+    expect(runnerState.jobFailureState.daily).toMatchObject({
+      halted: true,
+      escalationPending: true,
+      lastResultPath: "/tmp/daily-2.json"
+    });
+  });
+
+  it("does not re-mark escalationPending on failures after the halting one (already surfaced via getPendingEscalationJobs)", () => {
+    let runnerState = haltedDailyState();
+    // Clear it as if the escalation alert already succeeded once.
+    runnerState = state.clearEscalationPending(runnerState, "daily");
+    expect(runnerState.jobFailureState.daily.escalationPending).toBe(false);
+
+    // A further same-class failure while already halted (defensive case; shouldAttemptRun would
+    // normally prevent the runner itself from reaching this) must not flip it back to true.
+    runnerState = state.recordRunResult(
+      runnerState,
+      "daily:run-3:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable", resultPath: "/tmp/daily-3.json" },
+      baseNowMs + 180_000
+    );
+    expect(runnerState.jobFailureState.daily).toMatchObject({ halted: true, escalationPending: false });
+  });
+
+  it("getPendingEscalationJobs surfaces only halted jobs with a pending escalation", () => {
+    const runnerState = haltedDailyState();
+    expect(state.getPendingEscalationJobs(runnerState)).toEqual([
+      { jobName: "daily", jobFailure: runnerState.jobFailureState.daily }
+    ]);
+
+    const cleared = state.clearEscalationPending(runnerState, "daily");
+    expect(state.getPendingEscalationJobs(cleared)).toEqual([]);
+  });
+
+  it("clearEscalationPending is a no-op for a job with no failure history", () => {
+    const runnerState = state.normalizeRunnerState({});
+    expect(state.clearEscalationPending(runnerState, "weekly").jobFailureState.weekly).toBeUndefined();
+  });
+
+  it("a success clears escalationPending along with the rest of the job failure state", () => {
+    let runnerState = haltedDailyState();
+    runnerState = state.recordRunResult(runnerState, "daily:run-3:finished", { ok: true, job: "daily" }, baseNowMs + 180_000);
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 0, halted: false, escalationPending: false });
+  });
+
+  it("resetJobFailureState (the reset CLI's write) clears escalationPending too", () => {
+    const runnerState = haltedDailyState();
+    const restored = state.resetJobFailureState(runnerState, "daily");
+    expect(restored.jobFailureState.daily).toMatchObject({ halted: false, escalationPending: false });
+    expect(state.getPendingEscalationJobs(restored)).toEqual([]);
+  });
+
+  it("treats a state file written before this flag existed as escalationPending: false (backward compatible)", () => {
+    const legacyHaltedState = {
+      jobFailureState: {
+        daily: { failureClass: "daily:longbridge unavailable", consecutiveCount: 3, halted: true }
+      }
+    };
+    const normalized = state.normalizeRunnerState(legacyHaltedState);
+    expect(normalized.jobFailureState.daily).toMatchObject({ halted: true, escalationPending: false });
+    expect(state.getPendingEscalationJobs(normalized)).toEqual([]);
+  });
+});
+
 describe("failure alert level (1st + 3rd only)", () => {
   const baseNowMs = Date.parse("2026-07-01T00:00:00.000Z");
 

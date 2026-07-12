@@ -58,6 +58,7 @@ describe("OpenClaw cron runner halt escalation alert", () => {
 
     expect(markdown).toContain("已停机等待复位");
     expect(markdown).toContain("node apps/openclaw-config/scripts/cron-runner-reset.mjs daily");
+    expect(markdown).toContain("复位后最迟一个轮询周期内自动恢复");
     expect(markdown).toContain("任务：daily");
     expect(markdown).toContain("连续失败次数：3");
     expect(markdown).toContain("quality gate failed");
