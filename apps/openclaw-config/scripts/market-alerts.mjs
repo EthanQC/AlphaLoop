@@ -6,6 +6,14 @@
 // error. All raw SQL lives in market-alerts-store.mjs (task brief's "reuse
 // the store... rather than writing raw SQL in the CLI"); this file only does
 // argument parsing, validation, and dispatch.
+//
+// `remove` is non-destructive by default: it soft-deletes (disables) the
+// rule and keeps its alert_events (including 误报 feedback) so thresholds
+// can still be tuned from history later. Pass `--purge` to opt into the old
+// hard-delete behavior (rule + runtime state + events, unrecoverable). A
+// soft-removed rule remains resumable via `resume` - alert_rules has no
+// free-form column to mark "removed" distinctly from "paused" in the
+// (frozen) DDL, so this is a documented, accepted overlap, not a bug.
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,10 +37,32 @@ const DIRECTIONS = ["both", "up", "down"];
 
 const EXPOSURE_SYMBOL = "*";
 
-// `--all` (list) is this CLI's only genuine no-value boolean flag. Every
-// other flag (--actor/--symbol/--type/--threshold/--direction/--rule/--event/
-// --note) always expects a value.
-const BOOLEAN_FLAGS = new Set(["all"]);
+// `--all` (list) and `--purge` (remove, Fix 3) are this CLI's only genuine
+// no-value boolean flags. Every other flag (--actor/--symbol/--type/
+// --threshold/--direction/--rule/--event/--note) always expects a value.
+const BOOLEAN_FLAGS = new Set(["all", "purge"]);
+
+// Fix 4 (task P2-4 fix round): the full set of flags this CLI understands,
+// across every subcommand. parseFlags doesn't know which subcommand it's
+// parsing for, so this is deliberately the union of all of them rather than
+// a per-command allowlist - the per-command "which flags actually apply"
+// validation still happens where it always has (each run* function). This
+// set only exists to catch typos (`--treshold`) and stray flags fail-loud,
+// matching the rest of this CLI's philosophy (see the direction gate and
+// the omitted-value handling below) instead of silently ignoring them and
+// falling back to a default with no error at all.
+const KNOWN_FLAGS = new Set([
+  "actor",
+  "symbol",
+  "type",
+  "threshold",
+  "direction",
+  "rule",
+  "event",
+  "note",
+  "all",
+  "purge"
+]);
 
 /**
  * Parses `--flag value` / `--boolFlag` pairs from an argv slice (after the
@@ -48,6 +78,11 @@ const BOOLEAN_FLAGS = new Set(["all"]);
  * validation the same way a truly absent flag would, so this keeps "flag
  * present but empty" and "flag absent" both failing loud instead of one of
  * them silently succeeding with a bogus coerced value.
+ *
+ * An unrecognized `--flag` (a typo like `--treshold`) throws immediately
+ * instead of being silently recorded and ignored (Fix 4, task P2-4 fix
+ * round) - without this, `add --treshold 0.05` would fall back to the
+ * type's default threshold with no error at all.
  */
 export function parseFlags(argv) {
   const flags = {};
@@ -57,6 +92,9 @@ export function parseFlags(argv) {
       continue;
     }
     const name = token.slice(2);
+    if (!KNOWN_FLAGS.has(name)) {
+      throw new Error(`未知参数：--${name}。`);
+    }
     if (BOOLEAN_FLAGS.has(name)) {
       flags[name] = true;
       continue;
@@ -134,6 +172,16 @@ export function runAdd(flags, options = {}) {
     if (!Number.isFinite(threshold) || threshold <= 0) {
       throw new Error("threshold 必须是正数。");
     }
+    // Fix 2 (task P2-4 fix round): thresholds are decimal ratios (0.04 =
+    // 4%), but nothing stopped `--threshold 5` from silently creating a
+    // rule that needs a 500% move to ever fire - a rule that, in practice,
+    // never fires, with no error at creation time. Reject >= 1 (100%) and
+    // teach the correct form in the error rather than just rejecting.
+    if (threshold >= 1) {
+      throw new Error(
+        `阈值请用小数（5% 写作 0.05）；收到的值 ${threshold} 相当于 ${threshold * 100}%。`
+      );
+    }
 
     const symbol = resolveAddSymbol(type, flags.symbol, db, actor);
 
@@ -185,12 +233,57 @@ function resolveAddSymbol(type, rawSymbolFlag, db, actor) {
   return symbol;
 }
 
+// Fix 3 (spec-owner decision, task P2-4 fix round): `remove` used to hard-
+// delete the rule AND cascade away its alert_events - including the 误报
+// feedback that exists precisely to tune thresholds later. Default behavior
+// is now non-destructive:
+//   - `remove --actor X --rule R`           -> soft delete: enabled=0.
+//     Runtime state and events (including feedback) survive untouched.
+//   - `remove --actor X --rule R --purge`   -> the old hard delete
+//     (rule + runtime state + events), opt-in and explicit.
+//
+// Distinguishing "soft-removed" from "merely paused" would need a marker
+// field on alert_rules, and that table has no free-form column in the
+// (frozen) DDL - no DDL change is made here. So this reuses `enabled` (the
+// same column pause/resume already flips) for the soft-delete marker,
+// which means `resume` on a soft-removed rule re-enables it exactly like
+// resuming a paused rule (see runResume below - unchanged, and see this
+// file's tests for the accepted-overlap regression test). This is the
+// documented, accepted limitation: a soft-removed rule is resumable. A
+// future phase that needs "removed" and "paused" to be truly
+// distinguishable will need a schema change (e.g. a `removed_at` column).
 export function runRemove(flags, options = {}) {
   const actor = requireActor(flags);
+  const purge = Boolean(flags.purge);
   return withDb(options, (db) => {
     const rule = requireOwnedRule(db, actor, flags.rule);
-    store.deleteRule(db, rule.id);
-    return { ok: true, ruleId: rule.id, removed: true };
+    const eventCount = store.countEventsForRule(db, rule.id);
+
+    if (purge) {
+      store.deleteRule(db, rule.id);
+      return {
+        ok: true,
+        ruleId: rule.id,
+        action: "removed",
+        mode: "purge",
+        eventsDeleted: eventCount,
+        message: "已彻底删除该规则及其全部历史事件（含误报反馈），无法恢复。"
+      };
+    }
+
+    store.setRuleEnabled(db, rule.id, false);
+    return {
+      ok: true,
+      ruleId: rule.id,
+      action: "removed",
+      mode: "soft",
+      eventsPreserved: eventCount,
+      message:
+        "已停用该规则（软删除）：历史事件与误报反馈已保留，可用于日后调整阈值。" +
+        "注意：由于 alert_rules 无独立的删除标记字段，软删除复用了 enabled 字段，" +
+        "resume 仍可重新启用该规则（与 pause 语义重叠，暂无法区分）。" +
+        "如需彻底清除历史且不再需要恢复，请追加 --purge（不可恢复）。"
+    };
   });
 }
 

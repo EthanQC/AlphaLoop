@@ -366,12 +366,20 @@ describe("isSymbolWatched", () => {
     expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
   });
 
-  it("returns false for a legacy owner_id=NULL row (no per-owner fallback for the watchlist)", () => {
+  // Inverted (spec-owner decision, task P2-4 fix round): stock_analysis_targets
+  // is structurally a single shared watchlist - `symbol TEXT PRIMARY KEY` (one
+  // row per symbol, globally) and setTargets never writes owner_id, so every
+  // existing row has owner_id NULL. Treating NULL as "no per-owner fallback"
+  // made the gate match nothing for 100% of production rows. NULL rows ARE
+  // the shared pool, not another member's private data, so any active actor
+  // must match them. A true per-owner watchlist needs a composite-key schema
+  // migration and is deferred to a later phase.
+  it("returns true for a legacy/shared owner_id=NULL active row (shared watchlist pool)", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
     seedTarget(db, { symbol: "AAPL.US", ownerId: null });
 
-    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(true);
   });
 
   // Regression (code review finding): stock-analysis.mjs's setTargets soft-
@@ -383,6 +391,19 @@ describe("isSymbolWatched", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
     seedTarget(db, { symbol: "AAPL.US", ownerId: "member_1", active: 0 });
+
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
+  });
+
+  // The active filter is now load-bearing for the shared pool: since the
+  // NULL fallback matches for ANY actor, a soft-deleted NULL-owner row must
+  // not stay matchable just because it's globally shared. Without this
+  // check the shared-pool fallback would resurrect a symbol every actor
+  // explicitly removed from the watchlist.
+  it("returns false for a soft-deleted (active=0) legacy owner_id=NULL row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, { symbol: "AAPL.US", ownerId: null, active: 0 });
 
     expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
   });
@@ -558,6 +579,31 @@ describe("deleteRule", () => {
     expect(store.getRule(db, ruleId)).toBeNull();
     expect(db.prepare("SELECT * FROM alert_runtime_state WHERE rule_id = ?").get(ruleId)).toBeUndefined();
     expect(db.prepare("SELECT * FROM alert_events WHERE id = ?").get(event.id)).toBeUndefined();
+  });
+});
+
+describe("countEventsForRule", () => {
+  it("returns 0 when the rule has no events", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db);
+
+    expect(store.countEventsForRule(db, ruleId)).toBe(0);
+  });
+
+  it("counts events scoped to that rule only", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleA = seedRule(db, { id: "rule_a" });
+    const ruleB = seedRule(db, { id: "rule_b", symbol: "MSFT.US" });
+    store.recordEvents(db, [
+      { ruleId: ruleA, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" },
+      { ruleId: ruleA, ownerId: "member_1", value: 0.06, triggeredAt: "2026-07-01T14:35:00.000Z" },
+      { ruleId: ruleB, ownerId: "member_1", value: 0.07, triggeredAt: "2026-07-01T14:40:00.000Z" }
+    ]);
+
+    expect(store.countEventsForRule(db, ruleA)).toBe(2);
+    expect(store.countEventsForRule(db, ruleB)).toBe(1);
   });
 });
 

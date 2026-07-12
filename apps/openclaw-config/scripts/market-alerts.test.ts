@@ -178,6 +178,38 @@ describe("runAdd: threshold defaults and validation", () => {
     expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "0" }, options)).toThrow(/threshold/);
     expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "-0.04" }, options)).toThrow(/threshold/);
   });
+
+  // Fix 2 (task P2-4 fix round): thresholds are decimal ratios (0.04 = 4%).
+  // `--threshold 5` used to silently create a rule needing a 500% move -
+  // it would never fire, with no error at creation time. Reject threshold
+  // >= 1 with a message that teaches the correct decimal form.
+  it("rejects a threshold >= 1 with a Chinese message teaching the decimal form", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "5" }, options)).toThrow(
+      /阈值请用小数.*0\.05.*500%/
+    );
+  });
+
+  it("rejects a threshold of exactly 1 (upper bound is inclusive)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "1" }, options)).toThrow(/阈值请用小数/);
+  });
+
+  it("accepts a valid boundary threshold just under 1 (0.99)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "0.99" }, options);
+
+    expect(result.rule.threshold).toBe(0.99);
+  });
 });
 
 describe("runAdd: direction validation (reviewer-noted write-side gate)", () => {
@@ -217,6 +249,23 @@ describe("runAdd: symbol pool validation (watchlist ∪ positions)", () => {
     const { db, options } = makeDb();
     seedMember(db, "member_1");
     seedTarget(db, "NVDA.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "NVDA", type: "daily_move" }, options);
+
+    expect(result.ok).toBe(true);
+    expect(result.rule.symbol).toBe("NVDA.US");
+  });
+
+  // Fix 1 (spec-owner decision, task P2-4 fix round): stock_analysis_targets
+  // is a single shared watchlist in production (symbol is the PK; setTargets
+  // never writes owner_id), so every real row has owner_id NULL. This is the
+  // end-to-end regression test for the reported production bug: "add an
+  // alert for a watchlist symbol I don't yet hold" must now succeed against
+  // the shared pool instead of failing 100% of the time.
+  it("accepts a symbol from the shared watchlist pool (owner_id=NULL row, the real production shape)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "NVDA.US", null);
 
     const result = cli.runAdd({ actor: "member_1", symbol: "NVDA", type: "daily_move" }, options);
 
@@ -371,25 +420,83 @@ function addOwnedRule(db: DatabaseSync, options: { dbPath: string }, ownerId: st
   return cli.runAdd({ actor: ownerId, symbol: symbol.replace(".US", ""), type: "daily_move" }, options).rule;
 }
 
-describe("runRemove / runPause / runResume: owner enforcement", () => {
-  it("removes an owned rule", () => {
+// Fix 3 (spec-owner decision, task P2-4 fix round): `remove` used to hard-
+// delete the rule AND cascade away its alert_events - including the 误报
+// feedback that exists precisely to tune thresholds later. New contract:
+// - `remove` (no flag) soft-deletes: enabled=0, rule/runtime/events survive.
+// - `remove --purge` is the old hard delete, opt-in and explicit.
+//
+// Distinguishing "soft-removed" from "merely paused" would need a marker
+// field, and alert_rules has no free-form column in the (frozen) DDL - so
+// per the brief's documented fallback, this implements soft-delete WITH
+// pause semantics: `resume` on a soft-removed rule re-enables it exactly
+// like resuming a paused one (accepted overlap, not a bug). See the
+// "documented limitation" test below.
+describe("runRemove: soft delete (default) preserves events; --purge hard-deletes", () => {
+  it("soft-deletes by default: disables the rule, keeps events, reports mode:soft", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    const rule = addOwnedRule(db, options, "member_1");
+    const [event] = store.recordEvents(db, [{ ruleId: rule.id, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" }]);
+    store.setFeedback(db, event.id, "误报，调高阈值");
+
+    const result = cli.runRemove({ actor: "member_1", rule: rule.id }, options);
+
+    expect(result.ok).toBe(true);
+    expect(result.ruleId).toBe(rule.id);
+    expect(result.action).toBe("removed");
+    expect(result.mode).toBe("soft");
+    expect(result.eventsPreserved).toBe(1);
+
+    const stored = store.getRule(db, rule.id);
+    expect(stored).not.toBeNull();
+    expect(stored?.enabled).toBe(false);
+    expect(store.getEvent(db, event.id)?.feedback).toBe("误报，调高阈值");
+  });
+
+  it("--purge hard-deletes the rule and its events, reports mode:purge", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    const rule = addOwnedRule(db, options, "member_1");
+    const [event] = store.recordEvents(db, [{ ruleId: rule.id, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" }]);
+
+    const result = cli.runRemove({ actor: "member_1", rule: rule.id, purge: true }, options);
+
+    expect(result.ok).toBe(true);
+    expect(result.ruleId).toBe(rule.id);
+    expect(result.action).toBe("removed");
+    expect(result.mode).toBe("purge");
+    expect(result.eventsDeleted).toBe(1);
+
+    expect(store.getRule(db, rule.id)).toBeNull();
+    expect(store.getEvent(db, event.id)).toBeNull();
+  });
+
+  it("reports eventsPreserved: 0 / eventsDeleted: 0 when the rule never fired", () => {
     const { db, options } = makeDb();
     seedMember(db, "member_1");
     const rule = addOwnedRule(db, options, "member_1");
 
-    const result = cli.runRemove({ actor: "member_1", rule: rule.id }, options);
-
-    expect(result).toEqual({ ok: true, ruleId: rule.id, removed: true });
-    expect(store.getRule(db, rule.id)).toBeNull();
+    expect(cli.runRemove({ actor: "member_1", rule: rule.id }, options).eventsPreserved).toBe(0);
   });
 
-  it("rejects removing another owner's rule", () => {
+  it("rejects removing another owner's rule (soft path)", () => {
     const { db, options } = makeDb();
     seedMember(db, "member_1");
     seedMember(db, "member_2");
     const rule = addOwnedRule(db, options, "member_1");
 
     expect(() => cli.runRemove({ actor: "member_2", rule: rule.id }, options)).toThrow(/不是你的规则/);
+    expect(store.getRule(db, rule.id)?.enabled).toBe(true);
+  });
+
+  it("rejects removing another owner's rule (--purge path)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    const rule = addOwnedRule(db, options, "member_1");
+
+    expect(() => cli.runRemove({ actor: "member_2", rule: rule.id, purge: true }, options)).toThrow(/不是你的规则/);
     expect(store.getRule(db, rule.id)).not.toBeNull();
   });
 
@@ -404,6 +511,25 @@ describe("runRemove / runPause / runResume: owner enforcement", () => {
     expect(() => cli.runRemove({ actor: "member_1" }, options)).toThrow(/--rule/);
   });
 
+  // Documents the accepted overlap between soft-removed and paused: there's
+  // no DDL marker to tell them apart, so `resume` on a soft-removed rule
+  // simply re-enables it, same as resuming a paused one. This is the
+  // spec-owner's explicit fallback decision, not an oversight.
+  it("resume re-enables a soft-removed rule (documented, accepted overlap with pause - no DDL marker exists to reject this)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    const rule = addOwnedRule(db, options, "member_1");
+    cli.runRemove({ actor: "member_1", rule: rule.id }, options);
+    expect(store.getRule(db, rule.id)?.enabled).toBe(false);
+
+    const result = cli.runResume({ actor: "member_1", rule: rule.id }, options);
+
+    expect(result).toEqual({ ok: true, ruleId: rule.id, enabled: true });
+    expect(store.getRule(db, rule.id)?.enabled).toBe(true);
+  });
+});
+
+describe("runRemove / runPause / runResume: owner enforcement", () => {
   it("pauses and resumes an owned rule", () => {
     const { db, options } = makeDb();
     seedMember(db, "member_1");
@@ -523,6 +649,28 @@ describe("parseFlags", () => {
 
   it("treats a value-flag immediately followed by another flag as an empty string, not boolean true", () => {
     expect(cli.parseFlags(["--threshold", "--direction", "up"])).toEqual({ threshold: "", direction: "up" });
+  });
+
+  // Fix 4 (task P2-4 fix round): fail loud on unrecognized flags instead of
+  // silently ignoring them - matching this CLI's existing philosophy of
+  // never letting a typo quietly fall back to a default (see the direction
+  // gate and the omitted-value handling above). Before this fix,
+  // `--treshold 0.05` would silently parse as an unused key and `add` would
+  // fall back to the type's default threshold with no error at all.
+  it("rejects an unknown flag instead of silently ignoring it (e.g. --treshold typo)", () => {
+    expect(() => cli.parseFlags(["--actor", "member_1", "--treshold", "0.05"])).toThrow(/未知参数/);
+  });
+
+  it("rejects an unknown boolean-looking flag too", () => {
+    expect(() => cli.parseFlags(["--al"])).toThrow(/未知参数/);
+  });
+
+  it("accepts --purge as a known boolean flag (Fix 3's hard-delete opt-in)", () => {
+    expect(cli.parseFlags(["--actor", "member_1", "--rule", "r1", "--purge"])).toEqual({
+      actor: "member_1",
+      rule: "r1",
+      purge: true
+    });
   });
 });
 

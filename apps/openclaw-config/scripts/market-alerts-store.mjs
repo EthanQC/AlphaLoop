@@ -95,16 +95,29 @@ export function getMemberById(db, memberId) {
   return row ? { id: String(row.id), status: String(row.status) } : null;
 }
 
-// Watchlist membership has no legacy NULL-owner fallback: the brief scopes
-// this strictly to `owner_id = actor` (unlike isSymbolInPositions below).
+// Spec-owner decision (task P2-4 fix round), superseding the original
+// brief's "owner_id = actor" strict gate: stock_analysis_targets is
+// structurally a SINGLE SHARED watchlist, not a per-owner one -
+// `symbol TEXT PRIMARY KEY` means one row per symbol globally, and
+// stock-analysis.mjs's setTargets never writes owner_id, so every existing
+// row has owner_id NULL. The strict gate matched NULL against nothing,
+// making "add an alert for a watchlist symbol I don't yet hold" fail 100%
+// of the time in production. NULL-owner rows ARE the shared pool - not some
+// other member's private data - so they must match for any actor, mirroring
+// the NULL fallback isSymbolInPositions already uses below. A true
+// per-owner watchlist requires a composite-key schema migration and is
+// deferred to a later phase; this is a read-side workaround, not a fix to
+// the underlying schema (DDL is frozen for this task).
 //
 // `active = 1` matches stock-analysis.mjs's own listTargets contract: its
 // setTargets soft-deletes by flipping a replaced row's `active` to 0 (never
 // deleting the row), so a symbol the owner explicitly removed must not stay
-// matchable here just because the row still physically exists.
+// matchable here just because the row still physically exists. This filter
+// is now load-bearing for the shared pool too: a soft-deleted NULL-owner row
+// must not be resurrected just because it's globally shared.
 export function isSymbolWatched(db, ownerId, symbol) {
   const row = db
-    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE owner_id = ? AND symbol = ? AND active = 1`)
+    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE (owner_id = ? OR owner_id IS NULL) AND symbol = ? AND active = 1`)
     .get(ownerId, symbol);
   return Boolean(row);
 }
@@ -221,6 +234,15 @@ export function deleteRule(db, ruleId) {
 export function getEvent(db, eventId) {
   const row = db.prepare(`SELECT * FROM alert_events WHERE id = ?`).get(eventId);
   return row ? mapEventRow(row) : null;
+}
+
+// Task P2-4 fix round (Fix 3, non-destructive `remove`): lets the CLI report
+// how many alert_events a rule has (eventsPreserved on the soft-delete path,
+// eventsDeleted on the --purge/hard-delete path) without needing to fetch
+// and count full rows itself.
+export function countEventsForRule(db, ruleId) {
+  const row = db.prepare(`SELECT COUNT(*) AS c FROM alert_events WHERE rule_id = ?`).get(ruleId);
+  return Number(row?.c ?? 0);
 }
 
 export function getQuota(db, ownerId, tradingDay) {
