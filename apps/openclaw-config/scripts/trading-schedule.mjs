@@ -26,6 +26,25 @@ const NYSE_EARLY_CLOSE_DATES = new Set([
   "2026-12-24"
 ]);
 
+export const CALENDAR_COVERED_YEARS = Array.from(
+  new Set(
+    [...NYSE_FULL_CLOSE_DATES, ...NYSE_EARLY_CLOSE_DATES].map((dateLabel) => Number(dateLabel.slice(0, 4)))
+  )
+).sort((a, b) => a - b);
+
+export function assertCalendarCoverage(date) {
+  const { year } = getZonedParts(date, NEW_YORK_TIMEZONE);
+  if (!CALENDAR_COVERED_YEARS.includes(year)) {
+    throw new Error(
+      `trading calendar has no data for year ${year}: update NYSE_FULL_CLOSE_DATES/NYSE_EARLY_CLOSE_DATES for year ${year} in trading-schedule.mjs`
+    );
+  }
+}
+
+export function currentUsEasternTradingDay(date = new Date()) {
+  return getZonedParts(date, NEW_YORK_TIMEZONE).dateLabel;
+}
+
 export function shouldRunReportDelivery(kind, date = new Date()) {
   const parts = getZonedParts(date, SHANGHAI_TIMEZONE);
   if (parts.minute !== 0 || parts.hour !== 20) {
@@ -62,6 +81,7 @@ export function shouldRunStockAnalysis(date = new Date(), lastRunAt, options = {
 }
 
 export function isUsRegularMarketHours(date = new Date()) {
+  assertCalendarCoverage(date);
   const parts = getZonedParts(date, NEW_YORK_TIMEZONE);
   if (parts.weekday < 1 || parts.weekday > 5 || NYSE_FULL_CLOSE_DATES.has(parts.dateLabel)) {
     return false;

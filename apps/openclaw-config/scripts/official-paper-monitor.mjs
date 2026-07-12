@@ -10,6 +10,7 @@ import {
   openTradingDatabase
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import { computeExposure } from "./portfolio-exposure.mjs";
 import { assertOfficialPaperReportEnvironment, normalizeOfficialPaperSnapshot, normalizeQuotePayload, toNumber } from "./report-data.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
@@ -140,8 +141,12 @@ function buildStrategyReflection(snapshot) {
   const primary = snapshot.primaryAsset ?? {};
   const netAssets = toNumber(primary.net_assets ?? primary.netAssets) ?? 0;
   const marketValue = estimateMarketValue(snapshot);
-  const exposurePercent = netAssets > 0 ? (marketValue / netAssets) * 100 : 0;
-  const budgetPercent = 10;
+  const exposure = computeExposure({ netAssets, marketValue, positions: snapshot.positions });
+  // netAssets was already coerced to 0 above, so exposure.exposureRatio is never
+  // actually null here; the `?? 0` only guards the type (computeExposure allows a
+  // null netAssets for other callers, e.g. the alert engine) without changing behavior.
+  const exposurePercent = (exposure.exposureRatio ?? 0) * 100;
+  const budgetPercent = exposure.budgetRatio * 100;
   const remainingBudget = Math.max(0, netAssets * budgetPercent / 100 - marketValue);
   const summary = `官方模拟盘当前暴露 ${exposurePercent.toFixed(2)}%，剩余 OpenClaw 自由发挥预算约 ${remainingBudget.toFixed(2)} USD。`;
   return {
@@ -150,7 +155,7 @@ function buildStrategyReflection(snapshot) {
     budgetPercent,
     remainingBudget,
     positionCount: snapshot.positions.length,
-    action: exposurePercent > budgetPercent ? "停止新增并等待降仓" : "允许继续观察，新增前仍需通过 broker-executor 预算检查"
+    action: exposure.overBudget ? "停止新增并等待降仓" : "允许继续观察，新增前仍需通过 broker-executor 预算检查"
   };
 }
 
