@@ -36,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -229,6 +229,21 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       ALTER TABLE stock_analysis_targets ADD COLUMN owner_id TEXT;
       ALTER TABLE paper_strategy_reflections ADD COLUMN owner_id TEXT;
       CREATE INDEX IF NOT EXISTS official_paper_snapshots_owner_idx ON official_paper_snapshots(owner_id, fetched_at);
+    `);
+  },
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS feishu_context_messages (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        sender_name TEXT NOT NULL,
+        text TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS feishu_context_messages_time_idx
+        ON feishu_context_messages(created_at);
     `);
   }
 ];

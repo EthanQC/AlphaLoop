@@ -209,11 +209,10 @@ describe("ApiTokenRepository", () => {
 });
 
 describe("v3 business tables migration", () => {
-  it("creates all new business tables and bumps schema version to 4", () => {
+  it("creates all new business tables", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(SCHEMA_VERSION).toBe(4);
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
@@ -302,5 +301,37 @@ describe("v4 owner_id columns on legacy tables", () => {
       .prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = 'snap_2'")
       .get() as { owner_id: string };
     expect(newRow.owner_id).toBe(member.id);
+  });
+});
+
+describe("v5 feishu_context_messages migration", () => {
+  it("creates feishu_context_messages and bumps schema version to 5", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(SCHEMA_VERSION).toBe(5);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("feishu_context_messages");
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("feishu_context_messages_time_idx");
+  });
+
+  it("round-trips a message insert/read", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    db.prepare(`
+      INSERT OR IGNORE INTO feishu_context_messages
+      (id, created_at, channel_id, chat_id, sender_id, sender_name, text)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("msg_1", "2026-07-12T00:00:00.000Z", "feishu", "chat_1", "user_1", "Alice", "hello");
+
+    const row = db
+      .prepare("SELECT text, sender_name FROM feishu_context_messages WHERE id = 'msg_1'")
+      .get() as { text: string; sender_name: string };
+    expect(row).toEqual({ text: "hello", sender_name: "Alice" });
   });
 });
