@@ -97,8 +97,15 @@ export function getMemberById(db, memberId) {
 
 // Watchlist membership has no legacy NULL-owner fallback: the brief scopes
 // this strictly to `owner_id = actor` (unlike isSymbolInPositions below).
+//
+// `active = 1` matches stock-analysis.mjs's own listTargets contract: its
+// setTargets soft-deletes by flipping a replaced row's `active` to 0 (never
+// deleting the row), so a symbol the owner explicitly removed must not stay
+// matchable here just because the row still physically exists.
 export function isSymbolWatched(db, ownerId, symbol) {
-  const row = db.prepare(`SELECT 1 FROM stock_analysis_targets WHERE owner_id = ? AND symbol = ?`).get(ownerId, symbol);
+  const row = db
+    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE owner_id = ? AND symbol = ? AND active = 1`)
+    .get(ownerId, symbol);
   return Boolean(row);
 }
 
@@ -151,11 +158,26 @@ export function countRules(db, ownerId, symbol, ruleType) {
 export function insertRule(db, rule) {
   const id = createId("alert_rule");
   const createdAt = new Date().toISOString();
+  const hysteresis = rule.hysteresis ?? 0;
   db.prepare(`
     INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, rule.threshold, rule.direction, rule.frequency, rule.hysteresis ?? 0, createdAt);
-  return getRule(db, id);
+  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, rule.threshold, rule.direction, rule.frequency, hysteresis, createdAt);
+  // Built directly from the insert args (matching recordEvents' pattern
+  // below) rather than a redundant getRule(db, id) re-fetch - every field
+  // returned here is already known, normalized the same way mapRuleRow does.
+  return {
+    id,
+    ownerId: rule.ownerId,
+    symbol: rule.symbol,
+    ruleType: rule.ruleType,
+    threshold: Number(rule.threshold),
+    direction: rule.direction,
+    frequency: rule.frequency,
+    hysteresis: Number(hysteresis),
+    enabled: true,
+    createdAt
+  };
 }
 
 export function getRule(db, ruleId) {

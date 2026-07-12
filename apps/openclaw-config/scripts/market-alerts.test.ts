@@ -498,7 +498,7 @@ describe("runMarketAlertsCommand: dispatch", () => {
 });
 
 describe("parseFlags", () => {
-  it("parses --flag value pairs and boolean flags", () => {
+  it("parses --flag value pairs and the --all boolean flag", () => {
     expect(cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--all"])).toEqual({
       actor: "member_1",
       symbol: "AAPL",
@@ -508,5 +508,38 @@ describe("parseFlags", () => {
 
   it("ignores non-flag tokens", () => {
     expect(cli.parseFlags(["stray", "--actor", "member_1"])).toEqual({ actor: "member_1" });
+  });
+
+  // Regression (code review finding): only `--all` is a genuine boolean
+  // flag. Every other flag expects a value; a value-flag with nothing
+  // after it (end of argv, or immediately followed by another `--flag`)
+  // must NOT become the JS boolean `true` - `Number(true) === 1` and
+  // `String(true).trim() === "true"` (both truthy/non-empty) would let a
+  // typo'd/omitted value silently pass downstream validation instead of
+  // being treated as "no value supplied".
+  it("treats a value-flag with no following token as an empty string, not boolean true", () => {
+    expect(cli.parseFlags(["--actor"])).toEqual({ actor: "" });
+  });
+
+  it("treats a value-flag immediately followed by another flag as an empty string, not boolean true", () => {
+    expect(cli.parseFlags(["--threshold", "--direction", "up"])).toEqual({ threshold: "", direction: "up" });
+  });
+});
+
+describe("runAdd / runList: omitted-value flags fail loud instead of silently coercing (code review regression)", () => {
+  it("an --actor with no value still fails with the missing-argument error, not a stringified 'true'", () => {
+    const { options } = makeDb();
+    const flags = cli.parseFlags(["--actor"]);
+
+    expect(() => cli.runList(flags, options)).toThrow(/--actor/);
+  });
+
+  it("a --threshold with no value is rejected, not silently coerced to 1 via Number(true)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+    const flags = cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--type", "daily_move", "--threshold"]);
+
+    expect(() => cli.runAdd(flags, options)).toThrow(/threshold/);
   });
 });

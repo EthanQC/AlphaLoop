@@ -373,6 +373,19 @@ describe("isSymbolWatched", () => {
 
     expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
   });
+
+  // Regression (code review finding): stock-analysis.mjs's setTargets soft-
+  // deletes by flipping a row's `active` to 0 (it never deletes the row),
+  // and its own listTargets reader filters `WHERE active = 1`. isSymbolWatched
+  // must honor that same "currently on the watchlist" contract, or a symbol
+  // an owner explicitly removed would stay matchable forever.
+  it("returns false for a soft-deleted (active=0) watchlist entry", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, { symbol: "AAPL.US", ownerId: "member_1", active: 0 });
+
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
+  });
 });
 
 describe("isSymbolInPositions", () => {

@@ -29,10 +29,25 @@ const DIRECTIONS = ["both", "up", "down"];
 
 const EXPOSURE_SYMBOL = "*";
 
+// `--all` (list) is this CLI's only genuine no-value boolean flag. Every
+// other flag (--actor/--symbol/--type/--threshold/--direction/--rule/--event/
+// --note) always expects a value.
+const BOOLEAN_FLAGS = new Set(["all"]);
+
 /**
  * Parses `--flag value` / `--boolFlag` pairs from an argv slice (after the
- * subcommand). A flag with no following value (or one followed immediately
- * by another `--flag`) is treated as a boolean `true` (e.g. `--all`).
+ * subcommand). Flags in BOOLEAN_FLAGS are always `true` when present.
+ *
+ * Every other flag with no following value (end of argv, or immediately
+ * followed by another `--flag`) is recorded as an empty string `""`, NOT the
+ * JS boolean `true` (code review regression: `Number(true) === 1` let an
+ * omitted `--threshold` silently become a valid positive threshold instead
+ * of erroring, and `String(true).trim()` === "true" - a non-empty string -
+ * let an omitted `--actor` slip past the "missing argument" check). An
+ * empty-string value still fails every downstream `!value`/`Number(value)`
+ * validation the same way a truly absent flag would, so this keeps "flag
+ * present but empty" and "flag absent" both failing loud instead of one of
+ * them silently succeeding with a bogus coerced value.
  */
 export function parseFlags(argv) {
   const flags = {};
@@ -42,9 +57,13 @@ export function parseFlags(argv) {
       continue;
     }
     const name = token.slice(2);
+    if (BOOLEAN_FLAGS.has(name)) {
+      flags[name] = true;
+      continue;
+    }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) {
-      flags[name] = true;
+      flags[name] = "";
     } else {
       flags[name] = next;
       i += 1;
@@ -175,22 +194,23 @@ export function runRemove(flags, options = {}) {
   });
 }
 
-export function runPause(flags, options = {}) {
+// Shared by runPause/runResume, which are otherwise identical control flow
+// differing only in the `enabled` boolean.
+function setOwnedRuleEnabled(flags, options, enabled) {
   const actor = requireActor(flags);
   return withDb(options, (db) => {
     const rule = requireOwnedRule(db, actor, flags.rule);
-    store.setRuleEnabled(db, rule.id, false);
-    return { ok: true, ruleId: rule.id, enabled: false };
+    store.setRuleEnabled(db, rule.id, enabled);
+    return { ok: true, ruleId: rule.id, enabled };
   });
 }
 
+export function runPause(flags, options = {}) {
+  return setOwnedRuleEnabled(flags, options, false);
+}
+
 export function runResume(flags, options = {}) {
-  const actor = requireActor(flags);
-  return withDb(options, (db) => {
-    const rule = requireOwnedRule(db, actor, flags.rule);
-    store.setRuleEnabled(db, rule.id, true);
-    return { ok: true, ruleId: rule.id, enabled: true };
-  });
+  return setOwnedRuleEnabled(flags, options, true);
 }
 
 export function runFeedback(flags, options = {}) {
