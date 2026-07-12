@@ -1,0 +1,105 @@
+# AlphaLoop 技术选型文档（r2）
+
+- 日期：2026-07-12
+- 状态：待用户 review（与《2026-07-12-detailed-requirements.md》配套）
+- 本版核心变化：多成员对等（per-owner 隔离贯穿全栈）、平台升级为动态 Web 应用（站内研究）、skill 客户端接入（替代 gateway.remote 主通道）、双模拟盘账户、记忆双层（本地私有 + 平台按 owner 隔离）
+- 未变更部分（沿用 07-11 版结论，不再重复论证）：报告管线复用、质量门、提醒引擎（launchd 直跑+状态落库）、飞书卡片回调（OpenClaw 原生 ocf1）、新闻引擎（RSSHub 仅回环+事件聚类新建）、SQLite 治理（集中迁移+user_version+每日备份）、交易日历 fail-loud、注入面隔离、XSS/脱敏纪律、观测与失败状态机、部署蓝图骨架
+
+---
+
+## 1. 宏观架构
+
+### 1.1 拓扑（r2）
+
+```
+                      ┌──────────────────────────────────────┐
+                      │            Mac mini（平台）            │
+     飞书云 ◄─WS长连──┤ OpenClaw Gateway（唯一，含 control agent│
+     (唯一监听)       │   与受限 research agent 配置）           │
+                      │ broker-executor :4312（多账户，唯一写券商）│
+                      │ trading.sqlite（全部结构化真源，per-owner）│
+                      │ platform-app :4314（动态服务：身份/个人页/ │
+                      │   研究任务/成员管理）                     │
+                      │ 静态站点服务 :4313（公共内容）             │
+                      │ memoryd 平台实例（仅回环；per-owner scope）│
+                      │ RSSHub（Docker，仅回环）                 │
+                      └──────────────┬───────────────────────┘
+                          cloudflared│（仅出站隧道）
+              ┌──────────────────────┼──────────────────────┐
+     reports.<域名>（Access 白名单）   │        api.<域名>（服务凭证+个人token）
+              │                      │                      │
+   成员手机/浏览器（登录=Access 身份） │        成员本地 OpenClaw + AlphaLoop skill
+                                     │        （私有策略在本地；查询/发布/研究经 API）
+```
+
+### 1.2 三个网络面
+
+1. **公网入站：零**。两个子域全部经 cloudflared 出站隧道发布：`reports.<域名>`（人用，Cloudflare Access 邮箱白名单）与 `api.<域名>`（机器用，边缘 Access service token + 应用层个人 bearer token 双层）。其余主机名默认拒绝。
+2. **本机回环**：broker-executor、memoryd、RSSHub、静态服务、platform-app 源端口全部只绑 127.0.0.1。
+3. **Tailscale 降级为可选运维通道**（你 SSH 进 mini 用），不再是成员接入的依赖——成员接入只需公网域名 + token，mashu 无需入 tailnet（接入摩擦更低）。
+
+### 1.3 身份与隔离（贯穿全栈的新增维度）
+
+- **人（浏览器）**：Cloudflare Access 登录后，请求自带 `Cf-Access-Authenticated-User-Email` 头——platform-app 直接以它为身份渲染个人内容与权限，**无需自建登录/会话系统**（Access JWT 校验防伪造头）。
+- **机器（本地 skill）**：平台签发的个人 bearer token，绑定成员；一键吊销。
+- **飞书**：open_id ↔ 成员映射表；单聊即身份，群内操作按发言者归属。
+- **数据**：members 表 + 全部业务表（提醒规则/事件、提案、预测、论点、纪律、研判任务、快照）加 owner 列；所有读写路径强制按身份过滤（服务端，不靠前端）。
+
+### 1.4 单写者约束（不可分布）
+
+与 07-11 版一致：飞书 WS、trading.sqlite、券商接口（broker-executor）、cron 调度、平台记忆库写入——全在 mini。新增：**成员本地只有私有层数据**，平台数据不在本地留权威副本。
+
+---
+
+## 2. 分项选型（本版新增/变更项）
+
+### 2.1 接入模式：AlphaLoop 客户端 skill + 平台 API（替代 gateway.remote 主通道）
+
+- **选择**：成员本地 OpenClaw 装一个 **AlphaLoop skill**（随仓库发布），配置只有两项：`api.<域名>` + 个人 token。skill 提供的工具面：查询（行情快照/个股分析/新闻/自己的持仓/提案/提醒）、策略记忆读写（自己的，含档位）、发布/升档、提交研究任务、提醒规则 CRUD（自己的）、提案请求（自己的盘）——与飞书对话能力对齐，全部操作按 token 身份落在本人名下。本地 agent 自治，需要平台时按需调 API。
+- **理由**：符合"用户拿 skill 本地就跑"的产品直觉；新成员接入=装 skill 填 token（无 tailnet、无 gateway 配对）；平台 API 同时服务 skill 与未来任何客户端；彻底解除 OpenClaw 版本耦合。gateway.remote 不再是成员通道（可留作你个人的运维后门，不在验收内）。
+- **风险**：API 成为新攻击面 → 双层认证（边缘 service token + 个人 token）、只暴露白名单路由、全部写操作按 token 身份过滤+审计。
+- **验证**：mashu 接入流程真实计时 ≤30 分钟；token 吊销即时生效实测。
+
+### 2.2 平台动态服务：platform-app（新组件，站内研究与个人化的载体）
+
+- **选择**：一个 Node 服务（:4314，回环）作为**全站前置身份网关**：cloudflared 把 reports 与 api 两个子域全部指向 platform-app，由它①解析身份（Access 邮箱头 / bearer token）；②对**纯公共产物**（公共日报/周报/个股分析正文 1-8 段、新闻页、名片）直接回源静态文件（:4313 或本地目录 passthrough）；③对**一切含个人化或本人可见性限制的页面**（首页、报告列表、`/stock/*` 第 9 段个人块、`/proposal/*`、`/research/*`、模拟盘页、策略页、个人页）按身份过滤后服务端渲染；④研究任务 API 与成员/token 管理。**静态服务永远不直接暴露**——这是三档可见性与 per-owner 隔离在 Web 面的唯一执法点，杜绝"个人内容被静态渲染后对全体白名单成员可见"的泄露路径。
+- **研究任务执行链**：platform-app 落任务表（SQLite，含每日配额检查）→ 任务 worker（platform-app 内置队列；任务表即状态机，进程重启后未完成任务自动续跑）→ 调用 mini 上的**受限 research agent**（在 07-11 技术文档 §2.8 的无 shell 检索配置基础上扩展行情/记忆读取工具；**记忆工具由 worker 按任务 owner 预绑定 scope 的代理调用，agent 没有自由 scope 参数**，杜绝跨人读取）→ 产物过数字校验 → 生成研判页 + 更新任务状态 → 飞书单聊通知。进行中页用**轮询**任务状态（3-5s，够用且零推送基建；不引入 WebSocket）。
+- **理由**：把"动态"收敛在一个小服务里，静态内容仍走纯静态（性能与攻击面都最小）；轮询换掉推送是两人规模下的正确取舍。
+- **风险**：这是 v2 相对上一版**最大的新增工程量**（估计与提醒引擎相当）；超时/失败语义要如实呈现（"已收集材料+未完成研判"降级态）。
+- **验证**：三个真实问题全链路 + 一次数据缺失场景 + 并发两任务排队行为。
+
+### 2.3 双模拟盘：broker-executor 多账户化
+
+- **选择**：每成员一套长桥凭据（独立存放于 mini，互不可见，命名隔离）；OrderTicket/提案带 owner；executor 按 owner 加载对应凭据执行（子进程级环境注入，长桥 CLI 凭据本就来自环境变量）；10% 预算校验、快照新鲜度、熔断全部 **per-owner** 计算（official_paper_snapshots 加 owner 列，每小时轮询逐账户拉取）。
+- **风险**：凭据管理复杂度翻倍（密钥清单按成员分节）；两账户轮询使长桥 API 调用量翻倍（远低于限速，无碍）；mashu 未开户期间系统按"无盘成员"降级（其余功能全可用）。
+- **验证**：双账户各一笔全链路 + 交叉审批拒绝实测 + 熔断独立触发回放。
+
+### 2.4 记忆双层：本地私有层 + 平台 per-owner 层
+
+- **平台层**：mini 上专用 memoryd 实例（仅回环），**每成员一个 scope**（owner 隔离的物理边界），可见性档位（②系统可用/③公开）写入每条记忆的 tags；平台读写全部经 platform-app/管线代理（它们做身份过滤），任何路径不直连 memoryd 跨 scope 读。
+- **本地私有层（①档）**：成员本地已有个人 memoryd 的，skill 直接用其一个专用 scope；没有的，skill 退化为本地 Markdown 文件目录。私有层永不上传。
+- **升档语义**：①→② = skill 把该条推送到平台 API（平台落库+进平台 memoryd）；②→③ = 平台改档位 tag + 名片重渲染。降档不回收历史产物（需求 §2.1）。
+- **沿用**：mem_save/mem_capture_passive 的通道区分、向量层部署时开启（黄灯）、fire-and-forget 降级、每日数据根快照备份——同 07-11 版。
+
+### 2.5 SQLite 多成员化
+
+members（email/feishu_open_id/昵称/偏好标签/战绩展示开关/状态）、api_tokens（hash/owner/吊销位）、research_tasks（owner/问题/状态/预算消耗/产物路径）三张新表；既有及规划中的业务表全部加 owner 列并建索引；**论点/策略结构化表加 visibility 列（②/③ 档位的 SQL 真源，memoryd tags 为镜像）**；迁移沿用 user_version 机制。名片页数据全部由现有表派生（偏好标签在 members，公开策略/论点按 visibility 列查询，战绩按 owner 查快照，公开研判按任务表档位查询）——**名片没有独立存储，是视图**。
+
+### 2.6 前端与 UI 三版流程
+
+- 技术底座不变（自研轻量生成器+内联 SVG+严格转义+CSP），新增：个人化片段由 platform-app 服务端渲染注入同一套模板；研究进行中页的轮询与主题切换用最小原生 JS。
+- **风格已定稿（2026-07-12，用户选定 A+C）**：一套骨架（C 作战室 bento）+ 两套主题 token（浅色=C 调色、暗色=A 终端调色，`data-theme` 切换 + `prefers-color-scheme` 默认 + localStorage 记忆）；**绿涨红跌**语义色进 token（up-green/down-red，两主题各自校准对比度）；响应式断点：<1024px 底部 5 tab + 1-2 列网格，≥1024px 左侧导航 + 多列 bento。定稿样张见 `ui-samples/final.html`，实现以其 token 系统为准。
+
+### 2.7 可行性红黄绿（本版增量）
+
+**绿灯**：Access 邮箱头作身份（Cloudflare 标准能力）；长桥 CLI 凭据环境注入（现有代码即此模式）；memoryd per-scope 隔离（数据模型原生支持）。
+**黄灯（点火后实测）**：Access 在飞书 webview 的会话与邮箱头传递；api 子域 service token 与个人 token 双层联调；research agent 单任务时延与成本（定每日配额的依据）；长桥双账户并发轮询——特别注意两处现存的跨账户共享状态需先隔离：`~/.longbridge` 的 region-cache 单文件（按成员覆盖 HOME/路径隔离）与 `runtime/longbridge-rate-limit-*.json` 按类别限流（按账户拆分或确认共享可接受）；沿用 07-11 版黄灯全部条目（卡片回调订阅、requireMention、interactive 发卡、memoryd 向量层/写入通道/headless LLM、mini 环境盘点、OpenClaw web search 配额）。
+**红灯与缓解**：平台 API 攻击面（双层认证+路由白名单+审计+吊销）；研究任务预算失控（每人每日配额+单任务硬顶+超时降级）；多账户凭据泄露（按成员隔离存放+脱敏纪律覆盖）；其余沿用 07-11 版。
+
+## 3. 部署蓝图（增量）
+
+在 07-11 版蓝图基础上：服务层新增 platform-app（launchd 守护；内置任务队列，任务表状态机保证崩溃后续跑）；cloudflared 两子域全部指向 platform-app（静态服务只作它的后端文件源，不直接暴露）；成员管理命令（add/revoke member，生成 token 与 Access 白名单提示）；长桥凭据按成员分目录（含 region-cache 隔离）；memoryd 平台实例按成员建 scope。开发→部署仍为 git push → mini 拉取 + 幂等安装脚本。
+
+---
+
+*本文档与详细需求文档（2026-07-12）配套，待你 review。07-11 版两份文档由本版取代。*

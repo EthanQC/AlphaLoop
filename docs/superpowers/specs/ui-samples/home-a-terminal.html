@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>样张 A · 盯盘室终端</title>
+<style>
+:root{
+  --bg:#0A0E1A; --panel:#101627; --panel2:#151C30; --ink:#E8ECF5; --sub:#98A2BB;
+  --up:#FF5C5C; --down:#34D399; --cyan:#38BDF8; --amber:#F5B84B; --line:#1E2740;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:16px}
+body{background:#05070D;color:var(--ink);font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.6}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:3px solid var(--cyan);outline-offset:2px;border-radius:4px}
+.stage{max-width:1100px;margin:0 auto;padding:28px 16px 60px}
+.stage-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:18px;color:#9AA3B8;font-size:13px}
+.stage-head b{color:#fff;font-size:16px}
+.stage-head a{color:var(--cyan)}
+.phone{max-width:412px;margin:0 auto;background:var(--bg);border:1px solid #232B44;border-radius:28px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6);position:relative}
+.screen{padding-bottom:76px;background:
+  repeating-linear-gradient(0deg,transparent 0 23px,rgba(56,92,160,.05) 23px 24px),
+  var(--bg)}
+/* ticker tape —— 签名元素 */
+.tape{display:flex;gap:0;overflow:hidden;border-bottom:1px solid var(--line);background:#0C1220;white-space:nowrap}
+.tape-track{display:inline-flex;gap:28px;padding:8px 14px;animation:tape 28s linear infinite;font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums}
+.tape span{color:var(--sub)} .tape b{font-weight:600;margin-left:6px}
+.r{color:var(--up)} .g{color:var(--down)}
+@keyframes tape{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@media (prefers-reduced-motion:reduce){.tape-track{animation:none}}
+/* 状态行 */
+.statusbar{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;font-size:12.5px;color:var(--sub)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--down);margin-right:6px;box-shadow:0 0 6px var(--down)}
+.fresh{border:1px solid var(--line);border-radius:99px;padding:1px 9px;font-size:11.5px;color:var(--down)}
+.sec{margin:0 14px 14px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px 16px}
+.sec h2{font-size:12.5px;font-weight:500;color:var(--sub);letter-spacing:.08em;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
+.sec h2 .more{color:var(--cyan);font-size:12px;letter-spacing:0;cursor:pointer}
+/* 研究框 */
+.ask{display:flex;gap:10px;align-items:center;background:var(--panel2);border:1px solid #24304F;border-radius:10px;padding:12px 14px;color:var(--sub);font-size:14.5px;cursor:text}
+.ask svg{flex:none}
+.ask-hint{margin-top:9px;font-size:12.5px;color:var(--sub)}
+.ask-hint a{color:var(--cyan)}
+/* 模拟盘 */
+.kpis{display:flex;align-items:flex-end;gap:18px}
+.kpi-main .num{font-family:var(--mono);font-size:34px;font-weight:600;letter-spacing:-.02em;line-height:1.1;font-variant-numeric:tabular-nums}
+.kpi-main .lbl{font-size:12px;color:var(--sub);margin-top:2px}
+.kpi .num{font-family:var(--mono);font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.kpi .lbl{font-size:11.5px;color:var(--sub)}
+.spark{margin-top:12px}
+.vs{margin-top:10px;font-size:12.5px;color:var(--sub)}
+.vs a{color:var(--cyan)}
+/* 待办 */
+.todo{border-left:3px solid var(--amber);background:var(--panel2);border-radius:8px;padding:11px 13px;display:flex;justify-content:space-between;gap:10px;align-items:center}
+.todo .t1{font-size:14.5px;font-weight:600}
+.todo .t2{font-family:var(--mono);font-size:12px;color:var(--sub);margin-top:2px}
+.todo .eta{font-family:var(--mono);font-size:12px;color:var(--amber);white-space:nowrap}
+/* 提醒 */
+.alert{display:flex;gap:10px;padding:9px 2px;border-bottom:1px dashed var(--line);font-size:13.5px;align-items:baseline}
+.alert:last-child{border-bottom:none}
+.alert time{font-family:var(--mono);font-size:12px;color:var(--sub);flex:none}
+.tag{font-size:10.5px;border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--sub);flex:none}
+/* 日报 */
+.report h3{font-size:16.5px;font-weight:650;line-height:1.5;margin-bottom:6px}
+.report p{font-size:13.5px;color:var(--sub);margin-bottom:10px}
+.report-links{display:flex;gap:10px}
+.btn{flex:1;text-align:center;border:1px solid #2A3554;border-radius:9px;padding:9px 0;font-size:13.5px;color:var(--cyan);cursor:pointer}
+.btn.primary{background:var(--cyan);color:#04263A;font-weight:600;border-color:var(--cyan)}
+/* 纪律 */
+.disc{display:flex;gap:10px;align-items:center;font-size:13.5px}
+.disc .days{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--down);white-space:nowrap}
+/* tab bar */
+.tabs{position:absolute;bottom:0;left:0;right:0;display:flex;background:#0C1120E6;backdrop-filter:blur(10px);border-top:1px solid var(--line);padding:7px 0 12px}
+.tab{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;font-size:10.5px;color:var(--sub);cursor:pointer}
+.tab.on{color:var(--cyan)}
+.tab svg{width:22px;height:22px}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="stage-head">
+    <b>样张 A · 盯盘室终端</b>
+    <span>深空蓝黑 · 等宽数字 · 行情纸带 · 「系统在为你值班」</span>
+    <span style="margin-left:auto"><a href="index.html">← 总览</a> · <a href="home-b-editorial.html">B 晨报</a> · <a href="home-c-bento.html">C 作战室</a></span>
+  </div>
+
+  <div class="phone"><div class="screen">
+
+    <div class="tape" aria-label="持仓行情纸带">
+      <div class="tape-track">
+        <span>NVDA<b class="r">+1.24%</b></span><span>TSLA<b class="g">-0.83%</b></span><span>QQQ<b class="r">+0.41%</b></span><span>AVGO<b class="r">+2.10%</b></span><span>MSFT<b class="g">-0.12%</b></span><span>AAPL<b class="r">+0.35%</b></span>
+        <span>NVDA<b class="r">+1.24%</b></span><span>TSLA<b class="g">-0.83%</b></span><span>QQQ<b class="r">+0.41%</b></span><span>AVGO<b class="r">+2.10%</b></span><span>MSFT<b class="g">-0.12%</b></span><span>AAPL<b class="r">+0.35%</b></span>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span><span class="dot"></span>盯盘中 · 下一轮 4 分钟后</span>
+      <span>07-12 周日 20:05 <span class="fresh">最新</span></span>
+    </div>
+
+    <section class="sec">
+      <div class="ask" role="button" tabindex="0">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38BDF8" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        问点什么…如「NVDA 财报前要减仓吗」
+      </div>
+      <div class="ask-hint">最近研判：<a href="#">NVDA 财报前风险研判 · 昨天 · 置信度 中</a></div>
+    </section>
+
+    <section class="sec">
+      <h2>我的模拟盘 <span class="more">对比 mashu →</span></h2>
+      <div class="kpis">
+        <div class="kpi-main"><div class="num">1.0832</div><div class="lbl">净值</div></div>
+        <div class="kpi"><div class="num r">+0.62%</div><div class="lbl">今日</div></div>
+        <div class="kpi"><div class="num r">+8.32%</div><div class="lbl">累计</div></div>
+        <div class="kpi"><div class="num g">-4.1%</div><div class="lbl">最大回撤</div></div>
+      </div>
+      <svg class="spark" width="100%" height="46" viewBox="0 0 360 46" preserveAspectRatio="none" aria-label="30 日净值曲线">
+        <polyline points="0,34 24,32 48,35 72,29 96,30 120,25 144,27 168,20 192,23 216,17 240,19 264,13 288,16 312,10 336,12 360,8" fill="none" stroke="#38BDF8" stroke-width="2"/>
+        <line x1="0" y1="36" x2="360" y2="36" stroke="#1E2740" stroke-width="1"/>
+        <text x="358" y="7" text-anchor="end" font-size="9" fill="#98A2BB" font-family="ui-monospace">1.083</text>
+      </svg>
+      <div class="vs">vs QQQ 同期 <b class="r" style="font-family:var(--mono)">+5.1%</b> · <a href="#">净值对比 →</a></div>
+    </section>
+
+    <section class="sec">
+      <h2>待办 · 1</h2>
+      <div class="todo">
+        <div>
+          <div class="t1">提案 P-124 · 买入 NVDA 2 股</div>
+          <div class="t2">限价 $845 · 纪律检查 3/3 通过 · 去飞书审批</div>
+        </div>
+        <div class="eta">23h 后失效</div>
+      </div>
+    </section>
+
+    <section class="sec">
+      <h2>提醒 · 最近交易时段 (3)</h2>
+      <div class="alert"><time>22:10</time><span class="tag">日内</span><span>NVDA 日内 <b class="g" style="font-family:var(--mono)">-4.3%</b>，触及 ±4% 阈值</span></div>
+      <div class="alert"><time>23:05</time><span class="tag">浮亏</span><span>TSLA 浮动盈亏 <b class="g" style="font-family:var(--mono)">-6.2%</b>，越过 -6% 线</span></div>
+      <div class="alert"><time>00:40</time><span class="tag">敞口</span><span>组合敞口 <b style="font-family:var(--mono);color:var(--amber)">10.4%</b> 超过预算上限</span></div>
+    </section>
+
+    <section class="sec report">
+      <h2>今日日报</h2>
+      <h3>联储纪要偏鹰，半导体走弱；你的持仓两涨一跌</h3>
+      <p>核心结论：中性偏谨慎（置信度 中）。纪要显示多数官员支持维持利率更久；费城半导体指数 -1.8%……</p>
+      <div class="report-links">
+        <a class="btn primary" href="#">阅读全文</a>
+        <a class="btn" href="#">我的个人页</a>
+      </div>
+    </section>
+
+    <section class="sec">
+      <h2>纪律速览</h2>
+      <div class="disc">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#F5B84B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/></svg>
+        <span>财报周不加仓 —— NVDA 财报 7/28</span>
+        <span class="days">已遵守 23 天</span>
+      </div>
+    </section>
+
+    <nav class="tabs" aria-label="主导航">
+      <a class="tab on" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>首页</a>
+      <a class="tab" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h6M9 16h6"/></svg>报告</a>
+      <a class="tab" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="15" rx="2"/><path d="M7 9h7M7 13h10M7 17h6"/></svg>新闻</a>
+      <a class="tab" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-5 4 3 6-7 3 3"/><path d="M3 21h18"/></svg>模拟盘</a>
+      <a class="tab" href="#"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/></svg>策略</a>
+    </nav>
+
+  </div></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaLoop 平台首页 · 三版风格样张</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#F5F5F4;color:#1c1c1c;font-family:-apple-system,"PingFang SC","Hiragino Sans GB",sans-serif;line-height:1.7;padding:40px 20px 80px}
+.wrap{max-width:900px;margin:0 auto}
+h1{font-size:24px;margin-bottom:6px}
+.sub{color:#666;font-size:14px;margin-bottom:28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-bottom:28px}
+.card{background:#fff;border:1px solid #e4e4e0;border-radius:14px;padding:20px;display:block;color:inherit;text-decoration:none;transition:transform .15s ease,box-shadow .15s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 10px 30px rgba(0,0,0,.08)}
+.card .tagline{font-size:12px;letter-spacing:.1em;margin-bottom:8px;font-weight:600}
+.card h2{font-size:18px;margin-bottom:8px}
+.card p{font-size:13px;color:#666}
+.a .tagline{color:#0891B2}.b .tagline{color:#B4362A}.c .tagline{color:#1E40AF}
+.swatches{display:flex;gap:6px;margin-top:14px}
+.sw{width:22px;height:22px;border-radius:6px;border:1px solid rgba(0,0,0,.08)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;background:#fff;border-radius:12px;overflow:hidden}
+th,td{border:1px solid #e8e8e4;padding:9px 12px;text-align:left;vertical-align:top}
+th{background:#efefec}
+.note{margin-top:20px;font-size:13px;color:#777}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AlphaLoop 平台首页 · 风格样张</h1>
+  <p class="sub"><b>✅ 已定稿（2026-07-12）：<a href="final.html">final.html</a></b> —— A+C 合体：浅色主题=作战室 bento、暗色主题=盯盘室终端（页内可切换、跟随系统、记住选择）；<b>绿涨红跌</b>；全端响应式（移动底部 tab / 桌面 ≥1024px 左侧导航+多列 bento）。以下三版为选型过程的历史样张（当时为红涨绿跌）。</p>
+
+  <div class="grid">
+    <a class="card a" href="home-a-terminal.html">
+      <div class="tagline">样张 A</div>
+      <h2>盯盘室终端</h2>
+      <p>深空蓝黑、等宽数字、顶部持仓行情纸带、状态呼吸灯。气质：专业机房，「系统在为你值班」。适合把它当交易工具看待的心态。</p>
+      <div class="swatches"><span class="sw" style="background:#0A0E1A"></span><span class="sw" style="background:#38BDF8"></span><span class="sw" style="background:#FF5C5C"></span><span class="sw" style="background:#34D399"></span><span class="sw" style="background:#F5B84B"></span></div>
+    </a>
+    <a class="card b" href="home-b-editorial.html">
+      <div class="tagline">样张 B</div>
+      <h2>投资晨报</h2>
+      <p>暖白纸面、宋体刊头带期号、日报即头版头条、提问是「向编辑部去信」。气质：私人财经报馆，重阅读体验。适合把它当每日读物的心态。</p>
+      <div class="swatches"><span class="sw" style="background:#FBFAF7"></span><span class="sw" style="background:#161513"></span><span class="sw" style="background:#1F3A5F"></span><span class="sw" style="background:#B4362A"></span><span class="sw" style="background:#2F6B4F"></span></div>
+    </a>
+    <a class="card c" href="home-c-bento.html">
+      <div class="tagline">样张 C</div>
+      <h2>作战室</h2>
+      <p>浅色高密度 bento 网格、每张卡右上角自带数据新鲜度标签（把「诚实标注」变成视觉语言）、系统状态小卡常驻。气质：指挥中心，一屏尽收。</p>
+      <div class="swatches"><span class="sw" style="background:#F2F5FA"></span><span class="sw" style="background:#1E40AF"></span><span class="sw" style="background:#B45309"></span><span class="sw" style="background:#D5342B"></span><span class="sw" style="background:#12805C"></span></div>
+    </a>
+  </div>
+
+  <table>
+    <tr><th></th><th>A 盯盘室终端</th><th>B 投资晨报</th><th>C 作战室</th></tr>
+    <tr><td>第一眼感受</td><td>紧张感、专业、酷</td><td>安静、讲究、像订阅了一份私家报纸</td><td>高效、清爽、信息密度最高</td></tr>
+    <tr><td>长报告阅读</td><td>中（暗色长文稍累）</td><td>最佳（为阅读而生）</td><td>良好</td></tr>
+    <tr><td>数据扫读</td><td>最佳（等宽数字+红绿语义）</td><td>中</td><td>最佳（KPI 卡+状态卡）</td></tr>
+    <tr><td>夜间盯盘</td><td>最佳（暗色原生）</td><td>需另做暗色</td><td>需另做暗色</td></tr>
+    <tr><td>独有签名</td><td>持仓行情纸带 + 值班状态灯</td><td>宋体刊头/期号 + 今日社训</td><td>每卡新鲜度标签 + 系统状态卡</td></tr>
+    <tr><td>混搭建议</td><td colspan="3">三版信息架构完全一致，可任意混搭：例如 C 的骨架 + A 的暗色配色，或 B 的报告阅读页 + C 的首页。挑一个主方向，再点名想保留的元素即可。</td></tr>
+  </table>
+
+  <p class="note">涨跌配色均采用国内习惯「红涨绿跌」；三版均为自包含 HTML、零外部请求、支持键盘焦点与 reduced-motion。正式实现时统一适配深浅双主题。</p>
+</div>
+</body>
+</html>

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaLoop v2 PRD 评审报告（2026-07-07）</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e2e2e2;
+  --accent: #0b6bcb; --code-bg: #f5f5f5; --th-bg: #f0f3f7;
+  --blocker: #b42318; --warn: #b54708; --ok: #067647;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14161a; --fg: #e6e6e6; --muted: #9a9a9a; --border: #333;
+    --accent: #5aa2e8; --code-bg: #1f2329; --th-bg: #1d232e; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  line-height: 1.75; font-size: 16px; }
+.layout { display: flex; max-width: 1200px; margin: 0 auto; }
+nav.toc { position: sticky; top: 0; align-self: flex-start; width: 260px; flex: none;
+  padding: 24px 16px; font-size: 13px; max-height: 100vh; overflow-y: auto;
+  border-right: 1px solid var(--border); }
+nav.toc .toctitle { font-weight: 700; margin-bottom: 8px; color: var(--muted); }
+nav.toc ul { list-style: none; padding-left: 0; margin: 0; }
+nav.toc li { margin: 6px 0; }
+nav.toc a { color: var(--fg); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); }
+main { flex: 1; min-width: 0; padding: 32px 40px 80px; }
+h1 { font-size: 26px; border-bottom: 2px solid var(--border); padding-bottom: 12px; }
+h2 { font-size: 21px; margin-top: 44px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+h3 { font-size: 17px; margin-top: 28px; }
+a { color: var(--accent); }
+code { background: var(--code-bg); padding: 2px 5px; border-radius: 4px;
+  font-size: 0.88em; font-family: "SF Mono", Menlo, Consolas, monospace; }
+pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px;
+  overflow-x: auto; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+.tablewrap { overflow-x: auto; margin: 16px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+th { background: var(--th-bg); white-space: nowrap; }
+hr { border: none; border-top: 1px solid var(--border); margin: 36px 0; }
+blockquote { margin: 0; padding: 4px 16px; border-left: 3px solid var(--accent); color: var(--muted); }
+li { margin: 4px 0; }
+strong { font-weight: 650; }
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  nav.toc { position: static; width: auto; max-height: none; border-right: none;
+    border-bottom: 1px solid var(--border); }
+  main { padding: 20px 18px 60px; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc"><div class="toctitle">目录</div><div class="toc">
+<ul>
+<li><a href="#0">0. 总体结论</a></li>
+<li><a href="#1-r6">1. 被证伪的"最大风险"：R6 卡片回调有现成路径</a></li>
+<li><a href="#2-prd">2. PRD 对现状的不实/过时断言（全部经代码核实）</a></li>
+<li><a href="#3-f0">3. 缺失的三块共享地基（建议立为 F0 前置工作项）</a></li>
+<li><a href="#4-over-design">4. 建议砍掉 / 缩小的功能（over-design，全部经确认）</a></li>
+<li><a href="#5-gaps">5. 必须补的设计点（gaps，全部经确认）</a></li>
+<li><a href="#6-confirmed">6. 安全必改清单（全部 CONFIRMED）</a></li>
+<li><a href="#7">7. 修订后的实施顺序建议</a></li>
+<li><a href="#8">8. 待用户决策项</a></li>
+<li><a href="#a-prd">附录 A：经实读核实为真的 PRD 断言（可承重地基）</a></li>
+<li><a href="#b">附录 B：数据与方法</a></li>
+</ul>
+</div>
+</nav>
+<main><h1 id="alphaloop-v2-prd">AlphaLoop v2 PRD 评审报告</h1>
+<ul>
+<li>日期：2026-07-07</li>
+<li>评审对象：<code>docs/superpowers/specs/2026-07-03-v2-product-iteration-prd.md</code></li>
+<li>方法：45 个子 agent 的三阶段 workflow——7 名读者深读全部子系统 → 4 个维度（可行性 / 过度设计 / 遗漏 / 安全）评审 PRD → 42 条 blocker/major 发现逐条对照代码对抗验证（39 条确认、3 条证伪）</li>
+<li>结论性质：本文是决策材料，不改动 PRD 本身；修订待用户拍板后统一进行</li>
+</ul>
+<hr />
+<h2 id="0">0. 总体结论</h2>
+<p>PRD 的骨架是扎实的：四层框架完整、宪法真实存在（AGENTS.md）、验收文化正确（实测-only）、R6 执行护栏的全部断言经实读核实为真（paper 三件套、服务端 10% 新鲜快照校验、equity-only、live/option/shadow 硬拒、完整审计——见附录 A）。<strong>方向不需要推翻。</strong></p>
+<p>但按原文直接开工会踩三类坑：</p>
+<ol>
+<li><strong>三块共享地基没有归属</strong>：交互卡片能力、SQLite 迁移/备份/运行日志、静态文件服务器——R1/R4/R6/R7 都依赖它们，但不属于任何 R 的行为定义。</li>
+<li><strong>若干"已有基础"实际不存在或语义不同</strong>：<code>.env.local</code> 不存在（迁移后丢失）、"同类失败 3 次停止"与现有无限重试状态机直接矛盾、5 分钟轮询不适配现有 cron→runner 链路、交易日历只有 2026 年。</li>
+<li><strong>"审批不可绕过"目前是 prompt 级而非代码级</strong>：broker-executor <code>/v1/tickets</code> 无鉴权、无提案关联；卡片点击者身份校验未提；新闻注入面无对策。</li>
+</ol>
+<p>另有一条重要的<strong>反向修正</strong>（评审者被证伪）：R6 卡片回调不是重大未知——本机安装的 OpenClaw 2026.5.28 原生处理 <code>card.action.trigger</code>（见 §1）。</p>
+<hr />
+<h2 id="1-r6">1. 被证伪的"最大风险"：R6 卡片回调有现成路径</h2>
+<p>评审的 4 条 R6 相关 blocker 中，3 条断言"卡片回调链路完全未验证、可能违反宪法 #7"。对抗验证<strong>证伪</strong>了这一前提：</p>
+<ul>
+<li>本机 <code>/opt/homebrew/lib/node_modules/openclaw</code>（openclaw@2026.5.28）在唯一飞书 WebSocket 的事件表中<strong>原生注册了 <code>card.action.trigger</code> 处理器</strong>（<code>monitor.account-*.js:5300</code>）。</li>
+<li>按钮点击经 <code>handleFeishuCardAction → dispatchSyntheticCommand → handleFeishuMessage</code>，即<strong>卡片按钮的 <code>action.value</code>（文本/命令）会被转成合成消息，注入与群 @ 完全相同的 control agent 管线</strong>——按钮 value 填 <code>批准 P-123</code> 与用户手打 <code>批准 P-123</code> 走同一条 dispatch 路径。</li>
+<li>OpenClaw 还自带结构化审批卡语义（<code>ocf1</code> 信封）：token 去重、过期失效（stale）、<strong>绑定点击用户（wrong_user 拒绝）</strong>、绑定会话、异步 ack。</li>
+</ul>
+<p><strong>结论</strong>：无需第二条 WS 监听，宪法 #7 不冲突；R6 仓库侧新增量收敛为：发卡（能力待建，见 §3.1）+ proposals 表 + 审批 CLI + 24h 清扫器。残余未知仅两点，点火后几分钟可验：①飞书开发者后台是否已订阅卡片回调事件；②<code>requireMention:true</code> 是否拦截合成消息。建议列为 R0 后的第一个冒烟测试，而非 R6 的前置 spike。</p>
+<hr />
+<h2 id="2-prd">2. PRD 对现状的不实/过时断言（全部经代码核实）</h2>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>PRD 断言</th>
+<th>实际情况</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>「.env.local 核对」（R0.1）</td>
+<td>文件不存在，也无 <code>.env.local.example</code> 模板；实为<strong>从零重建</strong>，凭据需从旧机/密码库找回</td>
+<td>R0 最耗时步骤被一笔带过</td>
+</tr>
+<tr>
+<td>2</td>
+<td>「同类失败 3 次→停止重试（cron-runner-alerts 已有基础）」（2.4）</td>
+<td>现状是<strong>无限重试</strong>（退避封顶 30 分钟、无次数上限，<code>openclaw-cron-runner-state.mjs:24-46</code>），告警在第 1 次即发；"同类"未定义、无 R 负责</td>
+<td>Loop 层核心安全承诺无人实现</td>
+</tr>
+<tr>
+<td>3</td>
+<td>「OpenClaw cron 每 5 分钟轮询」（R4.3）</td>
+<td>现有链路每次 cron 触发都注入 agent 会话事件（≈78 次/日）、runKey 缓存 1000 条约两周溢出重放、故障时每 5 分钟一张告警卡、子进程超时按 15-20 分钟设定</td>
+<td>R4 需改走 launchd StartInterval 模式（已有 official-paper 小时轮询先例）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>「交易时段/假日判定复用 trading-schedule.mjs」（R4.3）</td>
+<td>假日表<strong>只有 2026 年</strong>（<code>trading-schedule.mjs:12-27</code>），无年份越界保护，2027-01-01 起假日按交易日处理</td>
+<td>常驻设施跨年静默出错</td>
+</tr>
+<tr>
+<td>5</td>
+<td>「注册全部报告/轮询任务」（R0.4）</td>
+<td><code>openclaw:cron:install</code> 只装 3 个报告任务；<strong>每小时 official-paper 快照是 <code>launchd:install-user</code> 装的，R0 未列</strong>——而 10% 服务端校验要求快照 ≤90 分钟，缺了它所有 paper 买单被硬拒，R4 敞口规则、R6 熔断也无数据</td>
+<td>R0 验收清单缺关键一项</td>
+</tr>
+<tr>
+<td>6</td>
+<td>「保留现有 Yahoo/Google/Bing RSS」（R3.3）</td>
+<td>Bing 抓取器不存在（只有显示名映射）；现有 4 源为 Longbridge/Yahoo search/Yahoo RSS/Google News</td>
+<td>措辞修正</td>
+</tr>
+<tr>
+<td>7</td>
+<td>「SQLite 运行日志表」（2.4）</td>
+<td>不存在；run 记录是散落 JSON 文件（仅 timing/exit/stdio tail）；token 成本从 OpenClaw 外部运行时<strong>可能根本拿不到</strong></td>
+<td>R3 验收依赖不存在的表</td>
+</tr>
+<tr>
+<td>8</td>
+<td>「SQLite 每日备份」（2.3 回滚）</td>
+<td>全仓零备份代码；WAL 模式正确备份需 <code>VACUUM INTO</code>，不能直接 cp</td>
+<td>复盘/审计真源无保护</td>
+</tr>
+<tr>
+<td>9</td>
+<td>「复用 buildStrategyReflection」（R4.2）</td>
+<td>函数存在但是 <code>official-paper-monitor.mjs</code> 内未导出的私有函数，需先抽提</td>
+<td>小重构，列任务即可</td>
+</tr>
+<tr>
+<td>10</td>
+<td>宪法引用</td>
+<td>条款 7（监听唯一+3 秒 ack）在任何现有文档中<strong>不存在</strong>（PRD 新引入）；条款 3 的 10% 不在 AGENTS.md；AGENTS.md:10 期权白名单与「期权永不自动化」冲突、AGENTS.md:8 引用已废弃的 Honcho</td>
+<td>需要一次宪法文档同步</td>
+</tr>
+</tbody>
+</table></div>
+<p>另确认：PRD 引用为真的关键地基见附录 A，可放心承重。</p>
+<hr />
+<h2 id="3-f0">3. 缺失的三块共享地基（建议立为 F0 前置工作项）</h2>
+<h3 id="31-f-a">3.1 F-A 飞书交互卡片能力</h3>
+<p><code>notifications.ts</code> 只会发 <code>text/post/file</code>，<strong>全仓从未发过 interactive 卡片</strong>；发送路径丢弃 MCP 返回详情拿不到 <code>message_id</code>；<code>update_message</code> 从未接线。而 R1 摘要卡按钮、R4 提醒卡、R6 审批卡、R6 决策后更新卡片<strong>全部依赖它</strong>。
+→ 立项：<code>sendInteractiveCard</code>（含 message_id 回传）+ <code>updateCard</code>；点火后先实测一张带按钮的卡。</p>
+<h3 id="32-f-b-sqlite">3.2 F-B SQLite 治理（迁移 + 备份 + 运行日志）</h3>
+<p>v2 新增 5 张表（alert_rules、alert_events、analysis_predictions、proposals、run_log）+ outcome 回填列。现状：<code>migrate()</code> 只有 <code>CREATE TABLE IF NOT EXISTS</code>、无 <code>user_version</code> 版本化、无法表达加列；另有 3 处脚本自建 DDL（漂移风险）。
+→ 立项：所有新表集中进 shared-types <code>migrate()</code> + <code>PRAGMA user_version</code> 分步迁移 + 禁止脚本自建表；每日 launchd <code>VACUUM INTO</code> 备份（保留 N 天 + 一次恢复演练验收）；run_log 表（token 成本降级为调用次数）。</p>
+<h3 id="33-f-c">3.3 F-C 报告站点静态文件服务器</h3>
+<p>PRD 只写「本机静态文件服务」，仓库无任何静态服务器，cloudflared 不能直接伺服目录。
+→ 立项：~100 行只读 node 服务（禁目录列表、拒非法路径、缓存头）+ launchd plist + doctor 检查；索引「原子更新」定义为 write-temp + rename。</p>
+<hr />
+<h2 id="4-over-design">4. 建议砍掉 / 缩小的功能（over-design，全部经确认）</h2>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>原 PRD</th>
+<th>建议</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R5.4 五因子 A-F 同业分级</td>
+<td>Value/Growth/Profitability/Momentum/Revisions 相对同行业 + 一票否决</td>
+<td><strong>砍掉 v1</strong>；改为已抓数据的绝对值启发标签（无字母级、无否决）</td>
+<td>无同业数据源；同业面板需拉全行业基本面，免费配额撑不住；这是把零售研究产品移植进单人工具</td>
+</tr>
+<tr>
+<td>R5.1 EDGAR 13F</td>
+<td>「免费源」之一</td>
+<td><strong>砍掉 v1</strong>（facts 键置空+「数据不可得」标注）</td>
+<td>13F 按机构（filer）申报而非按标的，需批量解析数千份季报；数据滞后至 4.5 个月，对短线决策近零价值</td>
+</tr>
+<tr>
+<td>R5.3 置信度五档</td>
+<td>Morningstar 五档</td>
+<td><strong>降为三档</strong>（schema 留扩展）</td>
+<td>每月约 10-20 条到期预测摊到五档=每档 2-4 样本，R7 校准到 2027 年都是噪声；五档是假精度</td>
+</tr>
+<tr>
+<td>R3 L3 事件深挖</td>
+<td>日报默认开</td>
+<td><strong>先周报 only</strong>（日报加开关默认关），观察 2-3 周后再开</td>
+<td>30 次 L2 + 15 次 L3 检索最挤压 ≤15 分钟管线预算；L3 是零先例的最新层，不该放最高频档</td>
+</tr>
+<tr>
+<td>R4 v1 规则集</td>
+<td>四规则 + 5 分钟轮询一步到位</td>
+<td><strong>v1 = 日内涨跌 + 浮动盈亏</strong>，走 15-30 分钟 launchd 轮询（复制 official-paper 已验证模式）；5 分钟急涨急跌 + 敞口规则为 R4.1 增量</td>
+<td>只有急涨急跌规则需要 5 分钟节奏；先证明提醒通道有价值再上高频（§2 表 #3 的四个坑也随之避开）</td>
+</tr>
+<tr>
+<td>R4 规则配额</td>
+<td>每股每类型 ≤10 条</td>
+<td>改为全局 sanity 上限（如 50 条）</td>
+<td>多用户产品残留；NL CRUD 本身<strong>不是</strong>过度设计（确认保留：手机上飞书改规则 + CLI 反正要建）</td>
+</tr>
+<tr>
+<td>R1 索引与图表</td>
+<td>类型筛选 + 三类图表</td>
+<td>静态分组列表（零 JS）；图表 v1 只做净值 SVG 曲线 + 持仓表格</td>
+<td>单读者经深链到达；SVG 无 JS 依赖、体积可控，保住 4G ≤3 秒验收（ECharts 全量内联约 1MB/份）</td>
+</tr>
+<tr>
+<td>R6 提案节奏</td>
+<td>每交易日收盘后 cron</td>
+<td><strong>先 on-demand</strong>，三笔验收实测通过后再开每日 cron</td>
+<td>PRD 自己承认无 alpha、0 条是常见输出；避免凌晨 4 点空转 job 污染首月运行日志</td>
+</tr>
+<tr>
+<td>R7 拒绝提案反事实</td>
+<td>「假想收益」</td>
+<td>定义为<strong>朴素 mark-to-market</strong>（提案价→复盘日收盘价）+ 固定免责声明</td>
+<td>严谨模拟需要止损/失效路径回放语义，无人定义且样本个位数；口径不定死会让独立校验验收打架</td>
+</tr>
+<tr>
+<td>2.4 可观测性</td>
+<td>token/调用成本入 SQLite</td>
+<td>扩展现有 JSON run 记录（检索次数、降级事件、证据 ID）；成本字段降为调用次数</td>
+<td>OpenClaw 外部运行时的 token 用量可能拿不到；先实测有无接口</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="5-gaps">5. 必须补的设计点（gaps，全部经确认）</h2>
+<ol>
+<li><strong>R3↔R5 依赖倒置</strong>：R3 质量门要"数字与事实表比对"，但事实表 schema 在 R5 才建，实施顺序 R3 在前。→ 把「日报级最小事实表」（行情/持仓/宏观数字）提前为 R3 的一部分，R5 再扩展为个股 facts。</li>
+<li><strong>R4 运行时状态持久化</strong>：滞回臂位、冷却、每日一次标记、全局 30 张配额都要跨进程/跨重启成立，PRD 表设计全部缺列。→ 新增 alert 运行时状态表（armed、last_triggered_at、cooldown_until、daily_fire_count），跨日重置按<strong>美东交易日</strong>。</li>
+<li><strong>标的池唯一真源</strong>：三个互相矛盾的候选（SQLite <code>stock_analysis_targets</code> / 长桥 watchlist / notes 承诺的目录）。→ 建议定为 <code>stock_analysis_targets</code>，R4 规则 symbol 必须 ∈ 池 ∪ 持仓，并给池子大小上限（配额推算依据）。</li>
+<li><strong>RSSHub 恢复与冗余</strong>：Docker Desktop 容器不是 launchd 服务，重启恢复依赖登录会话；「≥30% 中文源」验收全押在 cls/wallstreetcn/gelonghui 三条历史上常失效的路由上。→ launchd 包一层 <code>docker start</code> 或改 colima；加第二中文源冗余；doctor 加容器健康检查。</li>
+<li><strong>失败处理状态机</strong>：定义"同类"（job + 错误类别）、3 次后置 halted 需人工复位、告警第 1 次提示 + 第 3 次升级。列为具名工作项。</li>
+<li><strong>R6 状态机细节</strong>：24h 作废清扫器归属（并入小时级轮询）、清扫与点击的竞态裁决、熔断暂停态落 SQLite 单行状态表、作废/熔断更新原卡片。</li>
+<li><strong>交易日历跨年</strong>：查询超出覆盖年份即 fail-loud + 告警；「每年更新假日表」入运维手册；收盘后任务用「固定北京时间跑 + 脚本内校验美股已收盘」模式。</li>
+<li><strong>飞书测试替身</strong>：回调 handler 接受注入的事件 JSON fixture；发卡抽象可 stub 的 transport；「回调→提案状态迁移→ticket 生成」做成纯函数可单测——否则 R6 每次改动都要真人手点回归。</li>
+<li><strong>R1 连带清理</strong>：PDF 退役需同步修订 4 处文档（2026-06-14 spec、两个 README、control.md）+ <code>stock-analysis.mjs:129</code> 调用点，否则 control agent 按旧口径应答。</li>
+<li><strong>死包清理</strong>：live-advisor/event-bus/event-ingestor/paper-trader + context-builder 的 dist/node_modules 残留会误导读代码的 agent。→ v2 首个 PR 顺带删除；R6 设计前翻一遍 <code>git show f2984a5^</code> 的 live-advisor 审批学习实现作参考。</li>
+<li><strong>验收时间线声明</strong>：R3 连续 5 交易日、R4 一周误报观察、R7 首月——代码完成 ≠ 验收完成；R6 第①笔「成交」改为可控条件（贴价限价 + 成交或撤单重试）。</li>
+<li><strong>R7 误报反馈通道</strong>：alert_events 加一个 nullable feedback 列，用户对 control agent 说「这条提醒没用」即标记——否则 R4 误报验收与 R7 提醒质量指标都无法计算。</li>
+</ol>
+<hr />
+<h2 id="6-confirmed">6. 安全必改清单（全部 CONFIRMED）</h2>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>风险</th>
+<th>现状证据</th>
+<th>修法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S1</td>
+<td><strong>审批可绕过</strong>：<code>/v1/tickets</code> 无鉴权、无提案关联；control agent 有无沙箱 shell（sandbox off + approve-all），一条 curl 即达执行</td>
+<td><code>broker-executor/src/index.ts:110-187</code>；<code>render-openclaw-config.mjs:100,188</code></td>
+<td>broker-executor 服务端校验：ticket 必须携带 proposal_id，查 proposals 表 status='approved' 且未消费（原子标记）；外加 <code>/v1/tickets</code> 共享密钥头。无对应提案的 ticket 拒绝 + 飞书告警</td>
+</tr>
+<tr>
+<td>S2</td>
+<td><strong>点击者身份</strong>：群内任何成员可点「批准」</td>
+<td>PRD:269 无身份校验；allowlist 只覆盖消息</td>
+<td>审批卡 <strong>DM 发给 owner</strong>（不发群）+ 回调校验 operator open_id == OWNER_OPEN_ID + 按 proposal_id 幂等；优先用 OpenClaw ocf1 信封自带的绑定用户能力</td>
+</tr>
+<tr>
+<td>S3</td>
+<td><strong>规则 CRUD 越权</strong>：任何 allowlist 成员可删 owner 的风控提醒 / 刷爆 30 张配额（提醒 DoS）</td>
+<td><code>render-openclaw-config.mjs:45-56</code> 只有群级门</td>
+<td><code>market-alerts.mjs</code> CLI 加 <code>--actor &lt;open_id&gt;</code>，add/remove/pause 强制 actor==owner（确定性层校验，不靠 prompt）；非 owner 只读</td>
+</tr>
+<tr>
+<td>S4</td>
+<td><strong>注入面</strong>：新闻正文是攻击者可控输入，流入分析叙事与 R6 提案理由；质量门只查事实/格式，不防指令注入；现 control agent 无沙箱</td>
+<td>PRD:65-69,211-213 全是事实校验</td>
+<td>L2/L3 检索跑在<strong>专用受限 agent profile</strong>（仅 web search + HTTP fetch，无 shell、无文件写、无 MCP）；取回内容以数据定界符包裹；新闻文本永不参与选择/参数化工具调用；人批门为硬后盾</td>
+</tr>
+<tr>
+<td>S5</td>
+<td><strong>存储型 XSS</strong>：新 report-html.mjs 渲染 agent 产出的标题/摘要/URL；一条恶意标题=Access 会话内执行</td>
+<td>现有 <code>escapeHtml</code>（<code>report-rendering.mjs:315-321</code>）是安全先例</td>
+<td>新渲染器继承 escapeHtml 纪律（含属性/URL 上下文，拒非 http(s) href）+ 严格内联 CSP；agent 输出永不作原始 HTML</td>
+</tr>
+<tr>
+<td>S6</td>
+<td><strong>凭据泄漏进公开报告</strong>：fetch 错误串含完整 URL（可能带 <code>?token=</code>），现有降级模式把错误串写进报告文本，R1/R2 后报告上公网</td>
+<td><code>stock-analysis.mjs:695</code></td>
+<td>Finnhub key 走 <code>X-Finnhub-Token</code> 头；报告文本方向的错误串统一过脱敏（复用 broker-executor redaction helpers）；单测覆盖</td>
+</tr>
+<tr>
+<td>S7</td>
+<td><strong>本机第三方进程</strong>：R3 加 Docker 容器、R2 加 tunnel，扩大了对无鉴权 loopback 端点的信任面</td>
+<td><code>/v1/tickets</code> 信任一切 localhost</td>
+<td>S1 的密钥头顺带覆盖；RSSHub 容器仅绑 127.0.0.1；tunnel ingress 只映射 reports 子域 + deny 兜底</td>
+</tr>
+<tr>
+<td>S8</td>
+<td><strong>手动下单脚本定位</strong>：<code>submit-official-paper-equity-order.mjs</code> 直接 POST /v1/tickets，control.md 明确授权 agent 在用户口头指示下使用——它本身就是"未批准触达路径"</td>
+<td><code>control.md:14-15</code></td>
+<td>需用户决策：改走提案流（保留審批一致性）或保留但改验收措辞为「无审批记录的自动路径不可触达」</td>
+</tr>
+<tr>
+<td>S9</td>
+<td><strong>Access 残余风险</strong></td>
+<td>OTP 单因素；会话默认可长达数周</td>
+<td>显式设定会话时长；白名单先 owner-only 起步；文档写明"成员邮箱安全=报告保密性"</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="7">7. 修订后的实施顺序建议</h2>
+<pre><code>R0 点火（补 launchd:install-user、.env.local 重建清单、密钥清单）
+ ├─→ 冒烟测试①：feishu-user-plugin 发一张带按钮的 interactive 卡（验 F-A 可行性 + OpenClaw 卡片回调透传）
+ ├─→ R2 NS 迁移启动（24-48h 传播期，最早挂起）
+ ├─→ F-B SQLite 治理（迁移框架 + 备份 + run_log）
+ └─→ F-A 交互卡片能力（sendInteractiveCard + message_id + updateCard）
+      └─→ R4 v1（两规则、15-30 分钟 launchd 轮询、状态持久化表、owner-only CRUD）
+R1 HTML 渲染 + F-C 静态服务器 ──→ R2 收尾（Access 策略 + 实测合拢）
+R1 ──→ R3（L1 中文源 + L2 预算检索 + 日报级最小事实表 + 质量门扩展；L3 周报 only）
+R3 ──→ R5（个股 facts 扩展 + LLM 叙事 + 数字比对 + 三档结论框 + analysis_predictions）
+R5 + F-A ──→ R6（proposals 表 + on-demand 提案 + ocf1 审批卡 + S1/S2 服务端强化 + 熔断状态机）
+R6 ──→ R7（月度复盘 + 误报反馈列 + mark-to-market 反事实口径）
+全程伴随：宪法文档同步（AGENTS.md 更新）、死包清理、R1 连带文档修订
+</code></pre>
+<p>与原 PRD 顺序的差异：R4 提前依赖 F-A/F-B 而非裸奔；R2 收尾与 R1 合拢不变；新增三个 F 前置项与两个冒烟测试。</p>
+<hr />
+<h2 id="8">8. 待用户决策项</h2>
+<ol>
+<li><strong>R6 审批形态</strong>：直接做 ocf1 卡片按钮（有原生路径，增量小），还是 v1 先文本回复审批、按钮作增量？</li>
+<li><strong>R2 访问控制</strong>：保留 Access OTP（会话拉长 + 验收改「已登录会话 ≤3 秒」+ 白名单先 owner-only），还是 v1 先 Tunnel + 不可猜路径、Access 后置？</li>
+<li><strong>瘦身清单</strong>（§4）是否整体接受？（逐项可谈）</li>
+<li><strong>S8 手动下单脚本</strong>：并入提案流，还是保留旁路 + 收窄验收措辞？</li>
+<li><strong>宪法归一</strong>：以「期权永不自动化」为准更新 AGENTS.md（删 v1 期权白名单、补 10% 与监听条款、删 Honcho 引用）？</li>
+</ol>
+<hr />
+<h2 id="a-prd">附录 A：经实读核实为真的 PRD 断言（可承重地基）</h2>
+<ul>
+<li><code>TARGET_USER=abble</code> 默认已修正（<code>install-system-daemons.sh:5</code>）</li>
+<li><code>runLongbridgeJsonWithRetry</code> 存在（<code>_longbridge.mjs:39</code>）</li>
+<li><code>report-quality.mjs</code> 存在且为可扩展的确定性质量门（PRD 对"只查格式"认知正确）</li>
+<li><code>selectDiverseNewsArticles</code> 存在可复用（<code>report-news.mjs:98</code>）</li>
+<li>SQLite 真源路径与 §2.2 一致（<code>runtime.ts:21-22</code>；schema <code>database.ts:37-127</code>；文件待 R0 重建）</li>
+<li>8 段个股模板存在（<code>stock-analysis-template.mjs:7-72</code>）</li>
+<li>R6.4 全部执行护栏属实且服务端强制：paper 三件套（<code>longbridge-paper.ts:250-266</code>）、10% 新鲜快照校验（<code>risk.ts:33-51</code>）、equity-only、live/option/shadow 硬拒（<code>execution-guards.ts:3-26</code>）、完整审计（<code>index.ts:150-171</code>）</li>
+<li>飞书 allowlist 已实现（<code>render-openclaw-config.mjs:44-45,135-155</code>）；OpenClaw 网关单进程持有唯一 WS（宪法 #7 现状即满足）</li>
+<li>实测-only 验收整体可执行（全部 pnpm 入口存在），但注意 §5.11 的验收时间线</li>
+</ul>
+<h2 id="b">附录 B：数据与方法</h2>
+<ul>
+<li>Workflow run：<code>wf_0c69ee25-91b</code>（45 agents，约 172 万 tokens，506+94 次工具调用）</li>
+<li>逐 agent 结果：会话 <code>subagents/workflows/wf_0c69ee25-91b/journal.jsonl</code></li>
+<li>68 条去重发现全文与 7 份子系统报告：见会话工件（tool-results/bwote6zw7.txt、bpv0ns3ha.txt）</li>
+</ul></main>
+</div>
+</body>
+</html>
