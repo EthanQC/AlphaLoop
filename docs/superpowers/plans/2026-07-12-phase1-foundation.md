@@ -31,7 +31,7 @@
 - Produces: `migrate(db: DatabaseSync): void`（签名不变，内部改为步进迁移）；`export const SCHEMA_VERSION: number`；`export function getSchemaVersion(db: DatabaseSync): number`
 - 迁移步骤内部结构：`const MIGRATIONS: Array<(db: DatabaseSync) => void>`，`MIGRATIONS[i]` 把 user_version 从 i 升到 i+1；migrate() 循环执行未应用步骤，每步一个事务，结束 `PRAGMA user_version = i+1`
 
-- [ ] **Step 1: 写失败测试**（新库迁移到最新版本；旧式已有表的库【user_version=0 但表已存在】迁移后 user_version 更新且数据保留；migrate 幂等）
+- [x] **Step 1: 写失败测试**（新库迁移到最新版本；旧式已有表的库【user_version=0 但表已存在】迁移后 user_version 更新且数据保留；migrate 幂等）
 
 ```ts
 // packages/shared-types/src/database.test.ts
@@ -76,8 +76,8 @@ describe("versioned migrations", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**：`pnpm vitest run packages/shared-types/src/database.test.ts` → FAIL（getSchemaVersion/SCHEMA_VERSION 不存在）
-- [ ] **Step 3: 实现**——把现有 migrate() 的整段 DDL 原样变成 `MIGRATIONS[0]`（v0→v1 基线；全部保留 `IF NOT EXISTS`，天然兼容 legacy 库）；框架代码：
+- [x] **Step 2: 跑测试确认失败**：`pnpm vitest run packages/shared-types/src/database.test.ts` → FAIL（getSchemaVersion/SCHEMA_VERSION 不存在）
+- [x] **Step 3: 实现**——把现有 migrate() 的整段 DDL 原样变成 `MIGRATIONS[0]`（v0→v1 基线；全部保留 `IF NOT EXISTS`，天然兼容 legacy 库）；框架代码：
 
 ```ts
 export const SCHEMA_VERSION = 1; // Task 2/3/4 会递增
@@ -110,8 +110,8 @@ export function migrate(db: DatabaseSync): void {
 }
 ```
 
-- [ ] **Step 4: 跑测试全绿** + `pnpm typecheck` + `pnpm test`（防回归）
-- [ ] **Step 5: Commit** `refactor: versioned sqlite migrations with user_version`
+- [x] **Step 4: 跑测试全绿** + `pnpm typecheck` + `pnpm test`（防回归）
+- [x] **Step 5: Commit** `refactor: versioned sqlite migrations with user_version`
 
 ### Task 2: members 与 api_tokens（迁移 v2）+ MemberRepository
 
@@ -124,8 +124,8 @@ export function migrate(db: DatabaseSync): void {
 - Produces: `class MemberRepository { upsert(m: Member): void; getByEmail(email: string): Member | null; getByFeishuOpenId(openId: string): Member | null; listActive(): Member[] }`；`interface Member { id: string; email: string; feishuOpenId?: string; displayName: string; riskTags: string[]; stockTags: string[]; showPerformance: boolean; status: "active" | "revoked"; createdAt: string }`（放 domain.ts）
 - Produces: `class ApiTokenRepository { issue(memberId: string, label: string): { id: string; token: string }; verify(token: string): Member | null; revoke(tokenId: string): void }`——token 生成用 `crypto.randomBytes(32).toString("base64url")`，存 `sha256` hex hash；verify 对活跃成员且未吊销的 token 返回 Member
 
-- [ ] Step 1: 失败测试（upsert/getByEmail/issue+verify 往返/revoke 后 verify 为 null/吊销成员的 token verify 为 null）——测试代码按上述接口直接编写，断言行为
-- [ ] Step 2: 确认失败 → Step 3: 实现（迁移 v2 DDL + 两个 repository + domain 类型）→ Step 4: 测试与 typecheck 全绿 → Step 5: Commit `feat: members and api tokens with repositories`
+- [x] Step 1: 失败测试（upsert/getByEmail/issue+verify 往返/revoke 后 verify 为 null/吊销成员的 token verify 为 null）——测试代码按上述接口直接编写，断言行为
+- [x] Step 2: 确认失败 → Step 3: 实现（迁移 v2 DDL + 两个 repository + domain 类型）→ Step 4: 测试与 typecheck 全绿 → Step 5: Commit `feat: members and api tokens with repositories`
 
 ### Task 3: 业务新表全集（迁移 v3）+ 既有表 owner 列（迁移 v4）
 
@@ -200,8 +200,8 @@ CREATE TABLE IF NOT EXISTS run_log (
 
 **v4（owner 列回填既有表）**：`ALTER TABLE official_paper_snapshots ADD COLUMN owner_id TEXT`；`ALTER TABLE official_paper_order_lifecycle ADD COLUMN owner_id TEXT`；`ALTER TABLE stock_analysis_targets ADD COLUMN owner_id TEXT`；`ALTER TABLE paper_strategy_reflections ADD COLUMN owner_id TEXT`（可空——历史行留空，新写入必填；相关索引 `CREATE INDEX IF NOT EXISTS official_paper_snapshots_owner_idx ON official_paper_snapshots(owner_id, fetched_at)`）
 
-- [ ] Step 1: 失败测试（迁移后全部新表存在、CHECK 约束生效【插非法 enforcement 抛错】、legacy 库经 v1→v4 后旧表数据仍在且新列可写）
-- [ ] Step 2-5: TDD 循环 + `pnpm test` 全绿 + Commit `feat: phase-1 schema for members-scoped business tables`
+- [x] Step 1: 失败测试（迁移后全部新表存在、CHECK 约束生效【插非法 enforcement 抛错】、legacy 库经 v1→v4 后旧表数据仍在且新列可写）
+- [x] Step 2-5: TDD 循环 + `pnpm test` 全绿 + Commit `feat: phase-1 schema for members-scoped business tables`
 
 ### Task 4: 消除分散 DDL（4 处）
 
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS run_log (
 - Consumes: Task 1 的 migrate()；脚本侧改为 `import { openTradingDatabase } from "@apps/../shared-types"` 等仓库既有导入方式（先 grep 现有 import 写法保持一致；.mjs 里现用 `new DatabaseSync` 的路径改走 openTradingDatabase 以触发迁移）
 - 原则：**行为不变**——脚本读写的表名列名不动，只挪 DDL 归属
 
-- [ ] Step 1: 先跑四个脚本相关的现有测试记录基线 → Step 2: 逐脚本改造（删自建 DDL、openTradingDatabase 开库）→ Step 3: `pnpm test` 全绿 → Step 4: Commit `refactor: centralize all DDL into versioned migrations`
+- [x] Step 1: 先跑四个脚本相关的现有测试记录基线 → Step 2: 逐脚本改造（删自建 DDL、openTradingDatabase 开库）→ Step 3: `pnpm test` 全绿 → Step 4: Commit `refactor: centralize all DDL into versioned migrations`
 
 ### Task 5: 每日备份与恢复脚本 + launchd 模板
 
@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS run_log (
 - `restore-trading-data.mjs`：`--from <backup-file> --to <db-path>`（目标存在则拒绝，需 `--force`），恢复后跑 migrate() 并打印 schema version。
 - 测试用临时目录小库端到端：备份→改库→恢复→断言数据回到备份点；retention 清理断言。
 
-- [ ] TDD 循环 + Commit `feat: daily backup and restore for trading db and memoryd root`
+- [x] TDD 循环 + Commit `feat: daily backup and restore for trading db and memoryd root`
 
 ### Task 6: cron-runner 失败停机状态机
 
@@ -248,7 +248,7 @@ CREATE TABLE IF NOT EXISTS run_log (
 - 语义：同类失败计数 ≥3 → state 置 `halted:true`（shouldAttemptRun 返回 false 且不再退避重试）；成功清零计数；告警第 1 次失败发提示、第 3 次发升级告警（中文文案含"已停机等待复位"与复位命令）；`cron-runner-reset.mjs` 清 halted+计数并写 audit。
 - 兼容：state JSON 新增字段向后兼容（读旧 state 不炸）。
 
-- [ ] TDD 循环（同类 3 次→halted；不同类不互相累计；成功清零；reset 恢复）+ Commit `feat: halt-after-3-same-class-failures state machine with reset CLI`
+- [x] TDD 循环（同类 3 次→halted；不同类不互相累计；成功清零；reset 恢复）+ Commit `feat: halt-after-3-same-class-failures state machine with reset CLI`
 
 ### Task 7: 飞书交互卡片能力（sendInteractiveCard / updateCard / message_id 回传）
 
@@ -273,7 +273,7 @@ export async function updateInteractiveCard(messageId: string, card: Interactive
 - 默认 transport：复用现有 feishu-user-plugin MCP 子进程通道（参考本文件既有 `trySendFeishuUserPluginBot*` 的 spawn 模式），调工具 `send_message_as_bot`（msg_type interactive）并**解析返回中的 message_id**（现有代码在 794-800 行丢弃结果详情——新路径必须提取）；updateCard 调 `update_message` 工具。真实 MCP 行为点火后实测（黄灯），本阶段单测全部走注入的 fake transport。
 - 纯函数 buildFeishuCardPayload 单测：标题/行/按钮/URL 各形态的 JSON 结构断言；中文内容原样保留。
 
-- [ ] TDD 循环 + Commit `feat: interactive feishu card send/update with message_id passthrough`
+- [x] TDD 循环 + Commit `feat: interactive feishu card send/update with message_id passthrough`
 
 ### Task 8: 仓库卫生（死包清理 + 宪法同步 + 凭据模板）
 
@@ -284,7 +284,7 @@ export async function updateInteractiveCard(messageId: string, card: Interactive
 - Create: `docs/superpowers/specs/secrets-inventory.md`（密钥清单：每个密钥的用途/存放位置/轮换方式/迁移注意，按成员分节的长桥凭据结构说明）
 - Test: `pnpm test` 全绿（删包不破坏 workspace）；`pnpm build` 通过
 
-- [ ] Step 1: 删除目录 → Step 2: `pnpm install && pnpm build && pnpm test` 确认无引用残留 → Step 3: AGENTS.md 修订 + 两个新文件 → Step 4: Commit `chore: remove retired packages, sync constitution, add env template and secrets inventory`
+- [x] Step 1: 删除目录 → Step 2: `pnpm install && pnpm build && pnpm test` 确认无引用残留 → Step 3: AGENTS.md 修订 + 两个新文件 → Step 4: Commit `chore: remove retired packages, sync constitution, add env template and secrets inventory`
 
 ---
 
