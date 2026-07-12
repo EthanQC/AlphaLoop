@@ -2,6 +2,12 @@
 // alert_runtime_state, alert_daily_quota - created by shared-types' migration
 // index 2). All camelCase <-> snake_case mapping and JSON encode/decode lives
 // here; market-alerts-engine.mjs never touches SQL or JSON.stringify/parse.
+//
+// Task P2-4 (market-alerts.mjs, the rule-management CLI) widened this
+// module's scope beyond the alert_* tables: it also reads `members` and
+// validates against `stock_analysis_targets`/`official_paper_snapshots`,
+// because the CLI must not contain raw SQL (per that task's brief) and those
+// reads only exist to serve the CLI's write-side validation.
 
 import { createId } from "../../../packages/shared-types/dist/index.js";
 
@@ -74,6 +80,127 @@ export function setFeedback(db, eventId, feedback) {
   db.prepare(`UPDATE alert_events SET feedback = ? WHERE id = ?`).run(feedback, eventId);
 }
 
+// ---------------------------------------------------------------------------
+// Task P2-4 additions: rule CRUD + cross-table validation reads for
+// market-alerts.mjs (the owner-enforced rule-management CLI). These reach
+// outside the alert_* tables (members, stock_analysis_targets,
+// official_paper_snapshots) because the CLI's write-side validation needs
+// them and the task brief directs "reuse the store... rather than writing
+// raw SQL in the CLI" - so the no-raw-SQL-in-the-CLI rule wins over this
+// module's original alert_*-tables-only scope.
+// ---------------------------------------------------------------------------
+
+export function getMemberById(db, memberId) {
+  const row = db.prepare(`SELECT id, status FROM members WHERE id = ?`).get(memberId);
+  return row ? { id: String(row.id), status: String(row.status) } : null;
+}
+
+// Watchlist membership has no legacy NULL-owner fallback: the brief scopes
+// this strictly to `owner_id = actor` (unlike isSymbolInPositions below).
+export function isSymbolWatched(db, ownerId, symbol) {
+  const row = db.prepare(`SELECT 1 FROM stock_analysis_targets WHERE owner_id = ? AND symbol = ?`).get(ownerId, symbol);
+  return Boolean(row);
+}
+
+// Per the task brief's binding rule: the latest official_paper_snapshots row
+// for `owner_id = actor` OR `owner_id IS NULL`. NULL-owner rows are legacy
+// data from before per-owner snapshots existed (this system has a single
+// shared paper-trading account) - they don't prove the position is
+// specifically actor's, but since there's only one account, they're included
+// as pool-level evidence rather than excluded outright. A single query
+// picking the most recent row across both sets keeps "latest snapshot" a
+// single well-defined row instead of two separate lookups with an ordering
+// question between them.
+export function isSymbolInPositions(db, ownerId, symbol) {
+  const row = db
+    .prepare(`
+      SELECT positions FROM official_paper_snapshots
+      WHERE owner_id = ? OR owner_id IS NULL
+      ORDER BY fetched_at DESC
+      LIMIT 1
+    `)
+    .get(ownerId);
+
+  if (!row) {
+    return false;
+  }
+
+  let positions;
+  try {
+    positions = JSON.parse(String(row.positions));
+  } catch {
+    return false;
+  }
+
+  if (!Array.isArray(positions)) {
+    return false;
+  }
+
+  return positions.some((position) => String(position?.symbol ?? "").toUpperCase() === symbol);
+}
+
+// Counts ALL rules for (owner, symbol, ruleType) regardless of enabled state,
+// so pausing/resuming can't be used to churn past the brief's <=10 cap.
+export function countRules(db, ownerId, symbol, ruleType) {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS c FROM alert_rules WHERE owner_id = ? AND symbol = ? AND rule_type = ?`)
+    .get(ownerId, symbol, ruleType);
+  return Number(row?.c ?? 0);
+}
+
+export function insertRule(db, rule) {
+  const id = createId("alert_rule");
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, rule.threshold, rule.direction, rule.frequency, rule.hysteresis ?? 0, createdAt);
+  return getRule(db, id);
+}
+
+export function getRule(db, ruleId) {
+  const row = db.prepare(`SELECT * FROM alert_rules WHERE id = ?`).get(ruleId);
+  return row ? mapRuleRow(row) : null;
+}
+
+export function listRulesByOwner(db, ownerId) {
+  const rows = db.prepare(`SELECT * FROM alert_rules WHERE owner_id = ? ORDER BY created_at ASC`).all(ownerId);
+  return rows.map(mapRuleRow);
+}
+
+export function listAllRules(db) {
+  const rows = db.prepare(`SELECT * FROM alert_rules ORDER BY created_at ASC`).all();
+  return rows.map(mapRuleRow);
+}
+
+export function setRuleEnabled(db, ruleId, enabled) {
+  db.prepare(`UPDATE alert_rules SET enabled = ? WHERE id = ?`).run(enabled ? 1 : 0, ruleId);
+}
+
+// alert_runtime_state.rule_id and alert_events.rule_id both REFERENCE
+// alert_rules(id) with no ON DELETE CASCADE in the (frozen) DDL, and this
+// database opens with `PRAGMA foreign_keys = ON` - so deleting a rule that
+// already has runtime state or fired events would otherwise fail with a
+// FOREIGN KEY constraint error. Cascade manually here, in one transaction,
+// since the DDL can't be changed.
+export function deleteRule(db, ruleId) {
+  db.exec("BEGIN IMMEDIATE TRANSACTION");
+  try {
+    db.prepare(`DELETE FROM alert_events WHERE rule_id = ?`).run(ruleId);
+    db.prepare(`DELETE FROM alert_runtime_state WHERE rule_id = ?`).run(ruleId);
+    db.prepare(`DELETE FROM alert_rules WHERE id = ?`).run(ruleId);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export function getEvent(db, eventId) {
+  const row = db.prepare(`SELECT * FROM alert_events WHERE id = ?`).get(eventId);
+  return row ? mapEventRow(row) : null;
+}
+
 export function getQuota(db, ownerId, tradingDay) {
   const row = db
     .prepare(`SELECT fired_count FROM alert_daily_quota WHERE owner_id = ? AND trading_day = ?`)
@@ -105,6 +232,18 @@ function mapRuleRow(row) {
     hysteresis: Number(row.hysteresis),
     enabled: Number(row.enabled) === 1,
     createdAt: String(row.created_at)
+  };
+}
+
+function mapEventRow(row) {
+  return {
+    id: String(row.id),
+    ruleId: String(row.rule_id),
+    ownerId: String(row.owner_id),
+    triggeredAt: String(row.triggered_at),
+    value: Number(row.value),
+    messageId: row.message_id ?? null,
+    feedback: row.feedback ?? null
   };
 }
 

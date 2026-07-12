@@ -300,3 +300,275 @@ describe("getQuota / bumpQuota", () => {
     expect(store.getQuota(db, "member_2", "2026-07-01")).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task P2-4 additions: rule CRUD + cross-table validation reads consumed by
+// market-alerts.mjs (the rule-management CLI). Added here rather than as raw
+// SQL in the CLI, per the task brief's "reuse the store" instruction.
+// ---------------------------------------------------------------------------
+
+function seedTarget(db: DatabaseSync, overrides: Partial<{ symbol: string; ownerId: string | null; active: number }> = {}): void {
+  const target = { symbol: "AAPL.US", ownerId: null as string | null, active: 1, ...overrides };
+  db.prepare(`
+    INSERT INTO stock_analysis_targets (symbol, active, created_at, updated_at, owner_id)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(symbol) DO UPDATE SET active = excluded.active, owner_id = excluded.owner_id
+  `).run(target.symbol, target.active, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z", target.ownerId);
+}
+
+function seedSnapshot(
+  db: DatabaseSync,
+  overrides: Partial<{ id: string; ownerId: string | null; fetchedAt: string; positions: Array<{ symbol: string }> }> = {}
+): void {
+  const snapshot = {
+    id: `snapshot_${Math.random().toString(36).slice(2)}`,
+    ownerId: null as string | null,
+    fetchedAt: "2026-07-01T00:00:00.000Z",
+    positions: [{ symbol: "AAPL.US" }],
+    ...overrides
+  };
+  db.prepare(`
+    INSERT INTO official_paper_snapshots (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
+    VALUES (?, ?, 'test', 1000, 500, 500, ?, '{}', ?)
+  `).run(snapshot.id, snapshot.fetchedAt, JSON.stringify(snapshot.positions), snapshot.ownerId);
+}
+
+describe("getMemberById", () => {
+  it("returns id/status for an existing member", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(store.getMemberById(db, "member_1")).toEqual({ id: "member_1", status: "active" });
+  });
+
+  it("returns null for an unknown member id", () => {
+    const { db } = makeDb();
+
+    expect(store.getMemberById(db, "no_such_member")).toBeNull();
+  });
+});
+
+describe("isSymbolWatched", () => {
+  it("returns true when the symbol is in that owner's stock_analysis_targets", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, { symbol: "AAPL.US", ownerId: "member_1" });
+
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(true);
+  });
+
+  it("returns false for a different owner's watchlist entry", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    seedTarget(db, { symbol: "AAPL.US", ownerId: "member_2" });
+
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
+  });
+
+  it("returns false for a legacy owner_id=NULL row (no per-owner fallback for the watchlist)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, { symbol: "AAPL.US", ownerId: null });
+
+    expect(store.isSymbolWatched(db, "member_1", "AAPL.US")).toBe(false);
+  });
+});
+
+describe("isSymbolInPositions", () => {
+  it("returns true when the symbol is in the owner's latest snapshot", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", fetchedAt: "2026-07-01T00:00:00.000Z", positions: [{ symbol: "NVDA.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "NVDA.US")).toBe(true);
+  });
+
+  it("returns false when the symbol isn't in the owner's latest snapshot", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", positions: [{ symbol: "NVDA.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "TSLA.US")).toBe(false);
+  });
+
+  it("falls back to a legacy owner_id=NULL snapshot (single-account pool data, pre-multi-tenant)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: null, positions: [{ symbol: "MSFT.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "MSFT.US")).toBe(true);
+  });
+
+  it("does not leak a different owner's explicitly-owned snapshot", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    seedSnapshot(db, { ownerId: "member_2", positions: [{ symbol: "MSFT.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "MSFT.US")).toBe(false);
+  });
+
+  it("uses the single latest row across owner_id=actor and owner_id=NULL snapshots", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: null, fetchedAt: "2026-07-01T00:00:00.000Z", positions: [{ symbol: "OLD.US" }] });
+    seedSnapshot(db, { ownerId: "member_1", fetchedAt: "2026-07-02T00:00:00.000Z", positions: [{ symbol: "NEW.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "NEW.US")).toBe(true);
+    expect(store.isSymbolInPositions(db, "member_1", "OLD.US")).toBe(false);
+  });
+
+  it("returns false when there is no snapshot at all", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(store.isSymbolInPositions(db, "member_1", "AAPL.US")).toBe(false);
+  });
+});
+
+describe("countRules", () => {
+  it("counts rules scoped to (owner, symbol, ruleType), including disabled ones", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedRule(db, { id: "r1", ownerId: "member_1", symbol: "AAPL.US", ruleType: "daily_move", enabled: 1 });
+    seedRule(db, { id: "r2", ownerId: "member_1", symbol: "AAPL.US", ruleType: "daily_move", enabled: 0 });
+    seedRule(db, { id: "r3", ownerId: "member_1", symbol: "AAPL.US", ruleType: "unrealized_pnl", threshold: 0.06 });
+    seedRule(db, { id: "r4", ownerId: "member_1", symbol: "MSFT.US", ruleType: "daily_move" });
+
+    expect(store.countRules(db, "member_1", "AAPL.US", "daily_move")).toBe(2);
+  });
+
+  it("returns 0 when no matching rules exist", () => {
+    const { db } = makeDb();
+    expect(store.countRules(db, "member_1", "AAPL.US", "daily_move")).toBe(0);
+  });
+});
+
+describe("insertRule / getRule", () => {
+  it("inserts a rule and returns the camelCase-mapped row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    const rule = store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily",
+      hysteresis: 0
+    });
+
+    expect(rule).toMatchObject({
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily",
+      hysteresis: 0,
+      enabled: true
+    });
+    expect(typeof rule.id).toBe("string");
+    expect(typeof rule.createdAt).toBe("string");
+
+    expect(store.getRule(db, rule.id)).toEqual(rule);
+  });
+
+  it("getRule returns null for an unknown id", () => {
+    const { db } = makeDb();
+    expect(store.getRule(db, "no_such_rule")).toBeNull();
+  });
+});
+
+describe("listRulesByOwner / listAllRules", () => {
+  it("listRulesByOwner only returns that owner's rules", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    seedRule(db, { id: "r1", ownerId: "member_1" });
+    seedRule(db, { id: "r2", ownerId: "member_2", symbol: "MSFT.US" });
+
+    const rules = store.listRulesByOwner(db, "member_1");
+    expect(rules.map((r: { id: string }) => r.id)).toEqual(["r1"]);
+  });
+
+  it("listAllRules returns rules across all owners", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    seedRule(db, { id: "r1", ownerId: "member_1" });
+    seedRule(db, { id: "r2", ownerId: "member_2", symbol: "MSFT.US" });
+
+    const rules = store.listAllRules(db);
+    expect(rules.map((r: { id: string }) => r.id).sort()).toEqual(["r1", "r2"]);
+  });
+});
+
+describe("setRuleEnabled", () => {
+  it("disables and re-enables a rule", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "r1", ownerId: "member_1" });
+
+    store.setRuleEnabled(db, ruleId, false);
+    expect(store.getRule(db, ruleId)?.enabled).toBe(false);
+
+    store.setRuleEnabled(db, ruleId, true);
+    expect(store.getRule(db, ruleId)?.enabled).toBe(true);
+  });
+});
+
+describe("deleteRule", () => {
+  it("deletes a rule with no runtime/events rows", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "r1", ownerId: "member_1" });
+
+    store.deleteRule(db, ruleId);
+
+    expect(store.getRule(db, ruleId)).toBeNull();
+  });
+
+  it("cascades: deletes dependent alert_runtime_state and alert_events rows first (DDL has no ON DELETE CASCADE)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "r1", ownerId: "member_1" });
+    store.saveRuntimes(db, {
+      [ruleId]: { ruleId, armed: true, cooldownUntil: null, lastFiredTradingDay: null, lastValue: { lastPrice: 1, history: [] } }
+    });
+    const [event] = store.recordEvents(db, [{ ruleId, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" }]);
+
+    expect(() => store.deleteRule(db, ruleId)).not.toThrow();
+
+    expect(store.getRule(db, ruleId)).toBeNull();
+    expect(db.prepare("SELECT * FROM alert_runtime_state WHERE rule_id = ?").get(ruleId)).toBeUndefined();
+    expect(db.prepare("SELECT * FROM alert_events WHERE id = ?").get(event.id)).toBeUndefined();
+  });
+});
+
+describe("getEvent", () => {
+  it("returns the camelCase-mapped event row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db);
+    const [created] = store.recordEvents(db, [{ ruleId, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" }]);
+
+    const event = store.getEvent(db, created.id);
+    expect(event).toMatchObject({
+      id: created.id,
+      ruleId,
+      ownerId: "member_1",
+      value: 0.05,
+      triggeredAt: "2026-07-01T14:30:00.000Z",
+      messageId: null,
+      feedback: null
+    });
+  });
+
+  it("returns null for an unknown event id", () => {
+    const { db } = makeDb();
+    expect(store.getEvent(db, "no_such_event")).toBeNull();
+  });
+});

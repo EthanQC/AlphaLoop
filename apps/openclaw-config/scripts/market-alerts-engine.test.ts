@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { evaluateAll, evaluateRule } from "./market-alerts-engine.mjs";
+import { DEFAULT_THRESHOLDS, evaluateAll, evaluateRule, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -1270,5 +1270,32 @@ describe("evaluateAll: sample.atIso validation", () => {
     const sample = makeSample({ quotes: { "AAPL.US": { price: 105, prevClose: 100, volume: 1000 } } });
 
     expect(() => evaluateAll([rule], {}, sample, {})).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task P2-4: market-alerts.mjs (the rule-management CLI) imports these two
+// maps as its single source of truth for per-type default thresholds and the
+// rule_type -> frequency mapping, instead of re-declaring them. Pinning their
+// values here so a change to either is a deliberate, visible edit.
+// ---------------------------------------------------------------------------
+
+describe("DEFAULT_THRESHOLDS / RULE_TYPE_FREQUENCY (consumed by market-alerts.mjs)", () => {
+  it("exposes the per-type default thresholds from the brief", () => {
+    expect(DEFAULT_THRESHOLDS).toEqual({
+      daily_move: 0.04,
+      unrealized_pnl: 0.06,
+      spike_5m: 0.025,
+      exposure: 0.1
+    });
+  });
+
+  it("exposes the rule_type -> frequency mapping", () => {
+    expect(RULE_TYPE_FREQUENCY).toEqual({
+      daily_move: "once_daily",
+      unrealized_pnl: "continuous",
+      spike_5m: "continuous",
+      exposure: "continuous"
+    });
   });
 });

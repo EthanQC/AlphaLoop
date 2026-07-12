@@ -56,6 +56,19 @@ const QUOTA_LIMIT = 30;
 const SPIKE_COOLDOWN_MS = 60 * 60 * 1000;
 const SPIKE_HISTORY_SIZE = 3;
 
+// Default `threshold` values per rule type, used by market-alerts.mjs (the
+// rule-management CLI) when the operator doesn't pass an explicit
+// `--threshold`. Exported from here (not re-declared in the CLI) because the
+// engine is this system's single source of truth for what each rule type's
+// threshold actually means (see the per-type evaluators below) - keeping the
+// CLI's "sane default" in sync with that meaning belongs in one place.
+export const DEFAULT_THRESHOLDS = {
+  daily_move: 0.04,
+  unrealized_pnl: 0.06,
+  spike_5m: 0.025,
+  exposure: 0.1
+};
+
 // spike_5m compares the current sample against the oldest of the 3 retained
 // prior samples. At a steady 5-minute poll cadence that oldest point is
 // normally ~15 minutes old (3 samples x 5 min). Bound the window so a stale
@@ -66,7 +79,10 @@ const SPIKE_WINDOW_MAX_MS = 15 * 60 * 1000 + 60 * 1000;
 // rule_type has an inherent, fixed cadence; `frequency` is user/config-facing
 // but must agree with it. A mismatch is a config bug, not a runtime
 // condition - fail loud rather than silently misinterpreting the rule.
-const RULE_TYPE_FREQUENCY = {
+// Exported so market-alerts.mjs can derive the correct `frequency` to store
+// for a new rule from its `rule_type` alone, instead of re-declaring (and
+// risking drifting from) this same mapping.
+export const RULE_TYPE_FREQUENCY = {
   daily_move: "once_daily",
   unrealized_pnl: "continuous",
   spike_5m: "continuous",
