@@ -511,7 +511,7 @@ async function sendFeishuUserPluginBotText(payload: NotificationPayload): Promis
     });
 
     const detail = extractMcpText(result);
-    if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
+    if (result.isError || isFeishuProseFailure(detail)) {
       throw new Error(detail || "feishu-user-plugin returned an error response.");
     }
 
@@ -538,7 +538,7 @@ async function sendFeishuUserPluginBotPost(payload: NotificationPayload): Promis
     });
 
     const detail = extractMcpText(result);
-    if (result.isError || /^send failed\b/iu.test(detail) || /^error:/iu.test(detail)) {
+    if (result.isError || isFeishuProseFailure(detail)) {
       throw new Error(detail || "feishu-user-plugin bot post returned an error response.");
     }
 
@@ -695,7 +695,7 @@ const defaultCardTransport: CardTransport = {
           content: cardJson
         });
         const detail = extractMcpText(result);
-        if (result.isError) {
+        if (result.isError || isFeishuProseFailure(detail)) {
           throw new Error(detail || "feishu-user-plugin returned an error response.");
         }
         const messageId = extractMcpMessageId(detail);
@@ -717,7 +717,10 @@ const defaultCardTransport: CardTransport = {
           content: cardJson
         });
         const detail = extractMcpText(result);
-        if (result.isError) {
+        // update_message has no distinct prose-failure convention of its own in
+        // this codebase (it's the only update_message call site); the same
+        // send_message_as_bot prose checks are applied here for consistency.
+        if (result.isError || isFeishuProseFailure(detail)) {
           throw new Error(detail || "feishu-user-plugin returned an error response.");
         }
         return { ok: true };
@@ -947,6 +950,13 @@ function extractMcpText(result: McpToolResult): string {
     .map((entry) => entry.text)
     .join("\n")
     .trim();
+}
+
+// feishu-user-plugin can report failure as prose in its text response without
+// setting isError (e.g. "Send failed: ..." or "Error: ..."), so every tool
+// call site that inspects extractMcpText's output must also check this.
+export function isFeishuProseFailure(detail: string): boolean {
+  return /^send failed\b/iu.test(detail) || /^error:/iu.test(detail);
 }
 
 // feishu-user-plugin reports message ids inline in its text response, e.g.

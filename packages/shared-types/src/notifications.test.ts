@@ -4,6 +4,7 @@ import {
   allowReportFallbackDelivery,
   buildFeishuCardPayload,
   buildReportSummaryMarkdown,
+  isFeishuProseFailure,
   sendInteractiveCard,
   shouldSendFullReportChapters,
   updateInteractiveCard,
@@ -207,6 +208,20 @@ describe("buildFeishuCardPayload", () => {
     };
 
     expect(payload.body.elements.some((element) => element.tag === "action")).toBe(false);
+  });
+});
+
+describe("isFeishuProseFailure", () => {
+  it("flags a 'Send failed' prose response as a failure", () => {
+    expect(isFeishuProseFailure("Send failed: chat not found")).toBe(true);
+  });
+
+  it("flags an 'Error:' prose response as a failure", () => {
+    expect(isFeishuProseFailure("Error: invalid message id")).toBe(true);
+  });
+
+  it("does not flag a normal success response", () => {
+    expect(isFeishuProseFailure("Message sent (bot): om_123456")).toBe(false);
   });
 });
 
