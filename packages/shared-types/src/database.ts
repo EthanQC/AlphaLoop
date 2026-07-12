@@ -1,12 +1,14 @@
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type {
   ExecutionReport,
+  Member,
   OfficialPaperOrderLifecycle
 } from "./domain.js";
-import { createId } from "./domain.js";
+import { createId, nowIso } from "./domain.js";
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -34,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 1; // Task 2/3/4 will increment this
+export const SCHEMA_VERSION = 2; // Task 3/4 will increment this further
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -129,6 +131,30 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
         markdown_path TEXT NOT NULL,
         pdf_path TEXT NOT NULL,
         delivery TEXT NOT NULL
+      );
+    `);
+  },
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS members (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        feishu_open_id TEXT UNIQUE,
+        display_name TEXT NOT NULL,
+        risk_tags TEXT NOT NULL DEFAULT '[]',
+        stock_tags TEXT NOT NULL DEFAULT '[]',
+        show_performance INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id),
+        token_hash TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
       );
     `);
   }
@@ -309,6 +335,114 @@ export class NotificationTargetRepository {
       updatedAt: Number(row.updated_at)
     };
   }
+}
+
+export class MemberRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  upsert(m: Member): void {
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO members
+        (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        m.id,
+        m.email,
+        m.feishuOpenId ?? null,
+        m.displayName,
+        toJson(m.riskTags),
+        toJson(m.stockTags),
+        m.showPerformance ? 1 : 0,
+        m.status,
+        m.createdAt
+      );
+  }
+
+  getByEmail(email: string): Member | null {
+    const row = this.db
+      .prepare(`SELECT * FROM members WHERE email = ? LIMIT 1`)
+      .get(email) as Record<string, unknown> | undefined;
+
+    return row ? mapMember(row) : null;
+  }
+
+  getByFeishuOpenId(openId: string): Member | null {
+    const row = this.db
+      .prepare(`SELECT * FROM members WHERE feishu_open_id = ? LIMIT 1`)
+      .get(openId) as Record<string, unknown> | undefined;
+
+    return row ? mapMember(row) : null;
+  }
+
+  listActive(): Member[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM members WHERE status = 'active' ORDER BY created_at ASC`)
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map(mapMember);
+  }
+}
+
+export class ApiTokenRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  issue(memberId: string, label: string): { id: string; token: string } {
+    const id = createId("token");
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = hashToken(token);
+
+    this.db
+      .prepare(`
+        INSERT INTO api_tokens (id, member_id, token_hash, label, revoked_at, created_at)
+        VALUES (?, ?, ?, ?, NULL, ?)
+      `)
+      .run(id, memberId, tokenHash, label, nowIso());
+
+    return { id, token };
+  }
+
+  verify(token: string): Member | null {
+    const tokenHash = hashToken(token);
+    const row = this.db
+      .prepare(`
+        SELECT members.*
+        FROM api_tokens
+        JOIN members ON members.id = api_tokens.member_id
+        WHERE api_tokens.token_hash = ?
+          AND api_tokens.revoked_at IS NULL
+          AND members.status = 'active'
+        LIMIT 1
+      `)
+      .get(tokenHash) as Record<string, unknown> | undefined;
+
+    return row ? mapMember(row) : null;
+  }
+
+  revoke(tokenId: string): void {
+    this.db
+      .prepare(`UPDATE api_tokens SET revoked_at = ? WHERE id = ?`)
+      .run(nowIso(), tokenId);
+  }
+}
+
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function mapMember(row: Record<string, unknown>): Member {
+  return {
+    id: String(row.id),
+    email: String(row.email),
+    ...(row.feishu_open_id ? { feishuOpenId: String(row.feishu_open_id) } : {}),
+    displayName: String(row.display_name),
+    riskTags: fromJson<string[]>(String(row.risk_tags)),
+    stockTags: fromJson<string[]>(String(row.stock_tags)),
+    showPerformance: Number(row.show_performance) === 1,
+    status: String(row.status) as Member["status"],
+    createdAt: String(row.created_at)
+  };
 }
 
 function mapOfficialPaperOrderLifecycle(row: Record<string, unknown>): OfficialPaperOrderLifecycle {

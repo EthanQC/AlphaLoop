@@ -120,6 +120,18 @@ export interface ExecutionReport {
   createdAt: string;
 }
 
+export interface Member {
+  id: string;
+  email: string;
+  feishuOpenId?: string;
+  displayName: string;
+  riskTags: string[];
+  stockTags: string[];
+  showPerformance: boolean;
+  status: "active" | "revoked";
+  createdAt: string;
+}
+
 export function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
