@@ -34,96 +34,124 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
+export const SCHEMA_VERSION = 1; // Task 2/3/4 will increment this
+
+export function getSchemaVersion(db: DatabaseSync): number {
+  const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  return Number(row.user_version);
+}
+
+const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS execution_reports (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS notification_targets (
+        channel TEXT PRIMARY KEY,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS official_paper_order_lifecycle (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT,
+        external_order_id TEXT NOT NULL UNIQUE,
+        provider TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        account_mode TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        asset_class TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        limit_price REAL,
+        broker_status TEXT NOT NULL,
+        local_status TEXT NOT NULL,
+        lifecycle_stage TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        raw TEXT NOT NULL,
+        notes TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
+        ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
+
+      CREATE TABLE IF NOT EXISTS official_paper_snapshots (
+        id TEXT PRIMARY KEY,
+        fetched_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        net_assets REAL,
+        total_cash REAL,
+        market_value REAL NOT NULL,
+        positions TEXT NOT NULL,
+        raw TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS official_paper_snapshots_time_idx
+        ON official_paper_snapshots(fetched_at);
+
+      CREATE TABLE IF NOT EXISTS paper_strategy_reflections (
+        id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS stock_analysis_targets (
+        symbol TEXT PRIMARY KEY,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS stock_analysis_runs (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        symbols TEXT NOT NULL,
+        markdown_path TEXT NOT NULL,
+        pdf_path TEXT NOT NULL,
+        delivery TEXT NOT NULL
+      );
+    `);
+  }
+];
+
 export function migrate(db: DatabaseSync): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id TEXT PRIMARY KEY,
-      category TEXT NOT NULL,
-      action TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS execution_reports (
-      id TEXT PRIMARY KEY,
-      category TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL,
-      metadata TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS notification_targets (
-      channel TEXT PRIMARY KEY,
-      target_type TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      source TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS official_paper_order_lifecycle (
-      id TEXT PRIMARY KEY,
-      ticket_id TEXT,
-      external_order_id TEXT NOT NULL UNIQUE,
-      provider TEXT NOT NULL,
-      environment TEXT NOT NULL,
-      account_mode TEXT NOT NULL,
-      symbol TEXT NOT NULL,
-      asset_class TEXT NOT NULL,
-      side TEXT NOT NULL,
-      quantity REAL NOT NULL,
-      limit_price REAL,
-      broker_status TEXT NOT NULL,
-      local_status TEXT NOT NULL,
-      lifecycle_stage TEXT NOT NULL,
-      submitted_at TEXT NOT NULL,
-      last_observed_at TEXT NOT NULL,
-      raw TEXT NOT NULL,
-      notes TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
-      ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
-
-    CREATE TABLE IF NOT EXISTS official_paper_snapshots (
-      id TEXT PRIMARY KEY,
-      fetched_at TEXT NOT NULL,
-      reason TEXT NOT NULL,
-      net_assets REAL,
-      total_cash REAL,
-      market_value REAL NOT NULL,
-      positions TEXT NOT NULL,
-      raw TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS official_paper_snapshots_time_idx
-      ON official_paper_snapshots(fetched_at);
-
-    CREATE TABLE IF NOT EXISTS paper_strategy_reflections (
-      id TEXT PRIMARY KEY,
-      snapshot_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      payload TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS stock_analysis_targets (
-      symbol TEXT PRIMARY KEY,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS stock_analysis_runs (
-      id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      symbols TEXT NOT NULL,
-      markdown_path TEXT NOT NULL,
-      pdf_path TEXT NOT NULL,
-      delivery TEXT NOT NULL
-    );
-  `);
-
+  let version = getSchemaVersion(db);
+  while (version < MIGRATIONS.length) {
+    db.exec("BEGIN");
+    try {
+      const step = MIGRATIONS[version];
+      if (!step) {
+        throw new Error(`Missing migration step for schema version ${version}`);
+      }
+      step(db);
+      db.exec(`PRAGMA user_version = ${version + 1}`);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    version += 1;
+  }
 }
 
 export class AuditLogRepository {
