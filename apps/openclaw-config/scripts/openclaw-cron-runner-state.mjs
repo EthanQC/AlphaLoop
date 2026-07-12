@@ -1,15 +1,36 @@
+import { sanitizeAlertText } from "./openclaw-cron-runner-alerts.mjs";
+
+// Jobs whose consecutive same-class failure count reaches this threshold are halted: the runner
+// stops attempting further runs for that job until an operator resets it via cron-runner-reset.mjs.
+export const HALT_THRESHOLD = 3;
+
+export const KNOWN_CRON_JOB_NAMES = Object.freeze(["daily", "weekly", "stock-analysis"]);
+
 export function normalizeRunnerState(value = {}) {
   return {
     processedRunKeys: uniqueStrings(value.processedRunKeys),
     failedRunAttempts: normalizeFailedRunAttempts(value.failedRunAttempts),
-    alertedRunKeys: uniqueStrings(value.alertedRunKeys)
+    alertedRunKeys: uniqueStrings(value.alertedRunKeys),
+    jobFailureState: normalizeJobFailureState(value.jobFailureState)
   };
 }
 
-export function shouldAttemptRun(state, runKey, nowMs = Date.now()) {
+// Failure "class" groups errors that are likely the same root cause together, so unrelated
+// failures (e.g. a one-off network blip followed by a real bug) don't accumulate into the same
+// halt counter. Class key = jobName + normalized first line of the error message.
+export function classifyFailure(jobName, errorMessage) {
+  return `${String(jobName)}:${normalizeErrorFirstLine(errorMessage)}`;
+}
+
+export function shouldAttemptRun(state, runKey, nowMs = Date.now(), options = {}) {
   const normalized = normalizeRunnerState(state);
   const key = String(runKey);
   if (normalized.processedRunKeys.includes(key)) {
+    return false;
+  }
+
+  const jobName = stringOrUndefined(options.jobName);
+  if (jobName && normalized.jobFailureState[jobName]?.halted) {
     return false;
   }
 
@@ -24,24 +45,62 @@ export function shouldAttemptRun(state, runKey, nowMs = Date.now()) {
 export function recordRunResult(state, runKey, result, nowMs = Date.now(), options = {}) {
   const normalized = normalizeRunnerState(state);
   const key = String(runKey);
+  const jobName = resolveJobName(key, result, options);
 
   if (result?.ok) {
     normalized.processedRunKeys = pushUnique(normalized.processedRunKeys, key).slice(-limit(options.limit));
     delete normalized.failedRunAttempts[key];
     normalized.alertedRunKeys = normalized.alertedRunKeys.filter((value) => value !== key);
+    normalized.jobFailureState[jobName] = createEmptyJobFailureState();
     return normalized;
   }
 
   const previous = normalized.failedRunAttempts[key];
   const attempts = Number(previous?.attempts ?? 0) + 1;
   const delayMs = retryDelayMs(attempts, options);
+  const errorMessage = result?.error ?? result?.stderrTail ?? previous?.lastError;
+  const failureClass = classifyFailure(jobName, errorMessage);
+
+  const previousJobFailure = normalized.jobFailureState[jobName] ?? createEmptyJobFailureState();
+  const sameClass = previousJobFailure.failureClass === failureClass;
+  const consecutiveCount = sameClass ? previousJobFailure.consecutiveCount + 1 : 1;
+  normalized.jobFailureState[jobName] = {
+    failureClass,
+    consecutiveCount,
+    halted: previousJobFailure.halted || consecutiveCount >= HALT_THRESHOLD
+  };
+
   normalized.failedRunAttempts[key] = {
     attempts,
     lastAttemptAt: new Date(nowMs).toISOString(),
     nextRetryAt: new Date(nowMs + delayMs).toISOString(),
     lastResultPath: stringOrUndefined(result?.resultPath ?? previous?.lastResultPath),
-    lastError: stringOrUndefined(result?.error ?? result?.stderrTail ?? previous?.lastError)
+    lastError: stringOrUndefined(errorMessage)
   };
+  return normalized;
+}
+
+// Which failure alert (if any) should be reported for the state of `jobName` right after a
+// recordRunResult call. Only the 1st same-class failure (a heads-up) and the 3rd (the one that
+// halts the job) get an alert; everything in between or after halting is silent.
+export function getFailureAlertLevel(state, jobName) {
+  const normalized = normalizeRunnerState(state);
+  const entry = normalized.jobFailureState[String(jobName)];
+  const count = Number(entry?.consecutiveCount ?? 0);
+  if (count === 1) {
+    return "notice";
+  }
+  if (count === HALT_THRESHOLD) {
+    return "escalation";
+  }
+  return "none";
+}
+
+// Used by cron-runner-reset.mjs to clear a halted job's counters/flag after an operator has
+// investigated and fixed the underlying issue.
+export function resetJobFailureState(state, jobName) {
+  const normalized = normalizeRunnerState(state);
+  normalized.jobFailureState[String(jobName)] = createEmptyJobFailureState();
   return normalized;
 }
 
@@ -84,6 +143,50 @@ function normalizeFailedRunAttempts(value) {
       lastError: stringOrUndefined(raw.lastError)
     }]];
   }));
+}
+
+// Backward compatible with state files written before the halt-after-3-same-class-failures
+// machine existed: a missing/malformed jobFailureState is simply treated as "no job has ever
+// failed" (count 0, not halted) rather than crashing.
+function normalizeJobFailureState(value) {
+  const entries = value && typeof value === "object" ? Object.entries(value) : [];
+  return Object.fromEntries(entries.flatMap(([jobName, raw]) => {
+    if (!raw || typeof raw !== "object") {
+      return [];
+    }
+    return [[String(jobName), {
+      failureClass: stringOrUndefined(raw.failureClass),
+      consecutiveCount: Math.max(0, Number(raw.consecutiveCount ?? 0)),
+      halted: Boolean(raw.halted)
+    }]];
+  }));
+}
+
+function createEmptyJobFailureState() {
+  return { failureClass: undefined, consecutiveCount: 0, halted: false };
+}
+
+// The runner always passes the job's stable label via result.job; fall back to the options hint
+// or the runKey's leading segment so callers that don't set result.job (e.g. older tests) still
+// get a stable-ish grouping instead of throwing.
+function resolveJobName(runKey, result, options) {
+  return (
+    stringOrUndefined(result?.job) ??
+    stringOrUndefined(options?.jobName) ??
+    String(runKey).split(":")[0]
+  );
+}
+
+function normalizeErrorFirstLine(errorMessage) {
+  const firstLine = String(errorMessage ?? "").split(/\r?\n/u)[0] ?? "";
+  // Redact secrets/tokens before this text is persisted to the state file or shown in an alert,
+  // the same way the Feishu alert body is sanitized.
+  const sanitized = sanitizeAlertText(firstLine, 500);
+  return sanitized
+    .toLowerCase()
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 80);
 }
 
 function uniqueStrings(values) {

@@ -7,8 +7,9 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
-import { buildCronFailureAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
+import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
 import {
+  getFailureAlertLevel,
   normalizeRunnerState,
   recordFailureAlerted,
   recordRunResult,
@@ -98,7 +99,7 @@ async function pollOpenClawRunLogs() {
         continue;
       }
       const runKey = buildOpenClawRunKey(runEntry);
-      if (!shouldAttemptRun(runnerState, runKey) || inFlightRunKeys.has(runKey)) {
+      if (!shouldAttemptRun(runnerState, runKey, Date.now(), { jobName: entry.job.name }) || inFlightRunKeys.has(runKey)) {
         continue;
       }
       inFlightRunKeys.add(runKey);
@@ -112,8 +113,12 @@ async function pollOpenClawRunLogs() {
         });
         runnerState = recordRunResult(runnerState, runKey, result, Date.now(), { retryBaseMs, retryMaxMs });
         saveRunnerState();
-        if (!result.ok && shouldAlertFailure(runnerState, runKey)) {
-          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey])
+        // Same-class failure count reaching 3 halts the job (see openclaw-cron-runner-state.mjs);
+        // that halting failure always gets an escalation alert regardless of the per-runKey
+        // dedupe below, since a halt can happen on a retry of a runKey already alerted once.
+        const alertLevel = getFailureAlertLevel(runnerState, entry.job.name);
+        if (!result.ok && shouldAlertFailure(runnerState, runKey) && alertLevel === "notice") {
+          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey], "notice")
             .then(() => {
               runnerState = recordFailureAlerted(runnerState, runKey);
               saveRunnerState();
@@ -123,6 +128,18 @@ async function pollOpenClawRunLogs() {
                 ok: false,
                 service: "openclaw-cron-runner",
                 action: "failure-alert",
+                job: result.job,
+                error: String(error?.message ?? error)
+              }));
+            });
+        }
+        if (!result.ok && alertLevel === "escalation") {
+          await sendCronFailureAlert(result, runnerState.jobFailureState[entry.job.name], "escalation")
+            .catch((error) => {
+              console.error(JSON.stringify({
+                ok: false,
+                service: "openclaw-cron-runner",
+                action: "halt-escalation-alert",
                 job: result.job,
                 error: String(error?.message ?? error)
               }));
@@ -248,13 +265,18 @@ function saveRunnerState() {
   writeFileSync(processedRunsPath, `${JSON.stringify(serializeRunnerState(runnerState), null, 2)}\n`, "utf8");
 }
 
-async function sendCronFailureAlert(result, attempt) {
+async function sendCronFailureAlert(result, attempt, alertLevel = "notice") {
   if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
     return;
   }
-  const markdown = buildCronFailureAlertMarkdown(result, attempt);
+  const isEscalation = alertLevel === "escalation";
+  const markdown = isEscalation
+    ? buildCronHaltAlertMarkdown(result, attempt)
+    : buildCronFailureAlertMarkdown(result, attempt);
   const delivery = await deliverReportToFeishu({
-    title: `OpenClaw 自动报告失败告警：${result.job}`,
+    title: isEscalation
+      ? `OpenClaw 自动报告已停机：${result.job}`
+      : `OpenClaw 自动报告失败告警：${result.job}`,
     markdown,
     maxSectionChars: 3600
   });
