@@ -452,6 +452,14 @@ describe("evaluateRule: spike_5m", () => {
 
 // ---------------------------------------------------------------------------
 // exposure (continuous + 1% hysteresis)
+//
+// Known limitation, inherited on purpose (not fixed here): sample.exposure
+// comes from portfolio-exposure.mjs's computeExposure, which treats
+// netAssets <= 0 as exposureRatio 0 rather than an error - so if net assets
+// ever reads as zero/negative while real market value is still held, this
+// rule sees exposureRatio 0 and will never fire, a false negative it
+// silently inherits. The engine consumes exposureRatio exactly as given;
+// see portfolio-exposure.mjs's module doc comment for the full rationale.
 // ---------------------------------------------------------------------------
 
 describe("evaluateRule: exposure", () => {
