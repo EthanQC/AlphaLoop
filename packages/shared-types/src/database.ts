@@ -343,9 +343,17 @@ export class MemberRepository {
   upsert(m: Member): void {
     this.db
       .prepare(`
-        INSERT OR REPLACE INTO members
+        INSERT INTO members
         (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          email = excluded.email,
+          feishu_open_id = excluded.feishu_open_id,
+          display_name = excluded.display_name,
+          risk_tags = excluded.risk_tags,
+          stock_tags = excluded.stock_tags,
+          show_performance = excluded.show_performance,
+          status = excluded.status
       `)
       .run(
         m.id,

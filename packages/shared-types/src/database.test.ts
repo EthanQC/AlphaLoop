@@ -81,10 +81,43 @@ describe("MemberRepository", () => {
     const member = makeMember();
     repo.upsert(member);
 
-    const updated = makeMember({ displayName: "Updated Name", riskTags: [] });
+    const updated = makeMember({
+      displayName: "Updated Name",
+      riskTags: [],
+      createdAt: "2030-01-01T00:00:00.000Z"
+    });
     repo.upsert(updated);
 
-    expect(repo.getByEmail(member.email)).toEqual(updated);
+    // Updated fields persist, but created_at stays the original row's value.
+    expect(repo.getByEmail(member.email)).toEqual({ ...updated, createdAt: member.createdAt });
+  });
+
+  it("upsert throws instead of silently replacing a different member on email collision", () => {
+    const db = memoryDb();
+    migrate(db);
+    const repo = new MemberRepository(db);
+    const original = makeMember();
+    repo.upsert(original);
+
+    const conflicting = makeMember({ id: "mem_2", feishuOpenId: "ou_456" });
+
+    expect(() => repo.upsert(conflicting)).toThrow(/UNIQUE constraint failed/);
+    // The original member must still exist untouched.
+    expect(repo.getByEmail(original.email)).toEqual(original);
+  });
+
+  it("upsert throws instead of silently replacing a different member on feishu_open_id collision", () => {
+    const db = memoryDb();
+    migrate(db);
+    const repo = new MemberRepository(db);
+    const original = makeMember();
+    repo.upsert(original);
+
+    const conflicting = makeMember({ id: "mem_2", email: "other@example.com" });
+
+    expect(() => repo.upsert(conflicting)).toThrow(/UNIQUE constraint failed/);
+    // The original member must still exist untouched.
+    expect(repo.getByFeishuOpenId(original.feishuOpenId!)).toEqual(original);
   });
 
   it("getByEmail returns null when no member matches", () => {
