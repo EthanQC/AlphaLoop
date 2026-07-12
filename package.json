@@ -27,6 +27,7 @@
     "official-paper:poll": "node apps/openclaw-config/scripts/official-paper-monitor.mjs poll",
     "official-paper:pnl": "node apps/openclaw-config/scripts/official-paper-monitor.mjs pnl",
     "official-paper:snapshot": "node apps/openclaw-config/scripts/official-paper-monitor.mjs snapshot",
+    "alerts:poll": "node apps/openclaw-config/scripts/market-alerts-poll.mjs",
     "feishu:authorize-user": "node apps/openclaw-config/scripts/authorize-feishu-user.mjs",
     "feishu:user-plugin:oauth": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs oauth",
     "feishu:user-plugin:status": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs status",
