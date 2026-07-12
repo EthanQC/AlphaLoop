@@ -234,6 +234,16 @@ describe("runAdd: threshold defaults and validation", () => {
 
     expect(result.rule.threshold).toBe(0.99);
   });
+
+  it("rounds threshold percentage in rejection message (1.1 -> 110%, not 110.00000000000001%)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "1.1" }, options)).toThrow(
+      /相当于 110%/
+    );
+  });
 });
 
 describe("runAdd: direction validation (reviewer-noted write-side gate)", () => {
@@ -447,15 +457,13 @@ function addOwnedRule(db: DatabaseSync, options: { dbPath: string }, ownerId: st
 // Fix 3 (spec-owner decision, task P2-4 fix round): `remove` used to hard-
 // delete the rule AND cascade away its alert_events - including the 误报
 // feedback that exists precisely to tune thresholds later. New contract:
-// - `remove` (no flag) soft-deletes: enabled=0, rule/runtime/events survive.
+// - `remove` (no flag) soft-deletes: enabled=0 + removed_at, events survive.
 // - `remove --purge` is the old hard delete, opt-in and explicit.
 //
-// Distinguishing "soft-removed" from "merely paused" would need a marker
-// field, and alert_rules has no free-form column in the (frozen) DDL - so
-// per the brief's documented fallback, this implements soft-delete WITH
-// pause semantics: `resume` on a soft-removed rule re-enables it exactly
-// like resuming a paused one (accepted overlap, not a bug). See the
-// "documented limitation" test below.
+// Schema v6 added alert_rules.removed_at as a marker column, allowing
+// `resume` to distinguish soft-removed rules from merely paused ones.
+// `resume` now refuses to revive a removed rule with a user-facing error
+// (「该规则已删除，请重新创建。」), whereas pause remains reversible.
 describe("runRemove: soft delete (default) preserves events; --purge hard-deletes", () => {
   it("soft-deletes by default: disables the rule, keeps events, reports mode:soft", () => {
     const { db, options } = makeDb();

@@ -194,7 +194,7 @@ export function runAdd(flags, options = {}) {
     // teach the correct form in the error rather than just rejecting.
     if (threshold >= 1) {
       throw new Error(
-        `阈值请用小数（5% 写作 0.05）；收到的值 ${threshold} 相当于 ${threshold * 100}%。`
+        `阈值请用小数（5% 写作 0.05）；收到的值 ${threshold} 相当于 ${Math.round(threshold * 100)}%。`
       );
     }
 
