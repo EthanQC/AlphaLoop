@@ -36,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -245,6 +245,15 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       CREATE INDEX IF NOT EXISTS feishu_context_messages_time_idx
         ON feishu_context_messages(created_at);
     `);
+  },
+  (db) => {
+    // Closes the gap documented in task P2-4: alert_rules had no column to
+    // distinguish a soft-removed rule from a merely-paused one, so `resume`
+    // could revive a removed rule. `removed_at` (nullable) is that marker:
+    // NULL means "never removed" (active or paused via `enabled`); a
+    // timestamp means soft-removed. `enabled` keeps its existing meaning
+    // (pause/resume flip it) independent of this column.
+    db.exec("ALTER TABLE alert_rules ADD COLUMN removed_at TEXT;");
   }
 ];
 

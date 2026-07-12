@@ -309,7 +309,11 @@ describe("v5 feishu_context_messages migration", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(SCHEMA_VERSION).toBe(5);
+    // Tripwire: this hardcodes the schema version reached as of the v5
+    // migration. It must be bumped every time a new migration is appended
+    // (see the v6 test below) so this test keeps failing loudly instead of
+    // silently drifting from reality.
+    expect(SCHEMA_VERSION).toBe(6);
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
@@ -333,5 +337,72 @@ describe("v5 feishu_context_messages migration", () => {
       .prepare("SELECT text, sender_name FROM feishu_context_messages WHERE id = 'msg_1'")
       .get() as { text: string; sender_name: string };
     expect(row).toEqual({ text: "hello", sender_name: "Alice" });
+  });
+});
+
+describe("v6 alert_rules.removed_at migration", () => {
+  it("adds the removed_at column and bumps schema version to 6", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(SCHEMA_VERSION).toBe(6);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const columns = db.prepare("PRAGMA table_info(alert_rules)").all() as Array<{ name: string }>;
+    expect(columns.map((c) => c.name)).toContain("removed_at");
+  });
+
+  it("upgrades a legacy db (alert_rules rows present, user_version=5) to v6 without data loss, accepting writes to removed_at", () => {
+    const db = memoryDb();
+    // Simulate a legacy db that predates removed_at: build members + alert_rules
+    // exactly as the v1/v3 migrations leave them (no removed_at column), seed a
+    // real row, and leave user_version at 5 so migrate() only has to replay the
+    // new v6 step - not the whole history from scratch.
+    db.exec(`
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        feishu_open_id TEXT UNIQUE,
+        display_name TEXT NOT NULL,
+        risk_tags TEXT NOT NULL DEFAULT '[]',
+        stock_tags TEXT NOT NULL DEFAULT '[]',
+        show_performance INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE alert_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+        threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both',
+        frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+        hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL);
+    `);
+    db.prepare(`
+      INSERT INTO members (id, email, display_name, created_at)
+      VALUES ('mem_1', 'legacy@example.com', 'Legacy', ?)
+    `).run(nowIso());
+    db.prepare(`
+      INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, frequency, created_at)
+      VALUES ('rule_1', 'mem_1', 'AAPL.US', 'daily_move', 0.04, 'once_daily', ?)
+    `).run(nowIso());
+    db.exec("PRAGMA user_version = 5");
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // Old row survived the migration untouched.
+    const oldRow = db
+      .prepare("SELECT id, symbol FROM alert_rules WHERE id = 'rule_1'")
+      .get() as { id: string; symbol: string };
+    expect(oldRow).toEqual({ id: "rule_1", symbol: "AAPL.US" });
+
+    // New removed_at column exists on the legacy row and accepts writes.
+    db.prepare("UPDATE alert_rules SET removed_at = ? WHERE id = 'rule_1'").run(nowIso());
+    const updatedRow = db
+      .prepare("SELECT removed_at FROM alert_rules WHERE id = 'rule_1'")
+      .get() as { removed_at: string };
+    expect(typeof updatedRow.removed_at).toBe("string");
   });
 });

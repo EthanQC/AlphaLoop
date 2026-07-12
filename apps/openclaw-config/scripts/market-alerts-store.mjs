@@ -159,11 +159,15 @@ export function isSymbolInPositions(db, ownerId, symbol) {
   return positions.some((position) => String(position?.symbol ?? "").toUpperCase() === symbol);
 }
 
-// Counts ALL rules for (owner, symbol, ruleType) regardless of enabled state,
-// so pausing/resuming can't be used to churn past the brief's <=10 cap.
+// Counts rules for (owner, symbol, ruleType) regardless of enabled state, so
+// pausing/resuming can't be used to churn past the brief's <=10 cap - a
+// paused rule still occupies its slot. Schema v6's removed_at is the one
+// exception: a soft-removed rule is excluded here (removed_at IS NULL), so
+// removing a rule frees its slot the way deleting it always implicitly did,
+// while pausing (which never sets removed_at) still counts.
 export function countRules(db, ownerId, symbol, ruleType) {
   const row = db
-    .prepare(`SELECT COUNT(*) AS c FROM alert_rules WHERE owner_id = ? AND symbol = ? AND rule_type = ?`)
+    .prepare(`SELECT COUNT(*) AS c FROM alert_rules WHERE owner_id = ? AND symbol = ? AND rule_type = ? AND removed_at IS NULL`)
     .get(ownerId, symbol, ruleType);
   return Number(row?.c ?? 0);
 }
@@ -189,7 +193,8 @@ export function insertRule(db, rule) {
     frequency: rule.frequency,
     hysteresis: Number(hysteresis),
     enabled: true,
-    createdAt
+    createdAt,
+    removedAt: null
   };
 }
 
@@ -208,8 +213,21 @@ export function listAllRules(db) {
   return rows.map(mapRuleRow);
 }
 
+// Flips `enabled` only - used by pause/resume. Deliberately does not touch
+// `removed_at`: pausing (and resuming a paused rule) must never look like a
+// soft-remove, and vice versa (see removeRule below, schema v6).
 export function setRuleEnabled(db, ruleId, enabled) {
   db.prepare(`UPDATE alert_rules SET enabled = ? WHERE id = ?`).run(enabled ? 1 : 0, ruleId);
+}
+
+// Schema v6 (task P2-4 follow-up): soft-delete a rule in a way that's
+// distinguishable from pause. Sets enabled=0 (same immediate effect as
+// pause - listEnabledRules/the engine stop evaluating it) AND removed_at to
+// now, so `removed_at IS NOT NULL` marks "removed" independent of `enabled`.
+// The CLI's `resume` checks removed_at and refuses to revive a removed rule
+// (previously an accepted limitation - see the CLI's runResume/history).
+export function removeRule(db, ruleId) {
+  db.prepare(`UPDATE alert_rules SET enabled = 0, removed_at = ? WHERE id = ?`).run(new Date().toISOString(), ruleId);
 }
 
 // alert_runtime_state.rule_id and alert_events.rule_id both REFERENCE
@@ -275,7 +293,8 @@ function mapRuleRow(row) {
     frequency: String(row.frequency),
     hysteresis: Number(row.hysteresis),
     enabled: Number(row.enabled) === 1,
-    createdAt: String(row.created_at)
+    createdAt: String(row.created_at),
+    removedAt: row.removed_at ?? null
   };
 }
 

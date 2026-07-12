@@ -107,6 +107,23 @@ describe("listEnabledRules", () => {
     });
     expect(typeof rules[0].createdAt).toBe("string");
   });
+
+  // Schema v6 regression guard: a soft-removed rule sets enabled=0 (same as
+  // pause), and listEnabledRules already filters WHERE enabled = 1 - so a
+  // removed rule stays out of evaluation exactly like a paused one, with no
+  // change needed to this query. Pinning that down explicitly here so a
+  // future refactor of removeRule can't accidentally leave enabled=1.
+  it("excludes a soft-removed rule from evaluation", () => {
+    const { db } = makeDb();
+    seedMember(db);
+    seedRule(db, { id: "rule_active", enabled: 1 });
+    const removedId = seedRule(db, { id: "rule_removed", symbol: "MSFT.US", enabled: 1 });
+
+    store.removeRule(db, removedId);
+
+    const rules = store.listEnabledRules(db);
+    expect(rules.map((r: { id: string }) => r.id)).toEqual(["rule_active"]);
+  });
 });
 
 describe("getRuntimes / saveRuntimes", () => {
@@ -462,7 +479,7 @@ describe("isSymbolInPositions", () => {
 });
 
 describe("countRules", () => {
-  it("counts rules scoped to (owner, symbol, ruleType), including disabled ones", () => {
+  it("counts rules scoped to (owner, symbol, ruleType), including disabled (paused) ones", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
     seedRule(db, { id: "r1", ownerId: "member_1", symbol: "AAPL.US", ruleType: "daily_move", enabled: 1 });
@@ -476,6 +493,49 @@ describe("countRules", () => {
   it("returns 0 when no matching rules exist", () => {
     const { db } = makeDb();
     expect(store.countRules(db, "member_1", "AAPL.US", "daily_move")).toBe(0);
+  });
+
+  // Schema v6: removed_at now lets a soft-removed rule free its slot instead
+  // of permanently occupying it (unlike a merely paused rule, which still
+  // counts per the test above).
+  it("excludes a soft-removed rule from the count, so removing frees a slot", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedRule(db, { id: "r1", ownerId: "member_1", symbol: "AAPL.US", ruleType: "daily_move", enabled: 1 });
+    const removedId = seedRule(db, { id: "r2", ownerId: "member_1", symbol: "AAPL.US", ruleType: "daily_move", enabled: 1 });
+
+    expect(store.countRules(db, "member_1", "AAPL.US", "daily_move")).toBe(2);
+
+    store.removeRule(db, removedId);
+
+    expect(store.countRules(db, "member_1", "AAPL.US", "daily_move")).toBe(1);
+  });
+});
+
+describe("removeRule", () => {
+  it("sets enabled=0 and removed_at to an ISO timestamp", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "r1", ownerId: "member_1" });
+
+    store.removeRule(db, ruleId);
+
+    const rule = store.getRule(db, ruleId);
+    expect(rule?.enabled).toBe(false);
+    expect(typeof rule?.removedAt).toBe("string");
+    expect(Number.isNaN(Date.parse(String(rule?.removedAt)))).toBe(false);
+  });
+
+  it("does not touch removed_at when merely pausing (setRuleEnabled) - pause and remove stay distinguishable", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "r1", ownerId: "member_1" });
+
+    store.setRuleEnabled(db, ruleId, false);
+
+    const rule = store.getRule(db, ruleId);
+    expect(rule?.enabled).toBe(false);
+    expect(rule?.removedAt).toBeNull();
   });
 });
 

@@ -10,10 +10,14 @@
 // `remove` is non-destructive by default: it soft-deletes (disables) the
 // rule and keeps its alert_events (including 误报 feedback) so thresholds
 // can still be tuned from history later. Pass `--purge` to opt into the old
-// hard-delete behavior (rule + runtime state + events, unrecoverable). A
-// soft-removed rule remains resumable via `resume` - alert_rules has no
-// free-form column to mark "removed" distinctly from "paused" in the
-// (frozen) DDL, so this is a documented, accepted overlap, not a bug.
+// hard-delete behavior (rule + runtime state + events, unrecoverable).
+//
+// Schema v6 (packages/shared-types' migration index 5, alert_rules.removed_at):
+// soft-remove now sets removed_at alongside enabled=0, so it's distinguishable
+// from pause (which only flips enabled). `resume` checks removed_at and
+// refuses to revive a removed rule - this was previously a documented,
+// accepted overlap ("a soft-removed rule remains resumable, same as a paused
+// one") because alert_rules had no marker column; that gap is now closed.
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -142,11 +146,22 @@ function requireOwnedRule(db, actor, ruleIdRaw) {
   return rule;
 }
 
+// Schema v6: a rule now has 3 distinguishable states instead of 2. `enabled`
+// alone used to conflate "paused" and "removed" (both enabled:false);
+// removed_at breaks that tie. Computed here rather than stored, since it's
+// entirely derivable from the two existing columns.
+function ruleStatus(rule) {
+  if (rule.removedAt) {
+    return "removed";
+  }
+  return rule.enabled ? "active" : "paused";
+}
+
 export function runList(flags, options = {}) {
   const actor = requireActor(flags);
   return withDb(options, (db) => {
     const rules = flags.all ? store.listAllRules(db) : store.listRulesByOwner(db, actor);
-    return { ok: true, rules };
+    return { ok: true, rules: rules.map((rule) => ({ ...rule, status: ruleStatus(rule) })) };
   });
 }
 
@@ -236,22 +251,17 @@ function resolveAddSymbol(type, rawSymbolFlag, db, actor) {
 // Fix 3 (spec-owner decision, task P2-4 fix round): `remove` used to hard-
 // delete the rule AND cascade away its alert_events - including the 误报
 // feedback that exists precisely to tune thresholds later. Default behavior
-// is now non-destructive:
-//   - `remove --actor X --rule R`           -> soft delete: enabled=0.
-//     Runtime state and events (including feedback) survive untouched.
+// is non-destructive:
+//   - `remove --actor X --rule R`           -> soft delete: store.removeRule
+//     (enabled=0 AND removed_at=now). Runtime state and events (including
+//     feedback) survive untouched.
 //   - `remove --actor X --rule R --purge`   -> the old hard delete
 //     (rule + runtime state + events), opt-in and explicit.
 //
-// Distinguishing "soft-removed" from "merely paused" would need a marker
-// field on alert_rules, and that table has no free-form column in the
-// (frozen) DDL - no DDL change is made here. So this reuses `enabled` (the
-// same column pause/resume already flips) for the soft-delete marker,
-// which means `resume` on a soft-removed rule re-enables it exactly like
-// resuming a paused rule (see runResume below - unchanged, and see this
-// file's tests for the accepted-overlap regression test). This is the
-// documented, accepted limitation: a soft-removed rule is resumable. A
-// future phase that needs "removed" and "paused" to be truly
-// distinguishable will need a schema change (e.g. a `removed_at` column).
+// Schema v6 closed the gap this comment used to document: alert_rules now
+// has `removed_at` (packages/shared-types migration index 5), so a
+// soft-removed rule is distinguishable from a merely-paused one, and
+// `resume` (below) refuses to revive it instead of silently re-enabling it.
 export function runRemove(flags, options = {}) {
   const actor = requireActor(flags);
   const purge = Boolean(flags.purge);
@@ -271,7 +281,7 @@ export function runRemove(flags, options = {}) {
       };
     }
 
-    store.setRuleEnabled(db, rule.id, false);
+    store.removeRule(db, rule.id);
     return {
       ok: true,
       ruleId: rule.id,
@@ -279,31 +289,37 @@ export function runRemove(flags, options = {}) {
       mode: "soft",
       eventsPreserved: eventCount,
       message:
-        "已停用该规则（软删除）：历史事件与误报反馈已保留，可用于日后调整阈值。" +
-        "注意：由于 alert_rules 无独立的删除标记字段，软删除复用了 enabled 字段，" +
-        "resume 仍可重新启用该规则（与 pause 语义重叠，暂无法区分）。" +
+        "已删除该规则（软删除）：历史事件与误报反馈已保留，可用于日后调整阈值。" +
+        "该规则已无法通过 resume 恢复，如需继续监控请重新创建。" +
         "如需彻底清除历史且不再需要恢复，请追加 --purge（不可恢复）。"
     };
   });
 }
 
-// Shared by runPause/runResume, which are otherwise identical control flow
-// differing only in the `enabled` boolean.
-function setOwnedRuleEnabled(flags, options, enabled) {
+export function runPause(flags, options = {}) {
   const actor = requireActor(flags);
   return withDb(options, (db) => {
     const rule = requireOwnedRule(db, actor, flags.rule);
-    store.setRuleEnabled(db, rule.id, enabled);
-    return { ok: true, ruleId: rule.id, enabled };
+    store.setRuleEnabled(db, rule.id, false);
+    return { ok: true, ruleId: rule.id, enabled: false };
   });
 }
 
-export function runPause(flags, options = {}) {
-  return setOwnedRuleEnabled(flags, options, false);
-}
-
+// Schema v6: refuses to revive a soft-removed rule. This used to be an
+// accepted limitation (no DDL marker existed to tell "removed" apart from
+// "paused", so resume worked on both) - alert_rules.removed_at now makes
+// that distinction real, so a removed rule's resume attempt fails loud
+// instead of quietly undoing the removal.
 export function runResume(flags, options = {}) {
-  return setOwnedRuleEnabled(flags, options, true);
+  const actor = requireActor(flags);
+  return withDb(options, (db) => {
+    const rule = requireOwnedRule(db, actor, flags.rule);
+    if (rule.removedAt) {
+      throw new Error("该规则已删除，请重新创建。");
+    }
+    store.setRuleEnabled(db, rule.id, true);
+    return { ok: true, ruleId: rule.id, enabled: true };
+  });
 }
 
 export function runFeedback(flags, options = {}) {

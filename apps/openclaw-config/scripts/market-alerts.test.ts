@@ -92,6 +92,30 @@ describe("runList", () => {
 
     expect(result.rules).toHaveLength(2);
   });
+
+  // Schema v6: list must distinguish all three states in its JSON output -
+  // previously "removed" was indistinguishable from "paused" (both were just
+  // enabled:false).
+  it("distinguishes active / paused / removed via a status field", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+    seedTarget(db, "MSFT.US", "member_1");
+    seedTarget(db, "TSLA.US", "member_1");
+
+    const active = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move" }, options).rule;
+    const paused = cli.runAdd({ actor: "member_1", symbol: "MSFT", type: "daily_move" }, options).rule;
+    const removed = cli.runAdd({ actor: "member_1", symbol: "TSLA", type: "daily_move" }, options).rule;
+    cli.runPause({ actor: "member_1", rule: paused.id }, options);
+    cli.runRemove({ actor: "member_1", rule: removed.id }, options);
+
+    const result = cli.runList({ actor: "member_1" }, options);
+
+    const byId = Object.fromEntries(result.rules.map((r: { id: string; status: string }) => [r.id, r.status]));
+    expect(byId[active.id]).toBe("active");
+    expect(byId[paused.id]).toBe("paused");
+    expect(byId[removed.id]).toBe("removed");
+  });
 });
 
 describe("runAdd: actor validation", () => {
@@ -511,21 +535,56 @@ describe("runRemove: soft delete (default) preserves events; --purge hard-delete
     expect(() => cli.runRemove({ actor: "member_1" }, options)).toThrow(/--rule/);
   });
 
-  // Documents the accepted overlap between soft-removed and paused: there's
-  // no DDL marker to tell them apart, so `resume` on a soft-removed rule
-  // simply re-enables it, same as resuming a paused one. This is the
-  // spec-owner's explicit fallback decision, not an oversight.
-  it("resume re-enables a soft-removed rule (documented, accepted overlap with pause - no DDL marker exists to reject this)", () => {
+  // Schema v6 (task P2-4 follow-up): the previously accepted overlap between
+  // soft-removed and paused is now closed. removed_at distinguishes them, so
+  // `resume` must refuse a removed rule instead of silently reviving it.
+  it("removed_at is set on soft removal", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    const rule = addOwnedRule(db, options, "member_1");
+
+    cli.runRemove({ actor: "member_1", rule: rule.id }, options);
+
+    const stored = store.getRule(db, rule.id);
+    expect(stored?.enabled).toBe(false);
+    expect(typeof stored?.removedAt).toBe("string");
+  });
+
+  it("resume refuses to revive a removed rule (schema v6 closes the previously accepted overlap with pause)", () => {
     const { db, options } = makeDb();
     seedMember(db, "member_1");
     const rule = addOwnedRule(db, options, "member_1");
     cli.runRemove({ actor: "member_1", rule: rule.id }, options);
     expect(store.getRule(db, rule.id)?.enabled).toBe(false);
 
-    const result = cli.runResume({ actor: "member_1", rule: rule.id }, options);
+    expect(() => cli.runResume({ actor: "member_1", rule: rule.id }, options)).toThrow(
+      /该规则已删除，请重新创建。/
+    );
 
-    expect(result).toEqual({ ok: true, ruleId: rule.id, enabled: true });
-    expect(store.getRule(db, rule.id)?.enabled).toBe(true);
+    // The rejected resume must not have re-enabled the rule.
+    expect(store.getRule(db, rule.id)?.enabled).toBe(false);
+  });
+});
+
+describe("runRemove: a soft-removed rule frees its slot in the <=10 cap", () => {
+  it("removing after reaching 10 allows an 11th (unlike pausing, which still counts)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    let firstRuleId = "";
+    for (let i = 0; i < 10; i += 1) {
+      const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: String(0.01 + i * 0.001) }, options);
+      if (i === 0) {
+        firstRuleId = result.rule.id;
+      }
+    }
+    expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move" }, options)).toThrow(/上限（10 条）/);
+
+    cli.runRemove({ actor: "member_1", rule: firstRuleId }, options);
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "0.5" }, options);
+    expect(result.ok).toBe(true);
   });
 });
 
