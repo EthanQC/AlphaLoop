@@ -38,6 +38,8 @@
     "openclaw:runtime:doctor": "node apps/openclaw-config/scripts/openclaw-runtime-doctor.mjs",
     "launchd:install-system": "bash apps/openclaw-config/scripts/install-system-daemons.sh",
     "launchd:install-user": "node apps/openclaw-config/scripts/install-user-schedules.mjs",
+    "backup:daily": "node apps/openclaw-config/scripts/backup-trading-data.mjs",
+    "backup:restore": "node apps/openclaw-config/scripts/restore-trading-data.mjs",
     "test": "vitest run",
     "typecheck": "pnpm -r run typecheck"
   },
