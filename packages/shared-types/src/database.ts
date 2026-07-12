@@ -36,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 2; // Task 3/4 will increment this further
+export const SCHEMA_VERSION = 4;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -156,6 +156,79 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
         revoked_at TEXT,
         created_at TEXT NOT NULL
       );
+    `);
+  },
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS discipline_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        rule_text TEXT NOT NULL, enforcement TEXT NOT NULL CHECK(enforcement IN ('hard','proposal_check','self')),
+        linked_strategy TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, disabled_at TEXT);
+      CREATE TABLE IF NOT EXISTS theses (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('bull','bear','neutral')),
+        target_low REAL, target_high REAL, invalidation_price REAL,
+        visibility TEXT NOT NULL DEFAULT 'system' CHECK(visibility IN ('system','public')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn','superseded')),
+        memory_slug TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS theses_owner_symbol_idx ON theses(owner_id, symbol, status);
+      CREATE TABLE IF NOT EXISTS thesis_history (
+        id TEXT PRIMARY KEY, thesis_id TEXT NOT NULL REFERENCES theses(id),
+        note TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS proposals (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, side TEXT NOT NULL, quantity REAL NOT NULL, order_type TEXT NOT NULL,
+        limit_price REAL, reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '[]',
+        strategy_ref TEXT, discipline_report TEXT NOT NULL DEFAULT '[]',
+        invalidation TEXT, stop_loss REAL, budget_impact REAL, confidence TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','approved_half','rejected','expired','executed','failed')),
+        approval_token TEXT UNIQUE, consumed_at TEXT, decided_at TEXT, decided_by TEXT,
+        ticket_id TEXT, outcome TEXT, card_message_id TEXT,
+        created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS proposals_owner_status_idx ON proposals(owner_id, status, created_at);
+      CREATE TABLE IF NOT EXISTS alert_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+        threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both',
+        frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+        hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS alert_events (
+        id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id), owner_id TEXT NOT NULL,
+        triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT);
+      CREATE TABLE IF NOT EXISTS alert_runtime_state (
+        rule_id TEXT PRIMARY KEY REFERENCES alert_rules(id),
+        armed INTEGER NOT NULL DEFAULT 1, last_value REAL, cooldown_until TEXT,
+        last_fired_trading_day TEXT);
+      CREATE TABLE IF NOT EXISTS alert_daily_quota (
+        owner_id TEXT NOT NULL, trading_day TEXT NOT NULL, fired_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner_id, trading_day));
+      CREATE TABLE IF NOT EXISTS analysis_predictions (
+        id TEXT PRIMARY KEY, symbol TEXT NOT NULL, report_path TEXT NOT NULL,
+        conclusion TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('low','medium','high')),
+        review_trigger TEXT, review_date TEXT, outcome TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS research_tasks (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        question TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','degraded','failed')),
+        steps TEXT NOT NULL DEFAULT '[]', budget_spent INTEGER NOT NULL DEFAULT 0,
+        result_path TEXT, visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','public')),
+        created_at TEXT NOT NULL, finished_at TEXT);
+      CREATE INDEX IF NOT EXISTS research_tasks_owner_day_idx ON research_tasks(owner_id, created_at);
+      CREATE TABLE IF NOT EXISTS run_log (
+        id TEXT PRIMARY KEY, job TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+        ok INTEGER, inputs TEXT NOT NULL DEFAULT '[]', actions TEXT NOT NULL DEFAULT '[]',
+        failed_step TEXT, retries INTEGER NOT NULL DEFAULT 0, call_count INTEGER NOT NULL DEFAULT 0,
+        evidence TEXT NOT NULL DEFAULT '[]');
+    `);
+  },
+  (db) => {
+    db.exec(`
+      ALTER TABLE official_paper_snapshots ADD COLUMN owner_id TEXT;
+      ALTER TABLE official_paper_order_lifecycle ADD COLUMN owner_id TEXT;
+      ALTER TABLE stock_analysis_targets ADD COLUMN owner_id TEXT;
+      ALTER TABLE paper_strategy_reflections ADD COLUMN owner_id TEXT;
+      CREATE INDEX IF NOT EXISTS official_paper_snapshots_owner_idx ON official_paper_snapshots(owner_id, fetched_at);
     `);
   }
 ];

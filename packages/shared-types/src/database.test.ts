@@ -8,6 +8,7 @@ import {
   ApiTokenRepository
 } from "./database.js";
 import type { Member } from "./domain.js";
+import { nowIso } from "./domain.js";
 
 function memoryDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -204,5 +205,102 @@ describe("ApiTokenRepository", () => {
     new MemberRepository(db).upsert({ ...member, status: "revoked" });
 
     expect(tokens.verify(token)).toBeNull();
+  });
+});
+
+describe("v3 business tables migration", () => {
+  it("creates all new business tables and bumps schema version to 4", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(SCHEMA_VERSION).toBe(4);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    for (const table of [
+      "discipline_rules",
+      "theses",
+      "thesis_history",
+      "proposals",
+      "alert_rules",
+      "alert_events",
+      "alert_runtime_state",
+      "alert_daily_quota",
+      "analysis_predictions",
+      "research_tasks",
+      "run_log"
+    ]) {
+      expect(names).toContain(table);
+    }
+  });
+
+  it("rejects an invalid discipline_rules.enforcement value via CHECK constraint", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `)
+        .run("rule_1", member.id, "no revenge trading", "not_a_real_enforcement", nowIso())
+    ).toThrow(/CHECK constraint failed/);
+  });
+});
+
+describe("v4 owner_id columns on legacy tables", () => {
+  it("upgrades a v1 legacy db to v4, keeping old rows and accepting writes to the new owner_id columns", () => {
+    const db = memoryDb();
+    // Simulate a legacy db that predates owner_id: create official_paper_snapshots the old way
+    // (no owner_id column), user_version left at 0 so migrate() replays v1..v4 from scratch.
+    db.exec(`
+      CREATE TABLE official_paper_snapshots (
+        id TEXT PRIMARY KEY,
+        fetched_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        net_assets REAL,
+        total_cash REAL,
+        market_value REAL NOT NULL,
+        positions TEXT NOT NULL,
+        raw TEXT NOT NULL
+      );
+    `);
+    db.prepare(`
+      INSERT INTO official_paper_snapshots (id, fetched_at, reason, market_value, positions, raw)
+      VALUES ('snap_1', '2026-01-01T00:00:00.000Z', 'scheduled', 1000, '[]', '{}')
+    `).run();
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // Old row survived the migration untouched.
+    const oldRow = db
+      .prepare("SELECT id, reason FROM official_paper_snapshots WHERE id = 'snap_1'")
+      .get() as { id: string; reason: string };
+    expect(oldRow).toEqual({ id: "snap_1", reason: "scheduled" });
+
+    // New owner_id column exists on the legacy row and accepts writes.
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    db.prepare("UPDATE official_paper_snapshots SET owner_id = ? WHERE id = 'snap_1'").run(member.id);
+    const updatedRow = db
+      .prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = 'snap_1'")
+      .get() as { owner_id: string };
+    expect(updatedRow.owner_id).toBe(member.id);
+
+    // A brand-new row can also populate owner_id directly.
+    db.prepare(`
+      INSERT INTO official_paper_snapshots (id, fetched_at, reason, market_value, positions, raw, owner_id)
+      VALUES ('snap_2', '2026-01-02T00:00:00.000Z', 'scheduled', 2000, '[]', '{}', ?)
+    `).run(member.id);
+    const newRow = db
+      .prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = 'snap_2'")
+      .get() as { owner_id: string };
+    expect(newRow.owner_id).toBe(member.id);
   });
 });
