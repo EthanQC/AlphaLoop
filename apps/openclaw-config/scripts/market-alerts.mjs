@@ -22,7 +22,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { openTradingDatabase, resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
-import { DEFAULT_THRESHOLDS, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
+import { DEFAULT_THRESHOLDS, EXPOSURE_SYMBOL, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
 import * as store from "./market-alerts-store.mjs";
 import { normalizeSymbol } from "./report-data.mjs";
 
@@ -38,8 +38,6 @@ const RULE_TYPES = Object.keys(RULE_TYPE_FREQUENCY);
 // NOT repeat that silent-widening behavior - reject anything outside this
 // set instead of letting a typo quietly become 'both'.
 const DIRECTIONS = ["both", "up", "down"];
-
-const EXPOSURE_SYMBOL = "*";
 
 // `--all` (list) and `--purge` (remove, Fix 3) are this CLI's only genuine
 // no-value boolean flags. Every other flag (--actor/--symbol/--type/

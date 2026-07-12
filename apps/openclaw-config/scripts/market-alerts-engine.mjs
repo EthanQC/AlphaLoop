@@ -69,6 +69,14 @@ export const DEFAULT_THRESHOLDS = {
   exposure: 0.1
 };
 
+// Sentinel `symbol` value for portfolio-level (rule_type 'exposure') fires,
+// which are not about any one ticker. Exported from here (not re-declared in
+// market-alerts.mjs the CLI, or market-alerts-cards.mjs the card renderer -
+// both already import from this module) for the same single-source-of-truth
+// reason as DEFAULT_THRESHOLDS above: two independent copies of the same
+// string literal can silently drift.
+export const EXPOSURE_SYMBOL = "*";
+
 // spike_5m compares the current sample against the oldest of the 3 retained
 // prior samples. At a steady 5-minute poll cadence that oldest point is
 // normally ~15 minutes old (3 samples x 5 min). Bound the window so a stale

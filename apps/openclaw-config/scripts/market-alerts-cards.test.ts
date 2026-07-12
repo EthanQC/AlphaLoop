@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
-import { composeAlertCards, deliverAlertCards } from "./market-alerts-cards.mjs";
+import { buildPositionsForCards, composeAlertCards, deliverAlertCards } from "./market-alerts-cards.mjs";
 import * as store from "./market-alerts-store.mjs";
 
 // ---------------------------------------------------------------------------
@@ -54,8 +54,9 @@ describe("composeAlertCards", () => {
       })
     ];
 
-    const batches = composeAlertCards(fires, memberById, {});
+    const { batches, skipped } = composeAlertCards(fires, memberById, {});
 
+    expect(skipped).toEqual([]);
     expect(batches).toHaveLength(1);
     expect(batches[0].ownerId).toBe("member_1");
     expect(batches[0].openId).toBe("ou_member_1");
@@ -73,7 +74,7 @@ describe("composeAlertCards", () => {
       makeFire({ eventId: "event_2", ownerId: "member_2", ruleId: "rule_2", symbol: "AAPL.US" })
     ];
 
-    const batches = composeAlertCards(fires, memberById, {});
+    const { batches } = composeAlertCards(fires, memberById, {});
 
     expect(batches).toHaveLength(2);
     expect(batches.map((b) => b.ownerId).sort()).toEqual(["member_1", "member_2"]);
@@ -84,11 +85,11 @@ describe("composeAlertCards", () => {
 
   it("renders exact Chinese copy with a position and dollar impact", () => {
     const fires = [makeFire({ symbol: "NVDA.US", ruleType: "daily_move", value: -0.043, threshold: 0.04 })];
-    const positionsByOwner = {
-      member_1: { "NVDA.US": { quantity: 12, price: 1000 } }
-    };
+    // `positions` is flat by symbol - one shared Longbridge account behind
+    // this whole system, no per-owner nesting (see module header).
+    const positions = { "NVDA.US": { quantity: 12, price: 1000 } };
 
-    const batches = composeAlertCards(fires, memberById, positionsByOwner);
+    const { batches } = composeAlertCards(fires, memberById, positions);
 
     // amount = round(12 * 1000 * 0.043) = round(516) = 516
     expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -4.3%（阈值 ±4%）· 持仓 12 股 · 影响 -$516");
@@ -96,11 +97,9 @@ describe("composeAlertCards", () => {
 
   it("renders a positive move with an explicit + sign on both percent and dollar amount", () => {
     const fires = [makeFire({ symbol: "TSLA.US", ruleType: "spike_5m", value: 0.03, threshold: 0.025 })];
-    const positionsByOwner = {
-      member_1: { "TSLA.US": { quantity: 10, price: 200 } }
-    };
+    const positions = { "TSLA.US": { quantity: 10, price: 200 } };
 
-    const batches = composeAlertCards(fires, memberById, positionsByOwner);
+    const { batches } = composeAlertCards(fires, memberById, positions);
 
     // amount = round(10 * 200 * 0.03) = 60
     expect(batches[0].card.lines[0]).toBe("22:10 TSLA 5分钟 +3.0%（阈值 ±2.5%）· 持仓 10 股 · 影响 +$60");
@@ -108,11 +107,9 @@ describe("composeAlertCards", () => {
 
   it("thousands-separates a large dollar impact", () => {
     const fires = [makeFire({ symbol: "NVDA.US", ruleType: "daily_move", value: -0.05, threshold: 0.04 })];
-    const positionsByOwner = {
-      member_1: { "NVDA.US": { quantity: 500, price: 500 } }
-    };
+    const positions = { "NVDA.US": { quantity: 500, price: 500 } };
 
-    const batches = composeAlertCards(fires, memberById, positionsByOwner);
+    const { batches } = composeAlertCards(fires, memberById, positions);
 
     // amount = round(500 * 500 * 0.05) = 12500
     expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -5.0%（阈值 ±4%）· 持仓 500 股 · 影响 -$12,500");
@@ -121,7 +118,7 @@ describe("composeAlertCards", () => {
   it("uses the unrealized_pnl label", () => {
     const fires = [makeFire({ ruleType: "unrealized_pnl", value: -0.061, threshold: 0.06 })];
 
-    const batches = composeAlertCards(fires, memberById, {});
+    const { batches } = composeAlertCards(fires, memberById, {});
 
     expect(batches[0].card.lines[0]).toBe("22:10 NVDA 浮动盈亏 -6.1%（阈值 ±6%）");
   });
@@ -129,7 +126,7 @@ describe("composeAlertCards", () => {
   it("omits the 持仓/影响 clauses entirely when there is no known position for that symbol", () => {
     const fires = [makeFire({ symbol: "NVDA.US" })];
 
-    const batches = composeAlertCards(fires, memberById, { member_1: {} });
+    const { batches } = composeAlertCards(fires, memberById, {});
 
     expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -4.3%（阈值 ±4%）");
     expect(batches[0].card.lines[0]).not.toMatch(/NaN/);
@@ -137,17 +134,36 @@ describe("composeAlertCards", () => {
 
   it("omits only the 影响 clause when quantity is known but price is not", () => {
     const fires = [makeFire({ symbol: "NVDA.US" })];
-    const positionsByOwner = {
-      member_1: { "NVDA.US": { quantity: 12, price: null } }
-    };
+    const positions = { "NVDA.US": { quantity: 12, price: null } };
 
-    const batches = composeAlertCards(fires, memberById, positionsByOwner);
+    const { batches } = composeAlertCards(fires, memberById, positions);
 
     expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -4.3%（阈值 ±4%）· 持仓 12 股");
     expect(batches[0].card.lines[0]).not.toMatch(/NaN/);
   });
 
-  it("renders the exposure line shape with no symbol, no time, and no position clause", () => {
+  it("renders a short position's dollar impact with the correct sign (a down move is a gain when short)", () => {
+    const fires = [makeFire({ symbol: "NVDA.US", ruleType: "daily_move", value: -0.043, threshold: 0.04 })];
+    const positions = { "NVDA.US": { quantity: -12, price: 1000 } };
+
+    const { batches } = composeAlertCards(fires, memberById, positions);
+
+    // magnitude = round(abs(-12 * 1000 * -0.043)) = 516; sign from value*quantity = (-0.043)*(-12) > 0 -> "+"
+    // (never the double-negative "影响 -$-516" a naive `Math.abs(value)`-only magnitude would render).
+    expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -4.3%（阈值 ±4%）· 持仓 -12 股 · 影响 +$516");
+  });
+
+  it("renders a short position's dollar impact as a loss on an up move", () => {
+    const fires = [makeFire({ symbol: "TSLA.US", ruleType: "spike_5m", value: 0.03, threshold: 0.025 })];
+    const positions = { "TSLA.US": { quantity: -10, price: 200 } };
+
+    const { batches } = composeAlertCards(fires, memberById, positions);
+
+    // magnitude = round(abs(-10 * 200 * 0.03)) = 60; sign from value*quantity = 0.03*(-10) < 0 -> "-"
+    expect(batches[0].card.lines[0]).toBe("22:10 TSLA 5分钟 +3.0%（阈值 ±2.5%）· 持仓 -10 股 · 影响 -$60");
+  });
+
+  it("renders the exposure line with no symbol and no position clause, but keeps the time prefix", () => {
     const fires = [
       makeFire({
         symbol: "*",
@@ -157,37 +173,144 @@ describe("composeAlertCards", () => {
       })
     ];
     // Even if a stray position entry existed under '*' it must never be used.
-    const positionsByOwner = { member_1: { "*": { quantity: 999, price: 1 } } };
+    const positions = { "*": { quantity: 999, price: 1 } };
 
-    const batches = composeAlertCards(fires, memberById, positionsByOwner);
+    const { batches } = composeAlertCards(fires, memberById, positions);
 
-    expect(batches[0].card.lines[0]).toBe("组合敞口 10.4%（预算 10%）");
+    expect(batches[0].card.lines[0]).toBe("22:10 组合敞口 10.4%（预算 10%）");
   });
 
-  it("skips (and reports via stderr) an owner with no feishuOpenId on file", () => {
+  it("reports (in skipped) an owner with no feishuOpenId on file, with no card produced", () => {
+    const fires = [makeFire({ ownerId: "member_no_open_id", eventId: "event_a" })];
+
+    const { batches, skipped } = composeAlertCards(fires, { member_no_open_id: {} }, {});
+
+    expect(batches).toHaveLength(0);
+    expect(skipped).toEqual([{ ownerId: "member_no_open_id", reason: "no_open_id", eventIds: ["event_a"] }]);
+  });
+
+  it("reports an owner entirely absent from memberById in skipped", () => {
+    const fires = [makeFire({ ownerId: "member_unknown", eventId: "event_b" })];
+
+    const { batches, skipped } = composeAlertCards(fires, {}, {});
+
+    expect(batches).toHaveLength(0);
+    expect(skipped).toEqual([{ ownerId: "member_unknown", reason: "no_open_id", eventIds: ["event_b"] }]);
+  });
+
+  it("merges multiple no-openId fires for the same owner into a single skipped entry with all their eventIds", () => {
+    const fires = [
+      makeFire({ ownerId: "member_no_open_id", eventId: "event_a", symbol: "NVDA.US" }),
+      makeFire({ ownerId: "member_no_open_id", eventId: "event_b", ruleId: "rule_2", symbol: "TSLA.US" })
+    ];
+
+    const { batches, skipped } = composeAlertCards(fires, { member_no_open_id: {} }, {});
+
+    expect(batches).toHaveLength(0);
+    expect(skipped).toEqual([
+      { ownerId: "member_no_open_id", reason: "no_open_id", eventIds: ["event_a", "event_b"] }
+    ]);
+  });
+
+  it("does not log to stderr itself (PURE function, no IO) when skipping an owner", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const fires = [makeFire({ ownerId: "member_no_open_id" })];
 
-    const batches = composeAlertCards(fires, { member_no_open_id: {} }, {});
+    composeAlertCards(fires, { member_no_open_id: {} }, {});
 
-    expect(batches).toHaveLength(0);
-    expect(errorSpy).toHaveBeenCalled();
-    expect(errorSpy.mock.calls[0]?.[0]).toMatch(/member_no_open_id/);
+    expect(errorSpy).not.toHaveBeenCalled();
     errorSpy.mockRestore();
   });
 
-  it("skips an owner entirely absent from memberById", () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const fires = [makeFire({ ownerId: "member_unknown" })];
-
-    const batches = composeAlertCards(fires, {}, {});
-
-    expect(batches).toHaveLength(0);
-    errorSpy.mockRestore();
+  it("returns empty batches and skipped for an empty fires list", () => {
+    expect(composeAlertCards([], memberById, {})).toEqual({ batches: [], skipped: [] });
   });
 
-  it("returns an empty array for an empty fires list", () => {
-    expect(composeAlertCards([], memberById, {})).toEqual([]);
+  describe("contract validation (wiring bugs fail loud, not silently)", () => {
+    it("throws naming the ruleId and field when a fire is missing threshold", () => {
+      const fires = [makeFire({ ruleId: "rule_missing_threshold", threshold: undefined })];
+
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/rule_missing_threshold/);
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/threshold/);
+    });
+
+    it("throws when threshold is non-finite (e.g. NaN), not just undefined", () => {
+      const fires = [makeFire({ threshold: Number.NaN })];
+
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/threshold/);
+    });
+
+    it("throws naming the ruleId and field when a fire is missing eventId", () => {
+      const fires = [makeFire({ ruleId: "rule_missing_event", eventId: undefined })];
+
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/rule_missing_event/);
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/eventId/);
+    });
+
+    it("throws when an exposure fire is missing eventId too", () => {
+      const fires = [
+        makeFire({ symbol: "*", ruleType: "exposure", value: 0.104, threshold: 0.1, eventId: undefined })
+      ];
+
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/eventId/);
+    });
+
+    it("throws when an exposure fire is missing threshold (would otherwise render NaN in the 预算 clause)", () => {
+      const fires = [makeFire({ symbol: "*", ruleType: "exposure", value: 0.104, threshold: undefined })];
+
+      expect(() => composeAlertCards(fires, memberById, {})).toThrow(/threshold/);
+    });
+
+    it("does not throw for a well-formed fire (sanity check the guard isn't overly strict)", () => {
+      const fires = [makeFire()];
+      expect(() => composeAlertCards(fires, memberById, {})).not.toThrow();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPositionsForCards
+// ---------------------------------------------------------------------------
+
+describe("buildPositionsForCards", () => {
+  it("merges quantity from sample.positions and price from sample.quotes per symbol", () => {
+    const sample = {
+      atIso: "2026-07-13T14:10:00.000Z",
+      tradingDay: "2026-07-13",
+      positions: { "NVDA.US": { quantity: 12, costPrice: 900, marketValue: 12000 } },
+      quotes: { "NVDA.US": { price: 1000, prevClose: 990, volume: 1000 } }
+    };
+
+    expect(buildPositionsForCards(sample)).toEqual({ "NVDA.US": { quantity: 12, price: 1000 } });
+  });
+
+  it("includes a symbol with only a quote (no position) with quantity undefined", () => {
+    const sample = { positions: {}, quotes: { "TSLA.US": { price: 200, prevClose: 200, volume: 1 } } };
+
+    expect(buildPositionsForCards(sample)).toEqual({ "TSLA.US": { quantity: undefined, price: 200 } });
+  });
+
+  it("includes a symbol with only a position (no quote) with price undefined", () => {
+    const sample = { positions: { "AAPL.US": { quantity: 5, costPrice: 100, marketValue: 500 } }, quotes: {} };
+
+    expect(buildPositionsForCards(sample)).toEqual({ "AAPL.US": { quantity: 5, price: undefined } });
+  });
+
+  it("returns an empty object for a sample with no positions/quotes fields at all", () => {
+    expect(buildPositionsForCards({})).toEqual({});
+    expect(buildPositionsForCards(undefined)).toEqual({});
+  });
+
+  it("feeds composeAlertCards directly (the one obvious way to wire it), producing the exact expected line", () => {
+    const sample = {
+      positions: { "NVDA.US": { quantity: 12, costPrice: 900, marketValue: 12000 } },
+      quotes: { "NVDA.US": { price: 1000, prevClose: 990, volume: 1000 } }
+    };
+    const fires = [makeFire({ symbol: "NVDA.US", ruleType: "daily_move", value: -0.043, threshold: 0.04 })];
+
+    const { batches } = composeAlertCards(fires, memberById, buildPositionsForCards(sample));
+
+    expect(batches[0].card.lines[0]).toBe("22:10 NVDA 日内 -4.3%（阈值 ±4%）· 持仓 12 股 · 影响 -$516");
   });
 });
 
@@ -262,7 +385,7 @@ describe("deliverAlertCards", () => {
       updateCard: async () => ({ ok: true })
     };
 
-    const summary = await deliverAlertCards(db, [makeBatch([eventId])], fakeTransport);
+    const summary = await deliverAlertCards(db, { batches: [makeBatch([eventId])], skipped: [] }, fakeTransport);
 
     expect(summary).toEqual({ sent: 1, failed: 0, skipped: 0 });
     expect(receivedTarget).toEqual({ openId: "ou_member_1" });
@@ -288,7 +411,11 @@ describe("deliverAlertCards", () => {
       updateCard: async () => ({ ok: true })
     };
 
-    const summary = await deliverAlertCards(db, [makeBatch([eventId1, event2.id])], fakeTransport);
+    const summary = await deliverAlertCards(
+      db,
+      { batches: [makeBatch([eventId1, event2.id])], skipped: [] },
+      fakeTransport
+    );
 
     expect(summary).toEqual({ sent: 1, failed: 0, skipped: 0 });
     expect(store.getEvent(db, eventId1)?.messageId).toBe("om_merged_1");
@@ -303,7 +430,9 @@ describe("deliverAlertCards", () => {
       updateCard: async () => ({ ok: true })
     };
 
-    const summary = await expect(deliverAlertCards(db, [makeBatch([eventId])], fakeTransport)).resolves.toEqual({
+    const summary = await expect(
+      deliverAlertCards(db, { batches: [makeBatch([eventId])], skipped: [] }, fakeTransport)
+    ).resolves.toEqual({
       sent: 0,
       failed: 1,
       skipped: 0
@@ -325,7 +454,7 @@ describe("deliverAlertCards", () => {
       updateCard: async () => ({ ok: true })
     };
 
-    await expect(deliverAlertCards(db, [makeBatch([eventId])], fakeTransport)).resolves.toEqual({
+    await expect(deliverAlertCards(db, { batches: [makeBatch([eventId])], skipped: [] }, fakeTransport)).resolves.toEqual({
       sent: 0,
       failed: 1,
       skipped: 0
@@ -360,7 +489,7 @@ describe("deliverAlertCards", () => {
     const batch1 = makeBatch([eventId1]);
     const batch2 = { ...makeBatch([event2.id]), ownerId: "member_2", openId: "ou_member_2" };
 
-    const summary = await deliverAlertCards(db, [batch1, batch2], fakeTransport);
+    const summary = await deliverAlertCards(db, { batches: [batch1, batch2], skipped: [] }, fakeTransport);
 
     expect(summary).toEqual({ sent: 1, failed: 1, skipped: 0 });
     expect(store.getEvent(db, eventId1)?.messageId).toBeNull();
@@ -380,15 +509,72 @@ describe("deliverAlertCards", () => {
       updateCard: async () => ({ ok: true })
     };
 
-    const summary = await deliverAlertCards(db, [batch], fakeTransport);
+    const summary = await deliverAlertCards(db, { batches: [batch], skipped: [] }, fakeTransport);
 
     expect(summary).toEqual({ sent: 0, failed: 0, skipped: 1 });
     expect(sendCalled).toBe(false);
     errorSpy.mockRestore();
   });
 
-  it("returns a zeroed summary for an empty batch list", async () => {
-    const summary = await deliverAlertCards(db, [], { sendCard: async () => ({ ok: true }), updateCard: async () => ({ ok: true }) });
+  it("counts and logs composeAlertCards' skipped (no-openId) owners into its own skipped total", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fakeTransport = {
+      sendCard: async () => ({ ok: true, messageId: "om_unused" }),
+      updateCard: async () => ({ ok: true })
+    };
+
+    const summary = await deliverAlertCards(
+      db,
+      { batches: [], skipped: [{ ownerId: "member_no_open_id", reason: "no_open_id", eventIds: ["event_x"] }] },
+      fakeTransport
+    );
+
+    expect(summary).toEqual({ sent: 0, failed: 0, skipped: 1 });
+    expect(errorSpy).toHaveBeenCalled();
+    expect(errorSpy.mock.calls.some((call) => String(call[0]).includes("member_no_open_id"))).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it("chains directly from composeAlertCards' return value end to end", async () => {
+    const eventId = seedEvent();
+    const fires = [
+      { ruleId: "rule_1", ownerId: "member_1", symbol: "NVDA.US", ruleType: "daily_move", value: -0.043, triggeredAt: "2026-07-13T14:10:00.000Z", threshold: 0.04, eventId },
+      { ruleId: "rule_ghost", ownerId: "member_no_open_id", symbol: "AAPL.US", ruleType: "daily_move", value: 0.05, triggeredAt: "2026-07-13T14:10:00.000Z", threshold: 0.04, eventId: "event_ghost" }
+    ];
+    const fakeTransport = {
+      sendCard: async () => ({ ok: true, messageId: "om_chained" }),
+      updateCard: async () => ({ ok: true })
+    };
+
+    const composed = composeAlertCards(fires, { member_1: { feishuOpenId: "ou_member_1" } }, {});
+    const summary = await deliverAlertCards(db, composed, fakeTransport);
+
+    expect(summary).toEqual({ sent: 1, failed: 0, skipped: 1 });
+    expect(store.getEvent(db, eventId)?.messageId).toBe("om_chained");
+  });
+
+  it("returns a zeroed summary for an empty batch/skipped list", async () => {
+    const summary = await deliverAlertCards(
+      db,
+      { batches: [], skipped: [] },
+      { sendCard: async () => ({ ok: true }), updateCard: async () => ({ ok: true }) }
+    );
     expect(summary).toEqual({ sent: 0, failed: 0, skipped: 0 });
+  });
+
+  it("throws when handed a bare batches array instead of composeAlertCards' {batches, skipped} shape", async () => {
+    // Guards the same class of wiring bug composeAlertCards' fire validation
+    // guards: passing the pre-fix signature (a bare array) must fail loud, not
+    // silently return a success-looking zeroed summary while delivering nothing.
+    const eventId = seedEvent();
+    const fakeTransport = {
+      sendCard: async () => ({ ok: true, messageId: "om_should_not_happen" }),
+      updateCard: async () => ({ ok: true })
+    };
+
+    await expect(
+      // @ts-expect-error - deliberately passing the old (bare array) signature.
+      deliverAlertCards(db, [makeBatch([eventId])], fakeTransport)
+    ).rejects.toThrow(/batches/);
   });
 });
