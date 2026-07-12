@@ -155,9 +155,19 @@ function ruleStatus(rule) {
   return rule.enabled ? "active" : "paused";
 }
 
+// Finding 2 (task P2-4 live-verification fix round): `list --actor <unknown>`
+// used to return {ok:true, rules:[]} - indistinguishable from "a real member
+// with zero rules", which is misleading when the control agent relays it
+// verbatim. The actor performing the call must be a valid active member on
+// BOTH paths (owner-scoped and --all) before we even look at rules; a valid
+// member who genuinely has no rules still gets {ok:true, rules:[]}.
 export function runList(flags, options = {}) {
   const actor = requireActor(flags);
   return withDb(options, (db) => {
+    const member = store.getMemberById(db, actor);
+    if (!member || member.status !== "active") {
+      throw new Error("actor 不是有效的在职成员。");
+    }
     const rules = flags.all ? store.listAllRules(db) : store.listRulesByOwner(db, actor);
     return { ok: true, rules: rules.map((rule) => ({ ...rule, status: ruleStatus(rule) })) };
   });
@@ -363,16 +373,31 @@ export function runMarketAlertsCommand(command, flags, options = {}) {
   return handler(flags, options);
 }
 
-async function main() {
-  const [command, ...rest] = process.argv.slice(2);
-  const flags = parseFlags(rest);
-  const dbPath = resolveRuntimePaths(repoRoot).dbPath;
-
+// Finding 1 (task P2-4 live-verification fix round): this CLI's binding
+// contract is "always exactly one line of JSON on stdout; errors are
+// non-zero exit with a Chinese message" (the control agent relays stdout
+// verbatim). `parseFlags` used to run OUTSIDE main()'s try/catch, so an
+// unknown flag - or any other pre-dispatch failure - escaped as a raw
+// uncaught exception (a Node stack trace on stderr) instead of the
+// {"ok":false,"error":"..."} envelope. `buildCliResult` is the whole
+// pre-dispatch-through-dispatch path (argv parsing, db path resolution,
+// subcommand dispatch) wrapped in ONE try/catch, extracted out of main() so
+// it can be exercised directly in tests without spawning a process.
+export function buildCliResult(argv, options = {}) {
   try {
-    const result = runMarketAlertsCommand(command, flags, { dbPath });
-    console.log(JSON.stringify(result));
+    const [command, ...rest] = argv;
+    const flags = parseFlags(rest);
+    const dbPath = options.dbPath ?? resolveRuntimePaths(repoRoot).dbPath;
+    return runMarketAlertsCommand(command, flags, { dbPath });
   } catch (error) {
-    console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function main() {
+  const result = buildCliResult(process.argv.slice(2));
+  console.log(JSON.stringify(result));
+  if (result.ok === false) {
     process.exitCode = 1;
   }
 }

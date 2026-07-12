@@ -118,6 +118,45 @@ describe("runList", () => {
   });
 });
 
+// Finding 2 (task P2-4 live-verification fix round): `list --actor <unknown>`
+// used to return {ok:true, rules:[]} exit 0 - indistinguishable from "a real
+// member with zero rules". That's misleading when the control agent relays
+// it verbatim. `list` must reject a non-member/inactive actor the same way
+// `add` already does, for both the owner-scoped and --all paths (the actor
+// making the call must itself be a valid active member either way).
+describe("runList: actor validation", () => {
+  it("rejects an unknown actor", () => {
+    const { options } = makeDb();
+    expect(() => cli.runList({ actor: "no_such_member" }, options)).toThrow(/在职成员/);
+  });
+
+  it("rejects a revoked (inactive) actor", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1", "revoked");
+
+    expect(() => cli.runList({ actor: "member_1" }, options)).toThrow(/在职成员/);
+  });
+
+  it("rejects an unknown actor on the --all path too", () => {
+    const { options } = makeDb();
+    expect(() => cli.runList({ actor: "no_such_member", all: true }, options)).toThrow(/在职成员/);
+  });
+
+  it("rejects a revoked actor on the --all path too", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1", "revoked");
+
+    expect(() => cli.runList({ actor: "member_1", all: true }, options)).toThrow(/在职成员/);
+  });
+
+  it("still returns ok:true with an empty list for a valid member who genuinely has no rules", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(cli.runList({ actor: "member_1" }, options)).toEqual({ ok: true, rules: [] });
+  });
+});
+
 describe("runAdd: actor validation", () => {
   it("rejects an unknown actor", () => {
     const { options } = makeDb();
@@ -756,5 +795,63 @@ describe("runAdd / runList: omitted-value flags fail loud instead of silently co
     const flags = cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--type", "daily_move", "--threshold"]);
 
     expect(() => cli.runAdd(flags, options)).toThrow(/threshold/);
+  });
+});
+
+// Finding 1 (task P2-4 live-verification fix round): `parseFlags` used to run
+// OUTSIDE main()'s try/catch, so an unknown flag (or any other pre-dispatch
+// throw) escaped as a raw uncaught exception - a Node stack trace on stderr -
+// instead of the CLI's binding contract: a single line of JSON on stdout
+// ({"ok":false,"error":"..."}) plus a non-zero exit. `buildCliResult` is the
+// extracted, directly-testable entry function main() now delegates to; it
+// wraps argv parsing AND dispatch in one try/catch so nothing pre-dispatch
+// can throw past the envelope.
+describe("buildCliResult: the whole pre-dispatch path (parse + dispatch) is wrapped in the JSON envelope", () => {
+  it("converts an unknown-flag parseFlags throw into {ok:false, error} instead of throwing", () => {
+    const { options } = makeDb();
+
+    const result = cli.buildCliResult(
+      ["add", "--actor", "x", "--symbol", "NVDA", "--type", "daily_move", "--treshold", "0.05"],
+      options
+    );
+
+    expect(result).toEqual({ ok: false, error: "未知参数：--treshold。" });
+  });
+
+  it("converts a missing --actor into {ok:false, error}", () => {
+    const { options } = makeDb();
+
+    const result = cli.buildCliResult(["add", "--symbol", "NVDA", "--type", "daily_move"], options);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/--actor/);
+  });
+
+  it("converts an unknown subcommand into {ok:false, error}", () => {
+    const { options } = makeDb();
+
+    const result = cli.buildCliResult(["bogus"], options);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/未知子命令/);
+  });
+
+  it("converts no args at all into {ok:false, error} (command is undefined)", () => {
+    const { options } = makeDb();
+
+    const result = cli.buildCliResult([], options);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/未知子命令/);
+  });
+
+  it("still dispatches and returns {ok:true, ...} for a valid command", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.buildCliResult(["add", "--actor", "member_1", "--symbol", "AAPL", "--type", "daily_move"], options);
+
+    expect(result.ok).toBe(true);
   });
 });
