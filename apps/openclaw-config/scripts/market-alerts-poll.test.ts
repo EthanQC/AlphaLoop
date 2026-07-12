@@ -57,11 +57,13 @@ function seedSnapshot(
   db: DatabaseSync,
   {
     ownerId = null,
+    fetchedAt = "2026-07-01T00:00:00.000Z",
     netAssets = 100_000,
     marketValue = 9_000,
     positions = [] as Array<{ symbol: string; quantity: number; costPrice: number }>
   }: {
     ownerId?: string | null;
+    fetchedAt?: string;
     netAssets?: number;
     marketValue?: number;
     positions?: Array<{ symbol: string; quantity: number; costPrice: number }>;
@@ -73,7 +75,7 @@ function seedSnapshot(
     VALUES (?, ?, 'test', ?, ?, ?, ?, '{}', ?)
   `).run(
     `snap_${Math.random().toString(36).slice(2)}`,
-    "2026-07-01T00:00:00.000Z",
+    fetchedAt,
     netAssets,
     netAssets - marketValue,
     marketValue,
@@ -276,5 +278,206 @@ describe("runMarketAlertsPoll", () => {
       message_id: string | null;
     };
     expect(row.message_id).toBeNull();
+  });
+
+  // Fix 1 (reviewer-flagged, task P2-6 fix round): saveRuntimes/recordEvents/
+  // bumpQuota used to be three separate implicit transactions - a throw
+  // between them left state permanently corrupted. They must now all
+  // commit (or all roll back) as one unit via store.persistCycle.
+  it("rolls back the ENTIRE cycle - including a sibling rule's ALREADY-WRITTEN runtime - if persistence fails partway through", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    // Two rules for the SAME owner, inserted in this order - listEnabledRules
+    // has no explicit ORDER BY but SQLite returns a simple full-table scan in
+    // rowid/insertion order in practice (the existing config-error-isolation
+    // test above already relies on this same assumption), so keptRule's
+    // runtime upsert is attempted before doomedRule's within saveRuntimes'
+    // own loop.
+    const keptRule = store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+    const doomedRule = store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "MSFT.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }] });
+
+    const attempt = poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: async () => {
+        // Simulate a mid-cycle failure that hits only ONE of two rules for
+        // the same owner - e.g. a concurrent `market-alerts remove --purge`
+        // racing this poll cycle for doomedRule only. alert_runtime_state.rule_id
+        // REFERENCES alert_rules(id) with foreign_keys=ON and no ON DELETE
+        // CASCADE, so writing runtime state for a now-missing rule throws a
+        // genuine FOREIGN KEY constraint error partway through saveRuntimes'
+        // own upsert loop - AFTER keptRule's own upsert (for a rule that
+        // still exists) already ran. Under the pre-fix design (three
+        // separate implicit transactions, no wrapping BEGIN), keptRule's
+        // write would already be auto-committed to disk by the time
+        // doomedRule's throws - this is exactly the corruption Fix 1 closes.
+        db.prepare("DELETE FROM alert_rules WHERE id = ?").run(doomedRule.id);
+        return {
+          "NVDA.US": { price: 950, prevClose: 900, volume: 1000 },
+          "MSFT.US": { price: 100, prevClose: 100, volume: 1000 }
+        };
+      },
+      transport: fakeTransport()
+    });
+
+    await expect(attempt).rejects.toThrow();
+
+    // Neither rule's runtime survives - not even keptRule's, whose own write
+    // would have already auto-committed under the pre-fix design by the time
+    // doomedRule's write threw.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_runtime_state").get() as { c: number }).c).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
+    expect(store.getQuota(db, "member_1", TRADING_DAY)).toBe(0);
+  });
+});
+
+// Fix 2 (spec-owner decision, task P2-6 fix round): positions/exposure must
+// be resolved PER OWNER against each owner's own latest official_paper_snapshots
+// row, not one globally-latest row shared by every owner. Inert today (only
+// NULL-owner rows exist - a single shared paper account) but Phase 6
+// introduces per-member paper accounts, at which point sharing one row would
+// silently evaluate owner A's rules against owner B's positions.
+describe("per-owner snapshot resolution (Fix 2)", () => {
+  it("(a) preserves today's shared-account behavior: two owners with no per-owner row both use the same legacy owner_id=NULL snapshot", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "both",
+      frequency: "continuous"
+    });
+    store.insertRule(db, {
+      ownerId: "member_2",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "both",
+      frequency: "continuous"
+    });
+    seedSnapshot(db, { ownerId: null, positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }] });
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      dryRun: true,
+      quoteProvider: async () => ({ "NVDA.US": { price: 1000, prevClose: 950, volume: 1000 } })
+    });
+
+    expect(result.fires).toBe(2);
+    const valueByOwner = Object.fromEntries(
+      (result.wouldFire as Array<{ ownerId: string; value: number }>).map((f) => [f.ownerId, f.value])
+    );
+    expect(valueByOwner["member_1"]).toBeCloseTo(1000 / 900 - 1, 6);
+    expect(valueByOwner["member_2"]).toBeCloseTo(1000 / 900 - 1, 6);
+  });
+
+  it("(b) evaluates each owner against their OWN snapshot when one owner has their own row and the other only has the legacy NULL row", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.03,
+      direction: "both",
+      frequency: "continuous"
+    });
+    store.insertRule(db, {
+      ownerId: "member_2",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.03,
+      direction: "both",
+      frequency: "continuous"
+    });
+    // member_1 has its own snapshot row (Phase 6-style per-member account).
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-07-01T00:00:00.000Z",
+      positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }]
+    });
+    // member_2 has no row of its own - only the legacy shared NULL row.
+    seedSnapshot(db, {
+      ownerId: null,
+      fetchedAt: "2026-07-01T00:00:00.000Z",
+      positions: [{ symbol: "NVDA.US", quantity: 5, costPrice: 950 }]
+    });
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: async () => ({ "NVDA.US": { price: 1000, prevClose: 950, volume: 1000 } }),
+      transport: fakeTransport()
+    });
+
+    expect(result.fires).toBe(2);
+
+    const events = db.prepare("SELECT owner_id, value FROM alert_events").all() as Array<{
+      owner_id: string;
+      value: number;
+    }>;
+    const valueByOwner = Object.fromEntries(events.map((e) => [e.owner_id, e.value]));
+    expect(valueByOwner["member_1"]).toBeCloseTo(1000 / 900 - 1, 6); // own row: costPrice 900
+    expect(valueByOwner["member_2"]).toBeCloseTo(1000 / 950 - 1, 6); // NULL fallback: costPrice 950
+    expect(valueByOwner["member_1"]).not.toBe(valueByOwner["member_2"]);
+  });
+
+  it("(c) prefers an owner's own snapshot row even when it is OLDER than the legacy NULL row", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "up",
+      frequency: "continuous"
+    });
+    // member_1's own row is OLDER.
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-06-01T00:00:00.000Z",
+      positions: [{ symbol: "NVDA.US", quantity: 1, costPrice: 500 }]
+    });
+    // A NEWER legacy NULL row exists too - it must NOT win just for being newer.
+    seedSnapshot(db, {
+      ownerId: null,
+      fetchedAt: "2026-07-05T00:00:00.000Z",
+      positions: [{ symbol: "NVDA.US", quantity: 99, costPrice: 999 }]
+    });
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      dryRun: true,
+      quoteProvider: async () => ({ "NVDA.US": { price: 550, prevClose: 500, volume: 1000 } })
+    });
+
+    // Own (older) row: 550/500 - 1 = +0.10, direction 'up' -> fires.
+    // The newer NULL row would instead give 550/999 - 1 ~= -0.4495 (direction
+    // 'down', would NOT fire under direction:'up') - proving the own row was
+    // actually used, not merely the latest row across both.
+    expect(result.fires).toBe(1);
+    expect(result.wouldFire[0].value).toBeCloseTo(550 / 500 - 1, 6);
   });
 });

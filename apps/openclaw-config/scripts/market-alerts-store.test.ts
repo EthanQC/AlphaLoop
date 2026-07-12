@@ -667,6 +667,102 @@ describe("countEventsForRule", () => {
   });
 });
 
+describe("persistCycle", () => {
+  it("commits runtimes + events + a quota bump together as one atomic write", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "rule_1" });
+
+    const created = store.persistCycle(db, {
+      runtimes: {
+        [ruleId]: {
+          ruleId,
+          armed: false,
+          cooldownUntil: null,
+          lastFiredTradingDay: "2026-07-01",
+          lastValue: { lastPrice: 100, history: [] }
+        }
+      },
+      events: [{ ruleId, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" }],
+      quotaBumps: [{ ownerId: "member_1", tradingDay: "2026-07-01", delta: 1 }]
+    });
+
+    expect(created).toHaveLength(1);
+    expect(typeof created[0].id).toBe("string");
+    expect(store.getRuntimes(db, [ruleId])[ruleId]?.lastFiredTradingDay).toBe("2026-07-01");
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(1);
+    expect(store.getQuota(db, "member_1", "2026-07-01")).toBe(1);
+  });
+
+  it("returns created events in the same order as the input events array (order-safe eventId zip contract)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleA = seedRule(db, { id: "rule_a" });
+    const ruleB = seedRule(db, { id: "rule_b", symbol: "MSFT.US" });
+
+    const created = store.persistCycle(db, {
+      runtimes: {},
+      events: [
+        { ruleId: ruleA, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" },
+        { ruleId: ruleB, ownerId: "member_1", value: 0.06, triggeredAt: "2026-07-01T14:35:00.000Z" }
+      ],
+      quotaBumps: []
+    });
+
+    expect(created.map((e) => e.ruleId)).toEqual([ruleA, ruleB]);
+  });
+
+  it("rolls back ALL writes - including an already-applied runtime save and an earlier event in the same batch - when a later statement fails", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "rule_1" });
+
+    expect(() =>
+      store.persistCycle(db, {
+        runtimes: {
+          [ruleId]: {
+            ruleId,
+            armed: false,
+            cooldownUntil: null,
+            lastFiredTradingDay: "2026-07-01",
+            lastValue: { lastPrice: 100, history: [] }
+          }
+        },
+        events: [
+          { ruleId, ownerId: "member_1", value: 0.05, triggeredAt: "2026-07-01T14:30:00.000Z" },
+          // rule_id REFERENCES alert_rules(id) with no ON DELETE CASCADE and
+          // this db opens with foreign_keys=ON (see deleteRule above) - a
+          // non-existent rule_id here throws a real FOREIGN KEY constraint
+          // error, after the runtime save above AND the first event in this
+          // very array have already been applied (uncommitted) in this
+          // same transaction.
+          { ruleId: "no_such_rule", ownerId: "member_1", value: 0.06, triggeredAt: "2026-07-01T14:35:00.000Z" }
+        ],
+        quotaBumps: [{ ownerId: "member_1", tradingDay: "2026-07-01", delta: 2 }]
+      })
+    ).toThrow(/FOREIGN KEY/i);
+
+    expect(store.getRuntimes(db, [ruleId])).toEqual({});
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
+    expect(store.getQuota(db, "member_1", "2026-07-01")).toBe(0);
+  });
+
+  it("ignores zero/negative quota deltas rather than writing a no-op bump row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const ruleId = seedRule(db, { id: "rule_1" });
+
+    store.persistCycle(db, {
+      runtimes: {},
+      events: [],
+      quotaBumps: [{ ownerId: "member_1", tradingDay: "2026-07-01", delta: 0 }]
+    });
+
+    expect(store.getQuota(db, "member_1", "2026-07-01")).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_daily_quota").get() as { c: number }).c).toBe(0);
+  });
+});
+
 describe("getEvent", () => {
   it("returns the camelCase-mapped event row", () => {
     const { db } = makeDb();

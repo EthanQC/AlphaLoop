@@ -9,15 +9,50 @@
 // Flow per cycle:
 //   assertCalendarCoverage(now) -> isUsRegularMarketHours(now) false ->
 //   {ok:true, skipped:"off-hours"} -> load enabled rules (none -> quick
-//   exit) -> isolate per-rule config errors (see below) -> build sample
-//   (quotes via an injectable provider, positions/exposure from the latest
-//   official_paper_snapshots row via computeExposure) -> evaluateAll ->
-//   (unless --dry-run) persist runtimes/events/quota -> enrich fires with
-//   threshold+eventId -> composeAlertCards -> deliverAlertCards -> one-line
-//   JSON summary, exit 0. Any throw anywhere in this path produces a
-//   one-line {ok:false, error} + exit 1 - launchd's own StartInterval retry
-//   is the only retry mechanism; this script deliberately has none of its
-//   own (see market-alerts-cards.mjs's no-retry rationale, same principle).
+//   exit) -> isolate per-rule config errors (see below) -> fetch quotes once
+//   (shared across owners, market-wide data) -> for EACH owner: resolve
+//   THEIR OWN latest official_paper_snapshots row (falling back to the
+//   legacy shared owner_id=NULL row only when the owner has none of their
+//   own - see loadLatestSnapshotForOwner), build that owner's sample, and
+//   call evaluateAll for just that owner's rules -> merge fires/skips/
+//   runtimes/quotas across owners -> (unless --dry-run) persist runtimes/
+//   events/quota bumps for the WHOLE cycle atomically (store.persistCycle,
+//   one BEGIN IMMEDIATE transaction) -> enrich fires with threshold+eventId
+//   -> composeAlertCards per owner (each owner's own positions, since cards'
+//   positions param is flat-by-symbol and would collide across owners once
+//   per-owner snapshots exist) -> deliverAlertCards once for the merged
+//   batches -> one-line JSON summary, exit 0. Any throw anywhere in this
+//   path produces a one-line {ok:false, error} + exit 1 - launchd's own
+//   StartInterval retry is the only retry mechanism; this script
+//   deliberately has none of its own (see market-alerts-cards.mjs's
+//   no-retry rationale, same principle).
+//
+// Per-owner snapshot resolution (spec-owner decision, task P2-6 fix round):
+// positions/exposure used to come from ONE globally-latest snapshot row
+// shared across every owner in the cycle. That's inert today (only
+// owner_id=NULL rows exist - a single shared Longbridge paper account), but
+// Phase 6 introduces per-member paper accounts - the moment a non-NULL
+// owner_id row exists, owner A's rules would silently evaluate against
+// owner B's snapshot (wrong costPrice for unrealized_pnl, wrong
+// exposureRatio, wrong share count on A's card). Fixed by resolving the
+// snapshot PER OWNER and calling evaluateAll once per owner (the engine
+// itself still takes exactly one flat sample per call - see
+// market-alerts-engine.mjs's documented shape - so "per owner" means one
+// call per owner, not a change to the engine's contract).
+//
+// Atomic persistence (reviewer-flagged finding, task P2-6 fix round):
+// saveRuntimes/recordEvents/bumpQuota used to be three separate implicit
+// transactions - a crash or a throw between them left state permanently
+// corrupted (e.g. saveRuntimes commits `lastFiredTradingDay`, then
+// recordEvents throws: the once_daily rule is marked as already-fired today
+// with no alert_events row and no card ever sent, silently losing that
+// alert for the rest of the trading day; the reverse ordering under-counts
+// the quota instead, causing over-alerting). Fixed by store.persistCycle,
+// which wraps all three in one BEGIN IMMEDIATE transaction (mirroring
+// deleteRule's existing precedent) - the poller stays orchestration-only,
+// the transaction lives with the SQL. Card DELIVERY deliberately stays
+// OUTSIDE this transaction (network IO; the existing "delivery failure
+// leaves message_id NULL, no retry" behavior is preserved unchanged).
 //
 // Per-rule config-error isolation (reviewer-flagged in task P2-3's report,
 // binding for this task): market-alerts-engine.mjs's evaluateAll throws for
@@ -108,50 +143,78 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   const symbols = Array.from(
     new Set(validRules.map((rule) => rule.symbol).filter((symbol) => symbol !== EXPOSURE_SYMBOL))
   );
+  // Quotes are market-wide, not owner-scoped, so fetched exactly once per
+  // cycle and shared across every owner's evaluation below.
   const quotes = await quoteProvider(symbols);
 
-  // Single shared Longbridge paper-trading account behind the whole system
-  // (see market-alerts-cards.mjs's module header) - sample.exposure/
-  // sample.positions are ONE flat object for the entire batch, not per
-  // owner, so there is exactly one snapshot query per cycle regardless of
-  // how many distinct owners have rules. The "owner OR NULL" shape mirrors
-  // market-alerts-store.mjs's isSymbolInPositions precedent, generalized to
-  // every owner appearing in this cycle's rules.
   const ownerIds = Array.from(new Set(validRules.map((rule) => rule.ownerId)));
-  const snapshotRow = loadLatestSnapshotRow(db, ownerIds);
-  const exposureResult = computeExposure({
-    netAssets: snapshotRow ? toNumber(snapshotRow.net_assets) ?? null : null,
-    marketValue: snapshotRow ? toNumber(snapshotRow.market_value) ?? 0 : 0,
-    positions: snapshotRow ? parseSnapshotPositions(snapshotRow.positions) : []
-  });
+  const rulesByOwner = new Map();
+  for (const rule of validRules) {
+    const list = rulesByOwner.get(rule.ownerId) ?? [];
+    list.push(rule);
+    rulesByOwner.set(rule.ownerId, list);
+  }
 
-  const sample = {
-    atIso,
-    tradingDay,
-    quotes,
-    positions: buildEnginePositions(snapshotRow, quotes),
-    exposure: { exposureRatio: exposureResult.exposureRatio, overBudget: exposureResult.overBudget }
-  };
-
+  // Fetched once for every valid rule regardless of owner (a plain SELECT
+  // keyed by rule_id - evaluateAll only reads the entries for the rules it's
+  // actually given, so handing it the full map per owner call below is safe
+  // and avoids re-querying per owner).
   const runtimes = store.getRuntimes(db, validRules.map((rule) => rule.id));
   const quotaByOwner = {};
   for (const ownerId of ownerIds) {
     quotaByOwner[ownerId] = store.getQuota(db, ownerId, tradingDay);
   }
 
-  const evaluation = evaluateAll(validRules, runtimes, sample, quotaByOwner);
-  const quotaBlocked = evaluation.skips.filter((skip) => skip.reason === "quota").length;
+  // Evaluate one owner at a time so each owner's positions/exposure come
+  // from THEIR OWN latest snapshot (see loadLatestSnapshotForOwner) instead
+  // of one row shared by the whole batch - see the module header's Fix 2
+  // rationale. ruleIds are globally unique, so merging fires/skips/
+  // newRuntimes across owners is a plain concatenation/assign; each
+  // per-owner evaluateAll call only ever touches that one owner's quota key.
+  const fires = [];
+  const skips = [];
+  const newRuntimes = {};
+  const newQuotas = {};
+  const samplesByOwner = {};
+
+  for (const ownerId of ownerIds) {
+    const ownerRules = rulesByOwner.get(ownerId) ?? [];
+    const snapshotRow = loadLatestSnapshotForOwner(db, ownerId);
+    const exposureResult = computeExposure({
+      netAssets: snapshotRow ? toNumber(snapshotRow.net_assets) ?? null : null,
+      marketValue: snapshotRow ? toNumber(snapshotRow.market_value) ?? 0 : 0,
+      positions: snapshotRow ? parseSnapshotPositions(snapshotRow.positions) : []
+    });
+
+    const ownerSample = {
+      atIso,
+      tradingDay,
+      quotes,
+      positions: buildEnginePositions(snapshotRow, quotes),
+      exposure: { exposureRatio: exposureResult.exposureRatio, overBudget: exposureResult.overBudget }
+    };
+    samplesByOwner[ownerId] = ownerSample;
+
+    const ownerEvaluation = evaluateAll(ownerRules, runtimes, ownerSample, { [ownerId]: quotaByOwner[ownerId] ?? 0 });
+
+    fires.push(...ownerEvaluation.fires);
+    skips.push(...ownerEvaluation.skips);
+    Object.assign(newRuntimes, ownerEvaluation.newRuntimes);
+    newQuotas[ownerId] = ownerEvaluation.newQuotas[ownerId] ?? quotaByOwner[ownerId] ?? 0;
+  }
+
+  const quotaBlocked = skips.filter((skip) => skip.reason === "quota").length;
 
   if (dryRun) {
     // Contract: --dry-run evaluates but performs NO db writes and NO
-    // delivery at all - not saveRuntimes, not recordEvents, not bumpQuota,
-    // not composeAlertCards/deliverAlertCards. Return before any of those.
+    // delivery at all - not persistCycle, not composeAlertCards/
+    // deliverAlertCards. Return before any of those.
     return {
       ok: true,
       dryRun: true,
       evaluated: validRules.length,
-      fires: evaluation.fires.length,
-      wouldFire: evaluation.fires.map((fire) => ({
+      fires: fires.length,
+      wouldFire: fires.map((fire) => ({
         ruleId: fire.ruleId,
         ownerId: fire.ownerId,
         symbol: fire.symbol,
@@ -164,29 +227,30 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
     };
   }
 
-  store.saveRuntimes(db, evaluation.newRuntimes);
-  const createdEvents = store.recordEvents(
-    db,
-    evaluation.fires.map((fire) => ({
-      ruleId: fire.ruleId,
-      ownerId: fire.ownerId,
-      value: fire.value,
-      triggeredAt: fire.triggeredAt
-    }))
-  );
-
+  // Fix 1: saveRuntimes/recordEvents/bumpQuota persist as ONE atomic unit
+  // (store.persistCycle, one BEGIN IMMEDIATE transaction) instead of three
+  // separate implicit transactions - see the module header. `createdEvents`
+  // preserves `fires`' order, which the eventId zip below depends on.
+  const events = fires.map((fire) => ({
+    ruleId: fire.ruleId,
+    ownerId: fire.ownerId,
+    value: fire.value,
+    triggeredAt: fire.triggeredAt
+  }));
   // newQuotas is the running per-owner fired_count already reflecting this
-  // batch (see evaluateAll's doc comment) - bumpQuota only the delta actually
-  // applied this cycle, per owner, so a repeated poll never double-counts.
-  for (const ownerId of Object.keys(evaluation.newQuotas)) {
-    const delta = evaluation.newQuotas[ownerId] - (quotaByOwner[ownerId] ?? 0);
-    if (delta > 0) {
-      store.bumpQuota(db, ownerId, tradingDay, delta);
-    }
-  }
+  // batch (see evaluateAll's doc comment) - bump only the delta actually
+  // applied this cycle, per owner, so a repeated poll never double-counts
+  // (persistCycle itself also ignores non-positive deltas defensively).
+  const quotaBumps = ownerIds.map((ownerId) => ({
+    ownerId,
+    tradingDay,
+    delta: (newQuotas[ownerId] ?? 0) - (quotaByOwner[ownerId] ?? 0)
+  }));
+
+  const createdEvents = store.persistCycle(db, { runtimes: newRuntimes, events, quotaBumps });
 
   const ruleById = new Map(validRules.map((rule) => [rule.id, rule]));
-  const enrichedFires = evaluation.fires.map((fire, index) => ({
+  const enrichedFires = fires.map((fire, index) => ({
     ...fire,
     threshold: ruleById.get(fire.ruleId)?.threshold,
     eventId: createdEvents[index]?.id
@@ -200,14 +264,33 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   // composeAlertCards as a no_open_id skip rather than crashing.
   const memberById = Object.fromEntries(new MemberRepository(db).listActive().map((member) => [member.id, member]));
 
-  const composed = composeAlertCards(enrichedFires, memberById, buildPositionsForCards(sample));
-  const delivery = await deliverAlertCards(db, composed, transport);
+  // Fix 2 (cont'd): compose cards per owner too, not once for every owner's
+  // fires together - composeAlertCards' `positions` parameter is flat by
+  // symbol with no per-owner nesting (see that module's header), so a
+  // single merged positions map would collide the moment two owners hold
+  // the same symbol in different quantities/at different cost prices
+  // (post-Phase-6). Calling it once per owner with that owner's own
+  // ownerSample-derived positions keeps every owner's card correct without
+  // changing market-alerts-cards.mjs's contract at all.
+  const batches = [];
+  const skippedDelivery = [];
+  for (const ownerId of ownerIds) {
+    const ownerFires = enrichedFires.filter((fire) => fire.ownerId === ownerId);
+    if (ownerFires.length === 0) {
+      continue;
+    }
+    const composed = composeAlertCards(ownerFires, memberById, buildPositionsForCards(samplesByOwner[ownerId]));
+    batches.push(...composed.batches);
+    skippedDelivery.push(...composed.skipped);
+  }
+
+  const delivery = await deliverAlertCards(db, { batches, skipped: skippedDelivery }, transport);
 
   return {
     ok: true,
     dryRun: false,
     evaluated: validRules.length,
-    fires: evaluation.fires.length,
+    fires: fires.length,
     sent: delivery.sent,
     failed: delivery.failed,
     skipped: delivery.skipped,
@@ -238,21 +321,44 @@ function partitionConfigErrors(rules) {
 // market-alerts-store.mjs, which scopes itself to the alert_* tables plus
 // the P2-4 CLI's cross-table reads) - mirroring how official-paper-monitor.mjs
 // already queries this same table directly for its own purposes.
-function loadLatestSnapshotRow(db, ownerIds) {
-  const ids = (ownerIds ?? []).filter((id) => id !== null && id !== undefined);
-  const whereClause = ids.length > 0
-    ? `owner_id IN (${ids.map(() => "?").join(", ")}) OR owner_id IS NULL`
-    : "owner_id IS NULL";
-  const row = db
+//
+// Fix 2 (spec-owner decision, task P2-6 fix round): resolves the latest
+// snapshot for ONE owner, preferring that owner's OWN row over the legacy
+// shared owner_id=NULL row whenever one exists - regardless of which is
+// more recent. This is deliberately NOT a single "ORDER BY fetched_at DESC
+// LIMIT 1 across owner=X OR owner IS NULL" query: once per-owner snapshot
+// rows exist (Phase 6), an owner's own (possibly older) row must still win
+// over a newer NULL-owner row, or that owner's alerts would evaluate
+// against another owner's/the legacy pool's positions merely because it
+// happened to be fetched more recently. Today (only NULL-owner rows exist)
+// this degenerates to exactly the old shared-account behavior for every
+// owner - see market-alerts-poll.test.ts's "(a)" regression test.
+function loadLatestSnapshotForOwner(db, ownerId) {
+  if (ownerId !== null && ownerId !== undefined) {
+    const ownRow = db
+      .prepare(`
+        SELECT net_assets, market_value, positions
+        FROM official_paper_snapshots
+        WHERE owner_id = ?
+        ORDER BY fetched_at DESC
+        LIMIT 1
+      `)
+      .get(ownerId);
+    if (ownRow) {
+      return ownRow;
+    }
+  }
+
+  const fallbackRow = db
     .prepare(`
       SELECT net_assets, market_value, positions
       FROM official_paper_snapshots
-      WHERE ${whereClause}
+      WHERE owner_id IS NULL
       ORDER BY fetched_at DESC
       LIMIT 1
     `)
-    .get(...ids);
-  return row ?? null;
+    .get();
+  return fallbackRow ?? null;
 }
 
 function parseSnapshotPositions(raw) {

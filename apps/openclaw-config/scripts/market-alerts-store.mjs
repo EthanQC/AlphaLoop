@@ -263,6 +263,56 @@ export function countEventsForRule(db, ruleId) {
   return Number(row?.c ?? 0);
 }
 
+// Task P2-6 fix round (reviewer-flagged finding): persists one poll cycle's
+// runtime/event/quota writes as a SINGLE atomic unit. Before this helper
+// existed, market-alerts-poll.mjs called saveRuntimes -> recordEvents ->
+// bumpQuota as three separate implicit transactions - a crash, or a throw
+// in a later step, between them left state permanently corrupted (e.g.
+// saveRuntimes commits `lastFiredTradingDay`, then recordEvents throws: the
+// once_daily rule is now marked as already-fired today with no alert_events
+// row and no card ever sent, silently losing that alert for the rest of the
+// trading day; the reverse ordering under-counts the quota instead, causing
+// over-alerting). Mirrors deleteRule's BEGIN IMMEDIATE / COMMIT / ROLLBACK
+// pattern above - the only other multi-statement write in this module - so
+// the transaction lives with the SQL, keeping the poller orchestration-only.
+//
+// Card DELIVERY deliberately stays OUTSIDE this transaction (and outside
+// this function entirely) - it's network IO, and the existing "delivery
+// failure leaves message_id NULL, no retry" behavior (see
+// market-alerts-cards.mjs's deliverAlertCards) must be preserved unchanged.
+// updateEventMessageId's post-send backfill likewise stays a separate,
+// later write, same as before this fix.
+//
+// Returns recordEvents' `created` array, in the exact same rule/fire-order
+// as the input `events` array - composeAlertCards' eventId zip-on (see that
+// module's header: `createdEvents[index]?.id` onto `fires[index]`) depends
+// on this order being preserved end to end.
+//
+// @param {import('node:sqlite').DatabaseSync} db
+// @param {{
+//   runtimes: Record<string, object>,
+//   events: Array<{ruleId: string, ownerId: string, value: number, triggeredAt: string}>,
+//   quotaBumps: Array<{ownerId: string, tradingDay: string, delta: number}>
+// }} cycle
+// @returns {Array<{id: string, ruleId: string, ownerId: string, value: number, triggeredAt: string}>}
+export function persistCycle(db, { runtimes, events, quotaBumps }) {
+  db.exec("BEGIN IMMEDIATE TRANSACTION");
+  try {
+    saveRuntimes(db, runtimes);
+    const created = recordEvents(db, events);
+    for (const bump of quotaBumps ?? []) {
+      if (bump.delta > 0) {
+        bumpQuota(db, bump.ownerId, bump.tradingDay, bump.delta);
+      }
+    }
+    db.exec("COMMIT");
+    return created;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function getQuota(db, ownerId, tradingDay) {
   const row = db
     .prepare(`SELECT fired_count FROM alert_daily_quota WHERE owner_id = ? AND trading_day = ?`)
