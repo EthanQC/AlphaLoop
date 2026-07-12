@@ -48,6 +48,7 @@ export function applyRetention(dest, retentionDays, now = new Date(), timeZone =
   }
 
   const todayMs = Date.parse(`${formatLocalDate(now, timeZone)}T00:00:00Z`);
+  let firstError;
 
   for (const entry of readdirSync(dest)) {
     const dateStamp = parseBackupFileDate(entry);
@@ -59,9 +60,20 @@ export function applyRetention(dest, retentionDays, now = new Date(), timeZone =
     const ageDays = Math.floor((todayMs - fileMs) / 86_400_000);
     if (ageDays > retentionDays) {
       const filePath = join(dest, entry);
-      rmSync(filePath, { force: true });
-      deleted.push(filePath);
+      try {
+        rmSync(filePath, { force: true });
+        deleted.push(filePath);
+      } catch (error) {
+        // Keep cleaning up the rest of the eligible files; surface the first failure once
+        // the sweep is done instead of abandoning cleanup after a single bad entry.
+        firstError ??= error;
+      }
     }
+  }
+
+  if (firstError) {
+    firstError.deleted = deleted;
+    throw firstError;
   }
 
   return deleted;
@@ -71,6 +83,13 @@ export function applyRetention(dest, retentionDays, now = new Date(), timeZone =
 export function backupTradingDatabase(dbPath, destPath) {
   if (destPath.includes("\0")) {
     throw new Error(`Refusing to back up to an invalid path: ${destPath}`);
+  }
+
+  // VACUUM INTO refuses to run if the destination file already exists. Backups are stamped by
+  // calendar date, so re-running the job later the same day (manual retry, launchd catching up
+  // a missed run after sleep/wake) must overwrite today's snapshot rather than fail outright.
+  if (existsSync(destPath)) {
+    rmSync(destPath, { force: true });
   }
 
   const sourceDb = new DatabaseSync(dbPath, { readOnly: true, timeout: 5000 });
@@ -134,9 +153,25 @@ export function runBackup({
     }
   }
 
-  const deleted = applyRetention(dest, retentionDays, now, timeZone);
+  // Retention is best-effort housekeeping: a fresh trading/memoryd snapshot has already been
+  // written to disk above, so a cleanup failure (e.g. a permission error deleting an old file)
+  // must not be reported as "backup failed" and must not hide the files that did get created.
+  let deleted = [];
+  let retentionError;
+  try {
+    deleted = applyRetention(dest, retentionDays, now, timeZone);
+  } catch (error) {
+    deleted = Array.isArray(error?.deleted) ? error.deleted : [];
+    retentionError = error instanceof Error ? error.message : String(error);
+  }
 
-  return { ok: true, files, skipped, deleted };
+  return {
+    ok: true,
+    files,
+    skipped,
+    deleted,
+    ...(retentionError ? { retentionError } : {})
+  };
 }
 
 function readFlagValue(argv, flag) {

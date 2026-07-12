@@ -218,3 +218,57 @@ describe("runBackup error handling", () => {
     })).toThrow(/not found/u);
   });
 });
+
+describe("same-day re-runs", () => {
+  it("is idempotent: running the backup twice for the same calendar day overwrites rather than failing", () => {
+    // VACUUM INTO refuses to run if its destination file already exists, so without an
+    // explicit overwrite this would throw "output file already exists" on the second call
+    // (e.g. a manual re-run, or launchd catching up a missed run after sleep/wake).
+    const dbDir = makeTempDir("alphaloop-rerun-db-");
+    const destDir = makeTempDir("alphaloop-rerun-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+    const now = new Date("2026-07-12T01:00:00.000Z");
+
+    const first = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now });
+    expect(first.ok).toBe(true);
+
+    const second = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now });
+    expect(second.ok).toBe(true);
+    expect(second.files).toEqual(first.files);
+
+    const snapshotDb = new DatabaseSync(second.files[0]);
+    const row = snapshotDb.prepare("SELECT id FROM audit_log WHERE id = ?").get("audit_seed") as { id: string } | undefined;
+    expect(row?.id).toBe("audit_seed");
+    snapshotDb.close();
+  });
+});
+
+describe("retention failure isolation", () => {
+  it("still reports ok:true with the files it created when retention cleanup itself errors", () => {
+    const dbDir = makeTempDir("alphaloop-retention-fail-db-");
+    const destDir = makeTempDir("alphaloop-retention-fail-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+
+    // A directory sitting where a stale backup file is expected makes `rmSync` (without
+    // `recursive: true`) throw a real, non-ENOENT error - a stand-in for e.g. a permission
+    // failure during cleanup of one old file among many.
+    const stubbornEntry = join(destDir, "trading-2020-01-01.sqlite");
+    mkdirSync(stubbornEntry);
+    const staleFile = join(destDir, "memoryd-2020-01-01.tgz");
+    writeFileSync(staleFile, "stale");
+
+    const now = new Date("2026-07-12T01:00:00.000Z");
+    const result = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now });
+
+    expect(result.ok).toBe(true);
+    expect(result.files).toEqual([join(destDir, "trading-2026-07-12.sqlite")]);
+    expect(existsSync(result.files[0])).toBe(true);
+    expect(result.retentionError).toBeTruthy();
+    // The stubborn directory survives, but cleanup still made progress on the other stale file.
+    expect(existsSync(stubbornEntry)).toBe(true);
+    expect(existsSync(staleFile)).toBe(false);
+    expect(result.deleted).toEqual([staleFile]);
+  });
+});
