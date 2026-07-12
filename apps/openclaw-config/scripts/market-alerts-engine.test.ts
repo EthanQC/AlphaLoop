@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_THRESHOLDS, evaluateAll, evaluateRule, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
+import { DEFAULT_HYSTERESIS, DEFAULT_THRESHOLDS, evaluateAll, evaluateRule, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -556,6 +556,66 @@ describe("evaluateRule: spike_5m", () => {
     expect(result.decision).toBe("skip");
     expect(result.reason).toBe("quota");
     expect(result.newRuntime.cooldownUntil).toBeNull();
+  });
+
+  // I1 (Important, whole-branch-review finding): evaluateSpike used to gate
+  // purely on Math.abs(rawValue) >= threshold, never consulting
+  // rule.direction - even though the CLI accepts/stores/echoes back
+  // --direction for every rule type including spike_5m. A down-spike would
+  // silently fire an up-only rule. Route through the same directionMatches
+  // gate daily_move/unrealized_pnl already use.
+  it("direction 'up': does not fire on a down-spike even past threshold magnitude", () => {
+    const upRule = { ...rule, direction: "up" };
+    const runtime = makeRuntime({
+      ruleId: "rule_spike",
+      lastValue: {
+        lastPrice: 208,
+        history: [historyPoint(210, 1000, 15), historyPoint(209, 1000, 10), historyPoint(208, 1000, 5)]
+      }
+    });
+    // vs. 3-samples-ago reference (210): 200/210 - 1 ~= -4.76%, well past the
+    // 2.5% threshold in magnitude, but it's a DOWN move on an 'up'-only rule.
+    const sample = makeSample({ quotes: { "TSLA.US": { price: 200, prevClose: 200, volume: 1000 } } });
+
+    const result = evaluateRule(upRule, runtime, sample, 0);
+
+    expect(result.decision).toBe("skip");
+    expect(result.reason).toBe("below_threshold");
+  });
+
+  it("direction 'down': fires on a down-spike of matching magnitude", () => {
+    const downRule = { ...rule, direction: "down" };
+    const runtime = makeRuntime({
+      ruleId: "rule_spike",
+      lastValue: {
+        lastPrice: 208,
+        history: [historyPoint(210, 1000, 15), historyPoint(209, 1000, 10), historyPoint(208, 1000, 5)]
+      }
+    });
+    const sample = makeSample({ quotes: { "TSLA.US": { price: 200, prevClose: 200, volume: 1000 } } });
+
+    const result = evaluateRule(downRule, runtime, sample, 0);
+
+    expect(result.decision).toBe("fire");
+    expect(result.reason).toBe("spike_5m");
+    expect(result.value).toBeCloseTo(200 / 210 - 1);
+  });
+
+  it("direction 'down': does not fire on an up-spike of matching magnitude", () => {
+    const downRule = { ...rule, direction: "down" };
+    const runtime = makeRuntime({
+      ruleId: "rule_spike",
+      lastValue: {
+        lastPrice: 202,
+        history: [historyPoint(200, 1000, 15), historyPoint(201, 1000, 10), historyPoint(202, 1000, 5)]
+      }
+    });
+    const sample = makeSample({ quotes: { "TSLA.US": { price: 210, prevClose: 200, volume: 1000 } } });
+
+    const result = evaluateRule(downRule, runtime, sample, 0);
+
+    expect(result.decision).toBe("skip");
+    expect(result.reason).toBe("below_threshold");
   });
 
   // -------------------------------------------------------------------------
@@ -1296,6 +1356,26 @@ describe("DEFAULT_THRESHOLDS / RULE_TYPE_FREQUENCY (consumed by market-alerts.mj
       unrealized_pnl: "continuous",
       spike_5m: "continuous",
       exposure: "continuous"
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C1 (CRITICAL, whole-branch-review finding): the spec's per-type hysteresis
+// (滞回) values pinned here as the single source of truth market-alerts.mjs
+// (the CLI) must consume instead of hardcoding hysteresis: 0. daily_move and
+// spike_5m have no hysteresis by spec design (once-daily / cooldown gate
+// them instead); unrealized_pnl and exposure have NO other anti-flap
+// mechanism, so 0 there means zero anti-flap protection in production.
+// ---------------------------------------------------------------------------
+
+describe("DEFAULT_HYSTERESIS (consumed by market-alerts.mjs's runAdd)", () => {
+  it("exposes the per-type default hysteresis from the spec", () => {
+    expect(DEFAULT_HYSTERESIS).toEqual({
+      daily_move: 0,
+      unrealized_pnl: 0.01,
+      spike_5m: 0,
+      exposure: 0.01
     });
   });
 });

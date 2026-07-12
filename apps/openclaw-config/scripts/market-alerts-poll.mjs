@@ -179,7 +179,7 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
 
   for (const ownerId of ownerIds) {
     const ownerRules = rulesByOwner.get(ownerId) ?? [];
-    const snapshotRow = loadLatestSnapshotForOwner(db, ownerId);
+    const snapshotRow = store.loadLatestSnapshotForOwner(db, ownerId);
     const exposureResult = computeExposure({
       netAssets: snapshotRow ? toNumber(snapshotRow.net_assets) ?? null : null,
       marketValue: snapshotRow ? toNumber(snapshotRow.market_value) ?? 0 : 0,
@@ -317,50 +317,19 @@ function partitionConfigErrors(rules) {
   return { validRules, skippedRules };
 }
 
-// Raw SQL against official_paper_snapshots lives here (not in
-// market-alerts-store.mjs, which scopes itself to the alert_* tables plus
-// the P2-4 CLI's cross-table reads) - mirroring how official-paper-monitor.mjs
-// already queries this same table directly for its own purposes.
-//
-// Fix 2 (spec-owner decision, task P2-6 fix round): resolves the latest
-// snapshot for ONE owner, preferring that owner's OWN row over the legacy
-// shared owner_id=NULL row whenever one exists - regardless of which is
-// more recent. This is deliberately NOT a single "ORDER BY fetched_at DESC
-// LIMIT 1 across owner=X OR owner IS NULL" query: once per-owner snapshot
-// rows exist (Phase 6), an owner's own (possibly older) row must still win
-// over a newer NULL-owner row, or that owner's alerts would evaluate
-// against another owner's/the legacy pool's positions merely because it
-// happened to be fetched more recently. Today (only NULL-owner rows exist)
-// this degenerates to exactly the old shared-account behavior for every
-// owner - see market-alerts-poll.test.ts's "(a)" regression test.
-function loadLatestSnapshotForOwner(db, ownerId) {
-  if (ownerId !== null && ownerId !== undefined) {
-    const ownRow = db
-      .prepare(`
-        SELECT net_assets, market_value, positions
-        FROM official_paper_snapshots
-        WHERE owner_id = ?
-        ORDER BY fetched_at DESC
-        LIMIT 1
-      `)
-      .get(ownerId);
-    if (ownRow) {
-      return ownRow;
-    }
-  }
-
-  const fallbackRow = db
-    .prepare(`
-      SELECT net_assets, market_value, positions
-      FROM official_paper_snapshots
-      WHERE owner_id IS NULL
-      ORDER BY fetched_at DESC
-      LIMIT 1
-    `)
-    .get();
-  return fallbackRow ?? null;
-}
-
+// I2 fix (whole-branch-review finding, task P2-6 fix round): this used to be
+// a private copy of "resolve the latest snapshot for ONE owner, preferring
+// that owner's OWN row over the legacy shared owner_id=NULL row whenever one
+// exists - regardless of which is more recent." market-alerts-store.mjs's
+// isSymbolInPositions had its OWN, DIFFERENT precedence ("OR owner_id IS
+// NULL ORDER BY fetched_at DESC LIMIT 1" - newest across both sets wins),
+// which agreed with this one only by coincidence (every row today has
+// owner_id NULL) and would silently diverge the moment Phase 6 adds
+// per-member accounts. store.loadLatestSnapshotForOwner is now the ONE
+// shared implementation both this poller and the store's CLI-facing
+// validation use - see that function's doc comment for the full precedence
+// rationale, and market-alerts-poll.test.ts's "(a)"/"(c)" regression tests
+// and market-alerts-store.test.ts's loadLatestSnapshotForOwner tests.
 function parseSnapshotPositions(raw) {
   try {
     const parsed = JSON.parse(String(raw ?? "[]"));

@@ -285,6 +285,115 @@ describe("runAdd: threshold defaults and validation", () => {
   });
 });
 
+// C1 (CRITICAL, whole-branch-review finding): runAdd used to hardcode
+// `hysteresis: 0` regardless of rule type, silently killing the spec's
+// anti-flap band for unrealized_pnl/exposure (their ONLY anti-flap
+// mechanism - unlike daily_move/spike_5m, which have once-daily/cooldown
+// gating instead). DEFAULT_HYSTERESIS (market-alerts-engine.mjs) is the
+// single source of truth for the spec's per-type values; runAdd must use it
+// instead of a hardcoded 0.
+describe("runAdd: hysteresis defaults per rule type (C1 fix)", () => {
+  it("stores hysteresis 0 for daily_move (no anti-flap band; once-daily gating instead)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move" }, options);
+
+    expect(result.rule.hysteresis).toBe(0);
+  });
+
+  it("stores hysteresis 0.01 for unrealized_pnl (its only anti-flap mechanism)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "unrealized_pnl" }, options);
+
+    expect(result.rule.hysteresis).toBe(0.01);
+  });
+
+  it("stores hysteresis 0 for spike_5m (cooldown is its anti-flap mechanism instead)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "spike_5m" }, options);
+
+    expect(result.rule.hysteresis).toBe(0);
+  });
+
+  it("stores hysteresis 0.01 for exposure (its only anti-flap mechanism)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", type: "exposure" }, options);
+
+    expect(result.rule.hysteresis).toBe(0.01);
+  });
+
+  it("keeps the type default hysteresis even when a custom --threshold is supplied (hysteresis is an absolute band, not a fraction of threshold)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "unrealized_pnl", threshold: "0.08" }, options);
+
+    expect(result.rule.threshold).toBe(0.08);
+    expect(result.rule.hysteresis).toBe(0.01);
+  });
+
+  // Follow-on hardening found during review of the C1 fix: before C1,
+  // hysteresis was always hardcoded 0, so rearmBand (threshold - hysteresis)
+  // was always exactly `threshold`, which is always > 0 (threshold > 0 is
+  // already enforced above) - a negative/zero rearmBand was structurally
+  // impossible. Now that hysteresis defaults to 0.01 for unrealized_pnl/
+  // exposure, a caller-supplied --threshold at or below that 0.01 makes
+  // rearmBand <= 0. For exposure specifically that's a PERMANENT latch: its
+  // rearm check is exposureRatio <= rearmBand, and exposureRatio (from
+  // computeExposure) never goes negative, so a rearmBand <= 0 can never be
+  // satisfied again - the rule fires once and then silently never fires
+  // again for the rest of its life, no matter how far over budget the
+  // portfolio later gets. Verified directly against evaluateRule before this
+  // guard existed: cycle 1 (exposureRatio 0.006) fires and disarms; cycle 2
+  // (exposureRatio 0.5, drastically over budget) still returns
+  // skip:disarmed forever. Reject the threshold at creation time instead.
+  it("rejects an exposure threshold at or below its 0.01 hysteresis floor (would permanently latch after the first fire)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", type: "exposure", threshold: "0.005" }, options)).toThrow(/threshold/);
+    expect(() => cli.runAdd({ actor: "member_1", type: "exposure", threshold: "0.01" }, options)).toThrow(/threshold/);
+  });
+
+  it("rejects an unrealized_pnl threshold at or below its 0.01 hysteresis floor", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "unrealized_pnl", threshold: "0.01" }, options)).toThrow(/threshold/);
+  });
+
+  it("accepts an unrealized_pnl threshold just above its hysteresis floor", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "unrealized_pnl", threshold: "0.011" }, options);
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("does not apply the hysteresis floor to daily_move/spike_5m, which have no hysteresis at all", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedTarget(db, "AAPL.US", "member_1");
+
+    expect(cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", threshold: "0.005" }, options).ok).toBe(true);
+    expect(cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "spike_5m", threshold: "0.001" }, options).ok).toBe(true);
+  });
+});
+
 describe("runAdd: direction validation (reviewer-noted write-side gate)", () => {
   it("defaults direction to 'both' when omitted", () => {
     const { db, options } = makeDb();
@@ -314,6 +423,41 @@ describe("runAdd: direction validation (reviewer-noted write-side gate)", () => 
     seedTarget(db, "AAPL.US", "member_1");
 
     expect(() => cli.runAdd({ actor: "member_1", symbol: "AAPL", type: "daily_move", direction: "sideways" }, options)).toThrow(/direction/);
+  });
+});
+
+// I1 (Important, whole-branch-review finding): exposure is portfolio-level
+// and one-sided by nature (over-budget only - there's no symmetric "down"
+// side to gate on), yet the CLI accepted --direction for every type
+// including exposure and stored/echoed it back, implying a control the
+// engine's evaluateExposure never actually consults. Reject it outright
+// instead of silently accepting a flag that does nothing.
+describe("runAdd: exposure rejects --direction (I1 fix, one-sided by nature)", () => {
+  it("rejects an explicit --direction for exposure with a Chinese message", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", type: "exposure", direction: "up" }, options)).toThrow(
+      /敞口规则不支持 --direction/
+    );
+  });
+
+  it("rejects even an explicit --direction 'both' for exposure (the flag itself is unsupported, not just non-'both' values)", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() => cli.runAdd({ actor: "member_1", type: "exposure", direction: "both" }, options)).toThrow(
+      /敞口规则不支持 --direction/
+    );
+  });
+
+  it("still stores direction 'both' for exposure when --direction is simply omitted", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    const result = cli.runAdd({ actor: "member_1", type: "exposure" }, options);
+
+    expect(result.rule.direction).toBe("both");
   });
 });
 

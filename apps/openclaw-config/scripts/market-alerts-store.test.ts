@@ -460,7 +460,7 @@ describe("isSymbolInPositions", () => {
     expect(store.isSymbolInPositions(db, "member_1", "MSFT.US")).toBe(false);
   });
 
-  it("uses the single latest row across owner_id=actor and owner_id=NULL snapshots", () => {
+  it("uses the owner's own row when both an own row and a NULL-owner row exist and the own row happens to be newer", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
     seedSnapshot(db, { ownerId: null, fetchedAt: "2026-07-01T00:00:00.000Z", positions: [{ symbol: "OLD.US" }] });
@@ -470,11 +470,79 @@ describe("isSymbolInPositions", () => {
     expect(store.isSymbolInPositions(db, "member_1", "OLD.US")).toBe(false);
   });
 
+  // I2 (Important, whole-branch-review finding): isSymbolInPositions used to
+  // run "WHERE owner_id = ? OR owner_id IS NULL ORDER BY fetched_at DESC
+  // LIMIT 1" - newest across both sets wins - while the poller's
+  // loadLatestSnapshotForOwner (the adjudicated rule) always prefers the
+  // owner's OWN row, even if older, falling back to the NULL row only when
+  // the owner has none. The two agree today (every real row has owner_id
+  // NULL) but would silently diverge the moment Phase 6 adds per-member
+  // accounts. This is the regression test proving the store now uses the
+  // SAME shared precedence as the poller: an owner's own (older) row must
+  // win over a newer NULL-owner row.
+  it("prefers the owner's OWN row even when it is OLDER than a NULL-owner row (adjudicated precedence, shared with the poller)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", fetchedAt: "2026-06-01T00:00:00.000Z", positions: [{ symbol: "OWN.US" }] });
+    seedSnapshot(db, { ownerId: null, fetchedAt: "2026-07-05T00:00:00.000Z", positions: [{ symbol: "POOL.US" }] });
+
+    expect(store.isSymbolInPositions(db, "member_1", "OWN.US")).toBe(true);
+    expect(store.isSymbolInPositions(db, "member_1", "POOL.US")).toBe(false);
+  });
+
   it("returns false when there is no snapshot at all", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
 
     expect(store.isSymbolInPositions(db, "member_1", "AAPL.US")).toBe(false);
+  });
+});
+
+// I2 (cont'd): loadLatestSnapshotForOwner is the single shared
+// implementation of "which official_paper_snapshots row belongs to this
+// owner" - extracted out of market-alerts-poll.mjs (which previously had its
+// own private copy) so isSymbolInPositions above and the poller's per-owner
+// evaluation both use exactly one precedence rule instead of two
+// independently-maintained ones.
+describe("loadLatestSnapshotForOwner", () => {
+  it("returns the owner's own row when there is no NULL-owner row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", positions: [{ symbol: "NVDA.US" }] });
+
+    const row = store.loadLatestSnapshotForOwner(db, "member_1");
+
+    expect(row).not.toBeNull();
+    expect(JSON.parse(String(row?.positions))).toEqual([{ symbol: "NVDA.US" }]);
+  });
+
+  it("falls back to the NULL-owner row when the owner has none of their own", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: null, positions: [{ symbol: "MSFT.US" }] });
+
+    const row = store.loadLatestSnapshotForOwner(db, "member_1");
+
+    expect(row).not.toBeNull();
+    expect(JSON.parse(String(row?.positions))).toEqual([{ symbol: "MSFT.US" }]);
+  });
+
+  it("prefers the owner's own row over a newer NULL-owner row", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", fetchedAt: "2026-06-01T00:00:00.000Z", positions: [{ symbol: "OWN.US" }] });
+    seedSnapshot(db, { ownerId: null, fetchedAt: "2026-07-05T00:00:00.000Z", positions: [{ symbol: "POOL.US" }] });
+
+    const row = store.loadLatestSnapshotForOwner(db, "member_1");
+
+    expect(JSON.parse(String(row?.positions))).toEqual([{ symbol: "OWN.US" }]);
+  });
+
+  it("returns null when neither an own row nor a NULL-owner row exists", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(store.loadLatestSnapshotForOwner(db, "member_1")).toBeNull();
   });
 });
 

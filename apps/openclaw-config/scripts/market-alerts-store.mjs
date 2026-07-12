@@ -122,24 +122,55 @@ export function isSymbolWatched(db, ownerId, symbol) {
   return Boolean(row);
 }
 
-// Per the task brief's binding rule: the latest official_paper_snapshots row
-// for `owner_id = actor` OR `owner_id IS NULL`. NULL-owner rows are legacy
-// data from before per-owner snapshots existed (this system has a single
-// shared paper-trading account) - they don't prove the position is
-// specifically actor's, but since there's only one account, they're included
-// as pool-level evidence rather than excluded outright. A single query
-// picking the most recent row across both sets keeps "latest snapshot" a
-// single well-defined row instead of two separate lookups with an ordering
-// question between them.
-export function isSymbolInPositions(db, ownerId, symbol) {
-  const row = db
+// I2 fix (whole-branch-review finding): "which official_paper_snapshots row
+// belongs to this owner" used to have TWO independent implementations - this
+// function's own "OR owner_id IS NULL ORDER BY fetched_at DESC LIMIT 1"
+// (newest across both sets wins) and market-alerts-poll.mjs's
+// loadLatestSnapshotForOwner (the adjudicated rule: the owner's OWN row wins
+// even if older, NULL only as a fallback when the owner has none). They
+// agreed by coincidence - every row today has owner_id NULL - but would
+// silently diverge the moment Phase 6 adds per-member accounts: this CLI
+// validation would match the shared pool while the poller evaluates against
+// the owner's own account. Both now call the ONE shared implementation below
+// instead of maintaining two copies of the same precedence rule.
+export function loadLatestSnapshotForOwner(db, ownerId) {
+  if (ownerId !== null && ownerId !== undefined) {
+    const ownRow = db
+      .prepare(`
+        SELECT net_assets, market_value, positions
+        FROM official_paper_snapshots
+        WHERE owner_id = ?
+        ORDER BY fetched_at DESC
+        LIMIT 1
+      `)
+      .get(ownerId);
+    if (ownRow) {
+      return ownRow;
+    }
+  }
+
+  const fallbackRow = db
     .prepare(`
-      SELECT positions FROM official_paper_snapshots
-      WHERE owner_id = ? OR owner_id IS NULL
+      SELECT net_assets, market_value, positions
+      FROM official_paper_snapshots
+      WHERE owner_id IS NULL
       ORDER BY fetched_at DESC
       LIMIT 1
     `)
-    .get(ownerId);
+    .get();
+  return fallbackRow ?? null;
+}
+
+// Per the task brief's binding rule: the latest official_paper_snapshots row
+// for this owner, using the shared loadLatestSnapshotForOwner precedence
+// above (the owner's own row wins even if older; a NULL-owner row is legacy
+// pool-level evidence used only as a fallback). NULL-owner rows are legacy
+// data from before per-owner snapshots existed (this system has a single
+// shared paper-trading account) - they don't prove the position is
+// specifically actor's, but since there's only one account, they're included
+// as pool-level evidence rather than excluded outright.
+export function isSymbolInPositions(db, ownerId, symbol) {
+  const row = loadLatestSnapshotForOwner(db, ownerId);
 
   if (!row) {
     return false;

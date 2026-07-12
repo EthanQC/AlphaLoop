@@ -22,7 +22,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { openTradingDatabase, resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
-import { DEFAULT_THRESHOLDS, EXPOSURE_SYMBOL, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
+import { DEFAULT_HYSTERESIS, DEFAULT_THRESHOLDS, EXPOSURE_SYMBOL, RULE_TYPE_FREQUENCY } from "./market-alerts-engine.mjs";
 import * as store from "./market-alerts-store.mjs";
 import { normalizeSymbol } from "./report-data.mjs";
 
@@ -186,7 +186,17 @@ export function runAdd(flags, options = {}) {
       throw new Error("actor 不是有效的在职成员，无法创建提醒规则。");
     }
 
-    const direction = flags.direction === undefined ? "both" : String(flags.direction).trim();
+    // I1 fix (whole-branch-review finding): exposure is portfolio-level and
+    // one-sided by nature (over-budget only - evaluateExposure has no
+    // symmetric "down" side to gate on), so --direction is rejected outright
+    // for it rather than silently accepted-but-ignored. This must run before
+    // computing `direction` below so an explicit (even "both") flag is
+    // caught, not just non-'both' values.
+    if (type === "exposure" && flags.direction !== undefined) {
+      throw new Error("敞口规则不支持 --direction（只在超预算时触发）。");
+    }
+
+    const direction = type === "exposure" ? "both" : flags.direction === undefined ? "both" : String(flags.direction).trim();
     if (!DIRECTIONS.includes(direction)) {
       throw new Error(`direction 参数无效：${direction}，仅支持 ${DIRECTIONS.join("/")}。`);
     }
@@ -205,6 +215,24 @@ export function runAdd(flags, options = {}) {
         `阈值请用小数（5% 写作 0.05）；收到的值 ${threshold} 相当于 ${Math.round(threshold * 100)}%。`
       );
     }
+    // Hardening found while verifying the C1 fix: before hysteresis was
+    // wired up, rearmBand (threshold - hysteresis) was always exactly
+    // `threshold` (hysteresis was hardcoded 0), which is always > 0 given
+    // the check above - a non-positive rearmBand was structurally
+    // impossible. Now that unrealized_pnl/exposure default to a nonzero
+    // hysteresis, a custom --threshold at or below that value drives
+    // rearmBand to <= 0. For exposure specifically this is a PERMANENT
+    // latch, not just a wide band: its re-arm check is exposureRatio <=
+    // rearmBand, and exposureRatio never goes negative, so a rearmBand <= 0
+    // can never be satisfied again - the rule fires once and then silently
+    // never fires again, no matter how far over budget the portfolio later
+    // gets. Reject at creation time instead of shipping a rule that looks
+    // fine but is dead after its first fire.
+    if (DEFAULT_HYSTERESIS[type] > 0 && threshold <= DEFAULT_HYSTERESIS[type]) {
+      throw new Error(
+        `threshold 太小：必须大于该类型的滞回值 ${DEFAULT_HYSTERESIS[type]}（否则规则触发一次后将永远无法重新武装）；收到 ${threshold}。`
+      );
+    }
 
     const symbol = resolveAddSymbol(type, flags.symbol, db, actor);
 
@@ -213,6 +241,17 @@ export function runAdd(flags, options = {}) {
       throw new Error(`同一标的+类型的规则数已达上限（10 条）：${symbol} / ${type}。`);
     }
 
+    // C1 fix (whole-branch-review finding, CRITICAL): hysteresis used to be
+    // hardcoded 0 here regardless of type, silently killing the spec's
+    // anti-flap band for unrealized_pnl/exposure (their ONLY anti-flap
+    // mechanism - daily_move/spike_5m rely on once-daily/cooldown gating
+    // instead, hence 0 for them). DEFAULT_HYSTERESIS (market-alerts-engine.mjs)
+    // is the single source of truth for these spec-pinned values. Note: this
+    // stays the type default even when the caller supplies a custom
+    // --threshold - hysteresis is an ABSOLUTE band (rearmBand = threshold -
+    // hysteresis), not a fraction of threshold, so scaling it with a custom
+    // threshold would be wrong. There is deliberately no --hysteresis flag
+    // (YAGNI; the spec pins these values, not the operator).
     const rule = store.insertRule(db, {
       ownerId: actor,
       symbol,
@@ -220,7 +259,7 @@ export function runAdd(flags, options = {}) {
       threshold,
       direction,
       frequency: RULE_TYPE_FREQUENCY[type],
-      hysteresis: 0
+      hysteresis: DEFAULT_HYSTERESIS[type]
     });
 
     return { ok: true, rule };

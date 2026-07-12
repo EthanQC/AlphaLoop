@@ -69,6 +69,29 @@ export const DEFAULT_THRESHOLDS = {
   exposure: 0.1
 };
 
+// Default `hysteresis` (滞回/anti-flap band) values per rule type, from the
+// spec's Global Constraints (not to be changed). Exported from here for the
+// same single-source-of-truth reason as DEFAULT_THRESHOLDS above: market-
+// alerts.mjs's runAdd must consume this instead of hardcoding a value.
+//
+// daily_move and spike_5m have NO hysteresis by design - they use once-daily
+// gating and a 60-minute cooldown (respectively) as their anti-flap
+// mechanism instead. unrealized_pnl and exposure have no cooldown of any
+// kind, so hysteresis is their ONLY anti-flap mechanism - a 0 here (as the
+// CLI used to hardcode) means zero protection against a value wobbling
+// across the threshold line.
+//
+// Hysteresis is an ABSOLUTE band (rearmBand = threshold - hysteresis), not a
+// fraction of threshold, so a caller-supplied custom --threshold must NOT
+// scale it: the type default below applies unchanged regardless of the
+// rule's own threshold.
+export const DEFAULT_HYSTERESIS = {
+  daily_move: 0,
+  unrealized_pnl: 0.01,
+  spike_5m: 0,
+  exposure: 0.01
+};
+
 // Sentinel `symbol` value for portfolio-level (rule_type 'exposure') fires,
 // which are not about any one ticker. Exported from here (not re-declared in
 // market-alerts.mjs the CLI, or market-alerts-cards.mjs the card renderer -
@@ -407,7 +430,13 @@ function evaluateSpike(rule, runtime, sample, quota) {
   const cooldownUntilMs = runtime.cooldownUntil ? new Date(runtime.cooldownUntil).getTime() : null;
   const cooldownActive = cooldownUntilMs !== null && cooldownUntilMs >= now;
   const volumesOk = priorHistory.every((point) => Number.isFinite(point.v) && point.v > 0);
-  const thresholdOk = Math.abs(rawValue) >= rule.threshold;
+  // I1 fix (whole-branch-review finding): this used to be a bare
+  // Math.abs(rawValue) >= threshold, never consulting rule.direction - even
+  // though the CLI accepts/stores/echoes --direction for spike_5m same as
+  // every other type. Route through the same directionMatches gate
+  // daily_move/unrealized_pnl already use, so a down-spike can't fire an
+  // up-only rule (and vice versa).
+  const thresholdOk = directionMatches(rule.direction, rawValue, rule.threshold);
 
   if (cooldownActive) {
     return { decision: "skip", reason: "cooldown", value: rawValue, newRuntime: baseRuntime, quotaDelta: 0 };
