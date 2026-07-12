@@ -5,7 +5,7 @@
 
 import { createId } from "../../../packages/shared-types/dist/index.js";
 
-const DEFAULT_LAST_VALUE = { lastPrice: null, history: [] };
+const DEFAULT_LAST_VALUE = { lastPrice: null, history: [], armedDirection: null };
 
 export function listEnabledRules(db) {
   const rows = db.prepare(`SELECT * FROM alert_rules WHERE enabled = 1`).all();
@@ -122,8 +122,14 @@ function mapRuntimeRow(row) {
 // is declared REAL in the DDL, but SQLite's dynamic typing lets a column
 // store any type regardless of its declared affinity for values that don't
 // cleanly coerce - so this column instead holds a JSON string encoding
-// { lastPrice, history }. Verified by market-alerts-store.test.ts asserting
-// `typeof(last_value) = 'text'` on the raw stored value.
+// { lastPrice, history, armedDirection }. Verified by market-alerts-store.test.ts
+// asserting `typeof(last_value) = 'text'` on the raw stored value.
+//
+// `history` entries are `{ p, v, t, d }` (price, volume, sample epoch ms,
+// trading day) and `armedDirection` is `'up'|'down'|null` - both added by
+// task-p2-3's spike-window and signed-pnl-armed-state fixes. This column
+// stays a free-form JSON blob either way, so no DDL change was needed for
+// either field; the store just passes them through opaquely.
 function encodeLastValue(lastValue) {
   return JSON.stringify(lastValue ?? DEFAULT_LAST_VALUE);
 }
@@ -137,7 +143,8 @@ function decodeLastValue(raw) {
     const parsed = JSON.parse(String(raw));
     return {
       lastPrice: typeof parsed?.lastPrice === "number" ? parsed.lastPrice : null,
-      history: Array.isArray(parsed?.history) ? parsed.history : []
+      history: Array.isArray(parsed?.history) ? parsed.history : [],
+      armedDirection: parsed?.armedDirection === "up" || parsed?.armedDirection === "down" ? parsed.armedDirection : null
     };
   } catch {
     return { ...DEFAULT_LAST_VALUE };

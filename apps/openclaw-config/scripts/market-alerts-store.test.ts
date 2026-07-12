@@ -133,10 +133,11 @@ describe("getRuntimes / saveRuntimes", () => {
       lastValue: {
         lastPrice: 202.5,
         history: [
-          { p: 200, v: 1000 },
-          { p: 201, v: 1100 },
-          { p: 202, v: 1200 }
-        ]
+          { p: 200, v: 1000, t: 1751378400000, d: "2026-07-01" },
+          { p: 201, v: 1100, t: 1751378700000, d: "2026-07-01" },
+          { p: 202, v: 1200, t: 1751379000000, d: "2026-07-01" }
+        ],
+        armedDirection: "up"
       }
     };
 
@@ -150,7 +151,11 @@ describe("getRuntimes / saveRuntimes", () => {
       | undefined;
     expect(rawRow?.t).toBe("text");
     expect(() => JSON.parse(String(rawRow?.v))).not.toThrow();
-    expect(JSON.parse(String(rawRow?.v))).toEqual({ lastPrice: 202.5, history: runtime.lastValue.history });
+    expect(JSON.parse(String(rawRow?.v))).toEqual({
+      lastPrice: 202.5,
+      history: runtime.lastValue.history,
+      armedDirection: "up"
+    });
 
     // Now prove the round trip through a fresh DatabaseSync handle too (not
     // just the same connection that wrote it), to rule out any
