@@ -69,6 +69,33 @@ export interface ReportDeliveryResult {
   deliveries: ReportDeliveryEntry[];
 }
 
+export interface InteractiveCardButton {
+  text: string;
+  value: string;
+  style?: "primary" | "danger" | "default";
+}
+
+export interface InteractiveCard {
+  title: string;
+  lines: string[];
+  buttons?: InteractiveCardButton[];
+  url?: { text: string; href: string };
+}
+
+export interface CardSendResult {
+  ok: boolean;
+  messageId?: string;
+  error?: string;
+}
+
+export interface CardTransport {
+  sendCard(
+    target: { chatId?: string; openId?: string },
+    cardJson: unknown
+  ): Promise<{ ok: boolean; messageId?: string; error?: string }>;
+  updateCard(messageId: string, cardJson: unknown): Promise<{ ok: boolean; error?: string }>;
+}
+
 interface FeishuAppTarget {
   targetType: "open_id" | "chat_id";
   targetId: string;
@@ -578,6 +605,129 @@ async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string
   }
 }
 
+export function buildFeishuCardPayload(card: InteractiveCard): unknown {
+  const elements: unknown[] = card.lines.map((line) => ({
+    tag: "markdown",
+    content: line
+  }));
+
+  const actions: unknown[] = (card.buttons ?? []).map((button) => ({
+    tag: "button",
+    text: { tag: "plain_text", content: button.text },
+    type: button.style ?? "default",
+    value: { value: button.value }
+  }));
+
+  if (card.url) {
+    actions.push({
+      tag: "button",
+      text: { tag: "plain_text", content: card.url.text },
+      type: "default",
+      url: card.url.href
+    });
+  }
+
+  if (actions.length > 0) {
+    elements.push({ tag: "action", actions });
+  }
+
+  return {
+    schema: "2.0",
+    config: { update_multi: true },
+    header: {
+      title: { tag: "plain_text", content: card.title },
+      template: "blue"
+    },
+    body: { elements }
+  };
+}
+
+export async function sendInteractiveCard(
+  card: InteractiveCard,
+  target: { chatId?: string; openId?: string },
+  transport: CardTransport = defaultCardTransport
+): Promise<CardSendResult> {
+  const payload = buildFeishuCardPayload(card);
+  try {
+    const result = await transport.sendCard(target, payload);
+    if (!result.ok) {
+      return { ok: false, error: result.error ?? "Interactive card send failed." };
+    }
+    return {
+      ok: true,
+      ...(result.messageId ? { messageId: result.messageId } : {})
+    };
+  } catch (error) {
+    return { ok: false, error: sanitizeNotificationError(error) };
+  }
+}
+
+export async function updateInteractiveCard(
+  messageId: string,
+  card: InteractiveCard,
+  transport: CardTransport = defaultCardTransport
+): Promise<{ ok: boolean; error?: string }> {
+  const payload = buildFeishuCardPayload(card);
+  try {
+    const result = await transport.updateCard(messageId, payload);
+    if (!result.ok) {
+      return { ok: false, error: result.error ?? "Interactive card update failed." };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: sanitizeNotificationError(error) };
+  }
+}
+
+// Default transport reuses the feishu-user-plugin MCP subprocess channel
+// (see callFeishuUserPluginTool below). Real MCP behaviour is a
+// deployment-time concern; this path is intentionally left uncovered by unit
+// tests here (see notifications.test.ts) since there is no established
+// subprocess-mocking pattern in this suite yet.
+const defaultCardTransport: CardTransport = {
+  async sendCard(target, cardJson) {
+    try {
+      const chatId = target.chatId ?? target.openId ?? resolveFeishuUserPluginBotChatId();
+      return await withNotificationRetry(async () => {
+        const result = await callFeishuUserPluginTool("send_message_as_bot", {
+          chat_id: chatId,
+          msg_type: "interactive",
+          content: cardJson
+        });
+        const detail = extractMcpText(result);
+        if (result.isError) {
+          throw new Error(detail || "feishu-user-plugin returned an error response.");
+        }
+        const messageId = extractMcpMessageId(detail);
+        return {
+          ok: true,
+          ...(messageId ? { messageId } : {})
+        };
+      }, "feishu-user-plugin card send");
+    } catch (error) {
+      return { ok: false, error: sanitizeNotificationError(error) };
+    }
+  },
+  async updateCard(messageId, cardJson) {
+    try {
+      return await withNotificationRetry(async () => {
+        const result = await callFeishuUserPluginTool("update_message", {
+          message_id: messageId,
+          msg_type: "interactive",
+          content: cardJson
+        });
+        const detail = extractMcpText(result);
+        if (result.isError) {
+          throw new Error(detail || "feishu-user-plugin returned an error response.");
+        }
+        return { ok: true };
+      }, "feishu-user-plugin card update");
+    } catch (error) {
+      return { ok: false, error: sanitizeNotificationError(error) };
+    }
+  }
+};
+
 function resolveFeishuUserPluginBotChatId(): string {
   const explicitBotChatId = process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID?.trim();
   if (explicitBotChatId) {
@@ -797,6 +947,14 @@ function extractMcpText(result: McpToolResult): string {
     .map((entry) => entry.text)
     .join("\n")
     .trim();
+}
+
+// feishu-user-plugin reports message ids inline in its text response, e.g.
+// "Message sent (bot): om_xxxxx" or "Message updated: om_xxxxx". Built on top
+// of extractMcpText's output rather than forking a divergent parser, so
+// existing extractMcpText callers are unaffected.
+function extractMcpMessageId(detail: string): string | undefined {
+  return detail.match(/\bom_[A-Za-z0-9_-]+\b/u)?.[0];
 }
 
 function buildDegradedFallbackPayload(payload: NotificationPayload): NotificationPayload {
