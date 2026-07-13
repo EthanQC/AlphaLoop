@@ -122,7 +122,57 @@
 //   a rejection. Every bookkeeping call in runMarketAlertsPoll is now
 //   wrapped in its own try/catch that logs to stderr and never rethrows -
 //   see the top-level try/catch below and logFailureWithFreshDb.
-import { resolve } from "node:path";
+//
+// task H1 second fix round (a review found the delivery-health detector
+// Fix 3 above ADDED was itself INERT in production - defeating the entire
+// point of this task a second time):
+//
+//   Fix 1 - the delivery-health streak (consecutiveMarkerCount) broke on the
+//   very first row lacking the `delivery_health_bad` marker, including a
+//   `fires === 0` row - which never attempted delivery at all and so never
+//   carries the marker either way. Real alert fires are sparse (once_daily
+//   rules, a daily quota), so an expired Feishu token produced "bad, empty,
+//   bad, empty, bad, ..." forever and the streak never reached the
+//   threshold. recordSuccessRun now treats delivery health as STICKY
+//   (job-run-log.mjs's consecutiveStickyMarkerCount): a `fires === 0` cycle
+//   is NEUTRAL (skipped, neither extends nor resets the streak); only a
+//   cycle that actually delivered something (`sent > 0`) clears it.
+//
+//   Fix 2 - `fires > 0 && sent === 0 && failed === 0 && skipped > 0` (a fire
+//   for a member with no feishuOpenId - today's actual production shape:
+//   zero active members have one) used to count as HEALTHY, so the user
+//   received nothing, forever, with no escalation ever raised. `sent === 0`
+//   is now unhealthy regardless of whether the misses were `failed` or
+//   `skipped`, with a distinct card text for each: a pure no-recipient
+//   outage points at binding a Feishu account, not at Feishu auth.
+//
+//   Fix 3 - the first `fires === 0` cycle after a delivery escalation used
+//   to take the recovery branch anyway (the old health check was just
+//   `!deliveryUnhealthy`, true for an empty cycle too) and send a FALSE
+//   "recovered" card with no card ever actually delivered - which also reset
+//   the throttle, letting the machine loop escalate -> false-recover ->
+//   escalate. The recovery card now fires ONLY on a cycle with `sent > 0`.
+//
+//   Fix 4 - a write-blocked db (this task's "db 锁" scenario) means
+//   recordJobRun's INSERT throws on every cycle even though the db opened
+//   fine - no row ever lands, so consecutiveFailureCount (a pure SELECT)
+//   never advances and the 3-failure escalation threshold is never reached.
+//   recordFailureRun/recordSuccessRun now also maintain a small file-based
+//   fallback counter (runtime/market-alerts/poller-state.json, written on
+//   EVERY run - see resolvePollerStatePath/readPollerState/writePollerState)
+//   and take max(dbCount, fileCount) / the newer of the two escalation
+//   timestamps, so an unwritable db no longer masks the outage.
+//
+//   Fix 5 (minor) - sendEscalationCard/sendRecoveryCard's own send attempt is
+//   now wrapped in its own try/catch inside recordFailureRun/
+//   recordSuccessRun so a throw from MemberRepository.listActive() can't
+//   also cost the cycle its run_log heartbeat row; every run_log scan keyed
+//   on this job (consecutiveFailureCount, lastMarkerAt,
+//   consecutiveStickyMarkerCount) now takes a bounded LIMIT (default 200 -
+//   see job-run-log.mjs's module header for why) instead of scanning the
+//   job's entire history every cycle.
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -135,7 +185,7 @@ import {
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import {
   consecutiveFailureCount,
-  consecutiveMarkerCount,
+  consecutiveStickyMarkerCount,
   lastMarkerAt,
   recordJobRun
 } from "./job-run-log.mjs";
@@ -236,7 +286,7 @@ export async function runMarketAlertsPoll(options = {}) {
       // log rather than let a bookkeeping throw replace a genuine success
       // with a rejection.
       try {
-        await recordSuccessRun(db, { now, transport, result });
+        await recordSuccessRun(db, { now, transport, result, dbPath });
       } catch (bookkeepingError) {
         console.error(
           `market-alerts-poll: recordSuccessRun bookkeeping failed (the poll cycle itself still succeeded): ${describeError(bookkeepingError)}`
@@ -252,7 +302,7 @@ export async function runMarketAlertsPoll(options = {}) {
       // "cannot write run_log" exception is strictly worse than seeing the
       // real cause with a stderr note that bookkeeping also failed.
       try {
-        await recordFailureRun(db, { now, error, transport });
+        await recordFailureRun(db, { now, error, transport, dbPath });
       } catch (bookkeepingError) {
         console.error(
           `market-alerts-poll: recordFailureRun bookkeeping failed (rethrowing the ORIGINAL error, not this one): ${describeError(bookkeepingError)}`
@@ -313,7 +363,7 @@ async function logFailureWithFreshDb(dbPath, { now, error, transport }) {
     return;
   }
   try {
-    await recordFailureRun(db, { now, error, transport });
+    await recordFailureRun(db, { now, error, transport, dbPath });
   } catch (bookkeepingError) {
     // Fix 4: never let a bookkeeping throw (e.g. the SAME db lock that
     // caused the original failure, now also blocking the write of the
@@ -326,28 +376,128 @@ async function logFailureWithFreshDb(dbPath, { now, error, transport }) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// File-based failure-counter fallback (Fix 4, task H1 second fix round)
+// ---------------------------------------------------------------------------
+//
+// recordJobRun's own INSERT can throw even though the db opened fine and
+// every SELECT against it still works - e.g. a concurrent long-running
+// transaction holding a write lock (this task's "db 锁" scenario, distinct
+// from openTradingDatabase failing to open at all, which
+// logFailureWithFreshDb above already handles). When that happens, EVERY
+// consecutive failing cycle throws before its own row ever lands -
+// consecutiveFailureCount (a pure SELECT) then never sees a new row to
+// extend its streak, so it stays wherever it already was and the
+// 3-consecutive-failure escalation threshold is never crossed. Only stderr
+// ever records the outage - exactly the silent failure this whole task
+// exists to catch.
+//
+// Fixed by a small JSON state file - runtime/market-alerts/poller-state.json
+// - mirroring openclaw-cron-runner.mjs's own processed-runs.json precedent
+// (see that module and openclaw-cron-runner-state.mjs for the read/write
+// pattern this borrows), written on EVERY real run regardless of whether the
+// db write itself succeeds: {consecutiveFailures, lastEscalationAt,
+// lastRecoveryAt}. When the db IS writable this file just mirrors it (no
+// divergence, no change in observed behavior - every existing test above
+// covers exactly that case); when it is not,
+// recordFailureRun/recordSuccessRun below take max(dbCount, fileCount) for
+// the failure count and the NEWER of the two escalation/recovery timestamps
+// (newerIso) for the throttle, so a db that has been unwritable for the
+// entire outage still escalates correctly and a db that recovers mid-outage
+// doesn't lose track either. Scoped to the HARD-failure pair only (task
+// brief's named scenario) - the delivery-health pair a few paragraphs down
+// stays db-only.
+function resolvePollerStatePath(dbPath) {
+  return join(dirname(dbPath), "market-alerts", "poller-state.json");
+}
+
+function readPollerState(path) {
+  try {
+    if (!existsSync(path)) {
+      return { consecutiveFailures: 0, lastEscalationAt: null, lastRecoveryAt: null };
+    }
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return {
+      consecutiveFailures: Math.max(0, Number(parsed?.consecutiveFailures ?? 0)),
+      lastEscalationAt: typeof parsed?.lastEscalationAt === "string" ? parsed.lastEscalationAt : null,
+      lastRecoveryAt: typeof parsed?.lastRecoveryAt === "string" ? parsed.lastRecoveryAt : null
+    };
+  } catch {
+    // Corrupt/unreadable state file - never let a bad file crash the poller
+    // or silently masquerade as "no history"; falling back to a fresh state
+    // is the safe direction (worst case: one redundant escalation resend).
+    return { consecutiveFailures: 0, lastEscalationAt: null, lastRecoveryAt: null };
+  }
+}
+
+function writePollerState(path, state) {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  } catch (error) {
+    // Best-effort: if even the FALLBACK file can't be written (disk full,
+    // read-only runtime dir), degrade to db-only behavior for this cycle
+    // rather than throwing out of bookkeeping - logged so a double-outage
+    // stays visible on stderr instead of silently disappearing.
+    console.error(`market-alerts-poll: failed to write poller-state.json: ${describeError(error)}`);
+  }
+}
+
+// Whichever of the two ISO timestamps is newer; either side may be
+// null/undefined ("no marker from that source yet").
+function newerIso(a, b) {
+  if (!a) {
+    return b ?? null;
+  }
+  if (!b) {
+    return a;
+  }
+  return Date.parse(a) >= Date.parse(b) ? a : b;
+}
+
 // Records a failing run and, on the 3rd+ consecutive failure (throttled to
 // one card per ESCALATION_THROTTLE_MS unless a recovery has since ended the
-// prior outage - see isEscalationDue), sends the escalation card BEFORE
-// writing the row so the resulting evidence marker lands on the exact row
-// that triggered the send (see job-run-log.mjs's module header for the
+// prior outage - see escalationDueFrom below), sends the escalation card
+// BEFORE writing the row so the resulting evidence marker lands on the exact
+// row that triggered the send (see job-run-log.mjs's module header for the
 // encoding).
-async function recordFailureRun(db, { now, error, transport }) {
+//
+// Fix 4: the consecutive-failure count and the escalation/recovery throttle
+// timestamps are each resolved as the db-derived view MERGED with the
+// file-based fallback's own view (see above) - so a db that has silently
+// stopped accepting writes for this whole outage still crosses the
+// threshold and still respects the throttle, exactly as if every write had
+// succeeded.
+async function recordFailureRun(db, { now, error, transport, dbPath }) {
   const startedAt = now.toISOString();
   const finishedAt = new Date().toISOString();
   const failedStep = (error && typeof error === "object" && error.jobStep) || "unknown";
   const errorSummary = sanitizeAlertText(error instanceof Error ? error.message : String(error), 500);
 
-  const priorFailures = consecutiveFailureCount(db, CRON_JOB_MARKET_ALERTS);
-  const consecutiveCount = priorFailures + 1;
+  const pollerStatePath = resolvePollerStatePath(dbPath);
+  const fileState = readPollerState(pollerStatePath);
+
+  const dbFailures = consecutiveFailureCount(db, CRON_JOB_MARKET_ALERTS);
+  const consecutiveCount = Math.max(dbFailures, fileState.consecutiveFailures) + 1;
+
+  const previousEscalation = newerIso(
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_ESCALATION_EVENT),
+    fileState.lastEscalationAt
+  );
+  const previousRecovery = newerIso(
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_RECOVERY_EVENT),
+    fileState.lastRecoveryAt
+  );
 
   const evidence = [];
-  if (
-    consecutiveCount >= ESCALATION_THRESHOLD &&
-    isEscalationDue(db, now, HARD_ESCALATION_EVENT, HARD_RECOVERY_EVENT)
-  ) {
-    evidence.push(
-      await sendEscalationCard(db, transport, now, {
+  let escalationSentAt = null;
+  if (consecutiveCount >= ESCALATION_THRESHOLD && escalationDueFrom(now, previousEscalation, previousRecovery)) {
+    // Fix 5: a throw from sendEscalationCard's own collaborators (e.g.
+    // MemberRepository.listActive()) must not ALSO cost this cycle its
+    // run_log heartbeat row below - caught locally rather than left to
+    // propagate and skip recordJobRun entirely.
+    try {
+      const marker = await sendEscalationCard(db, transport, now, {
         title: "⚠ 提醒器连续失败",
         lines: [
           `已连续失败 ${consecutiveCount} 次。`,
@@ -355,9 +505,26 @@ async function recordFailureRun(db, { now, error, transport }) {
           "提醒功能当前不可用，盘中价格/持仓/敞口告警暂时不会发送。",
           "请检查长桥登录状态、交易日历数据、数据库占用等常见原因；修复后下一次轮询成功会自动发送恢复通知，无需手动复位。"
         ]
-      }, HARD_ESCALATION_EVENT)
-    );
+      }, HARD_ESCALATION_EVENT);
+      evidence.push(marker);
+      if (marker.event === HARD_ESCALATION_EVENT) {
+        escalationSentAt = marker.at;
+      }
+    } catch (sendError) {
+      console.error(
+        `market-alerts-poll: sending the hard-failure escalation card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
+      );
+    }
   }
+
+  // Fix 4: written BEFORE recordJobRun below, which may itself throw (the
+  // exact scenario this fix exists for) - the file must stay the source of
+  // truth for the NEXT cycle even when this cycle's own db row never lands.
+  writePollerState(pollerStatePath, {
+    consecutiveFailures: consecutiveCount,
+    lastEscalationAt: escalationSentAt ?? fileState.lastEscalationAt,
+    lastRecoveryAt: fileState.lastRecoveryAt
+  });
 
   recordJobRun(db, {
     job: CRON_JOB_MARKET_ALERTS,
@@ -375,38 +542,75 @@ async function recordFailureRun(db, { now, error, transport }) {
 // for the row a recovery card happens to ride along on). Two INDEPENDENT
 // escalation/recovery state machines share this one row's evidence array:
 //
-//   1. The hard-failure recovery (Fix 2): ends the OUTAGE that
-//      recordFailureRun's escalation started, via HARD_ESCALATION_EVENT/
-//      HARD_RECOVERY_EVENT markers - see isRecoveryDue.
-//   2. The delivery-health escalation (Fix 3): this poll cycle's OWN
-//      evaluated/fires/sent/failed/skipped counters - recorded into
-//      evidence unconditionally (`delivery_counts`, for operator
-//      visibility) - can themselves indicate an outage (fires generated,
-//      NONE delivered) even though the cycle as a whole returned ok:true.
-//      Tracked via its own DELIVERY_ESCALATION_EVENT/DELIVERY_RECOVERY_EVENT
-//      marker pair and its own consecutive-cycle counter (job-run-log.mjs's
-//      consecutiveMarkerCount, since ok=1 rows are invisible to
-//      consecutiveFailureCount), but the SAME ESCALATION_THRESHOLD/
-//      ESCALATION_THROTTLE_MS/isEscalationDue-isRecoveryDue machinery as #1.
-async function recordSuccessRun(db, { now, transport, result }) {
+//   1. The hard-failure recovery: ends the OUTAGE that recordFailureRun's
+//      escalation started, via HARD_ESCALATION_EVENT/HARD_RECOVERY_EVENT
+//      markers, merged with the Fix 4 file-based fallback exactly as
+//      recordFailureRun does.
+//   2. The delivery-health escalation/recovery (task H1 second fix round's
+//      Fix 1/2/3): this poll cycle's OWN evaluated/fires/sent/failed/skipped
+//      counters - recorded into evidence unconditionally (`delivery_counts`,
+//      for operator visibility) - can themselves indicate an outage (fires
+//      generated, none delivered) even though the cycle as a whole returned
+//      ok:true. Tracked via its own DELIVERY_ESCALATION_EVENT/
+//      DELIVERY_RECOVERY_EVENT marker pair and its own STICKY
+//      consecutive-attempt counter (job-run-log.mjs's
+//      consecutiveStickyMarkerCount - see Fix 1 below for why the plain
+//      streak-based consecutiveMarkerCount this used to call was unsound),
+//      sharing the same ESCALATION_THRESHOLD/ESCALATION_THROTTLE_MS/
+//      isEscalationDue-isRecoveryDue machinery as #1 (db-only - this pair
+//      does NOT use the Fix 4 file fallback, which is scoped to hard
+//      failures only per the task brief).
+async function recordSuccessRun(db, { now, transport, result, dbPath }) {
   const startedAt = now.toISOString();
   const evidence = [];
 
-  if (isRecoveryDue(db, HARD_ESCALATION_EVENT, HARD_RECOVERY_EVENT)) {
-    const marker = await sendRecoveryCard(db, transport, now, {
-      title: "✅ 提醒器已恢复",
-      lines: ["提醒器已恢复正常运行，盘中价格/持仓/敞口告警已重新生效。"]
-    }, HARD_RECOVERY_EVENT);
-    if (marker) {
-      evidence.push(marker);
+  // --- Hard-failure recovery (Fix 4: merged with the file-based fallback) ---
+  const pollerStatePath = resolvePollerStatePath(dbPath);
+  const fileState = readPollerState(pollerStatePath);
+
+  const previousEscalation = newerIso(
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_ESCALATION_EVENT),
+    fileState.lastEscalationAt
+  );
+  const previousRecovery = newerIso(
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_RECOVERY_EVENT),
+    fileState.lastRecoveryAt
+  );
+
+  let recoverySentAt = fileState.lastRecoveryAt;
+  if (recoveryDueFrom(previousEscalation, previousRecovery)) {
+    try {
+      const marker = await sendRecoveryCard(db, transport, now, {
+        title: "✅ 提醒器已恢复",
+        lines: ["提醒器已恢复正常运行，盘中价格/持仓/敞口告警已重新生效。"]
+      }, HARD_RECOVERY_EVENT);
+      if (marker) {
+        evidence.push(marker);
+        recoverySentAt = marker.at;
+      }
+    } catch (sendError) {
+      console.error(
+        `market-alerts-poll: sending the hard-failure recovery card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
+      );
     }
   }
 
-  // Fix 3: populate the run_log row's evidence with this cycle's REAL
-  // delivery counters instead of leaving evidence/actions empty shells -
-  // an operator (or a later doctor check) reading run_log must be able to
-  // see "alerts fired but nothing was delivered" at a glance, the same way
-  // failed_step already surfaces a hard failure's phase at a glance.
+  // Fix 4: a success always resets the file's failure counter to 0,
+  // mirroring consecutiveFailureCount's own db-side reset-on-success
+  // semantics exactly.
+  writePollerState(pollerStatePath, {
+    consecutiveFailures: 0,
+    lastEscalationAt: fileState.lastEscalationAt,
+    lastRecoveryAt: recoverySentAt
+  });
+
+  // --- Delivery-health escalation/recovery (task H1 second fix round) ---
+  //
+  // Populate the run_log row's evidence with this cycle's REAL delivery
+  // counters unconditionally - an operator (or a later doctor check) reading
+  // run_log must be able to see "alerts fired but nothing was delivered" at
+  // a glance, the same way failed_step already surfaces a hard failure's
+  // phase at a glance.
   const evaluated = Number(result?.evaluated ?? 0);
   const fires = Number(result?.fires ?? 0);
   const sent = Number(result?.sent ?? 0);
@@ -414,38 +618,97 @@ async function recordSuccessRun(db, { now, transport, result }) {
   const skipped = Number(result?.skipped ?? 0);
   evidence.push({ event: "delivery_counts", evaluated, fires, sent, failed, skipped });
 
-  // "Generated something to say and could not say ANY of it" - a delivery
-  // cycle that partially succeeds (sent > 0) is NOT this failure mode, and
-  // neither is a cycle with nothing to say at all (fires === 0).
-  const deliveryUnhealthy = fires > 0 && sent === 0 && failed > 0;
+  // Fix 1: only a cycle that actually ATTEMPTED delivery (fires > 0) is
+  // meaningful to this state machine at all - a fires===0 cycle is NEUTRAL,
+  // not evidence of health OR of an outage, and must neither extend nor
+  // break either streak. See job-run-log.mjs's consecutiveStickyMarkerCount
+  // and its module-header rationale for why the plain streak-based
+  // consecutiveMarkerCount this used to call was unsound here: real alert
+  // fires are sparse (once_daily rules, a daily quota), so an expired
+  // Feishu token used to produce "bad, empty, bad, empty, ..." forever and
+  // never crossed the escalation threshold - poller says ok, user gets
+  // nothing, nobody is told.
+  const isDeliveryAttempt = fires > 0;
+  // Fix 2: `sent === 0` is unhealthy regardless of WHY nothing was sent.
+  // `skipped` (a fire for a member with no feishuOpenId on file - today's
+  // actual production shape: zero active members have one) is exactly as
+  // silent to the user as `failed` (a real send attempt that errored). Only
+  // an ACTUAL send (sent > 0) counts as healthy, even if other owners in the
+  // same cycle were skipped/failed (see the "partial success is not this
+  // failure mode" note this replaces).
+  const deliveredSuccessfully = sent > 0;
+  const deliveryUnhealthy = isDeliveryAttempt && !deliveredSuccessfully;
+
+  if (isDeliveryAttempt) {
+    evidence.push({ event: "delivery_attempted", at: now.toISOString() });
+  }
 
   if (deliveryUnhealthy) {
-    evidence.push({ event: "delivery_health_bad", at: now.toISOString() });
-    const priorDeliveryFailures = consecutiveMarkerCount(db, CRON_JOB_MARKET_ALERTS, "delivery_health_bad");
+    // Fix 2: which of the two card texts to use depends on WHY nothing was
+    // sent this cycle - a real `failed` send attempt (most likely a Feishu
+    // auth problem) takes precedence over a pure `skipped` miss (no
+    // reachable recipient at all, most likely a member with no bound Feishu
+    // account) when a single cycle somehow has both, since an actual failed
+    // send is the stronger of the two signals.
+    const reason = failed > 0 ? "send_failed" : "no_recipients";
+    evidence.push({ event: "delivery_health_bad", at: now.toISOString(), reason });
+
+    const priorDeliveryFailures = consecutiveStickyMarkerCount(
+      db,
+      CRON_JOB_MARKET_ALERTS,
+      "delivery_health_bad",
+      "delivery_attempted"
+    );
     const deliveryConsecutiveCount = priorDeliveryFailures + 1;
 
     if (
       deliveryConsecutiveCount >= ESCALATION_THRESHOLD &&
       isEscalationDue(db, now, DELIVERY_ESCALATION_EVENT, DELIVERY_RECOVERY_EVENT)
     ) {
-      evidence.push(
-        await sendEscalationCard(db, transport, now, {
-          title: "⚠ 提醒卡片投递持续失败",
-          lines: [
-            `已连续 ${deliveryConsecutiveCount} 次轮询生成了提醒但一条都未能送达。`,
-            "提醒规则本身评估正常、条件也确实触发了，但卡片始终无法发出 - 用户实际上什么提醒都收不到。",
-            "最可能的原因是飞书应用鉴权过期或 user-plugin 进程异常，请检查；修复后下一次投递成功会自动发送恢复通知。"
-          ]
-        }, DELIVERY_ESCALATION_EVENT)
-      );
+      const card =
+        reason === "no_recipients"
+          ? {
+              title: "⚠ 提醒无法送达：无可达收件人",
+              lines: [
+                `已连续 ${deliveryConsecutiveCount} 次轮询生成了提醒但一条都未能送达。`,
+                "提醒规则本身评估正常、条件也确实触发了，但触发规则的会员都没有绑定飞书账号，卡片无处可发。",
+                "请为相关会员绑定飞书账号（feishuOpenId）；绑定后下一次投递成功会自动发送恢复通知。"
+              ]
+            }
+          : {
+              title: "⚠ 提醒卡片投递持续失败",
+              lines: [
+                `已连续 ${deliveryConsecutiveCount} 次轮询生成了提醒但一条都未能送达。`,
+                "提醒规则本身评估正常、条件也确实触发了，但卡片始终无法发出 - 用户实际上什么提醒都收不到。",
+                "最可能的原因是飞书应用鉴权过期或 user-plugin 进程异常，请检查；修复后下一次投递成功会自动发送恢复通知。"
+              ]
+            };
+      try {
+        evidence.push(await sendEscalationCard(db, transport, now, card, DELIVERY_ESCALATION_EVENT));
+      } catch (sendError) {
+        console.error(
+          `market-alerts-poll: sending the delivery-health escalation card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
+        );
+      }
     }
-  } else if (isRecoveryDue(db, DELIVERY_ESCALATION_EVENT, DELIVERY_RECOVERY_EVENT)) {
-    const marker = await sendRecoveryCard(db, transport, now, {
-      title: "✅ 提醒卡片投递已恢复",
-      lines: ["提醒卡片投递已恢复正常，此前生成的提醒现在可以正常送达。"]
-    }, DELIVERY_RECOVERY_EVENT);
-    if (marker) {
-      evidence.push(marker);
+  } else if (deliveredSuccessfully && isRecoveryDue(db, DELIVERY_ESCALATION_EVENT, DELIVERY_RECOVERY_EVENT)) {
+    // Fix 3: recovery fires ONLY on a cycle that actually delivered
+    // something (sent > 0) - an empty (fires === 0) cycle right after an
+    // escalation is neutral (Fix 1), not evidence of recovery, and must not
+    // send a false "recovered" card (which would also reset the throttle
+    // and let the machine loop escalate -> false-recover -> escalate).
+    try {
+      const marker = await sendRecoveryCard(db, transport, now, {
+        title: "✅ 提醒卡片投递已恢复",
+        lines: ["提醒卡片投递已恢复正常，此前生成的提醒现在可以正常送达。"]
+      }, DELIVERY_RECOVERY_EVENT);
+      if (marker) {
+        evidence.push(marker);
+      }
+    } catch (sendError) {
+      console.error(
+        `market-alerts-poll: sending the delivery-health recovery card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
+      );
     }
   }
 
@@ -470,26 +733,33 @@ const HARD_RECOVERY_EVENT = "recovery_sent";
 const DELIVERY_ESCALATION_EVENT = "delivery_escalation_sent";
 const DELIVERY_RECOVERY_EVENT = "delivery_recovery_sent";
 
-// Fix 2: a recovery ENDS the outage its matching escalation was about. Once
-// `recoveryEvent` has fired more recently than `escalationEvent`, the 12h
-// throttle window from that stale escalation must not suppress a BRAND NEW
-// outage's own 3rd-consecutive-failure escalation - so this returns true
-// (escalation is due) whenever there has never been an escalation, OR the
-// most recent escalation was already ended by a later recovery, OR the
-// throttle window since the still-open escalation has elapsed (>=, not >:
-// Fix 5's exact-boundary case resends right at the 12h mark, not only after
-// it).
-function isEscalationDue(db, now, escalationEvent, recoveryEvent) {
-  const previousEscalation = lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, escalationEvent);
-  if (!previousEscalation) {
+// Fix 2 (task H1 fix round): a recovery ENDS the outage its matching
+// escalation was about. Once `recoveryEvent` has fired more recently than
+// `escalationEvent`, the 12h throttle window from that stale escalation must
+// not suppress a BRAND NEW outage's own 3rd-consecutive-failure escalation -
+// so this returns true (escalation is due) whenever there has never been an
+// escalation, OR the most recent escalation was already ended by a later
+// recovery, OR the throttle window since the still-open escalation has
+// elapsed (>=, not >: Fix 5's exact-boundary case resends right at the 12h
+// mark, not only after it).
+//
+// escalationDueFrom/recoveryDueFrom (task H1 second fix round) are the pure
+// core of isEscalationDue/isRecoveryDue below, taking already-resolved
+// timestamps directly instead of reading them from the db themselves. Pulled
+// out so recordFailureRun/recordSuccessRun's HARD-failure pair can feed it
+// the Fix 4 file-fallback-MERGED timestamps (see newerIso above), while
+// isEscalationDue/isRecoveryDue stay the plain db-only lookup the
+// delivery-health pair still uses unchanged.
+function escalationDueFrom(now, previousEscalationIso, previousRecoveryIso) {
+  if (!previousEscalationIso) {
     return true;
   }
-  const previousRecovery = lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, recoveryEvent);
-  const outageAlreadyEnded = previousRecovery && Date.parse(previousRecovery) > Date.parse(previousEscalation);
+  const outageAlreadyEnded =
+    previousRecoveryIso && Date.parse(previousRecoveryIso) > Date.parse(previousEscalationIso);
   if (outageAlreadyEnded) {
     return true;
   }
-  const elapsedMs = now.getTime() - Date.parse(previousEscalation);
+  const elapsedMs = now.getTime() - Date.parse(previousEscalationIso);
   return elapsedMs >= ESCALATION_THROTTLE_MS;
 }
 
@@ -498,14 +768,28 @@ function isEscalationDue(db, now, escalationEvent, recoveryEvent) {
 // versus - escalationEvent). The common "no outage to recover from" path
 // (no escalation on record at all) returns false without ever touching
 // sendOperatorCard.
-function isRecoveryDue(db, escalationEvent, recoveryEvent) {
-  const previousEscalation = lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, escalationEvent);
-  if (!previousEscalation) {
+function recoveryDueFrom(previousEscalationIso, previousRecoveryIso) {
+  if (!previousEscalationIso) {
     return false;
   }
-  const previousRecovery = lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, recoveryEvent);
-  const alreadyRecovered = previousRecovery && Date.parse(previousRecovery) >= Date.parse(previousEscalation);
+  const alreadyRecovered =
+    previousRecoveryIso && Date.parse(previousRecoveryIso) >= Date.parse(previousEscalationIso);
   return !alreadyRecovered;
+}
+
+function isEscalationDue(db, now, escalationEvent, recoveryEvent) {
+  return escalationDueFrom(
+    now,
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, escalationEvent),
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, recoveryEvent)
+  );
+}
+
+function isRecoveryDue(db, escalationEvent, recoveryEvent) {
+  return recoveryDueFrom(
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, escalationEvent),
+    lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, recoveryEvent)
+  );
 }
 
 // Sends an escalation card and returns the evidence marker to push for it -
@@ -555,6 +839,15 @@ async function sendRecoveryCard(db, transport, now, card, recoveryEvent) {
 async function sendOperatorCard(db, transport, card) {
   const reachableMembers = new MemberRepository(db).listActive().filter((member) => member.feishuOpenId);
   let anyDelivered = false;
+  // Fix 5 (task H1 second fix round): this loop deliberately keeps going
+  // through every reachable member even after one send succeeds, and never
+  // retries a member whose own send failed - one successful send out of N is
+  // enough to mark the whole escalation "delivered" (see the `anyDelivered`
+  // check below). That is intentional for an OPERATOR alert: the point is
+  // that at least one human sees it, not that every recipient's copy is
+  // guaranteed, and a stuck member's send failing repeatedly must never by
+  // itself keep the alert stuck at "undeliverable" while everyone else got
+  // it fine.
   for (const member of reachableMembers) {
     const result = await sendInteractiveCard(card, { openId: member.feishuOpenId }, transport);
     if (result.ok) {

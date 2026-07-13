@@ -44,8 +44,46 @@
 // or an "escalation" is, and never imports notifications.js. All of that
 // policy (thresholds, throttle window, card copy, who to send to) lives in
 // market-alerts-poll.mjs; this module only knows how to read/write rows.
+//
+// task H1 second fix round (a review of the FIRST fix round found the
+// delivery-health detector it added was itself inert in production - see
+// market-alerts-poll.mjs's module header for the full four-fix account):
+//
+//   Fix 1 - consecutiveMarkerCount's plain break-on-first-miss streak is
+//   unsound for "delivery health": a cycle with `fires === 0` is NEUTRAL (it
+//   never attempted delivery at all) and carries no delivery_health_bad
+//   marker, exactly like a genuinely HEALTHY cycle - the plain streak can't
+//   tell those two apart and resets on either. Since real alert fires are
+//   sparse (once_daily rules, a daily quota), a persistently broken
+//   transport produces "bad, empty, bad, empty, bad, ..." forever and the
+//   escalation threshold is never reached. consecutiveStickyMarkerCount
+//   below fixes this by requiring a SECOND marker (`attemptEvent`) that
+//   distinguishes "this cycle attempted delivery" (fires>0) from "neutral,
+//   nothing to deliver" (fires===0): neutral rows (missing attemptEvent
+//   entirely) are skipped without affecting the count either way; only a
+//   row that DID attempt delivery but was healthy (attemptEvent present,
+//   markerEvent absent) ends the streak.
+//
+//   Fix 5 - every one of these scans used to run `SELECT ... WHERE job = ?
+//   ORDER BY rowid DESC` with no LIMIT at all, re-reading the job's ENTIRE
+//   run_log history every single cycle forever as the table grows. Every
+//   scan below now takes an explicit `limit` (default
+//   RUN_LOG_LOOKBACK_LIMIT = 200, overridable for tests) so per-cycle cost
+//   stays flat. 200 is chosen, not an arbitrary round number: at this
+//   poller's worst-case ~5-minute tick cadence (a calendar-coverage failure
+//   ticks day and night, not just during market hours - see
+//   market-alerts-poll.mjs), 200 rows covers a bit over 16.6 hours of
+//   history - comfortably more than the 12h ESCALATION_THROTTLE_MS resend
+//   window. Since a still-open outage keeps re-sending (and re-marking) its
+//   escalation every 12h, the MOST RECENT escalation marker is therefore
+//   always <12h old for as long as the outage continues, which keeps it
+//   inside this window - so lastMarkerAt can always find the escalation a
+//   later recovery needs to see, even though the scan itself is bounded.
 
 import { createId } from "../../../packages/shared-types/dist/index.js";
+
+// See Fix 5 above for why 200 was chosen.
+export const RUN_LOG_LOOKBACK_LIMIT = 200;
 
 /**
  * Insert one run_log row for a completed (or failed) job run.
@@ -130,10 +168,15 @@ export function recentFailures(db, job, limit = 10) {
  *
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {string} job
+ * @param {number} [limit] bounds the scan to this job's `limit` most recent
+ *   rows (see module header's Fix 5) - a job stuck failing forever would
+ *   otherwise make this a full-table scan every single cycle.
  * @returns {number}
  */
-export function consecutiveFailureCount(db, job) {
-  const rows = db.prepare(`SELECT ok FROM run_log WHERE job = ? ORDER BY rowid DESC`).all(String(job));
+export function consecutiveFailureCount(db, job, limit = RUN_LOG_LOOKBACK_LIMIT) {
+  const rows = db
+    .prepare(`SELECT ok FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
+    .all(String(job), Math.max(1, Number(limit ?? RUN_LOG_LOOKBACK_LIMIT)));
   let count = 0;
   for (const row of rows) {
     if (Number(row.ok) === 1) {
@@ -173,8 +216,10 @@ export function lastRecoveryAt(db, job) {
  * above are unchanged, kept as the two named convenience wrappers existing
  * callers/tests already use.
  */
-export function lastMarkerAt(db, job, event) {
-  const rows = db.prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC`).all(String(job));
+export function lastMarkerAt(db, job, event, limit = RUN_LOG_LOOKBACK_LIMIT) {
+  const rows = db
+    .prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
+    .all(String(job), Math.max(1, Number(limit ?? RUN_LOG_LOOKBACK_LIMIT)));
   for (const row of rows) {
     const markers = parseJsonArray(row.evidence);
     const hit = markers.find((marker) => marker && typeof marker === "object" && marker.event === event);
@@ -198,13 +243,55 @@ export function lastMarkerAt(db, job, event) {
  * break-on-first-miss semantics (a healthy cycle OR a hard failure resets
  * the streak to 0, since neither carries the marker).
  */
-export function consecutiveMarkerCount(db, job, markerEvent) {
-  const rows = db.prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC`).all(String(job));
+export function consecutiveMarkerCount(db, job, markerEvent, limit = RUN_LOG_LOOKBACK_LIMIT) {
+  const rows = db
+    .prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
+    .all(String(job), Math.max(1, Number(limit ?? RUN_LOG_LOOKBACK_LIMIT)));
   let count = 0;
   for (const row of rows) {
     const markers = parseJsonArray(row.evidence);
     const hasMarker = markers.some((marker) => marker && typeof marker === "object" && marker.event === markerEvent);
     if (!hasMarker) {
+      break;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Sticky variant of consecutiveMarkerCount - see module header's Fix 1 for
+ * the full rationale. Counts consecutive occurrences of `markerEvent` among
+ * only the rows that carry `attemptEvent` at all, walking newest-first:
+ *
+ *   - a row missing `attemptEvent` entirely is NEUTRAL - it is skipped
+ *     (neither counted nor stopping the scan);
+ *   - a row carrying `attemptEvent` but NOT `markerEvent` is a healthy
+ *     attempt - the scan stops here (the streak is over);
+ *   - a row carrying both is a bad attempt - counted, and the scan
+ *     continues further back.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string} job
+ * @param {string} markerEvent the "bad" marker (e.g. "delivery_health_bad")
+ * @param {string} attemptEvent the marker present on every row that counts as
+ *   an "attempt" at all, bad or healthy (e.g. "delivery_attempted")
+ * @param {number} [limit] see module header's Fix 5
+ * @returns {number}
+ */
+export function consecutiveStickyMarkerCount(db, job, markerEvent, attemptEvent, limit = RUN_LOG_LOOKBACK_LIMIT) {
+  const rows = db
+    .prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
+    .all(String(job), Math.max(1, Number(limit ?? RUN_LOG_LOOKBACK_LIMIT)));
+  let count = 0;
+  for (const row of rows) {
+    const markers = parseJsonArray(row.evidence);
+    const isAttempt = markers.some((marker) => marker && typeof marker === "object" && marker.event === attemptEvent);
+    if (!isAttempt) {
+      continue;
+    }
+    const isBad = markers.some((marker) => marker && typeof marker === "object" && marker.event === markerEvent);
+    if (!isBad) {
       break;
     }
     count += 1;

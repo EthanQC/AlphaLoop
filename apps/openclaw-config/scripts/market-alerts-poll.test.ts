@@ -948,6 +948,226 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
   });
 });
 
+// A review of the delivery-blindness detector added by the fix round above
+// found it was ITSELF inert in production - see market-alerts-poll.mjs's
+// module header for the full four-fix account. Each fix below is TDD'd
+// against the exact scenario the review named.
+describe("task H1 second fix round: the delivery-health detector's own inert paths", () => {
+  function seedOneRule(db: DatabaseSync) {
+    seedMember(db, "member_1");
+    return store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+  }
+
+  function seedUnrealizedPnlRule(db: DatabaseSync, ownerId = "member_1") {
+    return store.insertRule(db, {
+      ownerId,
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "both",
+      frequency: "continuous"
+    });
+  }
+
+  const highQuote = async () => ({ "NVDA.US": { price: 110, prevClose: 105, volume: 1000 } });
+  const lowQuote = async () => ({ "NVDA.US": { price: 90, prevClose: 95, volume: 1000 } });
+
+  // Local to this describe block (the sibling block above defines its own
+  // copy scoped to its own callback) - deliberately embeds a secret-shaped
+  // token, mirroring the sibling block's own rationale for reusing it here.
+  const failingQuoteProvider = async (): Promise<never> => {
+    throw new Error("Longbridge quote failed: LARK_APP_SECRET=shh-do-not-leak-this should never leak");
+  };
+
+  // Fix 1: a broken transport (real card sends always fail) with SPARSE fires
+  // (a rearmed rule fires, then disarms and stays quiet on a repeated
+  // same-direction cycle, then fires again on the next opposite breach) must
+  // still escalate - the old streak-based counter reset on every "empty"
+  // (fires===0) cycle in between and never reached the threshold.
+  it("(a) a sparse-fire sequence (unhealthy, empty, unhealthy, empty, unhealthy) still escalates the delivery-health card", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedUnrealizedPnlRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100 }] });
+
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        const title = String(cardJson?.header?.title?.content ?? "");
+        sent.push({ target, cardJson, title });
+        if (title.startsWith("盘中提醒")) {
+          return { ok: false, error: "simulated Feishu auth expiry" };
+        }
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    // high (fires up) -> high again (same direction, disarmed, NO fire) ->
+    // low (opposite breach, fires down) -> low again (same direction,
+    // disarmed, NO fire) -> high (opposite breach, fires up).
+    const results = [];
+    for (const quoteProvider of [highQuote, highQuote, lowQuote, lowQuote, highQuote]) {
+      results.push(
+        await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider, transport })
+      );
+    }
+
+    expect(results.map((r) => r.fires)).toEqual([1, 0, 1, 0, 1]);
+    for (const r of results) {
+      expect(r.sent).toBe(0);
+    }
+
+    const escalationCards = sent.filter((entry) => entry.title === "⚠ 提醒卡片投递持续失败");
+    expect(escalationCards).toHaveLength(1);
+  });
+
+  // Fix 2: `skipped` (a fire for a member with no feishuOpenId on file - the
+  // current production shape) must count as unhealthy exactly like `failed`
+  // does, with its own distinct card text pointing at the actual fix (bind a
+  // Feishu account), not the auth-troubleshooting text.
+  it("(b) fires with only `skipped` misses (no member has a feishuOpenId) escalate with the no-recipient card text", async () => {
+    const { db, dbPath } = makeDb();
+    seedMemberNoFeishu(db, "member_1");
+    seedUnrealizedPnlRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100 }] });
+
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson, title: String(cardJson?.header?.title?.content ?? "") });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    const results = [];
+    for (const quoteProvider of [highQuote, lowQuote, highQuote]) {
+      results.push(
+        await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider, transport })
+      );
+    }
+
+    for (const r of results) {
+      expect(r.fires).toBe(1);
+      expect(r.sent).toBe(0);
+      expect(r.failed).toBe(0);
+      expect(r.skipped).toBe(1);
+    }
+
+    const noRecipientCards = sent.filter((entry) => entry.title === "⚠ 提醒无法送达：无可达收件人");
+    expect(noRecipientCards).toHaveLength(1);
+    const bodyText = JSON.stringify(noRecipientCards[0]?.cardJson.body);
+    expect(bodyText).toContain("绑定");
+    expect(bodyText).toContain("飞书");
+    // The auth-troubleshooting text must NOT also fire for a pure no-recipient outage.
+    expect(sent.some((entry) => entry.title === "⚠ 提醒卡片投递持续失败")).toBe(false);
+  });
+
+  // Fix 3: an empty (fires===0) cycle right after a delivery escalation used
+  // to take the recovery branch anyway and send a false "recovered" card,
+  // which also reset the throttle - allowing an escalate/false-recover loop.
+  it("(c) an empty cycle after a delivery escalation does NOT send a recovery card; a later cycle with a REAL delivery does", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedUnrealizedPnlRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100 }] });
+
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const failingTransport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        const title = String(cardJson?.header?.title?.content ?? "");
+        sent.push({ target, cardJson, title });
+        if (title.startsWith("盘中提醒")) {
+          return { ok: false, error: "simulated Feishu auth expiry" };
+        }
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    // 3 consecutive real fires, all undelivered -> escalates on the 3rd.
+    for (const quoteProvider of [highQuote, lowQuote, highQuote]) {
+      const r = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider, transport: failingTransport });
+      expect(r.sent).toBe(0);
+    }
+    expect(sent.filter((e) => e.title === "⚠ 提醒卡片投递持续失败")).toHaveLength(1);
+
+    // An EMPTY cycle: same direction/price as the last fire (still "high",
+    // armedDirection already 'up') - disarmed, no breach, fires===0.
+    const emptyResult = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: highQuote,
+      transport: failingTransport
+    });
+    expect(emptyResult.fires).toBe(0);
+    expect(sent.some((e) => e.title === "✅ 提醒卡片投递已恢复")).toBe(false);
+
+    // A REAL successful delivery (opposite breach off "high"/'up', delivered
+    // this time) - only THIS may send the recovery card.
+    const healthyTransport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson, title: String(cardJson?.header?.title?.content ?? "") });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+    const recoveredResult = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: lowQuote,
+      transport: healthyTransport
+    });
+    expect(recoveredResult.sent).toBe(1);
+    expect(sent.filter((e) => e.title === "✅ 提醒卡片投递已恢复")).toHaveLength(1);
+  });
+
+  // Fix 4: a write-blocked db means recordJobRun throws on EVERY cycle, so
+  // the db-derived consecutiveFailureCount never advances past 1 (no row
+  // ever lands) and the 3-failure escalation threshold is never reached - a
+  // file-based fallback counter (kept in sync alongside the db, and used as
+  // max(dbCount, fileCount)) must still cross the threshold on the 3rd
+  // consecutive failure.
+  it("(d) db writes always throw: the 3rd consecutive failure still escalates via the file-based counter", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    for (let i = 0; i < 3; i += 1) {
+      vi.mocked(jobRunLog.recordJobRun).mockImplementationOnce(() => {
+        throw new Error("simulated persistent db lock while writing run_log");
+      });
+    }
+
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson, title: String(cardJson?.header?.title?.content ?? "") });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+
+    // Proves the db-only counter really was stuck: not one run_log row ever
+    // landed (every recordJobRun call threw), yet the escalation still fired.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
+    const escalationCards = sent.filter((entry) => entry.title === "⚠ 提醒器连续失败");
+    expect(escalationCards).toHaveLength(1);
+  });
+});
+
 // Fix 2 (spec-owner decision, task P2-6 fix round): positions/exposure must
 // be resolved PER OWNER against each owner's own latest official_paper_snapshots
 // row, not one globally-latest row shared by every owner. Inert today (only
