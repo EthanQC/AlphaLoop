@@ -8,8 +8,10 @@ import { openTradingDatabase } from "../../../packages/shared-types/dist/index.j
 import {
   consecutiveFailureCount,
   consecutiveStickyMarkerCount,
+  consecutiveStickyMarkerCountSince,
   lastEscalationAt,
   lastMarkerAt,
+  lastMarkerAtSince,
   lastRecoveryAt,
   recentFailures,
   recordJobRun
@@ -281,5 +283,122 @@ describe("consecutiveStickyMarkerCount (Fix 1, task H1 second fix round)", () =>
     }
     expect(consecutiveStickyMarkerCount(db, "j", "delivery_health_bad", "delivery_attempted")).toBe(5);
     expect(consecutiveStickyMarkerCount(db, "j", "delivery_health_bad", "delivery_attempted", 3)).toBe(3);
+  });
+});
+
+// Fix 1 (task H1 THIRD fix round, this task): the DELIVERY pair's scans must
+// be bounded by TIME (started_at >= now - windowMs), not by row count - see
+// module header for the full rationale (200 rows is barely 2.5 trading days
+// at this poller's cadence, and real delivery-outage attempts are sparse
+// enough to routinely span more rows than that while still being well
+// within any reasonable "same outage" window).
+describe("lastMarkerAtSince / consecutiveStickyMarkerCountSince (Fix 1, task H1 THIRD fix round)", () => {
+  const NOW = new Date("2026-07-15T00:00:00.000Z");
+
+  function isoMinutesBeforeNow(minutesBefore: number): string {
+    return new Date(NOW.getTime() - minutesBefore * 60 * 1000).toISOString();
+  }
+
+  function recordAttempt(db: DatabaseSync, startedAt: string, { bad }: { bad: boolean }): void {
+    const evidence: Array<Record<string, unknown>> = [{ event: "delivery_attempted", at: startedAt }];
+    if (bad) {
+      evidence.push({ event: "delivery_health_bad", at: startedAt });
+    }
+    recordJobRun(db, { job: "j", startedAt, ok: true, evidence });
+  }
+
+  function recordNeutral(db: DatabaseSync, startedAt: string): void {
+    recordJobRun(db, { job: "j", startedAt, ok: true, evidence: [] });
+  }
+
+  // THE regression test: three bad delivery attempts, each separated by ~100
+  // healthy/empty rows (>200 rows apart end to end, exactly the row-LIMIT
+  // trap the row-bounded consecutiveStickyMarkerCount falls into) - the
+  // sticky count across all three must still be 3, proving the fix, not just
+  // a smaller-scale unit of the same logic.
+  it("counts three bad delivery attempts spanning MORE than 200 rows (RUN_LOG_LOOKBACK_LIMIT), all inside the 30-day window", () => {
+    const { db } = makeDb();
+
+    // Oldest -> newest: bad, 100 neutral, bad, 100 neutral, bad. 5-minute
+    // ticks (this poller's own cadence), so the whole span is comfortably
+    // inside the 30-day window while comfortably exceeding 200 rows.
+    let minutesBefore = 210 * 5;
+    recordAttempt(db, isoMinutesBeforeNow(minutesBefore), { bad: true });
+    for (let i = 0; i < 100; i += 1) {
+      minutesBefore -= 5;
+      recordNeutral(db, isoMinutesBeforeNow(minutesBefore));
+    }
+    minutesBefore -= 5;
+    recordAttempt(db, isoMinutesBeforeNow(minutesBefore), { bad: true });
+    for (let i = 0; i < 100; i += 1) {
+      minutesBefore -= 5;
+      recordNeutral(db, isoMinutesBeforeNow(minutesBefore));
+    }
+    minutesBefore -= 5;
+    recordAttempt(db, isoMinutesBeforeNow(minutesBefore), { bad: true });
+
+    // 203 rows total - well past RUN_LOG_LOOKBACK_LIMIT (200). The
+    // row-bounded consecutiveStickyMarkerCount can only see the newest 200 of
+    // them, which excludes the very FIRST bad attempt entirely - proving the
+    // bug this fix closes, not a strawman.
+    expect(consecutiveStickyMarkerCount(db, "j", "delivery_health_bad", "delivery_attempted")).toBeLessThan(3);
+
+    // The time-bounded twin sees all three - this is the assertion that
+    // would have caught the round-3 regression.
+    expect(
+      consecutiveStickyMarkerCountSince(db, "j", "delivery_health_bad", "delivery_attempted", NOW)
+    ).toBe(3);
+  });
+
+  it("does not see a bad attempt OLDER than the 30-day window, even though it would still see one inside it", () => {
+    const { db } = makeDb();
+    const thirtyOneDaysAgo = new Date(NOW.getTime() - 31 * 24 * 60 * 60 * 1000).toISOString();
+    const tenDaysAgo = new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+    recordAttempt(db, thirtyOneDaysAgo, { bad: true });
+    recordAttempt(db, tenDaysAgo, { bad: true });
+
+    // Only the in-window attempt counts - the streak stops at the window
+    // boundary rather than reaching past it to the 31-day-old row.
+    expect(
+      consecutiveStickyMarkerCountSince(db, "j", "delivery_health_bad", "delivery_attempted", NOW)
+    ).toBe(1);
+  });
+
+  it("lastMarkerAtSince finds a marker inside the window and returns null once it ages past it", () => {
+    const { db } = makeDb();
+    const insideWindow = new Date(NOW.getTime() - 5 * 24 * 60 * 60 * 1000).toISOString();
+    recordJobRun(db, {
+      job: "j",
+      startedAt: insideWindow,
+      ok: true,
+      evidence: [{ event: "delivery_escalation_sent", at: insideWindow }]
+    });
+
+    expect(lastMarkerAtSince(db, "j", "delivery_escalation_sent", NOW)).toBe(insideWindow);
+    expect(
+      lastMarkerAtSince(db, "j", "delivery_escalation_sent", NOW, 3 * 24 * 60 * 60 * 1000)
+    ).toBeNull();
+  });
+
+  it("respects an explicit guardLimit override (pure runaway guard, not a real bound)", () => {
+    const { db } = makeDb();
+    for (let i = 0; i < 5; i += 1) {
+      recordAttempt(db, isoMinutesBeforeNow((5 - i) * 5), { bad: true });
+    }
+    expect(
+      consecutiveStickyMarkerCountSince(db, "j", "delivery_health_bad", "delivery_attempted", NOW)
+    ).toBe(5);
+    expect(
+      consecutiveStickyMarkerCountSince(
+        db,
+        "j",
+        "delivery_health_bad",
+        "delivery_attempted",
+        NOW,
+        undefined,
+        3
+      )
+    ).toBe(3);
   });
 });

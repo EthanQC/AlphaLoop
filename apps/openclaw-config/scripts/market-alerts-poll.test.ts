@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -17,9 +17,23 @@ vi.mock("./job-run-log.mjs", async (importOriginal) => {
   return { ...actual, recordJobRun: vi.fn(actual.recordJobRun as (...args: unknown[]) => unknown) };
 });
 
+// Fix 4 (task H1 THIRD fix round): renameSync is mocked the same way
+// (wrapping the REAL implementation via vi.fn(actual.renameSync), so every
+// OTHER test's use of node:fs - mkdtempSync/rmSync/existsSync/readFileSync
+// etc., all left untouched via `...actual` - behaves identically) purely so
+// the atomic-write test below can assert market-alerts-poll.mjs's own
+// writeJsonAtomic actually calls renameSync(tmpPath, path), not just that a
+// plain writeFileSync happened to leave no `.tmp` file lying around either
+// (which would pass a weaker "no leftover .tmp" check for the wrong reason).
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, renameSync: vi.fn(actual.renameSync as (...args: unknown[]) => unknown) };
+});
+
 const poll = await import("./market-alerts-poll.mjs");
 const store = await import("./market-alerts-store.mjs");
 const jobRunLog = await import("./job-run-log.mjs");
+const fsModule = await import("node:fs");
 
 // A known-good US regular-market-hours instant (Wednesday 10:30am US-Eastern,
 // July - EDT, no DST edge case), matching the fixture already used across
@@ -1165,6 +1179,316 @@ describe("task H1 second fix round: the delivery-health detector's own inert pat
     expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
     const escalationCards = sent.filter((entry) => entry.title === "⚠ 提醒器连续失败");
     expect(escalationCards).toHaveLength(1);
+  });
+});
+
+// A review of the SECOND fix round above found (1) its own Fix 5 row-LIMIT
+// optimization re-broke Fix 1's sticky delivery-health counter, and two more
+// silent-death paths in the escalation machinery itself: (2) a db that can't
+// even be OPENED still gets no escalation at all, and (3) a delivery
+// escalation whose whole point is "the Feishu channel is broken" rides that
+// exact same broken channel to report itself, so it's undeliverable by
+// construction with no external signal. Fix 4 (atomic writes) is exercised
+// throughout every test below implicitly (every state-file read after a
+// write goes through the same writeJsonAtomic path) and isn't its own
+// separate scenario to construct.
+describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, and the unreportable-outage artifact", () => {
+  function seedOneRule(db: DatabaseSync) {
+    seedMember(db, "member_1");
+    return store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+  }
+
+  function failingRealCardTransport(sink: Array<{ target: unknown; cardJson: any; title: string }>) {
+    return {
+      sendCard: async (target: unknown, cardJson: any) => {
+        const title = String(cardJson?.header?.title?.content ?? "");
+        sink.push({ target, cardJson, title });
+        if (title.startsWith("盘中提醒")) {
+          return { ok: false, error: "simulated Feishu auth expiry" };
+        }
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+  }
+
+  // Fix 1: THE regression test - three bad delivery attempts, each separated
+  // by ~100 healthy/empty rows (>200 rows apart end to end, well past
+  // job-run-log.mjs's RUN_LOG_LOOKBACK_LIMIT of 200), synthetically seeded
+  // directly into run_log (the same shape recordSuccessRun itself writes) so
+  // the test stays fast - then ONE real poll cycle that ALSO fails to
+  // deliver must still see the count as 3 and escalate, proving
+  // consecutiveStickyMarkerCountSince (not the row-bounded original) is what
+  // recordSuccessRun actually calls.
+  it("Fix 1: three bad delivery attempts spanning >200 run_log rows still escalate (the row-LIMIT regression this fix closes)", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }] });
+
+    const liveNow = new Date(TRADING_TIME);
+    let msBefore = 210 * 5 * 60 * 1000; // 5-minute ticks, this poller's own cadence
+
+    function seedRow(bad: boolean): void {
+      const startedAt = new Date(liveNow.getTime() - msBefore).toISOString();
+      msBefore -= 5 * 60 * 1000;
+      const evidence: Array<Record<string, unknown>> = [
+        { event: "delivery_counts", evaluated: 1, fires: bad ? 1 : 0, sent: 0, failed: bad ? 1 : 0, skipped: 0 }
+      ];
+      if (bad) {
+        evidence.push({ event: "delivery_attempted", at: startedAt });
+        evidence.push({ event: "delivery_health_bad", at: startedAt, reason: "send_failed" });
+      }
+      jobRunLog.recordJobRun(db, {
+        job: "market-alerts",
+        startedAt,
+        finishedAt: startedAt,
+        ok: true,
+        actions: ["poll"],
+        evidence
+      });
+    }
+
+    // Oldest -> newest: bad, 100 neutral, bad, 100 neutral (202 seeded rows -
+    // already past the 200-row LIMIT before the live 3rd bad attempt below
+    // even runs).
+    seedRow(true);
+    for (let i = 0; i < 100; i += 1) seedRow(false);
+    seedRow(true);
+    for (let i = 0; i < 100; i += 1) seedRow(false);
+
+    const preExistingRows = (db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c;
+    expect(preExistingRows).toBeGreaterThan(200);
+
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const transport = failingRealCardTransport(sent);
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: liveNow,
+      quoteProvider: async () => ({ "NVDA.US": { price: 950, prevClose: 900, volume: 1000 } }),
+      transport
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.fires).toBe(1);
+    expect(result.sent).toBe(0);
+    expect(result.failed).toBe(1);
+
+    const escalationCards = sent.filter((entry) => entry.title === "⚠ 提醒卡片投递持续失败");
+    expect(escalationCards).toHaveLength(1);
+  });
+
+  // Fix 2: openTradingDatabase itself throws on every attempt (not a
+  // transient write-lock with a db handle that DID open - see the "(d) db
+  // writes always throw" test in the sibling describe block above for that
+  // case). Reproduced by making dbPath an actual directory rather than
+  // mocking anything: `new DatabaseSync(aDirectoryPath)` throws for real, the
+  // same class of failure as a corrupt sqlite file or a read-only runtime
+  // dir.
+  it("Fix 2: openTradingDatabase failing to OPEN AT ALL still escalates via the file counter (3rd fails->throttles->resets on recovery)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-alerts-poll-dbopen-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "trading.sqlite");
+    mkdirSync(dbPath, { recursive: true }); // dbPath itself is a directory - opening it as a db always throws
+
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), transport })
+      ).rejects.toThrow(/unable to open database file/i);
+    }
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器数据库不可用");
+    const bodyText = JSON.stringify(sent[0]?.cardJson.body);
+    expect(bodyText).toContain("已连续 3 次");
+    expect(bodyText).toContain("无法打开");
+
+    // 4th consecutive failure: throttled, no resend.
+    await expect(
+      poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), transport })
+    ).rejects.toThrow(/unable to open database file/i);
+    expect(sent).toHaveLength(1);
+
+    const statePath = join(dir, "market-alerts", "poller-state.json");
+    const stateAfterFailures = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(stateAfterFailures.consecutiveFailures).toBe(4);
+
+    // "a later successful run resets the file counter": remove the
+    // stand-in directory so the SAME dbPath now opens as a genuine (fresh)
+    // sqlite file.
+    rmSync(dbPath, { recursive: true, force: true });
+    const result = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), transport });
+    expect(result.ok).toBe(true);
+
+    const stateAfterRecovery = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(stateAfterRecovery.consecutiveFailures).toBe(0);
+  });
+
+  // Fix 3 + Fix 4: an escalation that ends up undeliverable (the member send
+  // AND the `{}` fallback both fail - exactly "the wire it reports as dead")
+  // writes runtime/market-alerts/ALERTER-DOWN.json; a subsequent cycle that
+  // is otherwise "ok" (0 enabled rules - nothing to evaluate at all) still
+  // reports `alerterDown: true` while the artifact persists; the first
+  // delivery that actually gets through deletes it and clears the flag.
+  it("Fix 3: an undeliverable escalation writes ALERTER-DOWN.json (rewritten each cycle), and a later otherwise-ok cycle still reports alerterDown:true", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const alwaysFailTransport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson });
+        return { ok: false, error: "simulated total Feishu outage" };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    const failingQuoteProvider = async (): Promise<never> => {
+      throw new Error("Longbridge quote failed: forcing a hard-failure escalation");
+    };
+
+    const artifactPath = join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json");
+    expect(existsSync(artifactPath)).toBe(false);
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport: alwaysFailTransport })
+      ).rejects.toThrow();
+    }
+    // Member send + fallback send, both failing, on the 3rd consecutive failure.
+    expect(sent.length).toBeGreaterThan(0);
+    expect(existsSync(artifactPath)).toBe(true);
+    const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
+    expect(artifact).toMatchObject({ consecutiveFailures: 3, reason: "send_failed" });
+    expect(typeof artifact.since).toBe("string");
+    expect(typeof artifact.lastAttemptAt).toBe("string");
+
+    // The undeliverable escalation is never throttled (no "_sent" marker was
+    // ever written), so it retries - and rewrites the artifact - on the very
+    // next consecutive failure too. `since` (the ORIGINAL onset) must be
+    // preserved across the rewrite even as `lastAttemptAt`/consecutiveFailures
+    // advance. A strictly later `now` (not the same instant) proves
+    // `lastAttemptAt` actually moved rather than passing by coincidence.
+    const fourthNow = new Date(new Date(TRADING_TIME).getTime() + 60_000);
+    await expect(
+      poll.runMarketAlertsPoll({ dbPath, now: fourthNow, quoteProvider: failingQuoteProvider, transport: alwaysFailTransport })
+    ).rejects.toThrow();
+    const rewritten = JSON.parse(readFileSync(artifactPath, "utf8"));
+    expect(rewritten.consecutiveFailures).toBe(4);
+    expect(rewritten.since).toBe(artifact.since);
+    expect(rewritten.lastAttemptAt).not.toBe(artifact.lastAttemptAt);
+
+    // A later cycle with NOTHING to do (delete the rule so pollOnce
+    // quick-exits with 0 enabled rules) is otherwise a totally "ok" cycle -
+    // but the artifact from the unresolved outage above must still flag it.
+    db.prepare("DELETE FROM alert_rules").run();
+    const quietResult = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      transport: alwaysFailTransport
+    });
+    expect(quietResult.ok).toBe(true);
+    expect(quietResult.alerterDown).toBe(true);
+    expect(existsSync(artifactPath)).toBe(true); // still down - unresolved
+  });
+
+  it("Fix 3: the artifact is deleted the moment an escalation actually gets delivered again", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    let deliverable = false;
+    // Fails for the first 3 cycles, then starts succeeding - simulates the
+    // Feishu channel itself coming back up, independent of whatever the
+    // underlying hard failure (a bad quote provider, below) is doing.
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson });
+        return deliverable ? { ok: true } : { ok: false, error: "simulated total Feishu outage" };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    const failingQuoteProvider = async (): Promise<never> => {
+      throw new Error("Longbridge quote failed: forcing a hard-failure escalation");
+    };
+
+    const artifactPath = join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json");
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+    expect(existsSync(artifactPath)).toBe(true);
+
+    // The underlying hard failure is STILL happening (same failingQuoteProvider)
+    // but the Feishu channel itself now works - the escalation RETRY (not a
+    // recovery card - the outage per run_log hasn't ended) gets through and
+    // must clear the artifact.
+    deliverable = true;
+    await expect(
+      poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+    ).rejects.toThrow();
+
+    expect(existsSync(artifactPath)).toBe(false);
+  });
+
+  // Fix 4: poller-state.json/ALERTER-DOWN.json must be written via
+  // tmp+renameSync (mirroring backup-trading-data.mjs's
+  // backupTradingDatabase), not a bare writeFileSync - a crash mid-write
+  // must never leave a half-written state file (a rename is atomic; a bare
+  // writeFileSync is not). Asserts the ACTUAL renameSync(tmpPath, path) call
+  // happened (via the node:fs mock above) rather than just checking for the
+  // absence of a leftover `.tmp` file - a plain writeFileSync wouldn't leave
+  // one lying around EITHER in the success case, so that weaker check would
+  // pass for the wrong reason and not actually catch a regression back to a
+  // bare writeFileSync.
+  it("Fix 4: state files are written via tmp+renameSync, not a bare writeFileSync - content round-trips", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+
+    const dir = dirname(dbPath);
+    const statePath = join(dir, "market-alerts", "poller-state.json");
+    const artifactPath = join(dir, "market-alerts", "ALERTER-DOWN.json");
+
+    const alwaysFailTransport = {
+      sendCard: async () => ({ ok: false, error: "simulated total Feishu outage" }),
+      updateCard: async () => ({ ok: true })
+    };
+    const failingQuoteProvider = async (): Promise<never> => {
+      throw new Error("Longbridge quote failed: forcing atomic-write coverage");
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport: alwaysFailTransport })
+      ).rejects.toThrow();
+    }
+
+    expect(vi.mocked(fsModule.renameSync)).toHaveBeenCalledWith(`${statePath}.tmp`, statePath);
+    expect(vi.mocked(fsModule.renameSync)).toHaveBeenCalledWith(`${artifactPath}.tmp`, artifactPath);
+    expect(existsSync(`${statePath}.tmp`)).toBe(false);
+    expect(existsSync(`${artifactPath}.tmp`)).toBe(false);
+
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(state.consecutiveFailures).toBe(3);
+    const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
+    expect(artifact.consecutiveFailures).toBe(3);
   });
 });
 
