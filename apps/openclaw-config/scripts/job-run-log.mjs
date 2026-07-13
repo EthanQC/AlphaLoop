@@ -141,16 +141,24 @@ export const RUN_LOG_LOOKBACK_LIMIT = 200;
 export const DELIVERY_LOOKBACK_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 // A pure runaway guard, NOT a real bound - it must never actually truncate a
-// normal 30-day window. Even a pathological future cadence change (ticking
-// once a MINUTE, 24/7, forever) is only ~43,200 rows/30 days; today's actual
-// worst case (this poller's own ~300s/5-minute cadence, ticking day and
-// night for a calendar-coverage failure - see market-alerts-poll.mjs) is
-// under 8,700 rows/30 days. 5,000 sits comfortably below even the
-// pathological case specifically so a runaway/corrupted run_log can never
-// turn this into an unbounded full-table scan, while staying far enough
-// above the real worst case that it can never bite the window this task
-// exists to fix.
-export const DELIVERY_LOOKBACK_GUARD_LIMIT = 5000;
+// normal 30-day window. Today's actual worst case (this poller's own
+// ~300s/5-minute cadence, ticking day and night for a calendar-coverage
+// failure - see market-alerts-poll.mjs) is 30 * 24 * 60 / 5 = 8,640 rows/30
+// days.
+//
+// task H1 FOURTH fix round (this task) - Fix C: the PREVIOUS value here was
+// 5,000, which a review correctly flagged as self-contradicting: 5,000 <
+// 8,640, so the guard could in fact truncate the real 30-day window on
+// exactly the worst-case cadence this same comment described - the opposite
+// of "can never bite the window", and precisely the class of wrong-safety-
+// argument bound that caused the round-3 regression (RUN_LOG_LOOKBACK_LIMIT
+// being too small for the DELIVERY pair) in the first place. Fixed by
+// raising this to 50,000 - comfortably (~5.8x) above the derived 8,640-row
+// worst case, so it stays a pure runaway/corrupted-table guard that can
+// never legitimately fire, while still bounding a pathological future
+// cadence change (e.g. ticking once a MINUTE, 24/7, forever, which would be
+// ~43,200 rows/30 days - itself already under 50,000).
+export const DELIVERY_LOOKBACK_GUARD_LIMIT = 50_000;
 
 /**
  * Insert one run_log row for a completed (or failed) job run.

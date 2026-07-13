@@ -9,6 +9,7 @@ import {
   consecutiveFailureCount,
   consecutiveStickyMarkerCount,
   consecutiveStickyMarkerCountSince,
+  DELIVERY_LOOKBACK_GUARD_LIMIT,
   lastEscalationAt,
   lastMarkerAt,
   lastMarkerAtSince,
@@ -379,6 +380,17 @@ describe("lastMarkerAtSince / consecutiveStickyMarkerCountSince (Fix 1, task H1 
     expect(
       lastMarkerAtSince(db, "j", "delivery_escalation_sent", NOW, 3 * 24 * 60 * 60 * 1000)
     ).toBeNull();
+  });
+
+  // Fix C (task H1 FOURTH fix round): the PREVIOUS default (5,000) was below
+  // this module's own derived 30-day worst case (~8,640 rows, this poller's
+  // 5-minute cadence ticking day and night on a calendar-coverage failure) -
+  // a "guard" that could truncate the very window it claimed to never bite.
+  // 50,000 is comfortably (~5.8x) above that worst case.
+  it("DELIVERY_LOOKBACK_GUARD_LIMIT's default is comfortably above the derived 30-day worst case (Fix C)", () => {
+    const worstCaseRowsPer30Days = 30 * 24 * ((60 * 60) / (5 * 60)); // 5-minute ticks, 24/7
+    expect(DELIVERY_LOOKBACK_GUARD_LIMIT).toBeGreaterThanOrEqual(50_000);
+    expect(DELIVERY_LOOKBACK_GUARD_LIMIT).toBeGreaterThan(worstCaseRowsPer30Days * 2);
   });
 
   it("respects an explicit guardLimit override (pure runaway guard, not a real bound)", () => {

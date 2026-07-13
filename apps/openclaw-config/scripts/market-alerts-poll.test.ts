@@ -1394,8 +1394,20 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
     expect(rewritten.lastAttemptAt).not.toBe(artifact.lastAttemptAt);
 
     // A later cycle with NOTHING to do (delete the rule so pollOnce
-    // quick-exits with 0 enabled rules) is otherwise a totally "ok" cycle -
-    // but the artifact from the unresolved outage above must still flag it.
+    // quick-exits with 0 enabled rules) is otherwise a totally "ok" cycle.
+    //
+    // Fix B (task H1 FOURTH fix round) revises this from the PRE-Fix-B
+    // expectation (the artifact staying `alerterDown: true` forever, because
+    // the escalation was never DELIVERED so the marker-based recovery check
+    // could never see an outage "on record" to close): this quiet cycle is a
+    // genuine poll SUCCESS that ends the 4-failure hard-failure streak
+    // recorded above - one of Fix B's own independent proofs of health, even
+    // though the best-effort recovery notice this cycle also attempts still
+    // fails to deliver (still `alwaysFailTransport`). Proof of health is this
+    // cycle's own poll outcome, not whether that one extra notice happens to
+    // get through - so the artifact clears and the exit-code signal turns
+    // off immediately instead of latching forever, which was precisely the
+    // bug Fix B closes.
     db.prepare("DELETE FROM alert_rules").run();
     const quietResult = await poll.runMarketAlertsPoll({
       dbPath,
@@ -1403,8 +1415,8 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
       transport: alwaysFailTransport
     });
     expect(quietResult.ok).toBe(true);
-    expect(quietResult.alerterDown).toBe(true);
-    expect(existsSync(artifactPath)).toBe(true); // still down - unresolved
+    expect(quietResult.alerterDown).toBeUndefined();
+    expect(existsSync(artifactPath)).toBe(false);
   });
 
   it("Fix 3: the artifact is deleted the moment an escalation actually gets delivered again", async () => {
@@ -1489,6 +1501,251 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
     expect(state.consecutiveFailures).toBe(3);
     const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
     expect(artifact.consecutiveFailures).toBe(3);
+  });
+});
+
+// A final review of the THIRD fix round found two more ways the counters/
+// artifact could go silently dead, plus smaller gaps in the same machinery -
+// see market-alerts-poll.mjs's module header ("task H1 FOURTH fix round")
+// for the full account. Each fix below is TDD'd against the exact scenario
+// the review named.
+describe("task H1 FOURTH fix round: unpersistable counters and the permanently-latched artifact", () => {
+  function seedOneRule(db: DatabaseSync) {
+    seedMember(db, "member_1");
+    return store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+  }
+
+  // Fix A - the CONTRACT's test (a): both db writes AND file writes fail on
+  // the SAME cycle. recordFailureRun's path: the db opened fine (a real
+  // handle exists) but THIS cycle's own INSERT still throws (mocked, mirrors
+  // the sibling "(d) db writes always throw" test in the second-fix-round
+  // describe block above), and poller-state.json's write ALSO fails (the
+  // shared node:fs renameSync mock, throwing once). Neither backstop can
+  // record this cycle's failure, so the normal 3-failure threshold can never
+  // be reached from here on - the fix must escalate on THIS, the very FIRST,
+  // failing cycle instead.
+  it("(Fix A) db INSERT throws AND the state file also fails to write: escalates on the FIRST failing cycle, not the 3rd", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    vi.mocked(jobRunLog.recordJobRun).mockImplementationOnce(() => {
+      throw new Error("simulated db insert failure (disk full)");
+    });
+    vi.mocked(fsModule.renameSync).mockImplementationOnce(() => {
+      throw new Error("simulated state file write failure (disk full)");
+    });
+
+    await expect(
+      poll.runMarketAlertsPoll({
+        dbPath,
+        now: new Date(TRADING_TIME),
+        quoteProvider: async () => {
+          throw new Error("Longbridge quote failed: forcing a hard-failure cycle");
+        },
+        transport
+      })
+    ).rejects.toThrow(/Longbridge quote failed/);
+
+    // Escalated immediately - not throttled/waiting for a 3rd consecutive
+    // failure the counter can never actually reach from this state.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器状态无法持久化（磁盘/权限故障）");
+
+    // Proves neither backstop actually persisted this cycle - the db insert
+    // really did throw (no row landed) and the state write really did fail.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
+  });
+
+  // Fix A, the db-can't-even-OPEN twin (escalateWithoutDb): reproduced the
+  // same way as the sibling "Fix 2: openTradingDatabase failing to OPEN AT
+  // ALL" test above (dbPath IS a directory), with the state-file write ALSO
+  // failing this same cycle.
+  it("(Fix A) db cannot even be opened AND the state file also fails to write: escalates on the FIRST cycle, not the 3rd", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-alerts-poll-dbopen-unpersistable-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "trading.sqlite");
+    mkdirSync(dbPath, { recursive: true }); // dbPath itself is a directory - opening it as a db always throws
+
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sent.push({ target, cardJson });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    vi.mocked(fsModule.renameSync).mockImplementationOnce(() => {
+      throw new Error("simulated state file write failure (disk full)");
+    });
+
+    await expect(poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), transport })).rejects.toThrow(
+      /unable to open database file/i
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器状态无法持久化（磁盘/权限故障）");
+
+    const statePath = join(dir, "market-alerts", "poller-state.json");
+    expect(existsSync(statePath)).toBe(false); // the write really failed - nothing persisted
+  });
+
+  // Fix B/C - the CONTRACT's tests (b) and (c): an escalation that itself
+  // never reaches anyone (the whole Feishu channel is dead) writes ONLY an
+  // `*_undeliverable` marker, never `delivery_escalation_sent` - so the
+  // EXISTING marker-based recovery branch (isRecoveryDue) can never fire once
+  // the channel comes back, and pre-fix, the artifact would never clear. The
+  // next cycle that actually delivers (sent > 0) must clear it anyway, and a
+  // BRAND NEW outage afterward must start a fresh `since`.
+  it("(Fix B/C) an undeliverable delivery escalation writes the artifact; a later sent>0 cycle clears it with no *_sent marker ever recorded; a NEW outage afterward gets a fresh `since`", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "both",
+      frequency: "continuous"
+    });
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100 }] });
+
+    let channelDead = true;
+    const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+    const transport = {
+      sendCard: async (target: unknown, cardJson: any) => {
+        const title = String(cardJson?.header?.title?.content ?? "");
+        sent.push({ target, cardJson, title });
+        return channelDead ? { ok: false, error: "simulated total Feishu outage" } : { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+
+    const artifactPath = join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json");
+    const highQuote = async () => ({ "NVDA.US": { price: 110, prevClose: 105, volume: 1000 } });
+    const lowQuote = async () => ({ "NVDA.US": { price: 90, prevClose: 95, volume: 1000 } });
+
+    // 3 consecutive real fires, all undelivered - AND the escalation card
+    // ITSELF fails to reach anyone too (the whole channel is dead), so the
+    // artifact gets written.
+    for (const quoteProvider of [highQuote, lowQuote, highQuote]) {
+      const r = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider, transport });
+      expect(r.sent).toBe(0);
+    }
+    expect(existsSync(artifactPath)).toBe(true);
+    const firstSince = (JSON.parse(readFileSync(artifactPath, "utf8")) as { since: string }).since;
+
+    // Proves the gap this fix closes: no `delivery_escalation_sent` marker
+    // was EVER recorded for this outage (every attempt was undeliverable).
+    const rowsBefore = db
+      .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid ASC")
+      .all() as Array<{ evidence: string }>;
+    const markersBefore = rowsBefore.flatMap((row) => JSON.parse(row.evidence) as Array<Record<string, unknown>>);
+    expect(markersBefore.some((m) => m.event === "delivery_escalation_sent")).toBe(false);
+
+    // The channel recovers. The next fire is delivered - the EXISTING
+    // isRecoveryDue-gated branch still would NOT fire (no escalation marker
+    // on record for it to react to) - only Fix B's belt-and-suspenders block
+    // clears the artifact here.
+    channelDead = false;
+    const recovered = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: lowQuote, transport });
+    expect(recovered.sent).toBeGreaterThan(0);
+    expect(existsSync(artifactPath)).toBe(false);
+    expect(sent.some((e) => e.title.startsWith("✅"))).toBe(true); // the user is told the outage ended
+
+    // Fix C: a NEW outage afterward (channel dies again) must start a FRESH
+    // `since`, not resume the old one. A strictly LATER `now` (not the same
+    // instant as the first outage) proves this isn't passing by coincidence.
+    channelDead = true;
+    for (const quoteProvider of [highQuote, lowQuote, highQuote]) {
+      const r = await poll.runMarketAlertsPoll({ dbPath, now: new Date(LATER_TRADING_TIME), quoteProvider, transport });
+      expect(r.sent).toBe(0);
+    }
+    expect(existsSync(artifactPath)).toBe(true);
+    const secondSince = (JSON.parse(readFileSync(artifactPath, "utf8")) as { since: string }).since;
+    expect(secondSince).not.toBe(firstSince);
+  });
+
+  // Fix E bullet 2: the off-hours early return used to happen BEFORE any
+  // alerterDown check, so launchd/ops tooling watching this poller's exit
+  // code saw a false "all clear" for the ~17.5 hours/day outside US regular
+  // market hours even while the alerter was down.
+  it("(Fix E) an off-hours tick still reports alerterDown:true while the artifact persists", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const alwaysFailTransport = {
+      sendCard: async () => ({ ok: false, error: "simulated total Feishu outage" }),
+      updateCard: async () => ({ ok: true })
+    };
+    const failingQuoteProvider = async (): Promise<never> => {
+      throw new Error("Longbridge quote failed: forcing a hard-failure escalation");
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport: alwaysFailTransport })
+      ).rejects.toThrow();
+    }
+    const artifactPath = join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json");
+    expect(existsSync(artifactPath)).toBe(true);
+
+    const result = await poll.runMarketAlertsPoll({ dbPath, now: new Date(OFF_HOURS_TIME) });
+    expect(result).toEqual({ ok: true, skipped: "off-hours", alerterDown: true });
+  });
+
+  // Fix E bullet 1: a throw from sending the hard-failure escalation card
+  // (not just an ok:false send) used to be logged and swallowed WITHOUT
+  // marking the alerter down, even though nobody was told anything either
+  // way. Reproduced by dropping the `members` table AFTER seeding the rule -
+  // sendOperatorCard's `new MemberRepository(db).listActive()` call now
+  // throws for real, while the failure itself is forced via a throwing
+  // quoteProvider at the "fetch_quotes" step (before pollOnce ever reaches
+  // its own member lookups), so this stays a pure hard-failure scenario.
+  it("(Fix E) a throw from sending the hard-failure escalation card still marks the alerter down", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    // foreign_keys is ON by default (openTradingDatabase) - alert_rules.owner_id
+    // REFERENCES members(id), so dropping members outright would fail with a
+    // FOREIGN KEY constraint error. Toggled off just for the drop - this test
+    // only needs `new MemberRepository(db).listActive()` to throw for real,
+    // not for the FK to keep being enforced afterward.
+    db.exec("PRAGMA foreign_keys = OFF");
+    db.exec("DROP TABLE members");
+    db.exec("PRAGMA foreign_keys = ON");
+
+    const transport = fakeTransport();
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({
+          dbPath,
+          now: new Date(TRADING_TIME),
+          quoteProvider: async () => {
+            throw new Error("Longbridge quote failed: forcing the escalation attempt");
+          },
+          transport
+        })
+      ).rejects.toThrow();
+    }
+
+    const artifactPath = join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json");
+    expect(existsSync(artifactPath)).toBe(true);
   });
 });
 

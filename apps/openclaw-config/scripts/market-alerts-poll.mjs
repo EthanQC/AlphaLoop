@@ -245,7 +245,90 @@
 //   backupTradingDatabase, which uses the identical tmp+rename pattern for
 //   the same atomicity guarantee. Applies to both poller-state.json and
 //   ALERTER-DOWN.json.
+//
+// task H1 FOURTH fix round (this task - a final review of the THIRD round
+// found two more ways the counters/artifact could go silently dead, plus
+// three smaller gaps in the same machinery):
+//
+//   Fix A - a full disk or a read-only runtime dir fails BOTH failure
+//   counters AT ONCE: the db INSERT throws (recordJobRun/recordFailureRun),
+//   AND writeJsonAtomic's write of poller-state.json (or, in
+//   escalateWithoutDb's db-can't-even-open path, the ONLY counter that
+//   exists at all) ALSO fails - silently, since writeJsonAtomic used to just
+//   console.error and return nothing. Every cycle then reads back the same
+//   stuck state (dbFailures/fileState.consecutiveFailures never advance),
+//   so `consecutiveCount >= ESCALATION_THRESHOLD` can never become true -
+//   100% silent, forever, on exactly the disk-full/read-only scenario this
+//   whole task exists to catch. Fixed by: (1) writeJsonAtomic now returns
+//   `true`/`false` instead of swallowing silently; (2) recordFailureRun now
+//   catches recordJobRun's own throw locally (previously left to propagate,
+//   which aborted the function before it could ever notice); (3) when
+//   THIS cycle's own attempt proves NEITHER backstop can persist the
+//   counter (db insert failed AND the file write failed, and the normal
+//   threshold path hasn't already escalated), forceEscalateUnpersistable
+//   sends the ⚠ 提醒器状态无法持久化（磁盘/权限故障） card immediately -
+//   on the very first such cycle, not the 3rd. The normal 12h throttle can't
+//   be trusted here either (it lives in the exact file/db state that just
+//   proved unwritable), so this throttles instead via a SEPARATE marker in
+//   os.tmpdir() (very often a different filesystem/mount than the runtime
+//   dir, so it has a real chance of surviving the SAME failure) - and if
+//   even THAT write fails, every cycle sends. Per this task's guiding
+//   principle (noisy beats silent): a machine this broken deserves a card
+//   every cycle rather than risk a second silent-forever failure mode
+//   stacked on top of the first.
+//
+//   Fix B - every clearAlerterDown call site required a DELIVERED operator
+//   card (a genuine `*_sent` marker), but an escalation that itself could
+//   not reach anyone (the whole Feishu channel is dead - the exact scenario
+//   the artifact exists to report) writes only an `*_undeliverable` marker
+//   and never touches lastEscalationAt/lastRecoveryAt in a way
+//   recoveryDueFrom/isRecoveryDue can see - so once the outage ends,
+//   "no escalation on record" (from the marker-search's point of view) means
+//   no recovery card is ever due, the two existing clearAlerterDown call
+//   sites are never entered, and the artifact - the one out-of-band channel
+//   Fix 3 (task H1 THIRD fix round) built specifically so a doctor/ops check
+//   could read it with no db access - latches `alerterDown: true` and a
+//   non-zero exit code FOREVER. recordSuccessRun now also clears the
+//   artifact (sending a best-effort ✅ 提醒器已恢复 notice first, unless one
+//   of the two existing marker-based branches already sent one this same
+//   cycle) on ANY cycle that PROVES the alerter is healthy by a DIFFERENT
+//   route than "a marker says so": a real delivery this cycle (`sent > 0`),
+//   or a poll success that ends a hard-failure streak which was in
+//   progress (dbFailures/fileState.consecutiveFailures > 0 before this
+//   success). `since` is preserved across repeated markAlerterDown rewrites
+//   exactly as before; clearAlerterDown deleting the file is what makes the
+//   NEXT genuinely new outage start a fresh `since` (existsSync is false, so
+//   markAlerterDown's own since-preservation check falls through to `now`).
+//
+//   Fix C - DELIVERY_LOOKBACK_GUARD_LIMIT (job-run-log.mjs) was 5,000 while
+//   its own comment derived an ~8,640-8,700 row/30-day worst case - 5,000 <
+//   8,640, so the "guard" could in fact truncate the very window it claimed
+//   to never bite, exactly the class of wrong-safety-argument bound that
+//   caused the round-3 regression in the first place. Raised to 50,000 (see
+//   job-run-log.mjs's own doc comment for the corrected derivation).
+//
+//   Fix D - logFailureWithFreshDb's contract comment says it must NEVER
+//   throw (every caller unconditionally `throw error`s the ORIGINAL failure
+//   right after calling it), but it awaited escalateWithoutDb unguarded - a
+//   throw there would propagate out and mask that original error, exactly
+//   the invariant Fix 4 (task H1 fix round) established for every OTHER
+//   bookkeeping call in this file. Wrapped in the same try/catch-and-log
+//   pattern as its sibling below.
+//
+//   Fix E (minor) - (1) a throwing sendEscalationCard (e.g.
+//   MemberRepository.listActive() itself throwing) was caught and logged but
+//   never called markAlerterDown, even though the escalation is just as
+//   undeliverable as an ok:false send - added to both the hard-failure and
+//   delivery-health twins. (2) the off-hours early return used to happen
+//   BEFORE any alerterDown check, so launchd/ops tooling watching this
+//   poller's exit code saw a false "all clear" for the ~17.5 hours/day
+//   outside US regular market hours even while the alerter was down -
+//   isAlerterDownArtifactPresent is now checked before that early return
+//   too. (3) the phase-2.5 hardening plan's Task 2 doctor spec never named
+//   this artifact as something a doctor check should read - amended to say
+//   so explicitly (see that file).
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -333,6 +416,15 @@ export async function runMarketAlertsPoll(options = {}) {
   }
 
   if (!isUsRegularMarketHours(now)) {
+    // Fix E bullet 2 (task H1 FOURTH fix round, this task): checked BEFORE
+    // this early return, not after, so launchd/ops tooling watching this
+    // poller's exit code still sees the outage during the ~17.5 hours/day
+    // outside US regular market hours - isAlerterDownArtifactPresent is a
+    // pure fs.existsSync check (see its own doc comment), so this costs
+    // nothing extra even on the overwhelmingly common off-hours tick.
+    if (isAlerterDownArtifactPresent(dbPath)) {
+      return { ok: true, skipped: "off-hours", alerterDown: true };
+    }
     return { ok: true, skipped: "off-hours" };
   }
 
@@ -454,7 +546,20 @@ async function logFailureWithFreshDb(dbPath, { now, error, transport }) {
     // db: both the file counter (poller-state.json, Fix 4's own file - see
     // its doc comment) and the `{}` fallback Feishu send work with no db
     // handle at all.
-    await escalateWithoutDb(dbPath, { now, error, openError, transport });
+    //
+    // Fix D (task H1 FOURTH fix round, this task): this function's own
+    // contract (see every caller - they all unconditionally `throw error`
+    // the ORIGINAL failure right after calling this) says it must NEVER
+    // throw. escalateWithoutDb used to be awaited unguarded here - wrapped
+    // now, mirroring the identical try/catch-and-log pattern used for
+    // recordFailureRun just below.
+    try {
+      await escalateWithoutDb(dbPath, { now, error, openError, transport });
+    } catch (escalateError) {
+      console.error(
+        `market-alerts-poll: escalateWithoutDb threw (the ORIGINAL error will still be rethrown by the caller): ${describeError(escalateError)}`
+      );
+    }
     return;
   }
   try {
@@ -491,10 +596,11 @@ async function escalateWithoutDb(dbPath, { now, error, openError, transport }) {
   );
 
   let escalationSentAt = fileState.lastEscalationAt;
-  if (
+  let escalated = false;
+  const normalDue =
     consecutiveCount >= ESCALATION_THRESHOLD &&
-    escalationDueFrom(now, fileState.lastEscalationAt, fileState.lastRecoveryAt)
-  ) {
+    escalationDueFrom(now, fileState.lastEscalationAt, fileState.lastRecoveryAt);
+  if (normalDue) {
     const card = {
       title: "⚠ 提醒器数据库不可用",
       lines: [
@@ -536,16 +642,30 @@ async function escalateWithoutDb(dbPath, { now, error, openError, transport }) {
         reason: "db_unreachable"
       });
     }
+    escalated = true;
   }
 
   // Written even below the 3-failure threshold - mirrors recordFailureRun's
   // own file write, which always happens on every real run regardless of
   // whether this cycle itself escalated.
-  writePollerState(pollerStatePath, {
+  const fileWriteOk = writePollerState(pollerStatePath, {
     consecutiveFailures: consecutiveCount,
     lastEscalationAt: escalationSentAt,
     lastRecoveryAt: fileState.lastRecoveryAt
   });
+
+  // Fix A (task H1 FOURTH fix round, this task): the db is ALREADY known
+  // unavailable in this path (openTradingDatabase itself threw to get here)
+  // - if the state-file write just above ALSO failed, NEITHER backstop can
+  // persist this cycle's counter, so `fileState.consecutiveFailures` (read
+  // from the SAME file) can never grow past whatever it's stuck at and the
+  // normal `consecutiveCount >= ESCALATION_THRESHOLD` check above can never
+  // fire again. Force an escalation now via the last-resort path instead of
+  // waiting for a threshold this cycle just proved unreachable - unless the
+  // normal path already escalated above (avoid double-sending in one cycle).
+  if (!escalated && !fileWriteOk) {
+    await forceEscalateUnpersistable(dbPath, { now, transport, errorSummary, consecutiveCount });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,23 +734,33 @@ function readPollerState(path) {
 // half-written one. Shared by poller-state.json and ALERTER-DOWN.json below
 // (Fix 3) - both are small JSON state files with the identical corruption
 // risk.
+// Fix A (task H1 FOURTH fix round, this task): now returns `true`/`false`
+// instead of swallowing a write failure silently - callers need to KNOW
+// whether this cycle's own counter update actually persisted, so they can
+// tell "the normal threshold/throttle mechanism can still see this outage"
+// apart from "it just went blind" (see recordFailureRun/escalateWithoutDb's
+// own use of this return value below).
 function writeJsonAtomic(path, data) {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const tmpPath = `${path}.tmp`;
     writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
     renameSync(tmpPath, path);
+    return true;
   } catch (error) {
     // Best-effort: if even the FALLBACK file can't be written (disk full,
     // read-only runtime dir), degrade to db-only behavior for this cycle
     // rather than throwing out of bookkeeping - logged so a double-outage
-    // stays visible on stderr instead of silently disappearing.
+    // stays visible on stderr instead of silently disappearing. The boolean
+    // return (see above) is what lets callers react instead of just relying
+    // on this stderr line.
     console.error(`market-alerts-poll: failed to atomically write ${path}: ${describeError(error)}`);
+    return false;
   }
 }
 
 function writePollerState(path, state) {
-  writeJsonAtomic(path, state);
+  return writeJsonAtomic(path, state);
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +829,115 @@ function isAlerterDownArtifactPresent(dbPath) {
   return existsSync(resolveAlerterDownPath(dbPath));
 }
 
+// ---------------------------------------------------------------------------
+// Last-resort throttle + forced escalation when NEITHER backstop can persist
+// the failure counter (Fix A, task H1 FOURTH fix round)
+// ---------------------------------------------------------------------------
+//
+// escalateWithoutDb (db could not even be opened - the "db" side of "neither
+// db nor file" is a given there) and recordFailureRun (db opened fine but
+// THIS cycle's own INSERT still threw, e.g. disk full) both call
+// forceEscalateUnpersistable the moment they've proven this cycle's failure
+// count cannot be recorded anywhere durable: the normal
+// `consecutiveCount >= ESCALATION_THRESHOLD` check depends on a NEXT cycle
+// being able to see THIS cycle's failure reflected in either the db or
+// poller-state.json - if neither persisted, every future cycle reads back
+// the exact same stuck state and that threshold can never be crossed again.
+//
+// The normal 12h throttle can't be trusted here either - it lives in the
+// exact file/db state that just proved unwritable. Throttled instead via a
+// SEPARATE marker file in os.tmpdir(), which is very often a different
+// filesystem/mount than the runtime dir (a full root disk doesn't
+// necessarily fill /tmp, and vice versa) and so has a real chance of
+// surviving the SAME failure that broke the primary backstops. Namespaced by
+// a sanitized `dbPath` so unrelated runtime dirs (or, in tests, unrelated
+// temp dirs from different test cases) never share one throttle marker.
+//
+// If even THIS write fails, `lastResortThrottleDue` reads back "never sent"
+// every time (readLastResortThrottle's own catch-all - see below) and this
+// escalates on EVERY cycle rather than risk trusting an unpersistable
+// throttle - per this task's guiding principle (noisy beats silent), a
+// machine this broken deserves a card every cycle over a second silent-
+// forever failure mode stacked on top of the first.
+function resolveLastResortThrottlePath(dbPath) {
+  const key = resolve(dbPath).replace(/[^a-zA-Z0-9]+/g, "_");
+  return join(tmpdir(), `alphaloop-market-alerts-last-resort-throttle-${key}.json`);
+}
+
+function readLastResortThrottle(dbPath) {
+  try {
+    const path = resolveLastResortThrottlePath(dbPath);
+    if (!existsSync(path)) {
+      return { lastEscalationAt: null };
+    }
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return { lastEscalationAt: typeof parsed?.lastEscalationAt === "string" ? parsed.lastEscalationAt : null };
+  } catch {
+    // Corrupt/unreadable marker - same "fresh state is the safe direction"
+    // reasoning as readPollerState's own catch-all above.
+    return { lastEscalationAt: null };
+  }
+}
+
+function writeLastResortThrottle(dbPath, now) {
+  return writeJsonAtomic(resolveLastResortThrottlePath(dbPath), { lastEscalationAt: now.toISOString() });
+}
+
+function lastResortThrottleDue(dbPath, now) {
+  const state = readLastResortThrottle(dbPath);
+  // No "recovery" concept for this marker (it isn't tracking a full outage
+  // lifecycle, just "did we already send one in the last 12h") - fed `null`
+  // for the recovery side of escalationDueFrom.
+  return escalationDueFrom(now, state.lastEscalationAt, null);
+}
+
+// Shared by escalateWithoutDb and recordFailureRun's hard-failure path - see
+// this section's own header comment above for the full rationale. `card` is
+// built here (rather than passed in) since both callers want the identical
+// wording; `errorSummary`/`consecutiveCount` are already sanitized/computed
+// by the caller.
+async function forceEscalateUnpersistable(dbPath, { now, transport, errorSummary, consecutiveCount }) {
+  if (!lastResortThrottleDue(dbPath, now)) {
+    return;
+  }
+  const card = {
+    title: "⚠ 提醒器状态无法持久化（磁盘/权限故障）",
+    lines: [
+      `已连续 ${consecutiveCount} 次轮询失败，且数据库与状态文件均无法写入，失败计数机制本身已失效。`,
+      `最近一次错误：${errorSummary || "未知错误"}`,
+      "提醒功能当前完全不可用，请立即检查磁盘空间与运行目录（含数据库所在目录）权限。",
+      "本卡片可能会重复发送（状态无法持久化，无法可靠去重/节流）；磁盘/权限恢复后会自动停止。"
+    ]
+  };
+  try {
+    const send = await sendInteractiveCard(card, {}, transport);
+    if (send.ok) {
+      clearAlerterDown(dbPath);
+      writeLastResortThrottle(dbPath, now);
+    } else {
+      console.error(
+        `market-alerts-poll: forced unpersistable-counter escalation send failed: ${send.error ?? "unknown error"}`
+      );
+      markAlerterDown(dbPath, {
+        now,
+        consecutiveFailures: consecutiveCount,
+        lastError: errorSummary,
+        reason: "state_unpersistable"
+      });
+    }
+  } catch (sendError) {
+    console.error(
+      `market-alerts-poll: sending the forced unpersistable-counter escalation card threw: ${describeError(sendError)}`
+    );
+    markAlerterDown(dbPath, {
+      now,
+      consecutiveFailures: consecutiveCount,
+      lastError: errorSummary,
+      reason: "state_unpersistable"
+    });
+  }
+}
+
 // Whichever of the two ISO timestamps is newer; either side may be
 // null/undefined ("no marker from that source yet").
 function newerIso(a, b) {
@@ -747,6 +986,10 @@ async function recordFailureRun(db, { now, error, transport, dbPath }) {
 
   const evidence = [];
   let escalationSentAt = null;
+  // Fix A (task H1 FOURTH fix round, this task): tracks whether the NORMAL
+  // threshold path attempted an escalation this cycle at all, so the forced
+  // path below (unpersistable counter) never double-sends in the same cycle.
+  let escalated = false;
   if (consecutiveCount >= ESCALATION_THRESHOLD && escalationDueFrom(now, previousEscalation, previousRecovery)) {
     // Fix 5: a throw from sendEscalationCard's own collaborators (e.g.
     // MemberRepository.listActive()) must not ALSO cost this cycle its
@@ -786,27 +1029,67 @@ async function recordFailureRun(db, { now, error, transport, dbPath }) {
       console.error(
         `market-alerts-poll: sending the hard-failure escalation card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
       );
+      // Fix E bullet 1 (task H1 FOURTH fix round, this task): a throw here
+      // is JUST as undeliverable as an ok:false send (the marker.reason
+      // branch above) - the pre-fix code logged this and moved on without
+      // marking the artifact, even though nobody was told anything either
+      // way.
+      markAlerterDown(dbPath, {
+        now,
+        consecutiveFailures: consecutiveCount,
+        lastError: errorSummary,
+        reason: "send_failed"
+      });
     }
+    escalated = true;
   }
 
   // Fix 4: written BEFORE recordJobRun below, which may itself throw (the
   // exact scenario this fix exists for) - the file must stay the source of
   // truth for the NEXT cycle even when this cycle's own db row never lands.
-  writePollerState(pollerStatePath, {
+  const fileWriteOk = writePollerState(pollerStatePath, {
     consecutiveFailures: consecutiveCount,
     lastEscalationAt: escalationSentAt ?? fileState.lastEscalationAt,
     lastRecoveryAt: fileState.lastRecoveryAt
   });
 
-  recordJobRun(db, {
-    job: CRON_JOB_MARKET_ALERTS,
-    startedAt,
-    finishedAt,
-    ok: false,
-    actions: ["poll"],
-    failedStep,
-    evidence
-  });
+  // Fix A (this task): recordJobRun's own INSERT can throw for the SAME
+  // reason poller-state.json's write can fail (disk full, read-only runtime
+  // dir) - previously left unguarded here, so a throw aborted this function
+  // immediately and the forced-escalation check below never ran at all. The
+  // ORIGINAL poll error this whole failure cycle is about was already
+  // captured in `error`/`errorSummary` above and is rethrown by
+  // runMarketAlertsPoll's own caller - never by this function - so catching
+  // this locally does not risk masking it.
+  let dbWriteOk = true;
+  try {
+    recordJobRun(db, {
+      job: CRON_JOB_MARKET_ALERTS,
+      startedAt,
+      finishedAt,
+      ok: false,
+      actions: ["poll"],
+      failedStep,
+      evidence
+    });
+  } catch (dbError) {
+    dbWriteOk = false;
+    console.error(
+      `market-alerts-poll: recordJobRun insert failed (this cycle's failure could not be persisted to the db either): ${describeError(dbError)}`
+    );
+  }
+
+  // Fix A (this task): if THIS cycle proved it can persist its counter via
+  // NEITHER the db (the INSERT above just failed) NOR the file
+  // (poller-state.json also just failed to write), the normal threshold
+  // mechanism - which depends on ONE of those two eventually reflecting the
+  // growing streak - can never reach ESCALATION_THRESHOLD; every future
+  // cycle would read back this exact same stuck state. Escalate NOW instead
+  // of waiting for a threshold this cycle just proved unreachable, unless
+  // the normal path above already attempted one this same cycle.
+  if (!escalated && !dbWriteOk && !fileWriteOk) {
+    await forceEscalateUnpersistable(dbPath, { now, transport, errorSummary, consecutiveCount });
+  }
 }
 
 // Records a successful run - exactly one row, matching recordFailureRun's
@@ -840,6 +1123,15 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
   const pollerStatePath = resolvePollerStatePath(dbPath);
   const fileState = readPollerState(pollerStatePath);
 
+  // Fix B (task H1 FOURTH fix round, this task): read BEFORE this success's
+  // own row lands - `true` means a hard-failure streak WAS in progress and
+  // this success cycle just ended it, one of the two independent proofs of
+  // health the belt-and-suspenders block near the end of this function
+  // relies on (see its own comment for why "a delivered marker exists" is
+  // not the only acceptable proof).
+  const dbFailuresBeforeThisRun = consecutiveFailureCount(db, CRON_JOB_MARKET_ALERTS);
+  const hardFailureStreakEnding = dbFailuresBeforeThisRun > 0 || fileState.consecutiveFailures > 0;
+
   const previousEscalation = newerIso(
     lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_ESCALATION_EVENT),
     fileState.lastEscalationAt
@@ -848,6 +1140,12 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
     lastMarkerAt(db, CRON_JOB_MARKET_ALERTS, HARD_RECOVERY_EVENT),
     fileState.lastRecoveryAt
   );
+
+  // Fix B: whether EITHER of the two marker-based recovery branches below
+  // actually delivered a card this cycle - used purely to avoid a DUPLICATE
+  // "recovered" notice from the belt-and-suspenders block further down; it
+  // does not gate clearing the artifact itself.
+  let recoveryNoticeSent = false;
 
   let recoverySentAt = fileState.lastRecoveryAt;
   if (recoveryDueFrom(previousEscalation, previousRecovery)) {
@@ -859,6 +1157,7 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
       if (marker) {
         evidence.push(marker);
         recoverySentAt = marker.at;
+        recoveryNoticeSent = true;
         // Fix 3 (task H1 THIRD fix round, this task): a delivered recovery
         // card proves the alerter is reachable again - clear the artifact
         // (no-op if it was never set).
@@ -981,6 +1280,17 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
         console.error(
           `market-alerts-poll: sending the delivery-health escalation card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
         );
+        // Fix E bullet 1 (task H1 FOURTH fix round, this task): the
+        // hard-failure twin above marks the artifact on a send throw too -
+        // this branch used to log and move on without doing the same, even
+        // though a throw here is exactly as undeliverable as an ok:false
+        // send (the deliveryMarker.reason branch above).
+        markAlerterDown(dbPath, {
+          now,
+          consecutiveFailures: deliveryConsecutiveCount,
+          lastError: `card 投递持续失败 (${reason})`,
+          reason
+        });
       }
     }
   } else if (deliveredSuccessfully && isRecoveryDue(db, now, DELIVERY_ESCALATION_EVENT, DELIVERY_RECOVERY_EVENT)) {
@@ -996,6 +1306,7 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
       }, DELIVERY_RECOVERY_EVENT);
       if (marker) {
         evidence.push(marker);
+        recoveryNoticeSent = true;
         // Fix 3 (task H1 THIRD fix round, this task)
         clearAlerterDown(dbPath);
       }
@@ -1004,6 +1315,50 @@ async function recordSuccessRun(db, { now, transport, result, dbPath }) {
         `market-alerts-poll: sending the delivery-health recovery card threw (the run_log heartbeat row will still be written): ${describeError(sendError)}`
       );
     }
+  }
+
+  // Fix B (task H1 FOURTH fix round, this task): every clearAlerterDown call
+  // site ABOVE requires a genuinely DELIVERED marker-based recovery/retry -
+  // but an escalation that never reached anyone (the whole Feishu channel is
+  // dead - precisely the scenario the artifact exists to report) writes only
+  // an `*_undeliverable` marker, never touches lastEscalationAt in a way
+  // recoveryDueFrom/isRecoveryDue can see, and so - once the outage ends -
+  // "no escalation on record" makes every branch above conclude no recovery
+  // is due at all. None of them ever run, the artifact is never cleared, and
+  // `alerterDown: true` / a non-zero exit code latch FOREVER even though the
+  // system is demonstrably healthy again.
+  //
+  // This cycle itself is called ONLY on a successful poll - so "proof of
+  // health" here does not need a delivered MARKER at all: `sent > 0` (a real
+  // alert reached the user this cycle) or `hardFailureStreakEnding` (this
+  // success just ended a hard-failure streak that was in progress) are each
+  // independently sufficient proof, regardless of what run_log's markers
+  // say about the outage that originally set the artifact. If neither
+  // marker-based branch above already sent a notice this cycle, make one
+  // best-effort attempt here (a distinct ARTIFACT_RECOVERY_EVENT marker, so
+  // it can never be mistaken for a delivered recovery of either specific
+  // outage kind) - then clear the artifact regardless of whether even THIS
+  // attempt itself delivers: the PROOF of health is this cycle's own poll
+  // outcome, not whether Feishu happens to cooperate for this one card too.
+  if (isAlerterDownArtifactPresent(dbPath) && (deliveredSuccessfully || hardFailureStreakEnding)) {
+    if (!recoveryNoticeSent) {
+      try {
+        const marker = await sendRecoveryCard(db, transport, now, {
+          title: "✅ 提醒器已恢复",
+          lines: [
+            "提醒器已恢复正常运行 - 此前的故障提示因未能送达而一直未清除，现已确认系统恢复并解除。"
+          ]
+        }, ARTIFACT_RECOVERY_EVENT);
+        if (marker) {
+          evidence.push(marker);
+        }
+      } catch (sendError) {
+        console.error(
+          `market-alerts-poll: sending the artifact-clearing recovery notice threw (the artifact is still cleared - this cycle's own success is independent proof of health): ${describeError(sendError)}`
+        );
+      }
+    }
+    clearAlerterDown(dbPath);
   }
 
   recordJobRun(db, {
@@ -1026,6 +1381,14 @@ const HARD_ESCALATION_EVENT = "escalation_sent";
 const HARD_RECOVERY_EVENT = "recovery_sent";
 const DELIVERY_ESCALATION_EVENT = "delivery_escalation_sent";
 const DELIVERY_RECOVERY_EVENT = "delivery_recovery_sent";
+// Fix B (task H1 FOURTH fix round, this task) - a THIRD, purely
+// informational marker: recorded only on recordSuccessRun's belt-and-
+// suspenders artifact-clearing notice (see that function's own comment),
+// which fires independently of - and does not feed into - either marker pair
+// above's own due-checks. Kept distinct from HARD_RECOVERY_EVENT/
+// DELIVERY_RECOVERY_EVENT so that notice can never be mistaken for a real
+// recovery of either specific outage kind when a later cycle scans evidence.
+const ARTIFACT_RECOVERY_EVENT = "alerter_down_cleared";
 
 // Fix 2 (task H1 fix round): a recovery ENDS the outage its matching
 // escalation was about. Once `recoveryEvent` has fired more recently than
