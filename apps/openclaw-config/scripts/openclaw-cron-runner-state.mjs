@@ -18,8 +18,11 @@ export const HALT_THRESHOLD = 3;
 // all - the market-alerts poller runs under launchd via its own
 // StartInterval poll loop (see market-alerts-poll.mjs), never through
 // openclaw-cron-runner.mjs's allowedJobs. It still needs a recognized name
-// here so job-run-log.mjs's failure-escalation bookkeeping and
-// cron-runner-reset.mjs's name whitelist both see it as a known job.
+// here so cron-runner-reset.mjs's KNOWN_CRON_JOB_NAMES whitelist accepts it
+// as a resettable job name. (job-run-log.mjs itself does NOT consult
+// KNOWN_CRON_JOB_NAMES at all - it is storage-only and will happily read/
+// write a run_log row for any `job` string a caller passes it, known or
+// not; this constant is for cron-runner-reset.mjs's CLI validation only.)
 export const CRON_JOB_DAILY = "daily";
 export const CRON_JOB_WEEKLY = "weekly";
 export const CRON_JOB_STOCK_ANALYSIS = "stock-analysis";

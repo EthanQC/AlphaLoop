@@ -23,6 +23,23 @@
 //   (newest) row found IS the most recent send - no need to scan every row
 //   and compare timestamps.
 //
+// task H1 fix round (killing the "silently dead alerter" resurrection
+// paths a review found): market-alerts-poll.mjs now also encodes a handful
+// of OTHER marker events through this same evidence-array mechanism -
+// `escalation_undeliverable` (an escalation was DUE but no card actually
+// reached anyone - zero reachable recipients or every send failed, see that
+// module's sendOperatorCard), `delivery_health_bad`/`delivery_escalation_
+// sent`/`delivery_recovery_sent` (a SEPARATE state machine for "alerts fire
+// but no card is ever delivered", tracked independently of the ok/fail
+// column since a delivery-blind cycle still returns ok:true), and
+// `delivery_counts` (the cycle's real evaluated/fires/sent/failed/skipped
+// numbers, for operator visibility). `lastMarkerAt`/`consecutiveMarkerCount`
+// below are generic over the marker's `event` string precisely so
+// market-alerts-poll.mjs can reuse one throttle/recovery/streak
+// implementation for both the original escalation_sent/recovery_sent pair
+// and this newer delivery_escalation_sent/delivery_recovery_sent pair,
+// instead of forking near-duplicate logic per marker type.
+//
 // This module is intentionally storage-only: it has no idea what a "card"
 // or an "escalation" is, and never imports notifications.js. All of that
 // policy (thresholds, throttle window, card copy, who to send to) lives in
@@ -145,7 +162,18 @@ export function lastRecoveryAt(db, job) {
   return lastMarkerAt(db, job, "recovery_sent");
 }
 
-function lastMarkerAt(db, job, event) {
+/**
+ * ISO timestamp of the most recent evidence marker matching `event` for
+ * `job`, generic over the event name - see module header. Exported (unlike
+ * the original private helper this generalizes) so market-alerts-poll.mjs
+ * can drive its OWN, independent escalation/recovery marker pairs (e.g.
+ * "delivery_escalation_sent"/"delivery_recovery_sent" for the delivery-
+ * health state machine, task H1 fix round) through the same lookup instead
+ * of a forked copy per marker pair. `lastEscalationAt`/`lastRecoveryAt`
+ * above are unchanged, kept as the two named convenience wrappers existing
+ * callers/tests already use.
+ */
+export function lastMarkerAt(db, job, event) {
   const rows = db.prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC`).all(String(job));
   for (const row of rows) {
     const markers = parseJsonArray(row.evidence);
@@ -155,6 +183,33 @@ function lastMarkerAt(db, job, event) {
     }
   }
   return null;
+}
+
+/**
+ * How many of the MOST RECENT runs for `job` (newest first) carry a marker
+ * `{ event: markerEvent, ... }` somewhere in their evidence array, counting
+ * back until the first run whose evidence does NOT carry it - generalizes
+ * consecutiveFailureCount (which counts by the `ok` column) to count by an
+ * arbitrary evidence marker instead. Needed because a "delivery is
+ * generating alerts but none are being delivered" cycle (task H1 fix
+ * round's Fix 3) still returns ok:true from the poller - consecutiveFailure-
+ * Count's ok=0 streak can't see it, so market-alerts-poll.mjs tracks its own
+ * "delivery_health_bad" marker streak through this instead, with the same
+ * break-on-first-miss semantics (a healthy cycle OR a hard failure resets
+ * the streak to 0, since neither carries the marker).
+ */
+export function consecutiveMarkerCount(db, job, markerEvent) {
+  const rows = db.prepare(`SELECT evidence FROM run_log WHERE job = ? ORDER BY rowid DESC`).all(String(job));
+  let count = 0;
+  for (const row of rows) {
+    const markers = parseJsonArray(row.evidence);
+    const hasMarker = markers.some((marker) => marker && typeof marker === "object" && marker.event === markerEvent);
+    if (!hasMarker) {
+      break;
+    }
+    count += 1;
+  }
+  return count;
 }
 
 function mapRunLogRow(row) {

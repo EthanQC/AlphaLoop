@@ -2,12 +2,24 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 
+// Fix 4 (task H1 fix round): recordJobRun is mocked (wrapping the REAL
+// implementation by default via vi.fn(actual.recordJobRun)) purely so a
+// couple of tests below can force ONE call to throw - to prove a
+// bookkeeping failure never masks the original poll error/never turns a
+// successful run into a rejection. Every other test in this file never
+// overrides the mock, so it behaves identically to the unmocked function.
+vi.mock("./job-run-log.mjs", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, recordJobRun: vi.fn(actual.recordJobRun as (...args: unknown[]) => unknown) };
+});
+
 const poll = await import("./market-alerts-poll.mjs");
 const store = await import("./market-alerts-store.mjs");
+const jobRunLog = await import("./job-run-log.mjs");
 
 // A known-good US regular-market-hours instant (Wednesday 10:30am US-Eastern,
 // July - EDT, no DST edge case), matching the fixture already used across
@@ -49,6 +61,23 @@ function seedMember(db: DatabaseSync, id = "member_1"): void {
     id,
     email: `${id}@example.com`,
     feishuOpenId: `ou_${id}`,
+    displayName: id,
+    riskTags: [],
+    stockTags: [],
+    showPerformance: true,
+    status: "active",
+    createdAt: "2026-07-01T00:00:00.000Z"
+  });
+}
+
+// Fix 1 (task H1 fix round): a member with NO linked Feishu account - alert_
+// rules.owner_id has a NOT NULL FK to members(id), so a rule still needs a
+// real member row to exist even when simulating "zero REACHABLE members"
+// (production today: 0 active members have a feishuOpenId at all).
+function seedMemberNoFeishu(db: DatabaseSync, id = "member_1"): void {
+  new MemberRepository(db).upsert({
+    id,
+    email: `${id}@example.com`,
     displayName: id,
     riskTags: [],
     stockTags: [],
@@ -419,6 +448,26 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
     };
   }
 
+  // Like cardTransport, but `shouldFail` decides per-call whether the send
+  // reports ok:false - used by the Fix 1/Fix 3 tests below to simulate a
+  // specific channel (a member's openId, or the fallback's empty target, or
+  // real alert cards specifically) being unreachable while others succeed.
+  function cardTransportWithFailures(
+    sink: Array<{ target: unknown; cardJson: any }>,
+    shouldFail: (target: unknown, cardJson: any) => boolean
+  ) {
+    return {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sink.push({ target, cardJson });
+        if (shouldFail(target, cardJson)) {
+          return { ok: false, error: "simulated send failure" };
+        }
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+  }
+
   it("a successful real run writes exactly one ok=1 run_log row with no failedStep", async () => {
     const { db, dbPath } = makeDb();
     seedOneRule(db);
@@ -553,14 +602,349 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
     expect(sent).toHaveLength(2);
     expect(sent[1]?.cardJson.header.title.content).toBe("✅ 提醒器已恢复");
 
-    // A second consecutive success must NOT resend the recovery card.
-    await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: okQuoteProvider, transport });
+    // A second consecutive success - Fix 5: at a STRICTLY LATER `now` than
+    // the first (not the same instant, which would pass even by accident) -
+    // must NOT resend the recovery card.
+    const secondSuccessNow = new Date(new Date(TRADING_TIME).getTime() + 5 * 60 * 1000);
+    await poll.runMarketAlertsPoll({ dbPath, now: secondSuccessNow, quoteProvider: okQuoteProvider, transport });
     expect(sent).toHaveLength(2);
 
     const okRows = db.prepare("SELECT COUNT(*) AS c FROM run_log WHERE job = 'market-alerts' AND ok = 1").get() as {
       c: number;
     };
     expect(okRows.c).toBe(2);
+  });
+
+  // A review of the original H1 implementation above found three ways the
+  // escalation machinery could ITSELF go silently dead - defeating the
+  // whole point of this task. Each fix below is TDD'd against the exact
+  // scenario the review named.
+  describe("task H1 fix round: killing the escalation machinery's own dead-alerter paths", () => {
+    // Fix 1: production has ZERO active members with a feishuOpenId today.
+    it("zero reachable members + a failing fallback: never records escalation_sent, records escalation_undeliverable(no_recipients), and keeps retrying every cycle", async () => {
+      const { db, dbPath } = makeDb();
+      seedMemberNoFeishu(db, "member_1");
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "NVDA.US",
+        ruleType: "daily_move",
+        threshold: 0.04,
+        direction: "both",
+        frequency: "once_daily"
+      });
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      // Every send fails - there is no member to reach AND the fallback
+      // channel is (simulated) also down.
+      const transport = cardTransportWithFailures(sent, () => true);
+
+      for (let i = 0; i < 5; i += 1) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+
+      // Escalation is attempted on the 3rd/4th/5th failures (never
+      // throttled - no escalation_sent marker is ever written) - each
+      // attempt is exactly the one fallback send (target {}), since there
+      // is no member with a feishuOpenId to try first.
+      expect(sent).toHaveLength(3);
+      expect(sent.every((entry) => JSON.stringify(entry.target) === "{}")).toBe(true);
+
+      const rows = db
+        .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid ASC")
+        .all() as Array<{ evidence: string }>;
+      const allMarkers = rows.flatMap((row) => JSON.parse(row.evidence) as Array<Record<string, unknown>>);
+      expect(allMarkers.some((marker) => marker.event === "escalation_sent")).toBe(false);
+      const undeliverable = allMarkers.filter((marker) => marker.event === "escalation_undeliverable");
+      expect(undeliverable).toHaveLength(3);
+      expect(undeliverable.every((marker) => marker.reason === "no_recipients")).toBe(true);
+    });
+
+    it("zero reachable members but a WORKING fallback channel: the escalation still gets delivered (escalation_sent, target {})", async () => {
+      const { db, dbPath } = makeDb();
+      seedMemberNoFeishu(db, "member_1");
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "NVDA.US",
+        ruleType: "daily_move",
+        threshold: 0.04,
+        direction: "both",
+        frequency: "once_daily"
+      });
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      const transport = cardTransport(sent);
+
+      for (let i = 0; i < 3; i += 1) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.target).toEqual({});
+      const row = db
+        .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid DESC LIMIT 1")
+        .get() as { evidence: string };
+      const markers = JSON.parse(row.evidence) as Array<Record<string, unknown>>;
+      expect(markers).toContainEqual(expect.objectContaining({ event: "escalation_sent" }));
+    });
+
+    it("a reachable member whose send fails, with a failing fallback too: records escalation_undeliverable(send_failed), never escalation_sent", async () => {
+      const { db, dbPath } = makeDb();
+      seedOneRule(db); // member_1 HAS a feishuOpenId this time
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      const transport = cardTransportWithFailures(sent, () => true);
+
+      for (let i = 0; i < 3; i += 1) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+
+      // The real member is tried first, THEN the fallback - both fail.
+      expect(sent).toHaveLength(2);
+      expect(sent[0]?.target).toEqual({ openId: "ou_member_1" });
+      expect(sent[1]?.target).toEqual({});
+
+      const row = db
+        .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid DESC LIMIT 1")
+        .get() as { evidence: string };
+      const markers = JSON.parse(row.evidence) as Array<Record<string, unknown>>;
+      expect(markers).toContainEqual(expect.objectContaining({ event: "escalation_undeliverable", reason: "send_failed" }));
+      expect(markers.some((marker) => marker.event === "escalation_sent")).toBe(false);
+    });
+
+    // Fix 5
+    it("escalation goes to EVERY active member with a feishuOpenId; members without one are skipped", async () => {
+      const { db, dbPath } = makeDb();
+      seedMember(db, "member_1");
+      seedMember(db, "member_2");
+      seedMemberNoFeishu(db, "member_3");
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "NVDA.US",
+        ruleType: "daily_move",
+        threshold: 0.04,
+        direction: "both",
+        frequency: "once_daily"
+      });
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      const transport = cardTransport(sent);
+
+      for (let i = 0; i < 3; i += 1) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+
+      const targets = sent.map((entry) => entry.target);
+      expect(targets).toHaveLength(2);
+      expect(targets).toEqual(expect.arrayContaining([{ openId: "ou_member_1" }, { openId: "ou_member_2" }]));
+    });
+
+    // Fix 5: the throttle boundary is >=, not >. Driven through the
+    // calendar-coverage failure path specifically (rather than a real
+    // trading-hours failure) because a real 12h gap can never land inside
+    // BOTH endpoints' US regular market hours (a ~6.5h daily window, fixed
+    // UTC time-of-day) - the calendar-coverage check runs before the
+    // market-hours check and has no such constraint.
+    it("resends the escalation card at exactly the 12h throttle boundary (>= semantics)", async () => {
+      const { db, dbPath } = makeDb();
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      const transport = cardTransport(sent);
+      const t1 = new Date(OUT_OF_COVERAGE_TIME);
+
+      for (let i = 0; i < 3; i += 1) {
+        await expect(poll.runMarketAlertsPoll({ dbPath, now: t1, transport })).rejects.toThrow(/calendar/i);
+      }
+      expect(sent).toHaveLength(1);
+
+      const justUnder12h = new Date(t1.getTime() + 12 * 60 * 60 * 1000 - 1);
+      await expect(poll.runMarketAlertsPoll({ dbPath, now: justUnder12h, transport })).rejects.toThrow(/calendar/i);
+      expect(sent).toHaveLength(1);
+
+      const exactly12h = new Date(t1.getTime() + 12 * 60 * 60 * 1000);
+      await expect(poll.runMarketAlertsPoll({ dbPath, now: exactly12h, transport })).rejects.toThrow(/calendar/i);
+      expect(sent).toHaveLength(2);
+    });
+
+    // Fix 2: the exact flapping sequence named in the task brief - fail ->
+    // escalate -> recover -> fail again (well inside the 12h window) -> 3
+    // consecutive failures -> must escalate immediately (not suppressed by
+    // the stale throttle) -> recover again -> must NOT be swallowed either.
+    it("a recovery ends the outage: a NEW outage after a recovery escalates immediately, and its own recovery is not swallowed", async () => {
+      const { db, dbPath } = makeDb();
+      seedOneRule(db);
+      seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 950 }] });
+      const sent: Array<{ target: unknown; cardJson: any }> = [];
+      const transport = cardTransport(sent);
+      const okQuoteProvider = async () => ({ "NVDA.US": { price: 950, prevClose: 950, volume: 1000 } });
+
+      const t1 = new Date("2026-07-01T14:00:00.000Z"); // ~10:00am ET
+      const t2 = new Date(t1.getTime() + 5 * 60 * 1000);
+      const t3 = new Date(t1.getTime() + 10 * 60 * 1000); // 3rd consecutive failure -> escalates
+      const t4 = new Date(t1.getTime() + 30 * 60 * 1000); // recovers
+      const t5 = new Date(t1.getTime() + 4 * 60 * 60 * 1000); // NEW outage begins, well under 12h since t3
+      const t6 = new Date(t5.getTime() + 5 * 60 * 1000);
+      const t7 = new Date(t5.getTime() + 10 * 60 * 1000); // 3rd consecutive failure of the NEW outage
+      const t8 = new Date(t7.getTime() + 20 * 60 * 1000); // recovers again
+
+      for (const t of [t1, t2, t3]) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: t, quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器连续失败");
+
+      await poll.runMarketAlertsPoll({ dbPath, now: t4, quoteProvider: okQuoteProvider, transport });
+      expect(sent).toHaveLength(2);
+      expect(sent[1]?.cardJson.header.title.content).toBe("✅ 提醒器已恢复");
+
+      for (const t of [t5, t6, t7]) {
+        await expect(
+          poll.runMarketAlertsPoll({ dbPath, now: t, quoteProvider: failingQuoteProvider, transport })
+        ).rejects.toThrow();
+      }
+      // Pre-Fix-2 bug: t7 is only ~4h10m after t3's escalation (well under
+      // the 12h throttle) - the old code would have suppressed this because
+      // it only checked elapsed time, ignoring that t4's recovery already
+      // ended the FIRST outage.
+      expect(sent).toHaveLength(3);
+      expect(sent[2]?.cardJson.header.title.content).toBe("⚠ 提醒器连续失败");
+
+      await poll.runMarketAlertsPoll({ dbPath, now: t8, quoteProvider: okQuoteProvider, transport });
+      // Pre-Fix-2 bug: since t7's failure never wrote a FRESH escalation_sent
+      // marker (it was wrongly throttled), this second recovery would have
+      // seen t4's OLD recovery >= t3's OLD escalation and skipped the card
+      // entirely - total silence after the first "recovered" card.
+      expect(sent).toHaveLength(4);
+      expect(sent[3]?.cardJson.header.title.content).toBe("✅ 提醒器已恢复");
+    });
+
+    // Fix 3: deliverAlertCards deliberately swallows delivery failures (by
+    // design - no retry, no storm), so a poller that only records ok/fail on
+    // the CYCLE never notices "fires happened, zero delivered". This drives
+    // 3 consecutive REAL (non-throwing) cycles through that exact blind spot.
+    it("3 consecutive cycles that generate fires but deliver ZERO cards escalate a distinct delivery-health card, independent of hard failures", async () => {
+      const { db, dbPath } = makeDb();
+      seedMember(db, "member_1");
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "NVDA.US",
+        ruleType: "unrealized_pnl",
+        threshold: 0.05,
+        direction: "both",
+        frequency: "continuous"
+      });
+      seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100 }] });
+
+      const sent: Array<{ target: unknown; cardJson: any; title: string }> = [];
+      // Real alert cards ("盘中提醒 N 条") always fail to send (simulates an
+      // expired Feishu token) - operator cards (any other title) succeed,
+      // isolating this test to Fix 3's own mechanism rather than also
+      // exercising Fix 1's member/fallback fan-out.
+      const transport = {
+        sendCard: async (target: unknown, cardJson: any) => {
+          const title = String(cardJson?.header?.title?.content ?? "");
+          sent.push({ target, cardJson, title });
+          if (title.startsWith("盘中提醒")) {
+            return { ok: false, error: "simulated Feishu auth expiry" };
+          }
+          return { ok: true };
+        },
+        updateCard: async () => ({ ok: true })
+      };
+
+      // Alternates price above/below cost each cycle so unrealized_pnl
+      // re-arms and fires on 3 CONSECUTIVE cycles - a rule that fires once
+      // just disarms and stays quiet on a repeated same-direction breach
+      // (see market-alerts-engine.mjs's evaluateUnrealizedPnl armedDirection
+      // logic), so a constant quote would only fire on the FIRST cycle.
+      const highQuote = async () => ({ "NVDA.US": { price: 110, prevClose: 105, volume: 1000 } });
+      const lowQuote = async () => ({ "NVDA.US": { price: 90, prevClose: 95, volume: 1000 } });
+
+      const r1 = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: highQuote, transport });
+      const r2 = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: lowQuote, transport });
+      const r3 = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: highQuote, transport });
+
+      for (const r of [r1, r2, r3]) {
+        expect(r.ok).toBe(true);
+        expect(r.fires).toBe(1);
+        expect(r.sent).toBe(0);
+        expect(r.failed).toBe(1);
+      }
+
+      const escalationCards = sent.filter((entry) => entry.title === "⚠ 提醒卡片投递持续失败");
+      expect(escalationCards).toHaveLength(1);
+
+      const rows = db
+        .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid ASC")
+        .all() as Array<{ evidence: string }>;
+      const markersByRow = rows.map((row) => JSON.parse(row.evidence) as Array<Record<string, unknown>>);
+      expect(markersByRow[0]).toContainEqual(expect.objectContaining({ event: "delivery_counts", fires: 1, sent: 0, failed: 1 }));
+      expect(markersByRow[2]).toContainEqual(expect.objectContaining({ event: "delivery_escalation_sent" }));
+
+      // Recovery: the next cycle that DOES deliver sends a distinct recovery card.
+      const healthyTransport = {
+        sendCard: async (target: unknown, cardJson: any) => {
+          sent.push({ target, cardJson, title: String(cardJson?.header?.title?.content ?? "") });
+          return { ok: true };
+        },
+        updateCard: async () => ({ ok: true })
+      };
+      const r4 = await poll.runMarketAlertsPoll({
+        dbPath,
+        now: new Date(TRADING_TIME),
+        quoteProvider: lowQuote,
+        transport: healthyTransport
+      });
+      expect(r4.sent).toBe(1);
+      const recoveryCards = sent.filter((entry) => entry.title === "✅ 提醒卡片投递已恢复");
+      expect(recoveryCards).toHaveLength(1);
+    });
+
+    // Fix 4
+    it("a bookkeeping throw while recording a FAILING run does not mask the original error, and writes no row", async () => {
+      const { db, dbPath } = makeDb();
+      seedOneRule(db);
+      vi.mocked(jobRunLog.recordJobRun).mockImplementationOnce(() => {
+        throw new Error("simulated db lock while writing run_log");
+      });
+
+      await expect(
+        poll.runMarketAlertsPoll({
+          dbPath,
+          now: new Date(TRADING_TIME),
+          quoteProvider: async () => {
+            throw new Error("Longbridge quote failed: original cause");
+          },
+          transport: fakeTransport()
+        })
+      ).rejects.toThrow(/Longbridge quote failed: original cause/);
+
+      expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
+    });
+
+    it("a bookkeeping throw while recording a SUCCESSFUL run still resolves ok:true with its summary", async () => {
+      const { db, dbPath } = makeDb();
+      seedOneRule(db);
+      seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }] });
+      vi.mocked(jobRunLog.recordJobRun).mockImplementationOnce(() => {
+        throw new Error("simulated db lock while writing run_log");
+      });
+
+      const result = await poll.runMarketAlertsPoll({
+        dbPath,
+        now: new Date(TRADING_TIME),
+        quoteProvider: async () => ({ "NVDA.US": { price: 950, prevClose: 900, volume: 1000 } }),
+        transport: fakeTransport()
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.fires).toBe(1);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
+    });
   });
 });
 
