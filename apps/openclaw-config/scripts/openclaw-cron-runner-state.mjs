@@ -4,7 +4,33 @@ import { sanitizeAlertText } from "./openclaw-cron-runner-alerts.mjs";
 // stops attempting further runs for that job until an operator resets it via cron-runner-reset.mjs.
 export const HALT_THRESHOLD = 3;
 
-export const KNOWN_CRON_JOB_NAMES = Object.freeze(["daily", "weekly", "stock-analysis"]);
+// Single source of truth for every cron-ish job name this system recognizes
+// (task H1, Phase 2.5 hardening - closes the dual-source bug where
+// openclaw-cron-runner.mjs's allowedJobs/cronJobNames literals and this
+// module's KNOWN_CRON_JOB_NAMES each hardcoded "daily"/"weekly"/
+// "stock-analysis" as SEPARATE string literals, free to drift). This module
+// is the lower-level one (openclaw-cron-runner.mjs already imports several
+// functions FROM it, so the reverse dependency would be circular) - the
+// runner now imports these constants and uses them as its allowedJobs/
+// cronJobNames `name` fields instead of re-typing the strings.
+//
+// CRON_JOB_MARKET_ALERTS is NOT routed through the runner's HTTP job map at
+// all - the market-alerts poller runs under launchd via its own
+// StartInterval poll loop (see market-alerts-poll.mjs), never through
+// openclaw-cron-runner.mjs's allowedJobs. It still needs a recognized name
+// here so job-run-log.mjs's failure-escalation bookkeeping and
+// cron-runner-reset.mjs's name whitelist both see it as a known job.
+export const CRON_JOB_DAILY = "daily";
+export const CRON_JOB_WEEKLY = "weekly";
+export const CRON_JOB_STOCK_ANALYSIS = "stock-analysis";
+export const CRON_JOB_MARKET_ALERTS = "market-alerts";
+
+export const KNOWN_CRON_JOB_NAMES = Object.freeze([
+  CRON_JOB_DAILY,
+  CRON_JOB_WEEKLY,
+  CRON_JOB_STOCK_ANALYSIS,
+  CRON_JOB_MARKET_ALERTS
+]);
 
 export function normalizeRunnerState(value = {}) {
   return {

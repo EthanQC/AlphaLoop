@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
 import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
 import {
+  CRON_JOB_DAILY,
+  CRON_JOB_STOCK_ANALYSIS,
+  CRON_JOB_WEEKLY,
   clearEscalationPending,
   getFailureAlertLevel,
   getPendingEscalationJobs,
@@ -35,10 +38,15 @@ const retryMaxMs = Number(process.env.OPENCLAW_CRON_RUNNER_RETRY_MAX_MS ?? 30 * 
 mkdirSync(runtimeDir, { recursive: true });
 loadLocalEnv(repoRoot);
 
+// `name` fields reference openclaw-cron-runner-state.mjs's CRON_JOB_* constants
+// rather than re-typing "daily"/"weekly"/"stock-analysis" literals here - see
+// that module's KNOWN_CRON_JOB_NAMES comment for the single-source rationale
+// (task H1 fix: this object and KNOWN_CRON_JOB_NAMES used to hardcode the
+// same strings independently, free to drift).
 const allowedJobs = {
-  "/run/daily": { name: "daily", command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
-  "/run/weekly": { name: "weekly", command: [pnpmBin, "report:weekly:run"], timeoutMs: 15 * 60 * 1000 },
-  "/run/stock-analysis": { name: "stock-analysis", command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 }
+  "/run/daily": { name: CRON_JOB_DAILY, command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
+  "/run/weekly": { name: CRON_JOB_WEEKLY, command: [pnpmBin, "report:weekly:run"], timeoutMs: 15 * 60 * 1000 },
+  "/run/stock-analysis": { name: CRON_JOB_STOCK_ANALYSIS, command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 }
 };
 
 const cronJobNames = {

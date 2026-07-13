@@ -62,6 +62,27 @@
 // poller filters those rows out BEFORE they ever reach evaluateAll, and
 // reports them as skipped (`reason: "config_error"`) instead of letting one
 // bad row silence every other owner's alerting for the whole cycle.
+//
+// Heartbeat / run_log / failure escalation (task H1, Phase 2.5 hardening):
+// before this task, a persistently failing poller (expired Longbridge auth,
+// a trading calendar that has run out of covered years, a locked db) just
+// exited 1 every 5 minutes forever and wrote its own log file - nobody was
+// ever notified, even though notifying people is this poller's entire
+// purpose. Every REAL run (anything past the off-hours/--dry-run early
+// exits below) now writes exactly one row to job-run-log.mjs's run_log
+// wrapper, ok or not. `failedStep` is a best-effort label of which phase
+// threw (see the stepSync/stepAsync helpers below) so an operator reading
+// run_log can tell "calendar_coverage" (the calendar fix is stale) from
+// "fetch_quotes" (Longbridge auth expired) from "persist" (db contention)
+// at a glance, without reading a stack trace. On the 3rd+ consecutive
+// failure, throttled to at most one card per 12h (see recordFailureRun),
+// this poller sends every active member with a linked Feishu account an
+// escalation card - an operator alert, not a per-rule alert, so it goes to
+// everyone rather than being scoped to one rule's owner (a dead alerter
+// affects every member's alerts, not just one). The first success after an
+// escalation sends a matching recovery card. See job-run-log.mjs's module
+// header for exactly how the escalation/recovery timestamps are encoded
+// inside run_log's frozen schema (no new column).
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -69,18 +90,37 @@ import {
   MemberRepository,
   loadLocalEnv,
   openTradingDatabase,
-  resolveRuntimePaths
+  resolveRuntimePaths,
+  sendInteractiveCard
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import {
+  consecutiveFailureCount,
+  lastEscalationAt,
+  lastRecoveryAt,
+  recordJobRun
+} from "./job-run-log.mjs";
 import { buildPositionsForCards, composeAlertCards, deliverAlertCards } from "./market-alerts-cards.mjs";
 import { EXPOSURE_SYMBOL, RULE_TYPE_FREQUENCY, evaluateAll } from "./market-alerts-engine.mjs";
 import * as store from "./market-alerts-store.mjs";
+import { sanitizeAlertText } from "./openclaw-cron-runner-alerts.mjs";
+import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
 import { toNumber } from "./report-data.mjs";
 import { assertCalendarCoverage, currentUsEasternTradingDay, isUsRegularMarketHours } from "./trading-schedule.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
+
+// 3 consecutive failures halts confidence in the poller entirely (mirrors
+// openclaw-cron-runner-state.mjs's own HALT_THRESHOLD, though this poller
+// has no halt/retry-suppression behavior of its own - launchd keeps
+// retrying every StartInterval regardless; only the ALERT is gated).
+const ESCALATION_THRESHOLD = 3;
+// At most one escalation card per 12h so a persistently failing poller
+// alerts once, not every 5 minutes forever (an alert storm is its own
+// failure mode).
+const ESCALATION_THROTTLE_MS = 12 * 60 * 60 * 1000;
 
 /**
  * Run one poll cycle. Every side-effecting collaborator (db access path,
@@ -97,31 +137,222 @@ loadLocalEnv(repoRoot);
  */
 export async function runMarketAlertsPoll(options = {}) {
   const now = options.now ?? new Date();
+  const dryRun = Boolean(options.dryRun);
+  const quoteProvider = options.quoteProvider ?? defaultQuoteProvider;
+  const dbPath = options.dbPath ?? resolveRuntimePaths(repoRoot).dbPath;
+  const transport = options.transport;
 
   // isUsRegularMarketHours already calls assertCalendarCoverage internally;
   // this explicit call just documents the flow the task brief names
   // (calendar check, then market-hours check) and stays cheap/harmless even
   // if that internal detail ever changes.
-  assertCalendarCoverage(now);
+  //
+  // Deliberately still runs BEFORE opening any db handle (see below) - off
+  // hours is the overwhelmingly common outcome of any given tick (most of
+  // the day/week is outside US regular market hours), so opening SQLite on
+  // every one of those ticks for nothing would be wasted IO/lock contention.
+  // A calendar-coverage failure (the trading calendar has no data for
+  // `now`'s year - trading-schedule.mjs) is the one exception: unlike a
+  // plain off-hours tick this IS a real failure - one of this task's three
+  // named motivating scenarios (expired Longbridge auth / calendar year
+  // expiry / db lock, see module header) - so it still gets a run_log row
+  // and an escalation check, just via its own separately-opened db (never
+  // reusing the off-hours path, which touches no db at all).
+  try {
+    assertCalendarCoverage(now);
+  } catch (error) {
+    tagStep(error, "calendar_coverage");
+    if (!dryRun) {
+      await logFailureWithFreshDb(dbPath, { now, error, transport });
+    }
+    throw error;
+  }
 
   if (!isUsRegularMarketHours(now)) {
     return { ok: true, skipped: "off-hours" };
   }
 
-  const dryRun = Boolean(options.dryRun);
-  const quoteProvider = options.quoteProvider ?? defaultQuoteProvider;
-  const dbPath = options.dbPath ?? resolveRuntimePaths(repoRoot).dbPath;
-  const db = openTradingDatabase(dbPath);
+  let db;
+  try {
+    db = openTradingDatabase(dbPath);
+  } catch (error) {
+    // Can't open the primary db - e.g. task brief's "db lock" scenario. Best
+    // effort: try to log the failure via a fresh connection to the SAME
+    // path; if that also throws (the lock is real, not transient),
+    // logFailureWithFreshDb swallows it rather than masking the original
+    // error - the next launchd tick will retry both the poll and the log.
+    if (!dryRun) {
+      await logFailureWithFreshDb(dbPath, { now, error, transport });
+    }
+    throw error;
+  }
 
   try {
-    return await pollOnce(db, { now, dryRun, quoteProvider, transport: options.transport });
+    const result = await pollOnce(db, { now, dryRun, quoteProvider, transport });
+    if (!dryRun) {
+      await recordSuccessRun(db, { now, transport });
+    }
+    return result;
+  } catch (error) {
+    if (!dryRun) {
+      await recordFailureRun(db, { now, error, transport });
+    }
+    throw error;
   } finally {
     db.close();
   }
 }
 
+// ---------------------------------------------------------------------------
+// Heartbeat / run_log / failure escalation (task H1)
+// ---------------------------------------------------------------------------
+
+// Tags an error with which phase of the poll threw, WITHOUT wrapping it in a
+// new Error (that would risk changing `.message`, breaking callers/tests
+// that match on it, e.g. the calendar-coverage rejection's /calendar/i
+// match) - just annotates the same thrown object in place. Never overwrites
+// an already-tagged step (defensive against double-tagging if a tagged
+// error bubbles through a second tagStep/tagStepAsync call).
+function tagStep(error, step) {
+  if (error && typeof error === "object" && !("jobStep" in error)) {
+    error.jobStep = step;
+  }
+  return error;
+}
+
+function stepSync(step, fn) {
+  try {
+    return fn();
+  } catch (error) {
+    throw tagStep(error, step);
+  }
+}
+
+async function stepAsync(step, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    throw tagStep(error, step);
+  }
+}
+
+async function logFailureWithFreshDb(dbPath, { now, error, transport }) {
+  let db;
+  try {
+    db = openTradingDatabase(dbPath);
+  } catch {
+    // Genuinely can't open a db to log into - give up silently rather than
+    // let a secondary failure mask the original one being thrown by the
+    // caller.
+    return;
+  }
+  try {
+    await recordFailureRun(db, { now, error, transport });
+  } finally {
+    db.close();
+  }
+}
+
+// Records a failing run and, on the 3rd+ consecutive failure (throttled to
+// one card per ESCALATION_THROTTLE_MS), sends the escalation card BEFORE
+// writing the row so the "escalation_sent" evidence marker lands on the
+// exact row that triggered the send (see job-run-log.mjs's module header
+// for the encoding).
+async function recordFailureRun(db, { now, error, transport }) {
+  const startedAt = now.toISOString();
+  const finishedAt = new Date().toISOString();
+  const failedStep = (error && typeof error === "object" && error.jobStep) || "unknown";
+  const errorSummary = sanitizeAlertText(error instanceof Error ? error.message : String(error), 500);
+
+  const priorFailures = consecutiveFailureCount(db, CRON_JOB_MARKET_ALERTS);
+  const consecutiveCount = priorFailures + 1;
+
+  const evidence = [];
+  if (consecutiveCount >= ESCALATION_THRESHOLD) {
+    const previousEscalation = lastEscalationAt(db, CRON_JOB_MARKET_ALERTS);
+    const elapsedMs = previousEscalation ? now.getTime() - Date.parse(previousEscalation) : Infinity;
+    if (!previousEscalation || elapsedMs >= ESCALATION_THROTTLE_MS) {
+      await sendOperatorCard(db, transport, {
+        title: "⚠ 提醒器连续失败",
+        lines: [
+          `已连续失败 ${consecutiveCount} 次。`,
+          `最近一次错误：${errorSummary || "未知错误"}`,
+          "提醒功能当前不可用，盘中价格/持仓/敞口告警暂时不会发送。",
+          "请检查长桥登录状态、交易日历数据、数据库占用等常见原因；修复后下一次轮询成功会自动发送恢复通知，无需手动复位。"
+        ]
+      });
+      evidence.push({ event: "escalation_sent", at: now.toISOString() });
+    }
+  }
+
+  recordJobRun(db, {
+    job: CRON_JOB_MARKET_ALERTS,
+    startedAt,
+    finishedAt,
+    ok: false,
+    actions: ["poll"],
+    failedStep,
+    evidence
+  });
+}
+
+// Records a successful run - exactly one row, matching recordFailureRun's
+// contract (see module header: one run_log row per real run, no exceptions
+// for the row a recovery card happens to ride along on). Only sends the
+// recovery card when an escalation card was sent AND no recovery card has
+// been sent for it yet (lastRecoveryAt older than - or absent versus -
+// lastEscalationAt) - the common (no outage to recover from) path never
+// even reaches sendOperatorCard.
+async function recordSuccessRun(db, { now, transport }) {
+  const startedAt = now.toISOString();
+  const evidence = [];
+
+  const previousEscalation = lastEscalationAt(db, CRON_JOB_MARKET_ALERTS);
+  if (previousEscalation) {
+    const previousRecovery = lastRecoveryAt(db, CRON_JOB_MARKET_ALERTS);
+    const alreadyRecovered = previousRecovery && Date.parse(previousRecovery) >= Date.parse(previousEscalation);
+    if (!alreadyRecovered) {
+      await sendOperatorCard(db, transport, {
+        title: "✅ 提醒器已恢复",
+        lines: ["提醒器已恢复正常运行，盘中价格/持仓/敞口告警已重新生效。"]
+      });
+      evidence.push({ event: "recovery_sent", at: now.toISOString() });
+    }
+  }
+
+  recordJobRun(db, {
+    job: CRON_JOB_MARKET_ALERTS,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    ok: true,
+    actions: ["poll"],
+    evidence
+  });
+}
+
+// Operator alerts (escalation/recovery) are not scoped to one rule's owner -
+// a dead alerter silences every member's alerts, not just one - so they go
+// to every active member with a linked Feishu account, per the task brief's
+// recommendation. Delivery failures are logged and otherwise swallowed,
+// mirroring market-alerts-cards.mjs's deliverAlertCards: no retry here
+// either, the next poll cycle is the natural retry point.
+async function sendOperatorCard(db, transport, card) {
+  const members = new MemberRepository(db).listActive();
+  for (const member of members) {
+    if (!member.feishuOpenId) {
+      continue;
+    }
+    const result = await sendInteractiveCard(card, { openId: member.feishuOpenId }, transport);
+    if (!result.ok) {
+      console.error(
+        `market-alerts-poll: operator card delivery failed for member ${member.id}: ${result.error ?? "unknown error"}`
+      );
+    }
+  }
+}
+
 async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
-  const rules = store.listEnabledRules(db);
+  const rules = stepSync("load_rules", () => store.listEnabledRules(db));
   if (rules.length === 0) {
     return {
       ok: true,
@@ -145,7 +376,7 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   );
   // Quotes are market-wide, not owner-scoped, so fetched exactly once per
   // cycle and shared across every owner's evaluation below.
-  const quotes = await quoteProvider(symbols);
+  const quotes = await stepAsync("fetch_quotes", () => quoteProvider(symbols));
 
   const ownerIds = Array.from(new Set(validRules.map((rule) => rule.ownerId)));
   const rulesByOwner = new Map();
@@ -179,7 +410,7 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
 
   for (const ownerId of ownerIds) {
     const ownerRules = rulesByOwner.get(ownerId) ?? [];
-    const snapshotRow = store.loadLatestSnapshotForOwner(db, ownerId);
+    const snapshotRow = stepSync("load_snapshot", () => store.loadLatestSnapshotForOwner(db, ownerId));
     const exposureResult = computeExposure({
       netAssets: snapshotRow ? toNumber(snapshotRow.net_assets) ?? null : null,
       marketValue: snapshotRow ? toNumber(snapshotRow.market_value) ?? 0 : 0,
@@ -195,7 +426,9 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
     };
     samplesByOwner[ownerId] = ownerSample;
 
-    const ownerEvaluation = evaluateAll(ownerRules, runtimes, ownerSample, { [ownerId]: quotaByOwner[ownerId] ?? 0 });
+    const ownerEvaluation = stepSync("evaluate", () =>
+      evaluateAll(ownerRules, runtimes, ownerSample, { [ownerId]: quotaByOwner[ownerId] ?? 0 })
+    );
 
     fires.push(...ownerEvaluation.fires);
     skips.push(...ownerEvaluation.skips);
@@ -247,7 +480,7 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
     delta: (newQuotas[ownerId] ?? 0) - (quotaByOwner[ownerId] ?? 0)
   }));
 
-  const createdEvents = store.persistCycle(db, { runtimes: newRuntimes, events, quotaBumps });
+  const createdEvents = stepSync("persist", () => store.persistCycle(db, { runtimes: newRuntimes, events, quotaBumps }));
 
   const ruleById = new Map(validRules.map((rule) => [rule.id, rule]));
   const enrichedFires = fires.map((fire, index) => ({
@@ -262,7 +495,9 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   // rather than a per-id lookup (MemberRepository has none) - a rule owner
   // who has since gone inactive simply has no entry here and is reported by
   // composeAlertCards as a no_open_id skip rather than crashing.
-  const memberById = Object.fromEntries(new MemberRepository(db).listActive().map((member) => [member.id, member]));
+  const memberById = stepSync("load_members", () =>
+    Object.fromEntries(new MemberRepository(db).listActive().map((member) => [member.id, member]))
+  );
 
   // Fix 2 (cont'd): compose cards per owner too, not once for every owner's
   // fires together - composeAlertCards' `positions` parameter is flat by
@@ -279,12 +514,14 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
     if (ownerFires.length === 0) {
       continue;
     }
-    const composed = composeAlertCards(ownerFires, memberById, buildPositionsForCards(samplesByOwner[ownerId]));
+    const composed = stepSync("compose_cards", () =>
+      composeAlertCards(ownerFires, memberById, buildPositionsForCards(samplesByOwner[ownerId]))
+    );
     batches.push(...composed.batches);
     skippedDelivery.push(...composed.skipped);
   }
 
-  const delivery = await deliverAlertCards(db, { batches, skipped: skippedDelivery }, transport);
+  const delivery = await stepAsync("deliver_cards", () => deliverAlertCards(db, { batches, skipped: skippedDelivery }, transport));
 
   return {
     ok: true,

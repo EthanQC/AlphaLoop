@@ -17,6 +17,11 @@ const TRADING_TIME = "2026-07-01T14:30:00.000Z";
 const TRADING_DAY = "2026-07-01";
 // A Sunday - definitely outside US regular market hours.
 const OFF_HOURS_TIME = "2026-07-05T14:30:00.000Z";
+// The next trading day at the same US-Eastern hour as TRADING_TIME - 24h
+// later, comfortably past the 12h escalation-card throttle window, while
+// still landing inside regular market hours (unlike TRADING_TIME + 12h,
+// which would land at ~10:30pm ET the same evening, off-hours).
+const LATER_TRADING_TIME = "2026-07-02T14:30:00.000Z";
 // The trading calendar (trading-schedule.mjs) only has data for 2026.
 const OUT_OF_COVERAGE_TIME = "2027-01-15T15:00:00.000Z";
 
@@ -97,8 +102,38 @@ describe("runMarketAlertsPoll", () => {
     expect(result).toEqual({ ok: true, skipped: "off-hours" });
   });
 
+  it("off-hours writes NO run_log row and sends NO card (not a real run)", async () => {
+    const { db, dbPath } = makeDb();
+    let sendCalled = false;
+    const transport = fakeTransport(async () => {
+      sendCalled = true;
+      return { ok: true, messageId: "om_should_not_happen" };
+    });
+
+    const result = await poll.runMarketAlertsPoll({ now: new Date(OFF_HOURS_TIME), dbPath, transport });
+
+    expect(result).toEqual({ ok: true, skipped: "off-hours" });
+    expect(sendCalled).toBe(false);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
+  });
+
   it("rejects (non-zero at the CLI layer) for a year the trading calendar has no data for", async () => {
-    await expect(poll.runMarketAlertsPoll({ now: new Date(OUT_OF_COVERAGE_TIME) })).rejects.toThrow(/calendar/i);
+    // dbPath is passed explicitly (unlike the off-hours test above, which
+    // never opens any db) - a calendar-coverage error IS one of this task's
+    // three named failure modes for run_log/escalation (see module header),
+    // so this now opens its OWN db just to log the failure; without an
+    // explicit dbPath this would silently fall back to (and pollute) the
+    // real repo's runtime/trading.sqlite.
+    const { db, dbPath } = makeDb();
+    await expect(poll.runMarketAlertsPoll({ now: new Date(OUT_OF_COVERAGE_TIME), dbPath })).rejects.toThrow(
+      /calendar/i
+    );
+
+    const row = db.prepare("SELECT ok, failed_step FROM run_log WHERE job = 'market-alerts'").get() as
+      | { ok: number; failed_step: string }
+      | undefined;
+    expect(row?.ok).toBe(0);
+    expect(row?.failed_step).toBe("calendar_coverage");
   });
 
   it("quick-exits with zero counts and touches nothing when there are no enabled rules", async () => {
@@ -206,6 +241,9 @@ describe("runMarketAlertsPoll", () => {
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_runtime_state").get() as { c: number }).c).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_daily_quota").get() as { c: number }).c).toBe(0);
+    // --dry-run is not a real run either (see off-hours test above / module
+    // header) - no run_log row, ever.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
   });
 
   it("isolates a config-error rule (rule_type/frequency mismatch): other rules still evaluate and fire", async () => {
@@ -343,6 +381,186 @@ describe("runMarketAlertsPoll", () => {
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_runtime_state").get() as { c: number }).c).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
     expect(store.getQuota(db, "member_1", TRADING_DAY)).toBe(0);
+  });
+});
+
+// Task H1 (Phase 2.5 hardening): every REAL run (not off-hours, not
+// --dry-run - see the two tests above) writes a run_log row, ok or not, and
+// a persistently failing poller (3+ consecutive failures) escalates to
+// every active member with a linked Feishu account, throttled to one card
+// per 12h, followed by exactly one recovery card once it succeeds again.
+describe("run_log heartbeat + failure escalation (task H1)", () => {
+  function seedOneRule(db: DatabaseSync) {
+    seedMember(db, "member_1");
+    return store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+  }
+
+  // Deliberately embeds an obviously-secret-shaped token so the escalation
+  // card assertions below can prove sanitizeAlertText actually redacts it
+  // before the message reaches Feishu.
+  const failingQuoteProvider = async (): Promise<never> => {
+    throw new Error("Longbridge quote failed: LARK_APP_SECRET=shh-do-not-leak-this should never leak");
+  };
+
+  function cardTransport(sink: Array<{ target: unknown; cardJson: any }>) {
+    return {
+      sendCard: async (target: unknown, cardJson: any) => {
+        sink.push({ target, cardJson });
+        return { ok: true };
+      },
+      updateCard: async () => ({ ok: true })
+    };
+  }
+
+  it("a successful real run writes exactly one ok=1 run_log row with no failedStep", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 900 }] });
+
+    await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: async () => ({ "NVDA.US": { price: 950, prevClose: 900, volume: 1000 } }),
+      transport: fakeTransport()
+    });
+
+    const rows = db.prepare("SELECT ok, failed_step FROM run_log WHERE job = 'market-alerts'").all() as Array<{
+      ok: number;
+      failed_step: string | null;
+    }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.ok).toBe(1);
+    expect(rows[0]?.failed_step).toBeNull();
+  });
+
+  it("a failing real run writes a failed run_log row tagged with the phase that threw, no escalation yet (1st failure)", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+
+    await expect(
+      poll.runMarketAlertsPoll({
+        dbPath,
+        now: new Date(TRADING_TIME),
+        quoteProvider: failingQuoteProvider,
+        transport: cardTransport(sent)
+      })
+    ).rejects.toThrow(/Longbridge quote failed/);
+
+    const row = db.prepare("SELECT ok, failed_step FROM run_log WHERE job = 'market-alerts'").get() as {
+      ok: number;
+      failed_step: string;
+    };
+    expect(row.ok).toBe(0);
+    expect(row.failed_step).toBe("fetch_quotes");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("sends the escalation card on the 3rd consecutive failure (not the 1st or 2nd), sanitized", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = cardTransport(sent);
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.target).toEqual({ openId: "ou_member_1" });
+    expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器连续失败");
+    const bodyText = JSON.stringify(sent[0]?.cardJson.body);
+    expect(bodyText).toContain("已连续失败 3 次");
+    expect(bodyText).toContain("提醒功能当前不可用");
+    expect(bodyText).not.toContain("shh-do-not-leak-this");
+  });
+
+  it("does NOT resend the escalation card on the 4th/5th consecutive failures (12h throttle)", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = cardTransport(sent);
+
+    for (let i = 0; i < 5; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+
+    expect(sent).toHaveLength(1);
+    const failureRows = db.prepare("SELECT COUNT(*) AS c FROM run_log WHERE job = 'market-alerts' AND ok = 0").get() as {
+      c: number;
+    };
+    expect(failureRows.c).toBe(5);
+  });
+
+  it("sends a new escalation card once the 12h throttle window has passed", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = cardTransport(sent);
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+    expect(sent).toHaveLength(1);
+
+    await expect(
+      poll.runMarketAlertsPoll({
+        dbPath,
+        now: new Date(LATER_TRADING_TIME),
+        quoteProvider: failingQuoteProvider,
+        transport
+      })
+    ).rejects.toThrow();
+
+    expect(sent).toHaveLength(2);
+  });
+
+  it("sends the recovery card exactly once after the first successful run following an escalation", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db);
+    seedSnapshot(db, { positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 950 }] });
+    const sent: Array<{ target: unknown; cardJson: any }> = [];
+    const transport = cardTransport(sent);
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport })
+      ).rejects.toThrow();
+    }
+    expect(sent).toHaveLength(1); // escalation only
+
+    // prevClose === price (0% daily move, well under the 4% threshold) so
+    // this successful run's own rule evaluation does NOT also fire a real
+    // alert card on the shared transport - this test isolates the
+    // escalation/recovery cards specifically, not rule fires (daily_move's
+    // value is price-vs-prevClose, not price-vs-costPrice).
+    const okQuoteProvider = async () => ({ "NVDA.US": { price: 950, prevClose: 950, volume: 1000 } });
+
+    await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: okQuoteProvider, transport });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.cardJson.header.title.content).toBe("✅ 提醒器已恢复");
+
+    // A second consecutive success must NOT resend the recovery card.
+    await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: okQuoteProvider, transport });
+    expect(sent).toHaveLength(2);
+
+    const okRows = db.prepare("SELECT COUNT(*) AS c FROM run_log WHERE job = 'market-alerts' AND ok = 1").get() as {
+      c: number;
+    };
+    expect(okRows.c).toBe(2);
   });
 });
 
