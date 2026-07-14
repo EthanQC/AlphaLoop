@@ -222,6 +222,25 @@ export function recordJobRun(db, entry) {
 }
 
 /**
+ * ISO `started_at` of the single most recent run_log row for `job` (ok or
+ * not) - `null` if `job` has no run_log rows at all yet. Added for task H2
+ * (Phase 2.5 hardening, launchd installer + doctor coverage): the doctor's
+ * "has this poller stopped ticking" heartbeat check needs the latest run
+ * regardless of outcome, unlike recentFailures (ok=0 only) or
+ * consecutiveFailureCount (a streak length, not a timestamp) below.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string} job
+ * @returns {string | null}
+ */
+export function lastRunAt(db, job) {
+  const row = db
+    .prepare(`SELECT started_at FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT 1`)
+    .get(String(job));
+  return row ? String(row.started_at) : null;
+}
+
+/**
  * The most recent `limit` FAILED (ok=0) runs for `job`, newest first.
  *
  * @param {import('node:sqlite').DatabaseSync} db
