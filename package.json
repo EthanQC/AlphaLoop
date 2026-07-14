@@ -10,6 +10,8 @@
   "scripts": {
     "build": "pnpm -r run build",
     "dev:broker-executor": "pnpm --filter @apps/broker-executor run dev",
+    "platform:dev": "pnpm --filter @apps/platform-app run dev",
+    "platform:start": "pnpm --filter @apps/platform-app run start",
     "report:daily": "node apps/openclaw-config/scripts/scheduled-report.mjs daily prepare",
     "report:weekly": "node apps/openclaw-config/scripts/scheduled-report.mjs weekly prepare",
     "report:daily:prepare": "node apps/openclaw-config/scripts/scheduled-report.mjs daily prepare",

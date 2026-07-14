@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/shared-types" },
-    { "path": "./apps/broker-executor" }
+    { "path": "./apps/broker-executor" },
+    { "path": "./apps/platform-app" }
   ]
 }

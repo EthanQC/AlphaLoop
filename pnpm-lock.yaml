@@ -30,6 +30,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-types
 
+  apps/platform-app:
+    dependencies:
+      '@packages/shared-types':
+        specifier: workspace:*
+        version: link:../../packages/shared-types
+
   packages/shared-types: {}
 
 packages:
