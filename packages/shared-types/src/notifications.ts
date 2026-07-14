@@ -583,7 +583,12 @@ async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string
       }
     }), "feishu-user-plugin file send");
     const detail = extractMcpText(sent);
-    if (sent.isError || /^error:/iu.test(detail)) {
+    // Item 6 (task P2.5 Task 6): this was the one remaining call site that
+    // checked a narrower `/^error:/iu` directly instead of routing through
+    // isFeishuProseFailure - a "Send failed: ..." prose response (a real
+    // feishu-user-plugin shape, see that helper's own doc comment) fell
+    // through undetected and was reported as a successful PDF delivery.
+    if (sent.isError || isFeishuProseFailure(detail)) {
       return {
         sent: false,
         target: "feishu-user-plugin-bot-file",

@@ -5,8 +5,18 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
-import { buildPositionsForCards, composeAlertCards, deliverAlertCards } from "./market-alerts-cards.mjs";
-import * as store from "./market-alerts-store.mjs";
+
+// Item 2 (task P2.5 Task 6): wraps the REAL updateEventMessageId (transparent
+// to every other test in this file, which calls it via vi.fn(actual...))
+// purely so one test below can force it to throw for ONE eventId - proving a
+// post-send DB error no longer aborts deliverAlertCards' remaining batches.
+vi.mock("./market-alerts-store.mjs", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, updateEventMessageId: vi.fn(actual.updateEventMessageId as (...args: unknown[]) => unknown) };
+});
+
+const { buildPositionsForCards, composeAlertCards, deliverAlertCards } = await import("./market-alerts-cards.mjs");
+const store = await import("./market-alerts-store.mjs");
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -560,6 +570,47 @@ describe("deliverAlertCards", () => {
       { sendCard: async () => ({ ok: true }), updateCard: async () => ({ ok: true }) }
     );
     expect(summary).toEqual({ sent: 0, failed: 0, skipped: 0 });
+  });
+
+  // Item 2 (task P2.5 Task 6): updateEventMessageId's backfill call used to
+  // run un-guarded inside deliverAlertCards' loop - a DB error there (e.g. a
+  // lock contention) after the card had ALREADY been successfully sent threw
+  // straight out of deliverAlertCards, aborting every REMAINING owner's batch
+  // in the same cycle even though their sends hadn't even been attempted yet.
+  it("does not abort remaining batches when updateEventMessageId throws for an earlier, already-sent batch", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const eventId1 = seedEvent();
+    const rule2 = store.insertRule(db, {
+      ownerId: "member_2",
+      symbol: "AAPL.US",
+      ruleType: "daily_move",
+      threshold: 0.04,
+      direction: "both",
+      frequency: "once_daily"
+    });
+    const [event2] = store.recordEvents(db, [
+      { ruleId: rule2.id, ownerId: "member_2", value: 0.05, triggeredAt: "2026-07-13T14:10:00.000Z" }
+    ]);
+
+    vi.mocked(store.updateEventMessageId).mockImplementationOnce(() => {
+      throw new Error("database is locked");
+    });
+
+    const batch1 = makeBatch([eventId1]);
+    const batch2 = { ...makeBatch([event2.id]), ownerId: "member_2", openId: "ou_member_2" };
+    const fakeTransport = {
+      sendCard: async () => ({ ok: true, messageId: "om_after_db_error" }),
+      updateCard: async () => ({ ok: true })
+    };
+
+    const summary = await deliverAlertCards(db, { batches: [batch1, batch2], skipped: [] }, fakeTransport);
+
+    // Both cards were genuinely delivered - a message_id backfill failure
+    // must not be conflated with a delivery failure, nor abort batch2's send.
+    expect(summary).toEqual({ sent: 2, failed: 0, skipped: 0 });
+    expect(store.getEvent(db, event2.id)?.messageId).toBe("om_after_db_error");
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("throws when handed a bare batches array instead of composeAlertCards' {batches, skipped} shape", async () => {

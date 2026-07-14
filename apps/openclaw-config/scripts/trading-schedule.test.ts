@@ -84,4 +84,15 @@ describe("trading schedule policy", () => {
   it("computes the current US Eastern trading day, crossing midnight from Beijing time", () => {
     expect(schedule.currentUsEasternTradingDay(new Date("2026-07-13T04:00:00+08:00"))).toBe("2026-07-12");
   });
+
+  // Item 5 (task P2.5 Task 6): the sample above is a July (EDT, UTC-4) date -
+  // every existing test of currentUsEasternTradingDay in this file only ever
+  // exercised the daylight-saving offset. This pins the same
+  // crosses-midnight-from-Beijing-time behavior in winter (EST, UTC-5,
+  // January 2026 - outside any DST window per NYSE_FULL_CLOSE_DATES), so a
+  // future regression that only breaks the standard-time branch of
+  // getZonedParts' timezone math has a test to catch it.
+  it("computes the current US Eastern trading day in winter (EST, UTC-5), crossing midnight from Beijing time", () => {
+    expect(schedule.currentUsEasternTradingDay(new Date("2026-01-15T08:00:00+08:00"))).toBe("2026-01-14");
+  });
 });

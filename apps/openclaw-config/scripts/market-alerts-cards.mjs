@@ -233,7 +233,20 @@ export async function deliverAlertCards(db, composed, transport) {
     // backfill onto alert_events for later feedback correlation.
     if (result.messageId) {
       for (const eventId of batch.eventIds) {
-        updateEventMessageId(db, eventId, result.messageId);
+        // Item 2 (task P2.5 Task 6): the card has ALREADY been sent
+        // successfully by this point - a DB error backfilling message_id
+        // (e.g. lock contention) is a bookkeeping failure, not a delivery
+        // failure, and must never be allowed to escape this loop and abort
+        // the REMAINING owners' batches in this same cycle (whose sends
+        // haven't even been attempted yet). Logged and swallowed, same
+        // no-retry-this-cycle philosophy as a transport failure above.
+        try {
+          updateEventMessageId(db, eventId, result.messageId);
+        } catch (error) {
+          console.error(
+            `market-alerts-cards: failed to backfill message_id for event ${eventId} (card was already sent - still counts as sent): ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
       }
     }
   }

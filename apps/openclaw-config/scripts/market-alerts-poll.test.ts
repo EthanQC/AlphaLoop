@@ -30,10 +30,20 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, renameSync: vi.fn(actual.renameSync as (...args: unknown[]) => unknown) };
 });
 
+// Item 3 (task P2.5 Task 6): wraps the REAL persistCycle (transparent to
+// every other test in this file) purely so one test below can assert it was
+// never CALLED at all for an all-config-error batch - a spy on call count,
+// not a behavior override.
+vi.mock("./market-alerts-store.mjs", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, persistCycle: vi.fn(actual.persistCycle as (...args: unknown[]) => unknown) };
+});
+
 const poll = await import("./market-alerts-poll.mjs");
 const store = await import("./market-alerts-store.mjs");
 const jobRunLog = await import("./job-run-log.mjs");
 const fsModule = await import("node:fs");
+const persistCycleSpy = vi.mocked(store.persistCycle);
 
 // A known-good US regular-market-hours instant (Wednesday 10:30am US-Eastern,
 // July - EDT, no DST edge case), matching the fixture already used across
@@ -139,10 +149,30 @@ function fakeTransport(sendCard?: (target: unknown) => Promise<{ ok: boolean; me
   };
 }
 
+// Uniform summary shape (task P2.5 Task 6, item 1): every early-exit path
+// (off-hours, no-rules) used to invent its own bespoke shape - off-hours
+// returned the STRING `skipped: "off-hours"`, colliding with every other
+// path's NUMERIC `skipped` (a delivery-skip count). A consumer that always
+// reads `result.skipped` as a number (e.g. the delivery-health bookkeeping a
+// few hundred lines down in market-alerts-poll.mjs) would choke on the
+// off-hours shape specifically. Fixed shape: `{ ok, skipReason?, ...counts }`
+// where `counts.skipped` (and every other count) is ALWAYS a number, and
+// `skipReason` ("off-hours" | "no-rules") is the ONLY thing that varies by
+// early-exit reason.
+const ZERO_CYCLE_COUNTS = {
+  evaluated: 0,
+  fires: 0,
+  sent: 0,
+  failed: 0,
+  skipped: 0,
+  skippedRules: [],
+  quotaBlocked: 0
+};
+
 describe("runMarketAlertsPoll", () => {
-  it("skips cleanly off-hours, returning exactly {ok:true, skipped:'off-hours'} with no db touched", async () => {
+  it("skips cleanly off-hours, with a numeric zeroed-count shape (skipReason, not a string skipped) and no db touched", async () => {
     const result = await poll.runMarketAlertsPoll({ now: new Date(OFF_HOURS_TIME) });
-    expect(result).toEqual({ ok: true, skipped: "off-hours" });
+    expect(result).toEqual({ ok: true, skipReason: "off-hours", dryRun: false, ...ZERO_CYCLE_COUNTS });
   });
 
   it("off-hours writes NO run_log row and sends NO card (not a real run)", async () => {
@@ -155,7 +185,7 @@ describe("runMarketAlertsPoll", () => {
 
     const result = await poll.runMarketAlertsPoll({ now: new Date(OFF_HOURS_TIME), dbPath, transport });
 
-    expect(result).toEqual({ ok: true, skipped: "off-hours" });
+    expect(result).toEqual({ ok: true, skipReason: "off-hours", dryRun: false, ...ZERO_CYCLE_COUNTS });
     expect(sendCalled).toBe(false);
     expect((db.prepare("SELECT COUNT(*) AS c FROM run_log").get() as { c: number }).c).toBe(0);
   });
@@ -179,13 +209,14 @@ describe("runMarketAlertsPoll", () => {
     expect(row?.failed_step).toBe("calendar_coverage");
   });
 
-  it("quick-exits with zero counts and touches nothing when there are no enabled rules", async () => {
+  it("quick-exits with zero counts and skipReason:'no-rules' when there are no enabled rules", async () => {
     const { db, dbPath } = makeDb();
 
     const result = await poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME) });
 
     expect(result).toMatchObject({
       ok: true,
+      skipReason: "no-rules",
       evaluated: 0,
       fires: 0,
       sent: 0,
@@ -193,6 +224,45 @@ describe("runMarketAlertsPoll", () => {
       skipped: 0,
       skippedRules: []
     });
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
+  });
+
+  // Item 3 (task P2.5 Task 6): a batch that has enabled rules loaded, but
+  // where EVERY one of them is filtered out as a config_error (rule_type/
+  // frequency mismatch, see partitionConfigErrors), used to still call
+  // store.persistCycle with empty runtimes/events/quotaBumps - opening (and
+  // committing) a needless BEGIN IMMEDIATE TRANSACTION for nothing on every
+  // single poll cycle. Spies on the real store.persistCycle (wrapping the
+  // actual implementation everywhere else, per this file's existing
+  // job-run-log/node:fs mock convention) to prove it is never called at all
+  // when validRules.length === 0, distinct from the "rules.length === 0"
+  // quick-exit above (this scenario has rules loaded, just none of them valid).
+  it("does not open an empty persistCycle transaction when every enabled rule is a config_error", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    db.prepare(`
+      INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
+      VALUES ('rule_bad_only', 'member_1', 'MSFT.US', 'daily_move', 0.04, 'both', 'continuous', 0, 1, ?)
+    `).run("2026-07-01T00:00:00.000Z");
+
+    persistCycleSpy.mockClear();
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      quoteProvider: async () => ({}),
+      transport: fakeTransport()
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.evaluated).toBe(0);
+    expect(result.skippedRules).toEqual([{ ruleId: "rule_bad_only", reason: "config_error" }]);
+    // A plain call-count check, not `.not.toHaveBeenCalled()` - the latter
+    // pretty-prints every received call's arguments (including the DB handle
+    // argument) on failure, and by the time vitest formats that diff the
+    // poller's own db connection has already been closed in its `finally`
+    // block, which throws "database is not open" from inside the pretty
+    // printer and masks the real assertion failure.
+    expect(persistCycleSpy.mock.calls.length).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
   });
 
@@ -245,6 +315,45 @@ describe("runMarketAlertsPoll", () => {
     expect(runtimes[rule.id]?.lastFiredTradingDay).toBe(TRADING_DAY);
 
     expect(store.getQuota(db, "member_1", TRADING_DAY)).toBe(1);
+  });
+
+  // Item 2 (task P2.5 Task 6): buildEnginePositions used to key its returned
+  // positions map by `String(row.symbol).toUpperCase()` only - a bare snapshot
+  // symbol like "nvda" (no exchange suffix, as Longbridge's own position feed
+  // can return) upper-cased to "NVDA", which never matches a rule's
+  // normalized "NVDA.US" symbol (see market-alerts.mjs's resolveAddSymbol,
+  // which always normalizes via report-data.mjs's normalizeSymbol at rule
+  // creation time). unrealized_pnl's sample.positions?.[rule.symbol] lookup
+  // then permanently misses -> skip:no_data forever, even though the position
+  // genuinely exists. Fixed by normalizing the snapshot row's symbol the same
+  // way the rule's own symbol is normalized.
+  it("matches a bare (unsuffixed) snapshot position symbol to a normalized 'SYM.US' rule via normalizeSymbol (not just uppercase)", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.05,
+      direction: "both",
+      frequency: "continuous"
+    });
+    // Deliberately a BARE symbol, no ".US" suffix - simulates a real
+    // Longbridge position row that doesn't carry an exchange suffix.
+    seedSnapshot(db, { positions: [{ symbol: "nvda", quantity: 10, costPrice: 100 }] });
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      now: new Date(TRADING_TIME),
+      // +10% vs. cost, comfortably past the 0.05 threshold.
+      quoteProvider: async () => ({ "NVDA.US": { price: 110, prevClose: 105, volume: 1000 } }),
+      transport: fakeTransport()
+    });
+
+    expect(result.ok).toBe(true);
+    // Pre-fix: this fires 0 (the position lookup misses under "NVDA.US" and
+    // the rule permanently skips as no_data instead).
+    expect(result.fires).toBe(1);
   });
 
   it("--dry-run evaluates and reports would-fire but writes nothing and delivers nothing", async () => {
@@ -1707,7 +1816,13 @@ describe("task H1 FOURTH fix round: unpersistable counters and the permanently-l
     expect(existsSync(artifactPath)).toBe(true);
 
     const result = await poll.runMarketAlertsPoll({ dbPath, now: new Date(OFF_HOURS_TIME) });
-    expect(result).toEqual({ ok: true, skipped: "off-hours", alerterDown: true });
+    expect(result).toEqual({
+      ok: true,
+      skipReason: "off-hours",
+      dryRun: false,
+      ...ZERO_CYCLE_COUNTS,
+      alerterDown: true
+    });
   });
 
   // Fix E bullet 1: a throw from sending the hard-failure escalation card

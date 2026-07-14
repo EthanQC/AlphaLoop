@@ -8,8 +8,10 @@
 //
 // Flow per cycle:
 //   assertCalendarCoverage(now) -> isUsRegularMarketHours(now) false ->
-//   {ok:true, skipped:"off-hours"} -> load enabled rules (none -> quick
-//   exit) -> isolate per-rule config errors (see below) -> fetch quotes once
+//   {ok:true, skipReason:"off-hours", ...zeroed counts} (see zeroCycleCounts -
+//   task P2.5 Task 6's uniform-summary-shape fix: `skipped` is ALWAYS a
+//   number here, never the string "off-hours") -> load enabled rules (none ->
+//   quick exit, skipReason:"no-rules") -> isolate per-rule config errors (see below) -> fetch quotes once
 //   (shared across owners, market-wide data) -> for EACH owner: resolve
 //   THEIR OWN latest official_paper_snapshots row (falling back to the
 //   legacy shared owner_id=NULL row only when the owner has none of their
@@ -353,7 +355,7 @@ import * as store from "./market-alerts-store.mjs";
 import { sanitizeAlertText } from "./openclaw-cron-runner-alerts.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
-import { toNumber } from "./report-data.mjs";
+import { normalizeSymbol, toNumber } from "./report-data.mjs";
 import { assertCalendarCoverage, currentUsEasternTradingDay, isUsRegularMarketHours } from "./trading-schedule.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -423,9 +425,9 @@ export async function runMarketAlertsPoll(options = {}) {
     // pure fs.existsSync check (see its own doc comment), so this costs
     // nothing extra even on the overwhelmingly common off-hours tick.
     if (isAlerterDownArtifactPresent(dbPath)) {
-      return { ok: true, skipped: "off-hours", alerterDown: true };
+      return { ok: true, skipReason: "off-hours", dryRun, ...zeroCycleCounts(), alerterDown: true };
     }
-    return { ok: true, skipped: "off-hours" };
+    return { ok: true, skipReason: "off-hours", dryRun, ...zeroCycleCounts() };
   }
 
   let db;
@@ -1550,17 +1552,7 @@ async function sendOperatorCard(db, transport, card) {
 async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   const rules = stepSync("load_rules", () => store.listEnabledRules(db));
   if (rules.length === 0) {
-    return {
-      ok: true,
-      dryRun,
-      evaluated: 0,
-      fires: 0,
-      sent: 0,
-      failed: 0,
-      skipped: 0,
-      skippedRules: [],
-      quotaBlocked: 0
-    };
+    return { ok: true, skipReason: "no-rules", dryRun, ...zeroCycleCounts() };
   }
 
   const { validRules, skippedRules } = partitionConfigErrors(rules);
@@ -1656,6 +1648,18 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
     };
   }
 
+  // Item 3 (task P2.5 Task 6): a batch that HAD enabled rules loaded but
+  // where every single one was filtered out by partitionConfigErrors (all
+  // config_error - a rule_type/frequency mismatch) leaves validRules/ownerIds
+  // both empty. store.persistCycle unconditionally opens a BEGIN IMMEDIATE
+  // TRANSACTION even for empty runtimes/events/quotaBumps - pointless write-
+  // lock contention on every such cycle for literally nothing to persist.
+  // Distinct from the rules.length === 0 quick-exit above pollOnce (that one
+  // never even loads a rule); this one still reports the real skippedRules.
+  if (validRules.length === 0) {
+    return { ok: true, dryRun: false, evaluated: 0, fires: 0, sent: 0, failed: 0, skipped: 0, skippedRules, quotaBlocked: 0 };
+  }
+
   // Fix 1: saveRuntimes/recordEvents/bumpQuota persist as ONE atomic unit
   // (store.persistCycle, one BEGIN IMMEDIATE transaction) instead of three
   // separate implicit transactions - see the module header. `createdEvents`
@@ -1736,6 +1740,17 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Uniform summary shape (task P2.5 Task 6, item 1): every early-exit path
+// (off-hours in runMarketAlertsPoll, no-rules in pollOnce) shares this SAME
+// zeroed-count object, so `result.skipped` (and every sibling count) is
+// ALWAYS a number regardless of WHY the cycle was skipped - only `skipReason`
+// ("off-hours" | "no-rules") varies. Before this fix, off-hours returned the
+// bare string `skipped: "off-hours"`, a different type from every other
+// path's numeric delivery-skip count on the exact same field name.
+function zeroCycleCounts() {
+  return { evaluated: 0, fires: 0, sent: 0, failed: 0, skipped: 0, skippedRules: [], quotaBlocked: 0 };
+}
+
 function partitionConfigErrors(rules) {
   const validRules = [];
   const skippedRules = [];
@@ -1780,10 +1795,19 @@ function parseSnapshotPositions(raw) {
 // back to cost basis) - nothing downstream actually reads it today (the
 // engine only reads costPrice; buildPositionsForCards only reads quantity),
 // but it's included to match the documented sample shape.
+//
+// Item 2 (task P2.5 Task 6): keyed by report-data.mjs's normalizeSymbol, NOT
+// a bare `.toUpperCase()` - a rule's own symbol is always normalized at
+// creation time (market-alerts.mjs's resolveAddSymbol, e.g. a bare "NVDA"
+// becomes "NVDA.US"), but a real Longbridge position row can come back with
+// no exchange suffix at all. Keying this map by uppercase-only left such a
+// position permanently unmatched by evaluateRule's `sample.positions?.
+// [rule.symbol]` lookup (market-alerts-engine.mjs) - skip:no_data forever for
+// a position that genuinely exists, never a market-data outage.
 function buildEnginePositions(snapshotRow, quotes) {
   const positions = {};
   for (const row of parseSnapshotPositions(snapshotRow?.positions)) {
-    const symbol = String(row?.symbol ?? "").toUpperCase();
+    const symbol = normalizeSymbol(row?.symbol);
     if (!symbol) {
       continue;
     }

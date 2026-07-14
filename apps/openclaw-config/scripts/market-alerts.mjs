@@ -44,27 +44,24 @@ const DIRECTIONS = ["both", "up", "down"];
 // --threshold/--direction/--rule/--event/--note) always expects a value.
 const BOOLEAN_FLAGS = new Set(["all", "purge"]);
 
-// Fix 4 (task P2-4 fix round): the full set of flags this CLI understands,
-// across every subcommand. parseFlags doesn't know which subcommand it's
-// parsing for, so this is deliberately the union of all of them rather than
-// a per-command allowlist - the per-command "which flags actually apply"
-// validation still happens where it always has (each run* function). This
-// set only exists to catch typos (`--treshold`) and stray flags fail-loud,
-// matching the rest of this CLI's philosophy (see the direction gate and
-// the omitted-value handling below) instead of silently ignoring them and
-// falling back to a default with no error at all.
-const KNOWN_FLAGS = new Set([
-  "actor",
-  "symbol",
-  "type",
-  "threshold",
-  "direction",
-  "rule",
-  "event",
-  "note",
-  "all",
-  "purge"
-]);
+// Item 3 (task P2.5 Task 6): KNOWN_FLAGS used to be a single global union of
+// every subcommand's flags (Fix 4, task P2-4 fix round) - it caught typos
+// (`--treshold`) fine, but a flag that is real FOR A DIFFERENT SUBCOMMAND
+// (e.g. `--purge`, which only makes sense for `remove`) parsed successfully
+// under `pause` too and was then just never read by runPause - silently
+// ignored instead of erroring, the exact class of bug this CLI's philosophy
+// otherwise refuses to allow (see the direction gate and the omitted-value
+// handling below). COMMAND_FLAGS scopes the allowlist PER subcommand instead,
+// so a cross-command flag now fails loud with the same "未知参数" error a
+// genuine typo gets.
+const COMMAND_FLAGS = {
+  list: new Set(["actor", "all"]),
+  add: new Set(["actor", "symbol", "type", "threshold", "direction"]),
+  remove: new Set(["actor", "rule", "purge"]),
+  pause: new Set(["actor", "rule"]),
+  resume: new Set(["actor", "rule"]),
+  feedback: new Set(["actor", "event", "note"])
+};
 
 /**
  * Parses `--flag value` / `--boolFlag` pairs from an argv slice (after the
@@ -84,9 +81,18 @@ const KNOWN_FLAGS = new Set([
  * An unrecognized `--flag` (a typo like `--treshold`) throws immediately
  * instead of being silently recorded and ignored (Fix 4, task P2-4 fix
  * round) - without this, `add --treshold 0.05` would fall back to the
- * type's default threshold with no error at all.
+ * type's default threshold with no error at all. Item 3 (task P2.5 Task 6):
+ * "unrecognized" is now scoped to `command` - a flag that is real for a
+ * DIFFERENT subcommand (e.g. `--purge` under `pause`) throws the exact same
+ * "未知参数" error instead of parsing fine and then just never being read.
+ *
+ * @param {string[]} argv
+ * @param {string} [command] the dispatching subcommand (see COMMAND_FLAGS) -
+ *   an unrecognized/absent command allows NO flags at all, so any `--flag`
+ *   passed alongside one still fails loud here rather than silently no-oping.
  */
-export function parseFlags(argv) {
+export function parseFlags(argv, command) {
+  const allowedFlags = COMMAND_FLAGS[command] ?? new Set();
   const flags = {};
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -94,7 +100,7 @@ export function parseFlags(argv) {
       continue;
     }
     const name = token.slice(2);
-    if (!KNOWN_FLAGS.has(name)) {
+    if (!allowedFlags.has(name)) {
       throw new Error(`未知参数：--${name}。`);
     }
     if (BOOLEAN_FLAGS.has(name)) {
@@ -425,7 +431,7 @@ export function runMarketAlertsCommand(command, flags, options = {}) {
 export function buildCliResult(argv, options = {}) {
   try {
     const [command, ...rest] = argv;
-    const flags = parseFlags(rest);
+    const flags = parseFlags(rest, command);
     const dbPath = options.dbPath ?? resolveRuntimePaths(repoRoot).dbPath;
     return runMarketAlertsCommand(command, flags, { dbPath });
   } catch (error) {

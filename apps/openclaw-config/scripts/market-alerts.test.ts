@@ -881,32 +881,49 @@ describe("runMarketAlertsCommand: dispatch", () => {
   });
 });
 
+// Item 3 (task P2.5 Task 6): parseFlags now takes the dispatching subcommand
+// as its 2nd argument and only accepts flags that ACTUALLY apply to THAT
+// command (KNOWN_FLAGS became a per-command allowlist, replacing the old
+// single global union). Before this fix, `pause --purge` parsed successfully
+// (--purge WAS in the global union, added for `remove`) and was then just
+// never read by runPause - a cross-command flag was silently ignored instead
+// of erroring, exactly like a typo'd flag should. The tests below now always
+// pass an explicit command whose real flag set covers every flag used in that
+// call, so each test still exercises the same parsing MECHANIC as before
+// (value flags, the boolean flag, omitted-value handling, unknown-flag
+// rejection) - just scoped to a command it's actually valid for.
 describe("parseFlags", () => {
-  it("parses --flag value pairs and the --all boolean flag", () => {
-    expect(cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--all"])).toEqual({
+  it("parses --flag value pairs for a command that accepts them", () => {
+    expect(cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL"], "add")).toEqual({
       actor: "member_1",
-      symbol: "AAPL",
+      symbol: "AAPL"
+    });
+  });
+
+  it("parses the --all boolean flag for the command that accepts it (list)", () => {
+    expect(cli.parseFlags(["--actor", "member_1", "--all"], "list")).toEqual({
+      actor: "member_1",
       all: true
     });
   });
 
   it("ignores non-flag tokens", () => {
-    expect(cli.parseFlags(["stray", "--actor", "member_1"])).toEqual({ actor: "member_1" });
+    expect(cli.parseFlags(["stray", "--actor", "member_1"], "pause")).toEqual({ actor: "member_1" });
   });
 
-  // Regression (code review finding): only `--all` is a genuine boolean
-  // flag. Every other flag expects a value; a value-flag with nothing
-  // after it (end of argv, or immediately followed by another `--flag`)
-  // must NOT become the JS boolean `true` - `Number(true) === 1` and
-  // `String(true).trim() === "true"` (both truthy/non-empty) would let a
+  // Regression (code review finding): only `--all`/`--purge` are genuine
+  // boolean flags. Every other flag expects a value; a value-flag with
+  // nothing after it (end of argv, or immediately followed by another
+  // `--flag`) must NOT become the JS boolean `true` - `Number(true) === 1`
+  // and `String(true).trim() === "true"` (both truthy/non-empty) would let a
   // typo'd/omitted value silently pass downstream validation instead of
   // being treated as "no value supplied".
   it("treats a value-flag with no following token as an empty string, not boolean true", () => {
-    expect(cli.parseFlags(["--actor"])).toEqual({ actor: "" });
+    expect(cli.parseFlags(["--actor"], "pause")).toEqual({ actor: "" });
   });
 
   it("treats a value-flag immediately followed by another flag as an empty string, not boolean true", () => {
-    expect(cli.parseFlags(["--threshold", "--direction", "up"])).toEqual({ threshold: "", direction: "up" });
+    expect(cli.parseFlags(["--threshold", "--direction", "up"], "add")).toEqual({ threshold: "", direction: "up" });
   });
 
   // Fix 4 (task P2-4 fix round): fail loud on unrecognized flags instead of
@@ -916,26 +933,41 @@ describe("parseFlags", () => {
   // `--treshold 0.05` would silently parse as an unused key and `add` would
   // fall back to the type's default threshold with no error at all.
   it("rejects an unknown flag instead of silently ignoring it (e.g. --treshold typo)", () => {
-    expect(() => cli.parseFlags(["--actor", "member_1", "--treshold", "0.05"])).toThrow(/未知参数/);
+    expect(() => cli.parseFlags(["--actor", "member_1", "--treshold", "0.05"], "add")).toThrow(/未知参数/);
   });
 
   it("rejects an unknown boolean-looking flag too", () => {
-    expect(() => cli.parseFlags(["--al"])).toThrow(/未知参数/);
+    expect(() => cli.parseFlags(["--al"], "list")).toThrow(/未知参数/);
   });
 
-  it("accepts --purge as a known boolean flag (Fix 3's hard-delete opt-in)", () => {
-    expect(cli.parseFlags(["--actor", "member_1", "--rule", "r1", "--purge"])).toEqual({
+  it("accepts --purge as a known boolean flag on the command it applies to (remove, Fix 3's hard-delete opt-in)", () => {
+    expect(cli.parseFlags(["--actor", "member_1", "--rule", "r1", "--purge"], "remove")).toEqual({
       actor: "member_1",
       rule: "r1",
       purge: true
     });
+  });
+
+  // Item 3's core regression (task P2.5 Task 6): --purge is a REAL, known
+  // flag - just not for `pause`. Before this fix it parsed fine (global
+  // union) and runPause simply never read it, so `pause --purge` silently
+  // behaved like a plain pause with no error at all. It must now fail loud,
+  // the same way a genuine typo does.
+  it("rejects --purge on pause instead of silently ignoring it - it only applies to remove", () => {
+    expect(() => cli.parseFlags(["--actor", "x", "--rule", "y", "--purge"], "pause")).toThrow(/未知参数：--purge/);
+  });
+
+  it("rejects --all on add instead of silently ignoring it - it only applies to list", () => {
+    expect(() => cli.parseFlags(["--actor", "x", "--symbol", "AAPL", "--type", "daily_move", "--all"], "add")).toThrow(
+      /未知参数：--all/
+    );
   });
 });
 
 describe("runAdd / runList: omitted-value flags fail loud instead of silently coercing (code review regression)", () => {
   it("an --actor with no value still fails with the missing-argument error, not a stringified 'true'", () => {
     const { options } = makeDb();
-    const flags = cli.parseFlags(["--actor"]);
+    const flags = cli.parseFlags(["--actor"], "list");
 
     expect(() => cli.runList(flags, options)).toThrow(/--actor/);
   });
@@ -944,7 +976,7 @@ describe("runAdd / runList: omitted-value flags fail loud instead of silently co
     const { db, options } = makeDb();
     seedMember(db, "member_1");
     seedTarget(db, "AAPL.US", "member_1");
-    const flags = cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--type", "daily_move", "--threshold"]);
+    const flags = cli.parseFlags(["--actor", "member_1", "--symbol", "AAPL", "--type", "daily_move", "--threshold"], "add");
 
     expect(() => cli.runAdd(flags, options)).toThrow(/threshold/);
   });
@@ -977,6 +1009,20 @@ describe("buildCliResult: the whole pre-dispatch path (parse + dispatch) is wrap
 
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/--actor/);
+  });
+
+  // Item 3 (task P2.5 Task 6), end to end through the exact CLI entry point:
+  // `pause --purge` used to succeed silently (KNOWN_FLAGS was a single global
+  // union covering every subcommand's flags, so --purge - real for `remove` -
+  // parsed fine for `pause` too and was just never read). Must now fail loud
+  // with a Chinese, non-zero-exit-worthy error, matching this CLI's binding
+  // contract (buildCliResult's own doc comment).
+  it("converts 'pause --purge' into {ok:false, error} - --purge does not apply to pause", () => {
+    const { options } = makeDb();
+
+    const result = cli.buildCliResult(["pause", "--actor", "x", "--rule", "y", "--purge"], options);
+
+    expect(result).toEqual({ ok: false, error: "未知参数：--purge。" });
   });
 
   it("converts an unknown subcommand into {ok:false, error}", () => {
