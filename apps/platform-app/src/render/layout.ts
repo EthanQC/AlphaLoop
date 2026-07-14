@@ -156,7 +156,11 @@ export function formatBeijingGeneratedAt(date: Date): string {
   return `${month}-${day} 周${weekdayCn} ${hour}:${minute}`;
 }
 
-function freshnessPillClass(freshness: string): "ok" | "warn" {
+/** Exported so other pages' own inline freshness pills (e.g. home.ts's
+ * per-card "我的模拟盘概览" pill) map 最新/延迟/部分缺失 to the same
+ * ok/warn color as this page's own topbar pill, instead of each carrying its
+ * own copy that could silently drift out of sync with this one. */
+export function freshnessPillClass(freshness: string): "ok" | "warn" {
   return freshness === "最新" ? "ok" : "warn";
 }
 
