@@ -691,9 +691,36 @@ export class MemberRepository {
     return row ? mapMember(row) : null;
   }
 
+  // Task 3.2 (identity + member management CLI) addition: neither of the
+  // above lookups is keyed by id, but the CLI's `revoke` command needs to
+  // fetch-then-preserve-other-fields before round-tripping through `upsert`
+  // (upsert overwrites every column, so a partial object would silently drop
+  // the other fields). Not a schema/DDL change - `members.id` is already the
+  // PRIMARY KEY - just a read this repository didn't previously expose.
+  getById(id: string): Member | null {
+    const row = this.db
+      .prepare(`SELECT * FROM members WHERE id = ? LIMIT 1`)
+      .get(id) as Record<string, unknown> | undefined;
+
+    return row ? mapMember(row) : null;
+  }
+
   listActive(): Member[] {
     const rows = this.db
       .prepare(`SELECT * FROM members WHERE status = 'active' ORDER BY created_at ASC`)
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map(mapMember);
+  }
+
+  // Task 3.2 addition: the member-management CLI's `list` command is an
+  // admin-facing view - it must show revoked members too (otherwise
+  // confirming a `revoke` actually took effect requires reaching for raw
+  // SQL), unlike `listActive`, which is the "who can this resolve to"
+  // production-path read used by identity resolution / rule ownership checks.
+  listAll(): Member[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM members ORDER BY created_at ASC`)
       .all() as Array<Record<string, unknown>>;
 
     return rows.map(mapMember);
@@ -735,10 +762,16 @@ export class ApiTokenRepository {
     return row ? mapMember(row) : null;
   }
 
-  revoke(tokenId: string): void {
-    this.db
+  // Task 3.2 addition: the return value (previously void) lets callers - the
+  // member-management CLI's `token revoke` in particular - tell "revoked a
+  // real token" apart from "no row matched this id" (`changes === 0`)
+  // without a separate existence-check query. No existing caller inspected
+  // the old void return, so this widening is backward compatible.
+  revoke(tokenId: string): { changes: number | bigint } {
+    const result = this.db
       .prepare(`UPDATE api_tokens SET revoked_at = ? WHERE id = ?`)
       .run(nowIso(), tokenId);
+    return { changes: result.changes };
   }
 }
 

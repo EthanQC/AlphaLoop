@@ -184,6 +184,31 @@ describe("MemberRepository", () => {
 
     expect(result).toEqual([active]);
   });
+
+  it("getById round-trips a member", () => {
+    const db = memoryDb();
+    migrate(db);
+    const repo = new MemberRepository(db);
+    const member = makeMember();
+    repo.upsert(member);
+
+    expect(repo.getById(member.id)).toEqual(member);
+    expect(repo.getById("does-not-exist")).toBeNull();
+  });
+
+  it("listAll returns every member regardless of status", () => {
+    const db = memoryDb();
+    migrate(db);
+    const repo = new MemberRepository(db);
+    const active = makeMember({ id: "mem_1", email: "active@example.com", feishuOpenId: "ou_active" });
+    const revoked = makeMember({ id: "mem_2", email: "revoked@example.com", feishuOpenId: "ou_revoked", status: "revoked" });
+    repo.upsert(active);
+    repo.upsert(revoked);
+
+    const result = repo.listAll();
+
+    expect(result).toEqual([active, revoked]);
+  });
 });
 
 describe("ApiTokenRepository", () => {
@@ -244,6 +269,17 @@ describe("ApiTokenRepository", () => {
     tokens.revoke(id);
 
     expect(tokens.verify(token)).toBeNull();
+  });
+
+  it("revoke reports changes:0 for an unknown token id, changes:1 for a real one", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = seedMember(db);
+    const tokens = new ApiTokenRepository(db);
+    const { id } = tokens.issue(member.id, "cli");
+
+    expect(Number(tokens.revoke("does-not-exist").changes)).toBe(0);
+    expect(Number(tokens.revoke(id).changes)).toBe(1);
   });
 
   it("verify returns null when the owning member has been revoked", () => {
