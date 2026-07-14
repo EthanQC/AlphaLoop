@@ -256,6 +256,10 @@ describe("runMarketAlertsPoll", () => {
     expect(result.ok).toBe(true);
     expect(result.evaluated).toBe(0);
     expect(result.skippedRules).toEqual([{ ruleId: "rule_bad_only", reason: "config_error" }]);
+    // The early exit must report the mode the cycle ACTUALLY ran in, not a
+    // hardcoded dryRun:false - this call ran without dryRun, so false here,
+    // and the dry-run sibling case is asserted separately below.
+    expect(result.dryRun).toBe(false);
     // A plain call-count check, not `.not.toHaveBeenCalled()` - the latter
     // pretty-prints every received call's arguments (including the DB handle
     // argument) on failure, and by the time vitest formats that diff the
@@ -264,6 +268,27 @@ describe("runMarketAlertsPoll", () => {
     // printer and masks the real assertion failure.
     expect(persistCycleSpy.mock.calls.length).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_events").get() as { c: number }).c).toBe(0);
+  });
+
+  it("reports dryRun:true (not a hardcoded false) on the all-config-error early exit when running in dry-run mode", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    db.prepare(`
+      INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
+      VALUES ('rule_bad_only', 'member_1', 'MSFT.US', 'daily_move', 0.04, 'both', 'continuous', 0, 1, ?)
+    `).run("2026-07-01T00:00:00.000Z");
+
+    const result = await poll.runMarketAlertsPoll({
+      dbPath,
+      dryRun: true,
+      now: new Date(TRADING_TIME),
+      quoteProvider: async () => ({}),
+      transport: fakeTransport()
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.dryRun).toBe(true);
+    expect(result.skippedRules).toEqual([{ ruleId: "rule_bad_only", reason: "config_error" }]);
   });
 
   it("runs the happy path end to end: fires, persists events/runtimes/quota, delivers, backfills message_id", async () => {

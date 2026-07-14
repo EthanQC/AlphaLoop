@@ -1657,7 +1657,10 @@ async function pollOnce(db, { now, dryRun, quoteProvider, transport }) {
   // Distinct from the rules.length === 0 quick-exit above pollOnce (that one
   // never even loads a rule); this one still reports the real skippedRules.
   if (validRules.length === 0) {
-    return { ok: true, dryRun: false, evaluated: 0, fires: 0, sent: 0, failed: 0, skipped: 0, skippedRules, quotaBlocked: 0 };
+    // NOT hardcoded dryRun:false - this early exit is reachable in dry-run
+    // mode too (every enabled rule filtered as config_error), and the summary
+    // must report the mode the cycle actually ran in.
+    return { ok: true, dryRun, ...zeroCycleCounts(), skippedRules };
   }
 
   // Fix 1: saveRuntimes/recordEvents/bumpQuota persist as ONE atomic unit
