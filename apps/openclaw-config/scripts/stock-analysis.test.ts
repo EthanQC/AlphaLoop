@@ -177,6 +177,79 @@ describe("setTargets (direct writer call)", () => {
   });
 });
 
+// Task H7 (2026-07-14 legacy audit): one bad target used to kill the whole
+// analysis batch with no isolation - see fetchStockAnalysisRecords's own
+// doc comment. These tests exercise the isolation directly via dependency
+// injection (an in-memory fetchRecord) rather than real network/Longbridge
+// calls.
+describe("fetchStockAnalysisRecords: per-symbol isolation", () => {
+  it("isolates one symbol's failure and still returns the others' records", async () => {
+    const fetchRecord = async (symbol: string) => {
+      if (symbol === "BAD.US") {
+        throw new Error("BAD.US 行情格式异常。");
+      }
+      return { symbol, analysis: {} };
+    };
+
+    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(
+      ["AAPL.US", "BAD.US", "MSFT.US"],
+      { fetchRecord }
+    );
+
+    expect(records.map((r: { symbol: string }) => r.symbol)).toEqual(["AAPL.US", "MSFT.US"]);
+    expect(failedSymbols).toEqual([{ symbol: "BAD.US", error: "BAD.US 行情格式异常。" }]);
+  });
+
+  it("returns every record when nothing fails", async () => {
+    const fetchRecord = async (symbol: string) => ({ symbol, analysis: {} });
+
+    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(["AAPL.US"], { fetchRecord });
+
+    expect(records).toHaveLength(1);
+    expect(failedSymbols).toEqual([]);
+  });
+
+  it("reports every failure when the whole batch fails", async () => {
+    const fetchRecord = async () => {
+      throw new Error("行情读取失败。");
+    };
+
+    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(["AAPL.US", "MSFT.US"], { fetchRecord });
+
+    expect(records).toEqual([]);
+    expect(failedSymbols).toEqual([
+      { symbol: "AAPL.US", error: "行情读取失败。" },
+      { symbol: "MSFT.US", error: "行情读取失败。" }
+    ]);
+  });
+});
+
+describe("renderBatchStockAnalysis: discloses failed symbols instead of hiding the gap", () => {
+  it("includes a data-gap disclosure line naming the failed symbol and reason", () => {
+    const markdown = stockAnalysis.renderBatchStockAnalysis({
+      label: "2026-07-14",
+      generatedAt: "2026-07-14T05:00:00.000Z",
+      records: [],
+      failedSymbols: [{ symbol: "BAD.US", error: "BAD.US 行情格式异常。" }]
+    });
+
+    expect(markdown).toContain("数据缺口");
+    expect(markdown).toContain("BAD.US");
+    expect(markdown).toContain("BAD.US 行情格式异常。");
+  });
+
+  it("omits the disclosure line when nothing failed", () => {
+    const markdown = stockAnalysis.renderBatchStockAnalysis({
+      label: "2026-07-14",
+      generatedAt: "2026-07-14T05:00:00.000Z",
+      records: [],
+      failedSymbols: []
+    });
+
+    expect(markdown).not.toContain("数据缺口");
+  });
+});
+
 describe("listTargets: collapses per-owner duplicates into one global distinct set", () => {
   it("returns a symbol once even when two different owners both have it active", () => {
     const { db, options } = makeDb();

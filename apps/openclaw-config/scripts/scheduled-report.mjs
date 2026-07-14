@@ -24,6 +24,7 @@ import {
   normalizeQuotePayload,
   toNumber
 } from "./report-data.mjs";
+import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
 import { assertReportQuality } from "./report-quality.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
@@ -35,24 +36,49 @@ const dbPath = join(runtimeDir, "trading.sqlite");
 const statePath = join(runtimeDir, "report-delivery-state.json");
 const timezone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
 
-const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2).filter((arg) => arg !== "--");
-const kind = assertKind(kindArg);
-const action = assertAction(actionArg);
-const windowInfo = resolveReportWindow(kind, dateArg);
-const reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
-const reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
+// Task H7 (2026-07-14 legacy audit): this CLI dispatch used to run
+// UNCONDITIONALLY at module load time, parsing real `process.argv` via
+// assertKind/assertAction/assertDateLabel - which made the module
+// impossible to `import` for testing at all (any importer, e.g. a seam
+// test that only wants the pure renderDailyReport/renderWeeklyReport/
+// isPreparedReportMarkdownComplete functions, would crash on import
+// because those asserts validate whatever argv the TEST RUNNER happens to
+// be invoked with, not "daily"/"weekly"/etc). Guarded the same way every
+// other testable CLI script in this directory already is (stock-analysis.mjs,
+// market-alerts-poll.mjs, official-paper-monitor.mjs) - kind/action/
+// windowInfo/reportPath/reportPdfPath are declared here (prepareReport/
+// deliverReport close over them) but only ever COMPUTED inside the guard,
+// exactly as before when actually run as a CLI.
+let kind;
+let action;
+let windowInfo;
+let reportPath;
+let reportPdfPath;
 
-mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
-mkdirSync(runtimeDir, { recursive: true });
+const isMainModule = process.argv[1]
+  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
 
-if (action === "prepare") {
-  const report = await prepareReport(kind, windowInfo);
-  console.log(report.path);
-} else if (action === "deliver") {
-  await deliverReport(kind, windowInfo, false);
-} else {
-  await prepareReport(kind, windowInfo);
-  await deliverReport(kind, windowInfo, true);
+if (isMainModule) {
+  const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2).filter((arg) => arg !== "--");
+  kind = assertKind(kindArg);
+  action = assertAction(actionArg);
+  windowInfo = resolveReportWindow(kind, dateArg);
+  reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
+  reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
+
+  mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
+  mkdirSync(runtimeDir, { recursive: true });
+
+  if (action === "prepare") {
+    const report = await prepareReport(kind, windowInfo);
+    console.log(report.path);
+  } else if (action === "deliver") {
+    await deliverReport(kind, windowInfo, false);
+  } else {
+    await prepareReport(kind, windowInfo);
+    await deliverReport(kind, windowInfo, true);
+  }
 }
 
 async function prepareReport(reportKind, info) {
@@ -156,7 +182,11 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   }, null, 2));
 }
 
-function renderDailyReport(info, data) {
+// Exported for the seam test (scheduled-report.test.ts): generates a real
+// report from realistic fixture data and runs isPreparedReportMarkdownComplete
+// against it, so the marker text and the completeness check can never
+// silently diverge again (see that function's own doc comment).
+export function renderDailyReport(info, data) {
   const tradeRows = data.executionRows.filter((row) => row.category === "trade");
   const dailyRows = data.executionRows.filter((row) => row.category === "daily");
   const rejectedRows = tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`));
@@ -213,7 +243,7 @@ function renderDailyReport(info, data) {
   ].join("\n");
 }
 
-function renderWeeklyReport(info, data) {
+export function renderWeeklyReport(info, data) {
   const tradeRows = data.executionRows.filter((row) => row.category === "trade");
   const dailyRows = data.executionRows.filter((row) => row.category === "daily");
 
@@ -320,7 +350,7 @@ function renderDataSourceSummary(data) {
   return [
     "### 证据与来源",
     "",
-    `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥 QQQ 行情、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}。`,
+    `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥行情（QQQ 行情）、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}。`,
     `- 新闻检索：每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS；本次共读取 ${data.marketNews.length} 条。`,
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.longbridgeWarnings?.length ? [`- 长桥降级：${data.longbridgeWarnings.join("；")}；报告继续生成，但任何新增动作必须人工复核。`] : []),
@@ -769,20 +799,35 @@ function summarizeMacroSignal(entries) {
   return `${next.date} ${next.time || ""} ${next.title}${values ? `（${values}）` : ""}；关注是否改变利率、通胀或制造业景气预期`;
 }
 
-function summarizePaperBudget(snapshot, qqqQuote) {
+// Task H7 (2026-07-14 legacy audit): this used to read `snapshot.quotes`,
+// a field NO producer of officialPaperSnapshot (normalizeOfficialPaperSnapshot/
+// buildDegradedOfficialPaperSnapshot in report-data.mjs) ever sets - the
+// lookup was always undefined, so every non-QQQ position silently fell back
+// to its cost basis (or 0 when cost_price was missing), understating or
+// zeroing real exposure in the "今日结论"/"明日跟踪" budget line. Fix: reuse
+// H4's attachPriceSource/estimateMarketValue (official-paper-monitor.mjs) -
+// the same position.price/priceSource-aware valuation already used for the
+// trusted official_paper_snapshots table - instead of a second, dead
+// hand-rolled computation. The only live quote this pipeline fetches is
+// QQQ.US, so non-QQQ positions still price at cost when that's all that's
+// available, but it is now EXPLICIT (priceSource: 'cost'/'zero') and
+// disclosed in the rendered line, rather than a silently-wrong number
+// presented as ground truth.
+export function summarizePaperBudget(snapshot, qqqQuote) {
   const asset = snapshot.primaryAsset ?? {};
   const netAssets = toNumber(asset.net_assets ?? asset.netAssets) ?? 0;
-  const marketValue = snapshot.positions.reduce((sum, row) => {
-    const quote = row.symbol === "QQQ.US" ? qqqQuote : snapshot.quotes?.find((item) => item.symbol === row.symbol);
-    const last = toNumber(quote?.last ?? quote?.last_done ?? quote?.lastDone) ?? row.costPrice ?? 0;
-    return sum + row.quantity * last;
-  }, 0);
+  const quotes = qqqQuote ? [qqqQuote] : [];
+  const { positions: pricedPositions, degradedSymbols } = attachPriceSource(snapshot.positions, quotes);
+  const marketValue = estimateMarketValue({ positions: pricedPositions });
   if (netAssets <= 0) {
     return "无法计算模拟盘暴露比例";
   }
   const exposure = marketValue / netAssets * 100;
   const remaining = Math.max(0, netAssets * 0.1 - marketValue);
-  return `模拟盘暴露 ${exposure.toFixed(2)}%，剩余自由发挥预算约 ${formatNumber(remaining)} 美元`;
+  const degradedNote = degradedSymbols.length > 0
+    ? `（${degradedSymbols.join("、")}未取得实时行情，按估算价计入，非真实市价）`
+    : "";
+  return `模拟盘暴露 ${exposure.toFixed(2)}%，剩余自由发挥预算约 ${formatNumber(remaining)} 美元${degradedNote}`;
 }
 
 function classifyMarketNews(article) {
@@ -1121,26 +1166,44 @@ async function fetchGoogleNewsRss(symbol, count) {
   }).slice(0, count);
 }
 
-async function fetchMacroCalendar(info) {
+// Task H7 (2026-07-14 legacy audit): every OTHER required data source
+// (official-paper snapshot, QQQ quote, each news feed) degrades gracefully
+// via Promise.allSettled + a buildDegraded*/warnings path - this fetch had
+// NO try/catch at all, and its caller (fetchRequiredReportMarketData)
+// combined it with fetchMarketNews via a plain Promise.all, so an expired
+// Longbridge token or unparseable CLI output (both non-transient, thrown on
+// the FIRST attempt per _longbridge.mjs) crashed the entire daily/weekly
+// report - exactly when the degradation notices would matter most. The
+// quality gate already accepts "宏观日历降级" text (report-quality.mjs) and
+// renderMarketIntelligence already renders an empty macroEvents list as
+// "未来宏观日历没有返回高重要性事件" - this fetch just needed to stop being
+// the one required source with no degradation path into that existing
+// machinery.
+export async function fetchMacroCalendar(info) {
   const start = info.label;
   const end = addDays(info.label, Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14));
-  const payload = await fetchRequiredLongbridgeJson("quote", [
-    "finance-calendar",
-    "macrodata",
-    "--market",
-    "US",
-    "--star",
-    "2",
-    "--star",
-    "3",
-    "--start",
-    start,
-    "--end",
-    end,
-    "--count",
-    String(Number(process.env.REPORT_MACRO_COUNT ?? 20))
-  ], "Longbridge 美国宏观日历");
-  return normalizeReportMacroCalendarPayload(payload);
+  try {
+    const payload = await fetchRequiredLongbridgeJson("quote", [
+      "finance-calendar",
+      "macrodata",
+      "--market",
+      "US",
+      "--star",
+      "2",
+      "--star",
+      "3",
+      "--start",
+      start,
+      "--end",
+      end,
+      "--count",
+      String(Number(process.env.REPORT_MACRO_COUNT ?? 20))
+    ], "Longbridge 美国宏观日历");
+    return normalizeReportMacroCalendarPayload(payload);
+  } catch (error) {
+    const reason = singleLine(error?.message ?? error, 180);
+    return { entries: [], warnings: [`宏观日历读取失败：${reason}`] };
+  }
 }
 
 function formatQuoteTimestamp(quote) {
@@ -1152,7 +1215,22 @@ function formatQuoteTimestamp(quote) {
   return timestamps.length > 0 ? `行情时间 ${formatReportDateTime(timestamps[0])}` : "行情时间未提供";
 }
 
-function isPreparedReportMarkdownComplete(markdown) {
+// Task H7 (2026-07-14 legacy audit): the "长桥行情" marker never appeared in
+// any rendered report - renderDataSourceSummary emitted "长桥 QQQ 行情"
+// (note the space), which does not contain "长桥行情" as a contiguous
+// substring. isPreparedReportMarkdownComplete therefore ALWAYS returned
+// false on a genuine report, so every `deliver` regenerated the report from
+// scratch (doubling every Longbridge/news/macro fetch and PDF render), and
+// a delivery-time-only outage would fail delivery even though a valid,
+// already-quality-checked report sat on disk. Fix, chosen side: the
+// RENDERER now emits "长桥行情" literally (see renderDataSourceSummary's
+// "长桥行情（QQQ 行情）" text) so both markers are satisfied by the same
+// phrase - the check itself is unchanged, keeping this list the single
+// definition of "a prepared report has everything deliver needs" (see the
+// seam test in scheduled-report.test.ts, which generates a real report via
+// renderDailyReport/renderWeeklyReport and runs this exact function against
+// it, so the two sides can never silently diverge again).
+export function isPreparedReportMarkdownComplete(markdown) {
   const text = String(markdown ?? "");
   return [
     "长桥官方模拟盘",
@@ -1163,7 +1241,7 @@ function isPreparedReportMarkdownComplete(markdown) {
   ].every((marker) => text.includes(marker));
 }
 
-function resolveReportWindow(reportKind, explicitDate) {
+export function resolveReportWindow(reportKind, explicitDate) {
   const label = explicitDate ?? formatDateLabel(new Date(), timezone);
   assertDateLabel(label);
   const startOffsetDays = reportKind === "daily" ? -1 : -7;

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -80,5 +80,114 @@ describe("report rendering", () => {
     state = rendering.updatePdfStabilityState(state, { exists: true, size: 1300 }, { requiredStableChecks: 2 });
     expect(state.ready).toBe(false);
     expect(state.stableChecks).toBe(1);
+  });
+
+  // Task H7 (2026-07-14 legacy audit): runChromePdf used to treat a
+  // PRE-EXISTING pdfPath as "render finished" - a stable, non-empty, but
+  // STALE file from a previous run satisfied the readiness check within a
+  // couple of poll intervals regardless of whether Chrome ever rendered
+  // anything this run, silently delivering yesterday's PDF as today's.
+  it("never treats a stale pre-existing PDF (older than minMtimeMs) as ready, no matter how stable its size looks", () => {
+    let state = rendering.updatePdfStabilityState(
+      undefined,
+      { exists: true, size: 1200, mtimeMs: 1_000 },
+      { requiredStableChecks: 2, minMtimeMs: 5_000 }
+    );
+    expect(state.ready).toBe(false);
+    expect(state.exists).toBe(false);
+
+    state = rendering.updatePdfStabilityState(
+      state,
+      { exists: true, size: 1200, mtimeMs: 1_000 },
+      { requiredStableChecks: 2, minMtimeMs: 5_000 }
+    );
+    expect(state.ready).toBe(false);
+    expect(state.stableChecks).toBe(0);
+  });
+
+  it("treats a freshly (re)written file (mtime >= minMtimeMs) as a normal stability candidate", () => {
+    let state = rendering.updatePdfStabilityState(
+      undefined,
+      { exists: true, size: 1200, mtimeMs: 9_000 },
+      { requiredStableChecks: 2, minMtimeMs: 5_000 }
+    );
+    expect(state.stableChecks).toBe(1);
+
+    state = rendering.updatePdfStabilityState(
+      state,
+      { exists: true, size: 1200, mtimeMs: 9_000 },
+      { requiredStableChecks: 2, minMtimeMs: 5_000 }
+    );
+    expect(state.ready).toBe(true);
+  });
+
+  it("writeMarkdownPdf ignores a stale pre-existing PDF and waits for the real render instead of returning the old content (live repro of the H7 bug)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "openclaw-rendering-stale-pdf-"));
+    try {
+      const runtimeDir = join(dir, "runtime");
+      const reportsDir = join(dir, "reports");
+      const markdownPath = join(reportsDir, "2026-07-14.md");
+      const pdfPath = join(reportsDir, "2026-07-14.pdf");
+      const fakeChromePath = join(dir, "fake-chrome.sh");
+
+      mkdirSync(reportsDir, { recursive: true });
+      writeFileSync(markdownPath, "# stale pdf repro\n", "utf8");
+      // Seed a STALE pre-existing PDF at the target path, backdated well
+      // before this run - exactly the "same-day re-issue" / "--force
+      // backfill" scenario the audit named.
+      writeFileSync(pdfPath, "OLD-PDF-FROM-PREVIOUS-RUN", "utf8");
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(pdfPath, past, past);
+
+      writeFileSync(
+        fakeChromePath,
+        `#!/bin/bash
+for arg in "$@"; do
+  case $arg in
+    --print-to-pdf=*)
+      PDF="\${arg#--print-to-pdf=}"
+      ;;
+  esac
+done
+sleep 0.3
+printf 'NEW-PDF-FROM-THIS-RUN' > "$PDF"
+`,
+        "utf8"
+      );
+      chmodSync(fakeChromePath, 0o755);
+
+      const previousEnv = {
+        CHROME_BIN: process.env.CHROME_BIN,
+        REPORT_PDF_POLL_MS: process.env.REPORT_PDF_POLL_MS,
+        REPORT_PDF_STABLE_CHECKS: process.env.REPORT_PDF_STABLE_CHECKS,
+        REPORT_PDF_TIMEOUT_MS: process.env.REPORT_PDF_TIMEOUT_MS
+      };
+      process.env.CHROME_BIN = fakeChromePath;
+      process.env.REPORT_PDF_POLL_MS = "50";
+      process.env.REPORT_PDF_STABLE_CHECKS = "2";
+      process.env.REPORT_PDF_TIMEOUT_MS = "5000";
+
+      try {
+        await rendering.writeMarkdownPdf({
+          repoRoot: dir,
+          runtimeDir,
+          markdownPath,
+          pdfPath,
+          markdown: "# stale pdf repro\n"
+        });
+      } finally {
+        for (const [key, value] of Object.entries(previousEnv)) {
+          if (value === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = value;
+          }
+        }
+      }
+
+      expect(readFileSync(pdfPath, "utf8")).toBe("NEW-PDF-FROM-THIS-RUN");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

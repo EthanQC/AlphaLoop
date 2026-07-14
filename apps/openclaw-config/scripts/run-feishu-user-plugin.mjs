@@ -10,7 +10,24 @@ const envPath = join(repoRoot, ".env.local");
 loadLocalEnv(envPath);
 applyFeishuAliases();
 
-const child = spawn("npx", ["-y", "feishu-user-plugin", ...process.argv.slice(2)], {
+// Task H7 (2026-07-14 legacy audit): `npx -y feishu-user-plugin` (no
+// version specifier) resolves whatever the npm registry serves as `latest`
+// at EVERY cold start, with every Feishu secret in its environment
+// (LARK_APP_SECRET, LARK_COOKIE, user access/refresh tokens - see
+// secrets-inventory.md). A broken or compromised publish would run
+// silently under this repo's own credentials; version drift has already
+// happened silently on this machine (the npx cache holds multiple distinct
+// cached versions). Pinned to the version verified against this repo's
+// Feishu integration at audit time - both `npm view feishu-user-plugin
+// version` (registry `latest`) and the most recently-used npx cache entry
+// agreed on this version.
+//
+// To bump: verify the candidate version manually first (e.g.
+// `npx feishu-user-plugin@<new-version> status`), then update the constant
+// below - do not remove the pin.
+const FEISHU_USER_PLUGIN_VERSION = String(process.env.FEISHU_USER_PLUGIN_VERSION ?? "").trim() || "1.4.1";
+
+const child = spawn("npx", ["-y", `feishu-user-plugin@${FEISHU_USER_PLUGIN_VERSION}`, ...process.argv.slice(2)], {
   cwd: repoRoot,
   env: process.env,
   stdio: ["inherit", "inherit", "inherit"]

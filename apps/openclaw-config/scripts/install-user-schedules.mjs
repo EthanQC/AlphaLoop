@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const nodeBin = process.execPath;
 const launchAgentsDir = join(homedir(), "Library", "LaunchAgents");
@@ -18,32 +20,19 @@ if (uid === undefined) {
 mkdirSync(launchAgentsDir, { recursive: true });
 mkdirSync(runtimeLogDir, { recursive: true });
 
+// Task H7 (2026-07-14 legacy audit): the daily/weekly report and
+// stock-analysis jobs used to be installed HERE as direct launchd plists -
+// the exact same 5 jobs install-openclaw-cron.mjs retires in favor of its
+// openclaw-cron + cron-runner equivalents (per
+// docs/superpowers/specs/2026-06-14-openclaw-report-quality-cron-design.md,
+// the openclaw cron channel is the intended owner of scheduled report
+// production, not direct launchd). Re-running this installer after
+// `openclaw:cron:install` - the documented fix when official-paper polling
+// needs a (re)install, since ONLY this script installs those two jobs -
+// used to silently resurrect the 5 retired jobs, so every report was
+// generated and delivered TWICE. Those 5 are no longer installed here at
+// all; only the two jobs unique to this installer remain.
 const jobs = [
-  {
-    label: "com.openclaw.trading.report.daily.prepare",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily prepare`,
-    schedule: [2, 3, 4, 5, 6].map((Weekday) => ({ Weekday, Hour: 19, Minute: 45 }))
-  },
-  {
-    label: "com.openclaw.trading.report.daily.deliver",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs daily deliver`,
-    schedule: [2, 3, 4, 5, 6].map((Weekday) => ({ Weekday, Hour: 20, Minute: 0 }))
-  },
-  {
-    label: "com.openclaw.trading.report.weekly.prepare",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs weekly prepare`,
-    schedule: [{ Weekday: 1, Hour: 19, Minute: 45 }]
-  },
-  {
-    label: "com.openclaw.trading.report.weekly.deliver",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/scheduled-report.mjs weekly deliver`,
-    schedule: [{ Weekday: 1, Hour: 20, Minute: 0 }]
-  },
-  {
-    label: "com.openclaw.trading.stock-analysis",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/stock-analysis.mjs scheduled`,
-    schedule: [{ Hour: 21, Minute: 0 }]
-  },
   {
     label: "com.openclaw.trading.official-paper.poll",
     command: `${quote(nodeBin)} apps/openclaw-config/scripts/official-paper-monitor.mjs poll`,
@@ -63,7 +52,12 @@ const retiredLabels = [
   "com.openclaw.trading.paper-trader",
   "com.openclaw.trading.catchup",
   "com.openclaw.trading.maintenance.latest",
-  "com.openclaw.trading.context.maintenance"
+  "com.openclaw.trading.context.maintenance",
+  // Task H7: defensively retire these too (idempotent no-op if
+  // install-openclaw-cron.mjs already did) - single-sourced from
+  // openclaw-report-launchd-jobs.mjs so this installer can never again
+  // reinstall what the cron channel owns.
+  ...MANAGED_REPORT_LAUNCHD_LABELS
 ];
 
 for (const label of retiredLabels) {

@@ -54,10 +54,10 @@ pnpm official-paper:pnl
 
 ## Launchd
 
-`launchd:install-user` 和 `launchd:install-backup-alerts` 安装的是两组完全不重叠的 launchd 任务，都只在各自文档里出现过一次——正式部署机上两条命令通常都要跑一遍；只跑其中一条会漏装另一半（例如只跑 `launchd:install-user` 的机器既没有每日备份、盘中也没有提醒器轮询）。这里没有把两者合并成一条命令：它们面向的部署场景不完全相同（例如只需要日报/个股分析的轻量机器，未必需要 `install-launchd.sh` 顺带执行的 `openclaw gateway install`），合并会让 `launchd:install-user` 悄悄多做事，也会让不想装 gateway 的场景失去单独跳过的办法。
+`launchd:install-user` 和 `launchd:install-backup-alerts` 安装的是两组完全不重叠的 launchd 任务，都只在各自文档里出现过一次——正式部署机上两条命令通常都要跑一遍；只跑其中一条会漏装另一半（例如只跑 `launchd:install-user` 的机器盘中就没有官方模拟盘轮询，也没有每日备份/提醒器轮询）。这里没有把两者合并成一条命令：它们面向的部署场景不完全相同（例如只需要官方模拟盘轮询的轻量机器，未必需要 `install-launchd.sh` 顺带执行的 `openclaw gateway install`），合并会让 `launchd:install-user` 悄悄多做事，也会让不想装 gateway 的场景失去单独跳过的办法。
 
 ```bash
-# 日报/周报/个股分析/官方模拟盘轮询
+# 官方模拟盘每小时轮询 + 开盘后收支变化表
 pnpm launchd:install-user
 
 # 每日交易数据库备份 + 市场提醒（market-alerts）轮询器
@@ -66,9 +66,6 @@ pnpm launchd:install-backup-alerts
 
 `launchd:install-user` 安装后只会保留：
 
-- 周二到周五 20:00 日报发送。
-- 周一 20:00 周报发送。
-- 每天 21:00 检查个股分析三日 cadence。
 - 美股盘中官方模拟盘每小时轮询。
 - 美股开盘后 30 分钟官方模拟盘收支变化表。
 
@@ -78,3 +75,15 @@ pnpm launchd:install-backup-alerts
 - 市场提醒轮询器（`com.alphaloop.market-alerts`）。
 
 `pnpm openclaw:runtime:doctor` 会检测这两个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示。
+
+### 日报/周报/个股分析调度：已迁移到 OpenClaw cron（2026-07-14）
+
+日报（`report.daily.prepare/deliver`）、周报（`report.weekly.prepare/deliver`）和个股分析（`stock-analysis`）这 5 个调度**不再由 `launchd:install-user` 安装**，它们的唯一 owner 是 OpenClaw cron 通道：
+
+```bash
+pnpm openclaw:cron:install
+```
+
+该命令会：①先 retire 这 5 个 launchd 任务对应的旧 plist（如果存在）；②把等价的 5 个任务注册进 `openclaw cron`；③安装 `com.openclaw.trading.cron-runner` launchd 服务，由它监听 `openclaw cron` 的 run 记录并实际执行这些脚本。详见 `docs/superpowers/specs/2026-06-14-openclaw-report-quality-cron-design.md`。
+
+**历史教训（2026-07-14 存量代码审计）**：这 5 个标签曾经在 `install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 里各自硬编码一份——先跑 `openclaw:cron:install`（retire 这 5 个 plist、装 cron 等价物），后跑 `launchd:install-user`（原样重装这 5 个 plist）会让它们同时复活：两个通道各自成功，日报/周报/选股每次都双份生成、双份投递飞书。现在两边共享 `scripts/openclaw-report-launchd-jobs.mjs` 里的同一份标签清单：`install-user-schedules.mjs` 不再安装这 5 个任务，且防御性地把它们也 retire 一遍（如果 `openclaw:cron:install` 还没跑过，这一步是 no-op）。**部署顺序**：`openclaw:cron:install` 和 `launchd:install-user` 谁先谁后都安全，且可以任意重跑——不会再互相打架。

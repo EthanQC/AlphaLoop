@@ -189,21 +189,24 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) 
   }
 
   const generatedAt = new Date().toISOString();
-  const records = [];
-  for (const symbol of targets) {
-    records.push(await fetchStockAnalysisRecord(symbol));
+  const { records, failedSymbols } = await fetchStockAnalysisRecords(targets);
+  if (records.length === 0) {
+    throw new Error(
+      `全部标的数据获取失败，无法生成个股分析报告：${failedSymbols.map((entry) => `${entry.symbol}（${entry.error}）`).join("；")}`
+    );
   }
 
   const label = generatedAt.slice(0, 10);
-  const markdown = renderBatchStockAnalysis({ label, generatedAt, records });
+  const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
   const markdownPath = join(reportsDir, `${label}.md`);
   const pdfPath = join(reportsDir, `${label}.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
+  const deliveredSymbols = records.map((record) => record.symbol);
   if (!deliver) {
-    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: targets, markdownPath, pdfPath }, null, 2));
+    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
     return;
   }
 
@@ -221,10 +224,34 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) 
   db.prepare(`
     INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(runId, generatedAt, JSON.stringify(targets), markdownPath, pdfPath, JSON.stringify(delivery));
+  `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, pdfPath, JSON.stringify(delivery));
 
-  writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: targets });
-  console.log(JSON.stringify({ delivered: true, runId, symbols: targets, markdownPath, pdfPath }, null, 2));
+  writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols });
+  console.log(JSON.stringify({ delivered: true, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
+}
+
+// Task H7 (2026-07-14 legacy audit): one bad target (delisted/suspended
+// symbol, a typo `normalizeSymbol` happily turns into a bogus ticker, a
+// transient Longbridge quote failure) used to kill the ENTIRE batch with no
+// try/catch anywhere in this loop - every OTHER healthy symbol in the same
+// run also got no report, no delivery, and no state update, repeating every
+// scheduled trigger until a human edited the shared target list. Every
+// OTHER data source in fetchStockAnalysisRecord already degrades per-symbol
+// to an {error} object (history/fundamentals/options/news) - only the quote
+// fetch was fatal. Isolating it here means a bad symbol is disclosed in the
+// rendered output (see renderBatchStockAnalysis's failedSymbols handling)
+// instead of silently taking down every other target's analysis.
+export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchStockAnalysisRecord } = {}) {
+  const records = [];
+  const failedSymbols = [];
+  for (const symbol of targets) {
+    try {
+      records.push(await fetchRecord(symbol));
+    } catch (error) {
+      failedSymbols.push({ symbol, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { records, failedSymbols };
 }
 
 async function fetchStockAnalysisRecord(symbol) {
@@ -305,7 +332,7 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
     ],
     trading: [
       `短线支撑位参考：${formatNumber(historyStats.support ?? support)}；短线阻力位参考：${formatNumber(historyStats.resistance ?? resistance)}。`,
-      `均线：20 日 ${formatNumber(historyStats.ma20)}；60 日 ${formatNumber(historyStats.ma60)}；180 日 ${formatNumber(historyStats.ma180)}。`,
+      `均线：20 日 ${formatNumber(historyStats.ma20)}；60 日 ${formatNumber(historyStats.ma60)}；${historyStats.longWindowDays ?? "180"} 日 ${formatNumber(historyStats.ma180)}。`,
       `日内强弱：${pct === undefined ? "缺少前收数据" : pct >= 0 ? "相对前收偏强" : "相对前收偏弱"}。`,
       "大单、卖压和做空比例必须分开验证，不能用盘口现象直接推断做空。"
     ],
@@ -324,7 +351,7 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
   };
 }
 
-function renderBatchStockAnalysis({ label, generatedAt, records }) {
+export function renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols = [] }) {
   const template = loadStockAnalysisTemplate();
   const lines = [
     `# OpenClaw 个股分析 ${label}`,
@@ -339,6 +366,13 @@ function renderBatchStockAnalysis({ label, generatedAt, records }) {
     "## 本批次结论",
     "",
     ...records.map((record) => `- ${record.symbol}：支撑位 ${extractTradingLevel(record.analysis.trading[0], "support")}；阻力位 ${extractTradingLevel(record.analysis.trading[0], "resistance")}；需要按新闻与成交量继续验证。`),
+    // Task H7: per-symbol isolation (see fetchStockAnalysisRecords) means a
+    // batch can partially fail - disclose exactly which symbols were
+    // skipped and why, instead of the previous all-or-nothing behavior
+    // where a bad symbol silently took the whole report down with it.
+    ...(failedSymbols.length > 0
+      ? [`- 数据缺口：${failedSymbols.map((entry) => `${entry.symbol}（获取失败：${entry.error}）`).join("；")}；已跳过，仅呈现可用标的分析。`]
+      : []),
     ""
   ];
 
@@ -672,17 +706,31 @@ async function fetchTextWithTimeout(url, extraHeaders = {}) {
   throw lastError;
 }
 
+// Task H7 (2026-07-14 legacy audit): fetchYahooHistory requests range=6mo,
+// which yields at most ~126 daily closes - closes.slice(-180) on a ~126-
+// element array is silently the WHOLE array, so the value rendered/labeled
+// "180 日均线" (and the "偏便宜" verdict derived from it) was never actually
+// a 180-session average; it was a mislabeled full-range mean. Chosen fix:
+// LABEL the actual window truthfully (`longWindowDays`, capped at 180 but
+// reflecting however many sessions are really available) rather than
+// widening the fetch range - ma20/ma60/sixMonthReturn/trendScore all
+// deliberately key off this same 6-month sample, and widening the range
+// would dilute/change those alongside the unrelated bug being fixed here.
+// A future fetch of a full year (closes.slice(-180) on ~250 rows) would
+// make the label consistently "180 日" - either fix is legitimate per this
+// task's brief; this one has zero blast radius outside the mislabeled text.
 function summarizeHistory(history, currentPrice) {
   if (!Array.isArray(history) || history.length === 0) {
     return {
       summary: history?.error ? `历史走势读取失败：${history.error}` : "历史走势暂无可用数据。",
-      cheapness: "180 日均线不可用，便宜程度暂记为待验证",
+      cheapness: "长期均线不可用，便宜程度暂记为待验证",
       trendScore: 0,
       support: undefined,
       resistance: undefined,
       ma20: undefined,
       ma60: undefined,
-      ma180: undefined
+      ma180: undefined,
+      longWindowDays: undefined
     };
   }
 
@@ -692,7 +740,8 @@ function summarizeHistory(history, currentPrice) {
   const sixMonthReturn = first && lastClose ? ((lastClose - first) / first) * 100 : undefined;
   const ma20 = average(closes.slice(-20));
   const ma60 = average(closes.slice(-60));
-  const ma180 = average(closes.slice(-180));
+  const longWindowDays = Math.min(closes.length, 180);
+  const ma180 = average(closes.slice(-longWindowDays));
   const recent = closes.slice(-20);
   const support = recent.length ? Math.min(...recent) : undefined;
   const resistance = recent.length ? Math.max(...recent) : undefined;
@@ -708,16 +757,17 @@ function summarizeHistory(history, currentPrice) {
   return {
     summary: `${history[0]?.date} 到 ${history.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日。`,
     cheapness: vsMa180 === undefined
-      ? "180 日均线不可用，便宜程度待验证"
+      ? "长期均线不可用，便宜程度待验证"
       : vsMa180 < -5
-        ? `现价低于 180 日均线 ${formatPercent(Math.abs(vsMa180))}，按群聊口径偏便宜但需排除基本面恶化`
-        : `现价相对 180 日均线 ${formatPercent(vsMa180)}，不属于明显均线折价`,
+        ? `现价低于 ${longWindowDays} 日均线 ${formatPercent(Math.abs(vsMa180))}，按群聊口径偏便宜但需排除基本面恶化`
+        : `现价相对 ${longWindowDays} 日均线 ${formatPercent(vsMa180)}，不属于明显均线折价`,
     trendScore,
     support,
     resistance,
     ma20,
     ma60,
-    ma180
+    ma180,
+    longWindowDays
   };
 }
 

@@ -5,6 +5,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { applyEnvUpdates, parseEnvText } from "./env-file.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const envPath = join(repoRoot, ".env.local");
 const runtimeDir = join(repoRoot, "runtime");
@@ -37,29 +39,41 @@ const scopes = [
 
 mkdirSync(runtimeDir, { recursive: true });
 
-const [command, ...args] = process.argv.slice(2);
-const env = loadEnvFile(envPath);
-applyFeishuAliases(env);
+// Task H7 (2026-07-14 legacy audit): guarded the same way every other
+// testable CLI script in this directory already is (stock-analysis.mjs,
+// market-alerts-poll.mjs, official-paper-monitor.mjs) - this is what makes
+// updateEnvFile/loadEnvFile importable and directly testable (see
+// setup-feishu-user-auth.test.ts) without spawning the OAuth HTTP server or
+// touching the real .env.local as a side effect of `import`.
+const isMainModule = process.argv[1]
+  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
 
-if (command === "cookie-from-state") {
-  const [statePath] = args;
-  if (!statePath) {
-    throw new Error("Usage: setup-feishu-user-auth.mjs cookie-from-state <playwright-storage-state.json>");
+if (isMainModule) {
+  const [command, ...args] = process.argv.slice(2);
+  const env = loadEnvFile(envPath);
+  applyFeishuAliases(env);
+
+  if (command === "cookie-from-state") {
+    const [statePath] = args;
+    if (!statePath) {
+      throw new Error("Usage: setup-feishu-user-auth.mjs cookie-from-state <playwright-storage-state.json>");
+    }
+    importCookieFromPlaywrightState(statePath, env);
+  } else if (command === "oauth") {
+    await runOauth(env);
+  } else if (command === "open-oauth-url") {
+    openOauthUrl(env);
+  } else if (command === "status") {
+    printStatus(env);
+  } else {
+    console.error("Usage:");
+    console.error("  setup-feishu-user-auth.mjs cookie-from-state <playwright-storage-state.json>");
+    console.error("  setup-feishu-user-auth.mjs oauth");
+    console.error("  setup-feishu-user-auth.mjs open-oauth-url");
+    console.error("  setup-feishu-user-auth.mjs status");
+    process.exit(1);
   }
-  importCookieFromPlaywrightState(statePath, env);
-} else if (command === "oauth") {
-  await runOauth(env);
-} else if (command === "open-oauth-url") {
-  openOauthUrl(env);
-} else if (command === "status") {
-  printStatus(env);
-} else {
-  console.error("Usage:");
-  console.error("  setup-feishu-user-auth.mjs cookie-from-state <playwright-storage-state.json>");
-  console.error("  setup-feishu-user-auth.mjs oauth");
-  console.error("  setup-feishu-user-auth.mjs open-oauth-url");
-  console.error("  setup-feishu-user-auth.mjs status");
-  process.exit(1);
 }
 
 function importCookieFromPlaywrightState(statePath, currentEnv) {
@@ -80,7 +94,6 @@ function importCookieFromPlaywrightState(statePath, currentEnv) {
   }
 
   updateEnvFile(envPath, {
-    ...currentEnv,
     LARK_COOKIE: Array.from(cookieMap.entries()).map(([key, value]) => `${key}=${value}`).join("; ")
   });
 
@@ -125,7 +138,7 @@ async function runOauth(currentEnv) {
         LARK_UAT_SCOPE: tokenData.scope ?? "",
         LARK_UAT_EXPIRES: String(Math.floor(Date.now() / 1000 + resolveExpiresIn(tokenData.expires_in)))
       };
-      updateEnvFile(envPath, { ...currentEnv, ...updates });
+      updateEnvFile(envPath, updates);
       writeFileSync(oauthStatePath, `${JSON.stringify({
         authorizedAt: new Date().toISOString(),
         hasRefreshToken: Boolean(tokenData.refresh_token),
@@ -223,56 +236,39 @@ async function exchangeCode({ appId, appSecret, code }) {
   return data;
 }
 
-function loadEnvFile(filePath) {
-  const parsed = {};
+// Task H7 (2026-07-14 legacy audit): now a thin wrapper around the shared
+// env-file.mjs parser (see its module header) instead of an ad hoc
+// naive-quote-stripping reader - keeps this script's read side and its
+// write side (updateEnvFile below) using the exact same decode rules.
+export function loadEnvFile(filePath) {
   if (!existsSync(filePath)) {
-    return parsed;
+    return {};
   }
-
-  for (const rawLine of readFileSync(filePath, "utf8").split(/\r?\n/u)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u.exec(line);
-    if (!match) {
-      continue;
-    }
-    let value = match[2] ?? "";
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    parsed[match[1]] = value;
-  }
-  return parsed;
+  return parseEnvText(readFileSync(filePath, "utf8"));
 }
 
-function updateEnvFile(filePath, values) {
+// Task H7 (2026-07-14 legacy audit): `values` is now expected to be ONLY
+// the keys actually being changed (every call site below was fixed to stop
+// passing `{...currentEnv, ...updates}` - the merged form used to make
+// EVERY existing KEY=value line in the file eligible for rewriting, which
+// silently DE-QUOTED every one of them on every oauth/cookie-import run).
+// applyEnvUpdates (env-file.mjs) does the actual minimal-edit, correctly-
+// quoted rewrite; this function only owns the "only LARK_*/known
+// feishu-user-plugin keys may be newly appended" restriction that predates
+// this fix and is kept as a defensive scope limiter.
+export function updateEnvFile(filePath, values) {
   const existing = existsSync(filePath) ? readFileSync(filePath, "utf8") : "";
-  const lines = existing.split(/\r?\n/u);
-  const seen = new Set();
-  const nextLines = lines.map((line) => {
-    const match = /^([A-Za-z_][A-Za-z0-9_]*)=/u.exec(line);
-    if (!match || !(match[1] in values)) {
-      return line;
-    }
-    seen.add(match[1]);
-    return `${match[1]}=${values[match[1]] ?? ""}`;
-  });
-
-  for (const [key, value] of Object.entries(values)) {
-    if (!/^LARK_/u.test(key) && key !== "FEISHU_USER_PLUGIN_CHAT_ID" && key !== "FEISHU_USER_PLUGIN_GROUP_NAME") {
-      continue;
-    }
-    if (!seen.has(key)) {
-      nextLines.push(`${key}=${value ?? ""}`);
-    }
-  }
-
-  writeFileSync(filePath, `${nextLines.filter((line, index) => line.trim() || index < nextLines.length - 1).join("\n").trimEnd()}\n`, "utf8");
+  const existingKeys = parseEnvText(existing);
+  // Preserves the pre-existing scope limit: a key with NO line in the file
+  // yet may only be newly appended if it's a recognized feishu-user-plugin
+  // key; a key that already has a line may still be updated in place
+  // regardless (matches this function's original behavior 1:1).
+  const allowedUpdates = Object.fromEntries(
+    Object.entries(values).filter(
+      ([key]) => key in existingKeys || /^LARK_/u.test(key) || key === "FEISHU_USER_PLUGIN_CHAT_ID" || key === "FEISHU_USER_PLUGIN_GROUP_NAME"
+    )
+  );
+  writeFileSync(filePath, applyEnvUpdates(existing, allowedUpdates), "utf8");
 }
 
 function applyFeishuAliases(currentEnv) {

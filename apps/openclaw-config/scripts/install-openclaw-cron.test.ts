@@ -2,18 +2,20 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
+
 const script = readFileSync(join(process.cwd(), "apps/openclaw-config/scripts/install-openclaw-cron.mjs"), "utf8");
 
 describe("OpenClaw cron installer", () => {
-  it("retires legacy launchd report schedules so OpenClaw cron is the report owner", () => {
-    for (const label of [
-      "com.openclaw.trading.report.daily.prepare",
-      "com.openclaw.trading.report.daily.deliver",
-      "com.openclaw.trading.report.weekly.prepare",
-      "com.openclaw.trading.report.weekly.deliver",
-      "com.openclaw.trading.stock-analysis"
-    ]) {
-      expect(script).toContain(label);
+  // Task H7 (2026-07-14 legacy audit): single-sourced with
+  // install-user-schedules.mjs via openclaw-report-launchd-jobs.mjs - see
+  // install-user-schedules.test.ts's "shared report/stock-analysis launchd
+  // job list" suite for the cross-installer overlap test.
+  it("retires legacy launchd report schedules (single-sourced) so OpenClaw cron is the report owner", () => {
+    expect(script).toContain("openclaw-report-launchd-jobs.mjs");
+    expect(script).toContain("MANAGED_REPORT_LAUNCHD_LABELS");
+    for (const label of MANAGED_REPORT_LAUNCHD_LABELS) {
+      expect(script).not.toContain(`"${label}"`);
     }
   });
 

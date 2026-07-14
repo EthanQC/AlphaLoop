@@ -74,9 +74,19 @@ export function validateStockAnalysisMarkdown(markdown) {
   if (!/期权链只读补充/u.test(text)) {
     failures.push("stock.option_chain");
   }
+  // Task H7 (2026-07-14 legacy audit): renderBatchStockAnalysis explicitly
+  // discloses a whole-batch Longbridge-only news degradation with a fixed
+  // "已保留来源降级状态" notice (stock-analysis.mjs) instead of pretending
+  // diverse sources exist. That explicit, disclosed degradation used to be
+  // rejected by this exact gate every time - a routine external-news outage
+  // (Yahoo/Google returning zero items) meant NO report could ever be
+  // delivered, crash-looping every scheduled trigger. An honestly-disclosed
+  // degraded state must be allowed through; an UNDISCLOSED single-source
+  // report must still fail.
   if (sourceLabels.length > 0) {
     const uniqueSources = new Set(sourceLabels.map((source) => source.toLowerCase()));
-    if (uniqueSources.size < 2 || !sourceLabels.some((source) => !/longbridge/iu.test(source))) {
+    const isExplicitlyDegraded = /来源降级状态/u.test(text);
+    if (!isExplicitlyDegraded && (uniqueSources.size < 2 || !sourceLabels.some((source) => !/longbridge/iu.test(source)))) {
       failures.push("stock.news_source_diversity");
     }
   }
