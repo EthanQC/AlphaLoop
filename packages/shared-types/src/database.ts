@@ -344,7 +344,7 @@ const MIGRATIONS: MigrationStep[] = [
       //      shows up as a real/active member) created on demand, only if
       //      such a row actually exists.
       // ----------------------------------------------------------------
-      const legacySystemMemberCreatedAt = new Date().toISOString();
+      const legacySystemMemberCreatedAt = nowIso();
       db.prepare(`
         INSERT OR IGNORE INTO members (id, email, display_name, status, created_at)
         SELECT '__legacy_system__', '__legacy_system__@alphaloop.invalid',
@@ -408,6 +408,35 @@ const MIGRATIONS: MigrationStep[] = [
       `);
       db.exec("DROP TABLE stock_analysis_targets;");
       db.exec("ALTER TABLE stock_analysis_targets_new RENAME TO stock_analysis_targets;");
+
+      // ----------------------------------------------------------------
+      // Post-rebuild integrity gate for the ONE guarantee this step newly
+      // declares: alert_events.owner_id -> members(id). The rebuild runs
+      // with PRAGMA foreign_keys OFF, so a pre-existing "ghost" owner_id
+      // (nonexistent member - unreachable through the app's own write
+      // path, but so was NULL, which we defend against above) would be
+      // copied straight into a table whose DDL now promises it cannot
+      // exist, and SQLite never re-validates existing rows when the
+      // pragma comes back on. Fail loud inside the transaction instead:
+      // the migration rolls back and the operator sees exactly which
+      // rows are bad. Deliberately NOT a blanket foreign_key_check -
+      // dangling rule_id rows are pre-existing corruption the task brief
+      // requires preserving (orphaned events must not be dropped), so
+      // only the newly-declared owner_id edge is enforced here.
+      // ----------------------------------------------------------------
+      const ghostOwners = db.prepare(`
+        SELECT e.id, e.owner_id FROM alert_events e
+        LEFT JOIN members m ON m.id = e.owner_id
+        WHERE m.id IS NULL
+        LIMIT 5
+      `).all() as Array<{ id: string; owner_id: string }>;
+      if (ghostOwners.length > 0) {
+        const detail = ghostOwners.map((r) => `${r.id} -> ${r.owner_id}`).join(", ");
+        throw new Error(
+          `v7 migration aborted: alert_events rows reference nonexistent members (${detail}); ` +
+          `repair the owner_id values (or restore the missing members) and re-run.`
+        );
+      }
     }
   }
 ];

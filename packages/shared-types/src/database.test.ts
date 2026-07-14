@@ -675,4 +675,49 @@ describe("v7 schema hardening: per-owner watchlist, CHECK constraints, event own
       db.prepare(`INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at) VALUES ('AAPL.US', 'mem_1', 1, ?, ?)`).run(now, now)
     ).toThrow(/UNIQUE constraint failed|PRIMARY KEY/);
   });
+
+  it("aborts (with rollback) when a legacy alert_events row references a nonexistent member - the FK the rebuild newly declares", () => {
+    const db = memoryDb();
+
+    // The rebuild runs under PRAGMA foreign_keys=OFF, and SQLite never
+    // re-validates existing rows when the pragma comes back on - so without
+    // an explicit gate, a "ghost" owner_id would be committed into a table
+    // whose DDL promises it cannot exist. The gate must fail the migration
+    // loudly and leave the db at v6, untouched.
+    db.exec(`
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, feishu_open_id TEXT UNIQUE,
+        display_name TEXT NOT NULL, risk_tags TEXT NOT NULL DEFAULT '[]', stock_tags TEXT NOT NULL DEFAULT '[]',
+        show_performance INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+      );
+      CREATE TABLE alert_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+        threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both',
+        frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+        hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, removed_at TEXT);
+      CREATE TABLE alert_events (
+        id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id), owner_id TEXT,
+        triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT);
+      CREATE TABLE stock_analysis_targets (
+        symbol TEXT PRIMARY KEY, owner_id TEXT, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    `);
+    const now = nowIso();
+    db.prepare(`INSERT INTO members (id, email, display_name, status, created_at) VALUES ('mem_1', 'legacy@example.com', 'Legacy', 'active', ?)`).run(now);
+    db.prepare(`INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, frequency, created_at) VALUES ('rule_1', 'mem_1', 'AAPL.US', 'daily_move', 0.04, 'once_daily', ?)`).run(now);
+    // Ghost: owner_id set to a member that does not exist (only reachable via
+    // manual DB surgery - the same class of corruption the orphan-rule path
+    // already defends against).
+    db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_ghost', 'rule_1', 'ghost_member', ?, 1.0)`).run(now);
+    db.exec("PRAGMA user_version = 6");
+
+    expect(() => migrate(db)).toThrow(/nonexistent members.*evt_ghost -> ghost_member/);
+
+    // Rolled back: still v6, data untouched, db usable.
+    expect(getSchemaVersion(db)).toBe(6);
+    const evt = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_ghost'").get() as { owner_id: string };
+    expect(evt.owner_id).toBe("ghost_member");
+  });
 });
