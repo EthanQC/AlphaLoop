@@ -884,5 +884,16 @@ const isMainModule = process.argv[1]
   : false;
 
 if (isMainModule) {
-  await main();
+  try {
+    await main();
+  } catch (error) {
+    // Single-line JSON error envelope + non-zero exit, matching
+    // market-alerts.mjs's buildCliResult contract - a control agent (or an
+    // operator) reading this CLI's output must never have to parse a raw
+    // Node stack trace to learn that `--owner` was missing. (Same lesson as
+    // P2's live-binary check: unit tests exercise exported functions, not
+    // the process entry path.)
+    console.error(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    process.exitCode = 1;
+  }
 }
