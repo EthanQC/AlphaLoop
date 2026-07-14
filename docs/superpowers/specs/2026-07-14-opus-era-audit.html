@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaLoop 存量代码专项审计报告（2026-07-14）</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e2e2e2;
+  --accent: #0b6bcb; --code-bg: #f5f5f5; --th-bg: #f0f3f7; --hl: #fff8e1;
+  --row-alt: #f7f9fb;
+  --badge-important-bg: #fdeaea; --badge-important-fg: #b3261e; --badge-important-bd: #f2b8b5;
+  --badge-minor-bg: #eeeeee; --badge-minor-fg: #555555; --badge-minor-bd: #cccccc;
+  --badge-rejected-bg: #eeeeee; --badge-rejected-fg: #888888; --badge-rejected-bd: #cccccc;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14161a; --fg: #e6e6e6; --muted: #9a9a9a; --border: #333;
+    --accent: #5aa2e8; --code-bg: #1f2329; --th-bg: #1d232e; --hl: #2a2717;
+    --row-alt: #1a1e24;
+    --badge-important-bg: #3a1f1f; --badge-important-fg: #ff8a80; --badge-important-bd: #5c2b2b;
+    --badge-minor-bg: #2a2a2a; --badge-minor-fg: #aaaaaa; --badge-minor-bd: #444444;
+    --badge-rejected-bg: #242424; --badge-rejected-fg: #777777; --badge-rejected-bd: #3a3a3a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  line-height: 1.8; font-size: 16px; }
+.layout { display: flex; max-width: 1240px; margin: 0 auto; }
+nav.toc { position: sticky; top: 0; align-self: flex-start; width: 290px; flex: none;
+  padding: 24px 16px; font-size: 13px; max-height: 100vh; overflow-y: auto;
+  border-right: 1px solid var(--border); }
+nav.toc .toctitle { font-weight: 700; margin-bottom: 8px; color: var(--muted); }
+nav.toc ul { list-style: none; padding-left: 0; margin: 0; }
+nav.toc ul ul { padding-left: 14px; }
+nav.toc li { margin: 5px 0; }
+nav.toc a { color: var(--fg); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); }
+main { flex: 1; min-width: 0; padding: 32px 42px 80px; }
+h1 { font-size: 26px; border-bottom: 2px solid var(--border); padding-bottom: 12px; }
+h2 { font-size: 21px; margin-top: 46px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+h3 { font-size: 17.5px; margin-top: 30px; }
+a { color: var(--accent); }
+code { background: var(--code-bg); padding: 2px 5px; border-radius: 4px;
+  font-size: 0.88em; font-family: "SF Mono", Menlo, Consolas, monospace; }
+pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px;
+  overflow-x: auto; line-height: 1.45; font-size: 13px; }
+pre code { background: none; padding: 0; }
+.tablewrap { overflow-x: auto; margin: 16px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+th { background: var(--th-bg); }
+tbody tr:nth-child(even) { background: var(--row-alt); }
+hr { border: none; border-top: 1px solid var(--border); margin: 36px 0; }
+blockquote { margin: 16px 0; padding: 8px 16px; border-left: 3px solid var(--accent);
+  color: var(--muted); background: var(--hl); border-radius: 0 6px 6px 0; }
+blockquote p { margin: 8px 0; }
+li { margin: 5px 0; }
+strong { font-weight: 650; }
+.badge { display: inline-block; padding: 1px 9px; border-radius: 10px;
+  font-size: 0.82em; font-weight: 650; line-height: 1.6; border: 1px solid transparent; }
+.badge-important { background: var(--badge-important-bg); color: var(--badge-important-fg); border-color: var(--badge-important-bd); }
+.badge-minor { background: var(--badge-minor-bg); color: var(--badge-minor-fg); border-color: var(--badge-minor-bd); }
+.badge-rejected { background: var(--badge-rejected-bg); color: var(--badge-rejected-fg); border-color: var(--badge-rejected-bd); text-decoration: line-through; }
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  nav.toc { position: static; width: auto; max-height: none; border-right: none;
+    border-bottom: 1px solid var(--border); }
+  main { padding: 20px 18px 60px; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc"><div class="toctitle">目录</div><div class="toc">
+<ul>
+<li><a href="#overview">一句话总评</a></li>
+<li><a href="#findings">重点发现（按链路）</a><ul>
+<li><a href="#finding-1">1. 下单-对账链路（money path）</a></li>
+<li><a href="#finding-2">2. "绿色假象"类</a></li>
+<li><a href="#finding-3">3. 调度与状态存储</a></li>
+<li><a href="#finding-4">4. 报告管线</a></li>
+<li><a href="#finding-5">5. 凭据与飞书链路</a></li>
+<li><a href="#finding-6">6. 个股分析 CLI</a></li>
+</ul>
+</li>
+<li><a href="#rejected">被驳回的 4 项</a></li>
+<li><a href="#disposition">去向汇总</a></li>
+</ul>
+</div>
+</nav>
+<main>
+<h1 id="top">存量代码专项审计报告（2026-07-14）</h1>
+<blockquote>
+<p>背景：用户要求对 v2 重建之前的存量脚本（早期由 Opus 产出）做格外检查。</p>
+<p>方法：49-agent 对抗式审计 workflow——33 个存量脚本按 7 条链路分组，每组一个带定制视角的审计 agent，<strong>每条发现再派一个独立反驳者尝试推翻</strong>（读真实代码、可对临时库跑验证），驳不倒才算数。已修复/已排期的已知问题预先排除，不重复上报。</p>
+<p>结果：<strong>确认 38 项（<span class="badge badge-important">Important</span> 21 / <span class="badge badge-minor">Minor</span> 17），<span class="badge badge-rejected">驳回</span> 4 项</strong>。全量发现（含完整触发场景与验证推理）：<code>.superpowers/sdd/audit-2026-07-14-confirmed.json</code>。</p>
+</blockquote>
+
+<h2 id="overview">一句话总评</h2>
+<p>存量代码的<strong>主功能路径基本正确</strong>，但普遍缺"失败路径工程"：错误被静默吞掉、降级不披露、状态写坏无察觉——与 Phase 2.5 在提醒器上连修五轮的问题同属一类。最严重的集中在<strong>下单-对账链路</strong>（P6 要在上面建审批）和<strong>"绿色假象"类</strong>（系统看起来正常、实际在输出坏数据）。</p>
+
+<h2 id="findings">重点发现（按链路）</h2>
+
+<h3 id="finding-1">1. 下单-对账链路（money path）——4 项 <span class="badge badge-important">Important</span>，全部记为 P6 前置</h3>
+<p>这是含金量最高的一组，<strong>不做零散修补</strong>（改一处会让另一处更糟），P6 建审批链路时统一重设计：</p>
+<div class="tablewrap"><table>
+<thead>
+<tr><th>发现</th><th>要害</th></tr>
+</thead>
+<tbody>
+<tr><td>提交路径无任何幂等</td><td>下单成功但记录前崩溃/超时 → 用户重试 → <strong>同一笔单在券商重复下出</strong>；执行器先执行后落库，先天顺序反了</td></tr>
+<tr><td>对账查询的报告标题从来没有代码写过</td><td><code>Execution report for X</code> vs 实际写入的 <code>X 执行报告</code>——一次改名（f2984a5）漏改查询 → <strong>订单和 ticket 的关联从未建立过</strong>，全部 <code>Ticket: unknown</code></td></tr>
+<tr><td>关联逻辑是"同 symbol 最新者胜"</td><td>修好上面的标题反而<strong>更糟</strong>：卖单 ticket 会经 COALESCE 覆盖买单已正确的关联，审批/审计挂错单</td></tr>
+<tr><td>10% 预算守卫只看已成交持仓</td><td>未成交限价单不可见 → 预算可以被承诺两次</td></tr>
+</tbody>
+</table></div>
+<p><span class="badge badge-minor">Minor</span> 三项（币种混算、撤单状态映射成 unknown、对账每跑一次重复插一条 trade 报告虚增交易数）同记 P6。</p>
+<p><strong>给 P6 的结论</strong>：submit→record→reconcile 链条必须以幂等键 + 先记录后执行重建，不能在现骨架上贴补丁。</p>
+
+<h3 id="finding-2">2. "绿色假象"类——系统报健康、实际在输出坏数据（并入 Task 4/7 立即修）</h3>
+<div class="tablewrap"><table>
+<thead>
+<tr><th>发现</th><th>位置</th><th>去向</th></tr>
+</thead>
+<tbody>
+<tr><td>长桥 CLI 空输出被当成功的 <code>{}</code> → <strong>提醒引擎拿到零行情却记绿色轮询</strong>（H1 修的投递盲区在数据侧的镜像）</td><td><code>_longbridge.mjs</code></td><td>Task 7</td></tr>
+<tr><td>Chrome 静默失败时<strong>把上一次的旧 PDF 当本次产物投递</strong></td><td><code>report-rendering.mjs</code></td><td>Task 7</td></tr>
+<tr><td>逐 symbol 行情失败被静默按成本价（缺成本按 0）折进市值，快照写成"完整"</td><td><code>official-paper-monitor.mjs</code></td><td>Task 4</td></tr>
+<tr><td>预算摘要引用从不存在的 <code>snapshot.quotes</code> → 非 QQQ 持仓全按成本价估值，暴露比例失真</td><td><code>scheduled-report.mjs</code></td><td>Task 7</td></tr>
+<tr><td>手动 snapshot 子命令跳过环境断言 → 错账户数据写进受信任表</td><td><code>official-paper-monitor.mjs</code></td><td>Task 4</td></tr>
+</tbody>
+</table></div>
+
+<h3 id="finding-3">3. 调度与状态存储（并入 Task 5，与 H1 同一教训）</h3>
+<ul>
+<li><code>processed-runs.json</code> 非原子写，损坏即<strong>静默清空全部去重与停机标记</strong>——历史任务全量重放、已停机任务自动复活；</li>
+<li>状态文件写不进去（磁盘满/权限）无升级路径——任务执行了却记不上，KeepAlive 下重启即重跑重发；</li>
+<li>失败分类拿含时间戳的 stderr 首行当 key——同根因永远 count=1，3-strikes 停机永不触发（<strong>与 Task 5 已排期项撞车，互相印证</strong>）；</li>
+<li>超时只发一次 SIGTERM 无 SIGKILL 兜底；</li>
+<li>两个安装器互相打架：<code>launchd:install-user</code> 会重装另一个安装器刚 retire 的 5 个任务，报告双份执行。</li>
+</ul>
+
+<h3 id="finding-4">4. 报告管线（<span class="badge badge-important">Important</span> 并入 Task 7；注入类记 P4）</h3>
+<ul>
+<li>投递完整性标记「长桥行情」从不出现在报告里 → 每次投递都判不完整、<strong>强制重新生成整份报告</strong>（写侧/读侧各测各的，又是 seam 类）；</li>
+<li>宏观日历抓取失败无降级 → 整份日报直接失败（其他源都有降级）；</li>
+<li>记给 P4（重建新闻引擎时一并）：RSS 实体解码顺序会把合法转义还原成活 HTML、无日期旧闻被标"刚刚发布"排榜首、质量门的来源多样性可被标题注入伪造、新闻标题的 markdown 链接语法直通 PDF。</li>
+</ul>
+
+<h3 id="finding-5">5. 凭据与飞书链路（并入 Task 7）</h3>
+<ul>
+<li>oauth 成功一次就<strong>写坏 <code>.env.local</code></strong>（值不加引号/剥引号/毁注释）→ 直接让 H2 刚接线的安装器中断——两个写回点同病；</li>
+<li>插件用 <code>npx -y</code> 不固定版本冷启动——registry 给什么跑什么，进程环境里是全部飞书密钥（供应链面）；</li>
+<li><span class="badge badge-minor">Minor</span>：oauth 无 state 参数（P10 加固）、id 缺失的飞书事件全部塌缩到主键 <code>""</code> 互相覆盖。</li>
+</ul>
+
+<h3 id="finding-6">6. 个股分析 CLI（并入 Task 7）</h3>
+<ul>
+<li>无逐 symbol 隔离——一个标的行情失败杀掉整批分析且无限期；</li>
+<li>显式降级态（仅长桥新闻）被自己的质量门恒拒——<strong>整批新闻降级时永远发不出报告</strong>（死锁式降级）；</li>
+<li>「180 日均线」用 6 个月数据算（最多 ~126 根）——标签与事实不符；</li>
+<li><span class="badge badge-minor">Minor</span>：期权到期日当天跳到下月、带点的分级股票代码不转 Yahoo 横线格式（5 个数据源全 404）、prepare 静默覆盖已投递的报告归档。</li>
+</ul>
+
+<h2 id="rejected">被<span class="badge badge-rejected">驳回</span>的 4 项（反驳者证伪，不采纳）</h2>
+<p>嵌入 JSON 解析取首段（实际实现取的是最后一段有效 JSON）；对账重跑会改写历史关联（COALESCE 方向判断有误，历史非空值不会被覆盖——但"首次即错"的版本成立，见上）；5 秒轮询无防重入（inFlightRunKeys 实际按积压 run 逐条去重有效）；wrapper 复活旧 OAuth token 遮蔽轮换后的 refresh token（实际插件自持久化优先）。</p>
+
+<h2 id="disposition">去向汇总</h2>
+<div class="tablewrap"><table>
+<thead>
+<tr><th>去向</th><th>数量</th><th>载体</th></tr>
+</thead>
+<tbody>
+<tr><td>Phase 2.5 立即修（Task 4/5/7）</td><td>16 项</td><td>计划已修订（commit 2904eb6）</td></tr>
+<tr><td>P6 前置（下单链路重设计）</td><td>7 项</td><td>台账 P6 PREREQUISITES 段</td></tr>
+<tr><td>P4 备注（新闻引擎重建时）</td><td>4 项</td><td>台账 P4 NOTES 段</td></tr>
+<tr><td>延后 <span class="badge badge-minor">Minor</span>（台账留痕）</td><td>7 项</td><td>台账 deferred 段</td></tr>
+<tr><td><span class="badge badge-rejected">驳回</span></td><td>4 项</td><td>本报告</td></tr>
+</tbody>
+</table></div>
+</main>
+</div>
+</body>
+</html>
