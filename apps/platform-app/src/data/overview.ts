@@ -5,55 +5,26 @@
  * can't accidentally leak another member's rows by forgetting a JS-side
  * filter (plan Global Constraints: "服务端强制隔离...在 handler 层查询即过滤").
  *
- * Snapshot ownership precedence mirrors the ONE adjudicated rule already
- * shared between market-alerts-store.mjs and market-alerts-poll.mjs
- * (apps/openclaw-config/scripts/market-alerts-store.mjs's
- * `loadLatestSnapshotForOwner`): the owner's own row wins even if older than
- * every other row; a row that can't be attributed to a single owner is used
- * as a fallback ONLY when the owner has none of their own. That repo's
- * fallback set was originally just `owner_id IS NULL` (every row predates
- * per-owner snapshots); official-paper-monitor.mjs's `saveSnapshot` (task H4)
- * now also writes the `'__shared__'` sentinel (SHARED_OWNER_SENTINEL) when
- * 0 or >1 members are active, so this port of the rule folds that sentinel
- * into the SAME fallback set rather than inventing a third precedence
- * variant. The sentinel string is re-declared here (not imported from the
- * .mjs script) because apps/openclaw-config/scripts is a plain-Node script
- * directory, not a TS project this workspace package depends on - the same
- * "re-declare the literal, comment cross-references the source of truth"
- * convention already used for `__legacy_system__` across identity.ts and
- * members.mjs.
+ * Snapshot reading (SnapshotPosition/OwnerSnapshot/loadLatestSnapshotForOwner/
+ * loadPreviousDaySnapshotForOwner and the adjudicated own-row/fallback-set
+ * precedence rule they implement) MOVED to ./snapshots.ts in Task 6, which
+ * also added the net-worth SERIES reader the paper-trading page needs
+ * (loadSnapshotSeriesForOwner) - seeing an obvious "same precedence rule,
+ * one row vs. many rows" relationship, Task 6 folded both into one module
+ * rather than writing a third independent snapshot reader. Re-exported here
+ * so every caller that already imports these names from `data/overview.js`
+ * (routes/home.ts, this file's own test) keeps working unchanged - see
+ * snapshots.ts's header comment for the full rationale.
  */
 import type { DatabaseSync } from "node:sqlite";
 
-/** Mirrors official-paper-monitor.mjs's SHARED_OWNER_SENTINEL: the owner_id
- * written when a snapshot can't be attributed to exactly one active member. */
-const SHARED_OWNER_SENTINEL = "__shared__";
-
-export interface SnapshotPosition {
-  symbol: string;
-  /** H4 convention (official-paper-monitor.mjs attachPriceSource): 'live' is
-   * a real quote; 'cost'/'zero' are degraded-estimate fallbacks that MUST be
-   * rendered as a degraded-valuation marker, never silently shown as if live. */
-  priceSource?: "live" | "cost" | "zero";
-  price?: number;
-  costPrice?: number;
-  quantity?: number;
-  [key: string]: unknown;
-}
-
-export interface OwnerSnapshot {
-  id: string;
-  ownerId: string | null;
-  fetchedAt: string;
-  netAssets: number | null;
-  marketValue: number;
-  positions: SnapshotPosition[];
-  /** From the snapshot's `raw` JSON blob (report-data.mjs/official-paper-monitor.mjs
-   * `degraded`/`degradedReason` field convention) - total-fetch-failure or
-   * per-position degradation, must be surfaced, never swallowed. */
-  degraded: boolean;
-  degradedReason: string | null;
-}
+export {
+  loadLatestSnapshotForOwner,
+  loadPreviousDaySnapshotForOwner,
+  SHARED_OWNER_SENTINEL,
+  type OwnerSnapshot,
+  type SnapshotPosition
+} from "./snapshots.js";
 
 export interface AlertEventRow {
   id: string;
@@ -85,117 +56,6 @@ export interface DisciplineRuleRow {
   linkedStrategy: string | null;
   enabled: boolean;
   createdAt: string;
-}
-
-const SNAPSHOT_SELECT = `
-  SELECT id, fetched_at, net_assets, market_value, positions, raw, owner_id
-  FROM official_paper_snapshots
-`;
-
-function parsePositions(raw: unknown): SnapshotPosition[] {
-  try {
-    const parsed: unknown = JSON.parse(String(raw));
-    return Array.isArray(parsed) ? (parsed as SnapshotPosition[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseDegraded(raw: unknown): { degraded: boolean; degradedReason: string | null } {
-  try {
-    const parsed = JSON.parse(String(raw)) as { degraded?: unknown; degradedReason?: unknown };
-    const degraded = Boolean(parsed.degraded);
-    const degradedReason = typeof parsed.degradedReason === "string" ? parsed.degradedReason : null;
-    return { degraded, degradedReason };
-  } catch {
-    return { degraded: false, degradedReason: null };
-  }
-}
-
-function mapSnapshotRow(row: Record<string, unknown>): OwnerSnapshot {
-  const { degraded, degradedReason } = parseDegraded(row.raw);
-  return {
-    id: String(row.id),
-    ownerId: row.owner_id === null || row.owner_id === undefined ? null : String(row.owner_id),
-    fetchedAt: String(row.fetched_at),
-    netAssets: row.net_assets === null || row.net_assets === undefined ? null : Number(row.net_assets),
-    marketValue: Number(row.market_value),
-    positions: parsePositions(row.positions),
-    degraded,
-    degradedReason
-  };
-}
-
-/**
- * The ONE implementation of the adjudicated snapshot-ownership precedence
- * rule (this module's header comment): the owner's OWN row wins even if
- * older than every other row; a row with no single attributable owner
- * (`owner_id IS NULL` - pre-H4 legacy rows - or `owner_id = '__shared__'` -
- * H4's explicit "can't attribute" sentinel) is used only as a fallback when
- * the owner has none of their own. `loadLatestSnapshotForOwner` and
- * `loadPreviousDaySnapshotForOwner` are both thin wrappers around this, so
- * the precedence logic itself exists in exactly one place - a future change
- * to the fallback set (or the rule itself) cannot update one entry point
- * and silently miss the other, which is exactly the "two independent copies
- * agree by coincidence, diverge later" failure mode
- * market-alerts-store.mjs's own loadLatestSnapshotForOwner was written to
- * eliminate (see this module's header comment).
- *
- * @param boundary Optional ISO instant; when given, both the own-row and
- *   fallback queries are additionally bounded to `fetched_at < boundary`
- *   (used by `loadPreviousDaySnapshotForOwner` to mean "before today").
- */
-function loadSnapshotForOwnerImpl(db: DatabaseSync, ownerId: string, boundary?: string): OwnerSnapshot | null {
-  const boundaryClause = boundary ? "AND fetched_at < ?" : "";
-  const boundaryParams = boundary ? [boundary] : [];
-
-  const ownRow = db
-    .prepare(`${SNAPSHOT_SELECT} WHERE owner_id = ? ${boundaryClause} ORDER BY fetched_at DESC LIMIT 1`)
-    .get(ownerId, ...boundaryParams) as Record<string, unknown> | undefined;
-  if (ownRow) {
-    return mapSnapshotRow(ownRow);
-  }
-
-  const fallbackRow = db
-    .prepare(
-      `${SNAPSHOT_SELECT} WHERE (owner_id IS NULL OR owner_id = ?) ${boundaryClause} ORDER BY fetched_at DESC LIMIT 1`
-    )
-    .get(SHARED_OWNER_SENTINEL, ...boundaryParams) as Record<string, unknown> | undefined;
-  return fallbackRow ? mapSnapshotRow(fallbackRow) : null;
-}
-
-/**
- * Returns the newest `official_paper_snapshots` row this owner can see, per
- * the adjudicated precedence rule documented on `loadSnapshotForOwnerImpl`.
- */
-export function loadLatestSnapshotForOwner(db: DatabaseSync, ownerId: string): OwnerSnapshot | null {
-  return loadSnapshotForOwnerImpl(db, ownerId);
-}
-
-/**
- * Same precedence rule as `loadLatestSnapshotForOwner`, but bounded to
- * strictly before the start of `now`'s Beijing calendar day - used by the
- * home page to find "yesterday's close" so it can compute 今日涨跌 (today's
- * change). Beijing has no DST, so a fixed UTC+8 offset is exact year-round.
- */
-export function loadPreviousDaySnapshotForOwner(
-  db: DatabaseSync,
-  ownerId: string,
-  now: Date
-): OwnerSnapshot | null {
-  return loadSnapshotForOwnerImpl(db, ownerId, beijingDayStartUtcIso(now));
-}
-
-function beijingDayStartUtcIso(now: Date): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(now);
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  const dateStamp = `${byType.get("year")}-${byType.get("month")}-${byType.get("day")}`;
-  return new Date(`${dateStamp}T00:00:00+08:00`).toISOString();
 }
 
 /**

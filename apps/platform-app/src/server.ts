@@ -6,7 +6,9 @@ import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 import { applySecurityHeaders, createNonce } from "./security.js";
 import { handleHomeRoute } from "./routes/home.js";
 import { handleNewsRoute } from "./routes/news.js";
+import { handlePaperRoute } from "./routes/paper.js";
 import { handleReportsRoute } from "./routes/reports.js";
+import { handleStockRoute } from "./routes/stock.js";
 
 export interface PlatformServerDeps {
   /** Trading database handle; used by identity resolution (Task 2) and the
@@ -67,6 +69,22 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
     }
 
     if (handleNewsRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
+      return;
+    }
+
+    if (handlePaperRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
+      return;
+    }
+
+    if (
+      handleStockRoute(
+        req,
+        res,
+        url,
+        { db: deps.db, repoRoot: deps.repoRoot, ...(deps.now ? { now: deps.now } : {}) },
+        nonce
+      )
+    ) {
       return;
     }
 
