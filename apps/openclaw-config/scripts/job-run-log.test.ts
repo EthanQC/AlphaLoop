@@ -14,6 +14,7 @@ import {
   lastMarkerAt,
   lastMarkerAtSince,
   lastRecoveryAt,
+  lastRunAt,
   recentFailures,
   recordJobRun
 } from "./job-run-log.mjs";
@@ -127,6 +128,33 @@ describe("consecutiveFailureCount", () => {
 
     expect(consecutiveFailureCount(db, "market-alerts")).toBe(1);
     expect(consecutiveFailureCount(db, "other-job")).toBe(2);
+  });
+});
+
+// Task H2 (Phase 2.5 hardening): lastRunAt was added for the doctor's
+// "has this poller stopped ticking" heartbeat check but was, until now, only
+// ever exercised transitively through openclaw-runtime-doctor-core.test.ts.
+// Direct coverage here pins its own contract (most recent run regardless of
+// ok/fail, job-scoped, null when the job has never run) independent of that
+// caller.
+describe("lastRunAt", () => {
+  it("is null for a job with no run_log rows at all", () => {
+    const { db } = makeDb();
+    expect(lastRunAt(db, "nonexistent")).toBeNull();
+  });
+
+  it("returns the most recent run's startedAt regardless of ok/fail", () => {
+    const { db } = makeDb();
+    recordJobRun(db, { job: "j", startedAt: "2026-07-01T00:00:00.000Z", ok: true });
+    recordJobRun(db, { job: "j", startedAt: "2026-07-02T00:00:00.000Z", ok: false });
+    expect(lastRunAt(db, "j")).toBe("2026-07-02T00:00:00.000Z");
+  });
+
+  it("only considers the given job's own rows, ignoring a later run recorded under another job", () => {
+    const { db } = makeDb();
+    recordJobRun(db, { job: "market-alerts", startedAt: "2026-07-01T00:00:00.000Z", ok: true });
+    recordJobRun(db, { job: "other-job", startedAt: "2026-07-05T00:00:00.000Z", ok: true });
+    expect(lastRunAt(db, "market-alerts")).toBe("2026-07-01T00:00:00.000Z");
   });
 });
 

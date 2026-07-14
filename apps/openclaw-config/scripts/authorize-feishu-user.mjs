@@ -30,7 +30,13 @@ execFileSync(process.execPath, [join(repoRoot, "apps", "openclaw-config", "scrip
   cwd: repoRoot,
   stdio: "inherit"
 });
-execFileSync("bash", [join(repoRoot, "apps", "openclaw-config", "scripts", "install-launchd.sh")], {
+// install-launchd.sh has a `#!/bin/zsh` shebang and its render loop uses
+// zsh-only extended-glob qualifiers (`(N)`, see that script) - invoking it
+// via `bash` throws a syntax error (`unexpected token '('`) and crashes this
+// script before the launchd jobs are ever installed. Found via task H2's
+// live verification of the newly-added `pnpm launchd:install-backup-alerts`
+// alias, which wraps this exact same script.
+execFileSync("zsh", [join(repoRoot, "apps", "openclaw-config", "scripts", "install-launchd.sh")], {
   cwd: repoRoot,
   stdio: "inherit"
 });

@@ -21,7 +21,6 @@ const snapshot = {
   runtimeRoot,
   dbPath
 };
-const analysis = analyzeOpenClawRuntimeSnapshot(snapshot);
 
 // `launchdJobLabels` legitimately holds every launchd job on the whole
 // machine (hundreds of unrelated Apple/OS agents) - the full list is what
@@ -32,6 +31,28 @@ const printedSnapshot = {
   ...snapshot,
   launchdJobLabels: snapshot.launchdJobLabels.filter((label) => label.startsWith("com.alphaloop.") || label.startsWith("com.openclaw."))
 };
+
+// task H2 fix round (this task, CRITICAL finding): analyzeOpenClawRuntimeSnapshot
+// now isolates each individual check's own throws internally (see that
+// module's own doc comment on runChecksFailureIsolated) - this try/catch is
+// an outer, last-resort net for the analyzer itself somehow throwing outside
+// that per-check loop (e.g. a future bug in the shared pre-check
+// computation above it), so this CLI - the doctor's only external observer -
+// still prints something actionable instead of dying silently and printing
+// NOTHING, which is exactly the failure mode this task exists to close.
+let analysis;
+try {
+  analysis = analyzeOpenClawRuntimeSnapshot(snapshot);
+} catch (analysisError) {
+  analysis = {
+    ok: false,
+    findings: [{
+      severity: "error",
+      code: "doctor.analysis_crashed",
+      message: `分析过程自身抛出异常，未能生成完整报告：${analysisError instanceof Error ? analysisError.message : String(analysisError)}`
+    }]
+  };
+}
 
 console.log(JSON.stringify({ ok: analysis.ok, snapshot: printedSnapshot, findings: analysis.findings }, null, 2));
 process.exitCode = analysis.ok ? 0 : 1;
