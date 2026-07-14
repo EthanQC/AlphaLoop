@@ -10,11 +10,18 @@
 // reads only exist to serve the CLI's write-side validation.
 
 import { createId } from "../../../packages/shared-types/dist/index.js";
+import { DEFAULT_HYSTERESIS } from "./market-alerts-engine.mjs";
 
 const DEFAULT_LAST_VALUE = { lastPrice: null, history: [], armedDirection: null };
 
+// Task H4 (phase2.5 hardening): defensive redundancy alongside `enabled = 1`
+// - removeRule always sets both `enabled = 0` and `removed_at` together, so
+// this AND clause is a no-op against every row this codebase's own write
+// paths can produce today. It exists so a future writer that ever sets
+// removed_at without also flipping enabled (or a manual DB fixup) can't
+// silently resurrect a removed rule into evaluation.
 export function listEnabledRules(db) {
-  const rows = db.prepare(`SELECT * FROM alert_rules WHERE enabled = 1`).all();
+  const rows = db.prepare(`SELECT * FROM alert_rules WHERE enabled = 1 AND removed_at IS NULL`).all();
   return rows.map(mapRuleRow);
 }
 
@@ -124,7 +131,11 @@ export function getMemberById(db, memberId) {
 // matchable here just because the row still physically exists. This filter
 // is load-bearing for the shared pool too: a soft-deleted legacy-shared row
 // must not be resurrected just because it's globally shared.
-const LEGACY_SHARED_OWNER = "__legacy_shared__";
+// Exported (not just module-private) so other writers into
+// stock_analysis_targets - namely stock-analysis.mjs's setTargets (task H4)
+// - can guard against ever writing/soft-deleting this sentinel's rows
+// instead of re-declaring the same string literal in a second place.
+export const LEGACY_SHARED_OWNER = "__legacy_shared__";
 
 export function isSymbolWatched(db, ownerId, symbol) {
   const row = db
@@ -214,14 +225,36 @@ export function countRules(db, ownerId, symbol, ruleType) {
   return Number(row?.c ?? 0);
 }
 
+// Task H4 (phase2.5 hardening, invariant push-down): both the hysteresis
+// default and the rearmBand guard used to live ONLY in market-alerts.mjs's
+// runAdd (see that file's "C1 fix" / "Hardening found while verifying the
+// C1 fix" comments) - a caller that reached insertRule directly (bypassing
+// the CLI) got hysteresis 0 and no protection against a threshold at or
+// below the type's hysteresis (which drives rearmBand = threshold -
+// hysteresis to <= 0 - for exposure specifically a PERMANENT latch, since
+// its re-arm check can never be satisfied again once exposureRatio has
+// nowhere negative to go). Both now live here so every future caller
+// inherits them automatically, not just the CLI. The CLI's own duplicate
+// checks (runAdd) stay in place for fast feedback - this is a second,
+// independent line of defense, not a replacement.
 export function insertRule(db, rule) {
   const id = createId("alert_rule");
   const createdAt = new Date().toISOString();
-  const hysteresis = rule.hysteresis ?? 0;
+  const threshold = Number(rule.threshold);
+  const typeHysteresis = DEFAULT_HYSTERESIS[rule.ruleType];
+  const hysteresis = rule.hysteresis ?? typeHysteresis ?? 0;
+
+  if (typeHysteresis > 0 && threshold <= typeHysteresis) {
+    throw new Error(
+      `threshold 太小：必须大于 ${rule.ruleType} 类型的滞回值 ${typeHysteresis}` +
+      `（否则规则触发一次后将永远无法重新武装）；收到 ${threshold}。`
+    );
+  }
+
   db.prepare(`
     INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, rule.threshold, rule.direction, rule.frequency, hysteresis, createdAt);
+  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, threshold, rule.direction, rule.frequency, hysteresis, createdAt);
   // Built directly from the insert args (matching recordEvents' pattern
   // below) rather than a redundant getRule(db, id) re-fetch - every field
   // returned here is already known, normalized the same way mapRuleRow does.
@@ -230,7 +263,7 @@ export function insertRule(db, rule) {
     ownerId: rule.ownerId,
     symbol: rule.symbol,
     ruleType: rule.ruleType,
-    threshold: Number(rule.threshold),
+    threshold,
     direction: rule.direction,
     frequency: rule.frequency,
     hysteresis: Number(hysteresis),

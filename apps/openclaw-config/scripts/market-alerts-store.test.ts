@@ -85,6 +85,23 @@ function seedRule(
 }
 
 describe("listEnabledRules", () => {
+  // Task H4 (phase2.5 hardening, invariant push-down): `enabled` and
+  // `removed_at` are conceptually redundant today (removeRule always sets
+  // both together), but listEnabledRules only checked `enabled = 1` -
+  // nothing in the query itself actually depended on removed_at being NULL.
+  // This pins a defensive AND removed_at IS NULL clause so a future writer
+  // that ever sets removed_at without also flipping enabled to 0 (or a
+  // manual DB fixup) can't resurrect a removed rule into evaluation.
+  it("excludes a row with removed_at set even when enabled=1 (defensive redundancy - removed_at is the source of truth for 'removed')", () => {
+    const { db } = makeDb();
+    seedMember(db);
+    seedRule(db, { id: "rule_inconsistent", enabled: 1 });
+    db.prepare("UPDATE alert_rules SET removed_at = ? WHERE id = ?").run("2026-07-10T00:00:00.000Z", "rule_inconsistent");
+
+    const rules = store.listEnabledRules(db);
+    expect(rules.map((r: { id: string }) => r.id)).toEqual([]);
+  });
+
   it("returns only enabled rules, camelCase-mapped", () => {
     const { db } = makeDb();
     seedMember(db);
@@ -614,6 +631,66 @@ describe("removeRule", () => {
 });
 
 describe("insertRule / getRule", () => {
+  // Task H4 (phase2.5 hardening, invariant push-down): before this task,
+  // hysteresis defaulting (`?? 0`) and the "threshold must exceed the
+  // type's hysteresis" guard lived ONLY in market-alerts.mjs's runAdd (the
+  // C1/C1-hardening fixes documented there) - a caller reaching insertRule
+  // directly got hysteresis 0 and no rearmBand protection at all. Both are
+  // now enforced by the store itself, so every future caller inherits them
+  // automatically instead of having to remember to re-implement the CLI's
+  // guard.
+  it("defaults hysteresis to DEFAULT_HYSTERESIS[ruleType] when the caller supplies none (not 0)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    const rule = store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.06,
+      direction: "both",
+      frequency: "continuous"
+      // no `hysteresis` field at all
+    });
+
+    expect(rule.hysteresis).toBe(0.01);
+    expect(store.getRule(db, rule.id)?.hysteresis).toBe(0.01);
+  });
+
+  it("throws when threshold <= the type's hysteresis (permanent-latch guard, pushed down from the CLI)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() =>
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "*",
+        ruleType: "exposure",
+        threshold: 0.01, // == DEFAULT_HYSTERESIS.exposure
+        direction: "both",
+        frequency: "continuous"
+      })
+    ).toThrow(/滞回/);
+
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_rules").get() as { c: number }).c).toBe(0);
+  });
+
+  it("does not throw for a zero-hysteresis type (daily_move) regardless of threshold, since 0 can never make rearmBand non-positive", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() =>
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "AAPL.US",
+        ruleType: "daily_move",
+        threshold: 0.04,
+        direction: "both",
+        frequency: "once_daily"
+      })
+    ).not.toThrow();
+  });
+
   it("inserts a rule and returns the camelCase-mapped row", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
