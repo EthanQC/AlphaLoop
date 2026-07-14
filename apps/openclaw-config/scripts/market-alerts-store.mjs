@@ -96,29 +96,40 @@ export function getMemberById(db, memberId) {
 }
 
 // Spec-owner decision (task P2-4 fix round), superseding the original
-// brief's "owner_id = actor" strict gate: stock_analysis_targets is
-// structurally a SINGLE SHARED watchlist, not a per-owner one -
-// `symbol TEXT PRIMARY KEY` means one row per symbol globally, and
-// stock-analysis.mjs's setTargets never writes owner_id, so every existing
-// row has owner_id NULL. The strict gate matched NULL against nothing,
-// making "add an alert for a watchlist symbol I don't yet hold" fail 100%
-// of the time in production. NULL-owner rows ARE the shared pool - not some
-// other member's private data - so they must match for any actor, mirroring
-// the NULL fallback isSymbolInPositions already uses below. A true
-// per-owner watchlist requires a composite-key schema migration and is
-// deferred to a later phase; this is a read-side workaround, not a fix to
-// the underlying schema (DDL is frozen for this task).
+// brief's "owner_id = actor" strict gate: stock_analysis_targets used to be
+// a SINGLE SHARED watchlist, not a per-owner one - `symbol TEXT PRIMARY KEY`
+// meant one row per symbol globally, and stock-analysis.mjs's setTargets
+// never wrote owner_id, so every existing row had owner_id NULL. The strict
+// gate matched NULL against nothing, making "add an alert for a watchlist
+// symbol I don't yet hold" fail 100% of the time in production. NULL-owner
+// rows ARE the shared pool - not some other member's private data - so they
+// had to match for any actor, mirroring the NULL fallback isSymbolInPositions
+// still uses below (that table - official_paper_snapshots - keeps its
+// nullable owner_id; only stock_analysis_targets was rebuilt).
+//
+// Schema v7 (task H3) rebuilt stock_analysis_targets into a genuine
+// per-owner table: composite PRIMARY KEY (symbol, owner_id), owner_id NOT
+// NULL. A NULL owner_id is no longer representable at all - the migration
+// backfilled every pre-v7 NULL row to the sentinel '__legacy_shared__' (see
+// database.ts's v7 step), which this function now matches in place of the
+// old `owner_id IS NULL` branch, preserving the exact same "shared pool,
+// visible to any member" semantics across the schema change. Making
+// setTargets itself owner-aware (a `--owner` CLI flag, per-owner caps, etc.)
+// is deferred to a later task; this is only the read-side adaptation to the
+// new schema's representation of the same shared-pool concept.
 //
 // `active = 1` matches stock-analysis.mjs's own listTargets contract: its
 // setTargets soft-deletes by flipping a replaced row's `active` to 0 (never
 // deleting the row), so a symbol the owner explicitly removed must not stay
 // matchable here just because the row still physically exists. This filter
-// is now load-bearing for the shared pool too: a soft-deleted NULL-owner row
+// is load-bearing for the shared pool too: a soft-deleted legacy-shared row
 // must not be resurrected just because it's globally shared.
+const LEGACY_SHARED_OWNER = "__legacy_shared__";
+
 export function isSymbolWatched(db, ownerId, symbol) {
   const row = db
-    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE (owner_id = ? OR owner_id IS NULL) AND symbol = ? AND active = 1`)
-    .get(ownerId, symbol);
+    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE (owner_id = ? OR owner_id = ?) AND symbol = ? AND active = 1`)
+    .get(ownerId, LEGACY_SHARED_OWNER, symbol);
   return Boolean(row);
 }
 

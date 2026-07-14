@@ -63,11 +63,17 @@ function seedMember(db: DatabaseSync, id = "member_1"): void {
 }
 
 function seedTarget(db: DatabaseSync, symbol: string, ownerId: string | null): void {
+  // Schema v7 (task H3) rebuilt stock_analysis_targets with a composite
+  // PRIMARY KEY (symbol, owner_id) and owner_id NOT NULL. A caller passing
+  // `null` here means "seed the legacy shared-pool shape", so normalize it
+  // to the migration's sentinel ('__legacy_shared__') rather than a raw SQL
+  // NULL, which the NOT NULL constraint would now reject outright.
+  const normalizedOwnerId = ownerId ?? "__legacy_shared__";
   db.prepare(`
-    INSERT INTO stock_analysis_targets (symbol, active, created_at, updated_at, owner_id)
-    VALUES (?, 1, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET owner_id = excluded.owner_id
-  `).run(symbol, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z", ownerId);
+    INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+    VALUES (?, ?, 1, ?, ?)
+    ON CONFLICT(symbol, owner_id) DO UPDATE SET active = excluded.active, updated_at = excluded.updated_at
+  `).run(symbol, normalizedOwnerId, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z");
 }
 
 // Runs `rule` against a fixed sequence of samples, threading runtimes/quota

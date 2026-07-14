@@ -326,11 +326,17 @@ describe("getQuota / bumpQuota", () => {
 
 function seedTarget(db: DatabaseSync, overrides: Partial<{ symbol: string; ownerId: string | null; active: number }> = {}): void {
   const target = { symbol: "AAPL.US", ownerId: null as string | null, active: 1, ...overrides };
+  // Schema v7 (task H3) rebuilt stock_analysis_targets with a composite
+  // PRIMARY KEY (symbol, owner_id) and owner_id NOT NULL. `ownerId: null`
+  // here means "seed the legacy shared-pool shape", so normalize it to the
+  // migration's sentinel ('__legacy_shared__') rather than a raw SQL NULL,
+  // which the NOT NULL constraint would now reject outright.
+  const normalizedOwnerId = target.ownerId ?? "__legacy_shared__";
   db.prepare(`
-    INSERT INTO stock_analysis_targets (symbol, active, created_at, updated_at, owner_id)
+    INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET active = excluded.active, owner_id = excluded.owner_id
-  `).run(target.symbol, target.active, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z", target.ownerId);
+    ON CONFLICT(symbol, owner_id) DO UPDATE SET active = excluded.active
+  `).run(target.symbol, normalizedOwnerId, target.active, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z");
 }
 
 function seedSnapshot(
