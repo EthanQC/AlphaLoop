@@ -6,12 +6,13 @@ import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 import { applySecurityHeaders, createNonce } from "./security.js";
 import { html, type Html } from "./render/html.js";
 import { renderPage } from "./render/layout.js";
+import { handleReportsRoute } from "./routes/reports.js";
 
 export interface PlatformServerDeps {
-  /** Trading database handle. Unused by Task 1's routes but wired through
-   * for the identity/report/data routes landing in later tasks. */
+  /** Trading database handle; used by identity resolution (Task 2) and the
+   * report routes (Task 4), and wired through for later tasks' data routes. */
   db: DatabaseSync;
-  /** Repo root, used by later tasks for on-disk report scanning. */
+  /** Repo root; used by the report routes (Task 4) for on-disk scanning. */
   repoRoot: string;
   /** Injectable clock for deterministic tests; defaults to wall clock. */
   now?: () => Date;
@@ -23,12 +24,6 @@ export interface PlatformServerDeps {
  * so tests can bind to an ephemeral port instead of the production one.
  */
 export function createPlatformServer(deps: PlatformServerDeps): Server {
-  // Reserved for upcoming tasks (identity resolution, report scanning).
-  void deps.db;
-  void deps.repoRoot;
-  const now = deps.now ?? (() => new Date());
-  void now;
-
   return createServer((req, res) => {
     const nonce = createNonce();
     applySecurityHeaders(res, nonce);
@@ -41,6 +36,21 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         return;
       }
       sendJson(res, 200, { ok: true, service: "platform-app" });
+      return;
+    }
+
+    if (
+      handleReportsRoute(
+        req,
+        res,
+        url,
+        // exactOptionalPropertyTypes: only include `now` when deps actually
+        // supplied one - explicitly setting it to `undefined` is a type
+        // error against ReportsRouteDeps's optional `now?: () => Date`.
+        { db: deps.db, repoRoot: deps.repoRoot, ...(deps.now ? { now: deps.now } : {}) },
+        nonce
+      )
+    ) {
       return;
     }
 
