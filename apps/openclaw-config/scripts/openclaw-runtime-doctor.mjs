@@ -42,7 +42,13 @@ const printedSnapshot = {
 // NOTHING, which is exactly the failure mode this task exists to close.
 let analysis;
 try {
-  analysis = analyzeOpenClawRuntimeSnapshot(snapshot);
+  // Phase 3 Task 8: analyzeOpenClawRuntimeSnapshot is now async (its new
+  // platform-app-health check makes a real HTTP round-trip) - this file is
+  // ESM (top-level await is valid here) and already runs as a plain script,
+  // so awaiting in place is enough; the try/catch below still needs the
+  // `await` to be INSIDE it to catch a rejection the same way it already
+  // catches a synchronous throw.
+  analysis = await analyzeOpenClawRuntimeSnapshot(snapshot);
 } catch (analysisError) {
   analysis = {
     ok: false,

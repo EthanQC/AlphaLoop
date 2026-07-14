@@ -12,7 +12,8 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-user-schedules.mjs`：安装用户级 launchd 调度（日报/周报/个股分析/官方模拟盘轮询）。
-- `scripts/install-launchd.sh`：安装每日数据库备份 + 市场提醒（market-alerts）轮询器这两个 launchd 任务（`com.alphaloop.daily-backup` / `com.alphaloop.market-alerts`），并顺带跑一次 `openclaw gateway install`。
+- `scripts/install-launchd.sh`：安装每日数据库备份 + 市场提醒（market-alerts）轮询器 + platform-app 常驻服务这三个 launchd 任务（`com.alphaloop.daily-backup` / `com.alphaloop.market-alerts` / `com.alphaloop.platform-app`），并顺带跑一次 `openclaw gateway install`。
+- `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 
 ## Feishu
 
@@ -73,8 +74,38 @@ pnpm launchd:install-backup-alerts
 
 - 每日交易数据库备份（`com.alphaloop.daily-backup`）。
 - 市场提醒轮询器（`com.alphaloop.market-alerts`）。
+- platform-app 常驻服务（`com.alphaloop.platform-app`，Phase 3 起）——`KeepAlive`（不是周期任务），启动 `pnpm --filter @apps/platform-app start`，日志写到 `logs/platform-app.log` / `.err.log`。
 
-`pnpm openclaw:runtime:doctor` 会检测这两个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示。
+`pnpm openclaw:runtime:doctor` 会检测这三个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示；另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health` 检查项）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
+
+### platform-app（Phase 3 多成员 Web 平台）
+
+起停：
+
+```bash
+pnpm platform:dev    # tsx watch 本地开发
+pnpm platform:start  # node dist/index.js，launchd 常驻用的就是这条
+
+pnpm launchd:install-backup-alerts   # 顺带安装 com.alphaloop.platform-app
+```
+
+成员管理（`scripts/members.mjs`，单行 JSON 输出、错误非零退出）：
+
+```bash
+node apps/openclaw-config/scripts/members.mjs add --email a@example.com --name "张三" [--feishu <openId>]
+node apps/openclaw-config/scripts/members.mjs list
+node apps/openclaw-config/scripts/members.mjs revoke --member <memberId>
+node apps/openclaw-config/scripts/members.mjs token issue --member <memberId> --label "my-token"
+node apps/openclaw-config/scripts/members.mjs token revoke --token-id <tokenId>
+```
+
+`token issue` 打印的明文 token 只出现这一次，之后无法再次查看，请当场保存。
+
+环境变量（默认都指向真实 `runtime/trading.sqlite`，只应在手工验证时改指临时库）：
+
+- `PLATFORM_DB_PATH`：platform-app 进程自己的数据库路径覆盖。
+- `MEMBERS_DB_PATH`：`members.mjs` CLI 自己的数据库路径覆盖（与上面是两个独立变量）。
+- `PLATFORM_APP_PORT`：platform-app 监听端口，默认 `4314`。
 
 ### 日报/周报/个股分析调度：已迁移到 OpenClaw cron（2026-07-14）
 
