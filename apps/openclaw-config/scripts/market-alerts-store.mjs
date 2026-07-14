@@ -242,11 +242,19 @@ export function insertRule(db, rule) {
   const createdAt = new Date().toISOString();
   const threshold = Number(rule.threshold);
   const typeHysteresis = DEFAULT_HYSTERESIS[rule.ruleType];
-  const hysteresis = rule.hysteresis ?? typeHysteresis ?? 0;
+  // Guard against the EFFECTIVE hysteresis (the value actually inserted),
+  // not the type default - a direct caller passing an explicit
+  // rule.hysteresis larger than the type default could otherwise still
+  // create a permanently-latched rule (threshold <= hysteresis =>
+  // rearmBand <= 0), which is precisely what this push-down exists to stop.
+  const hysteresis = Number(rule.hysteresis ?? typeHysteresis ?? 0);
 
-  if (typeHysteresis > 0 && threshold <= typeHysteresis) {
+  if (!(threshold > 0)) {
+    throw new Error(`threshold 必须为正数；收到 ${rule.threshold}。`);
+  }
+  if (hysteresis > 0 && threshold <= hysteresis) {
     throw new Error(
-      `threshold 太小：必须大于 ${rule.ruleType} 类型的滞回值 ${typeHysteresis}` +
+      `threshold 太小：必须大于滞回值 ${hysteresis}` +
       `（否则规则触发一次后将永远无法重新武装）；收到 ${threshold}。`
     );
   }

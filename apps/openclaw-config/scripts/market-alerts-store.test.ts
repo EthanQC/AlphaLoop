@@ -675,6 +675,43 @@ describe("insertRule / getRule", () => {
     expect((db.prepare("SELECT COUNT(*) AS c FROM alert_rules").get() as { c: number }).c).toBe(0);
   });
 
+  it("guards against the EFFECTIVE hysteresis, not just the type default - an explicit oversized rule.hysteresis is rejected", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    // unrealized_pnl's type default is 0.01, which threshold 0.03 clears -
+    // but the caller explicitly passes hysteresis 0.05 > threshold, which
+    // would make rearmBand negative (permanent latch) if inserted.
+    expect(() =>
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "AAPL.US",
+        ruleType: "unrealized_pnl",
+        threshold: 0.03,
+        direction: "both",
+        frequency: "continuous",
+        hysteresis: 0.05
+      })
+    ).toThrow(/滞回/);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM alert_rules").get() as { c: number }).c).toBe(0);
+  });
+
+  it("rejects a non-positive threshold for any caller (invariant pushed below the CLI)", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() =>
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "AAPL.US",
+        ruleType: "daily_move",
+        threshold: 0,
+        direction: "both",
+        frequency: "once_daily"
+      })
+    ).toThrow(/正数/);
+  });
+
   it("does not throw for a zero-hysteresis type (daily_move) regardless of threshold, since 0 can never make rearmBand non-positive", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
