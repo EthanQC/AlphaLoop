@@ -113,6 +113,17 @@ export function loadPendingProposals(db: DatabaseSync, ownerId: string): Proposa
   }));
 }
 
+function mapDisciplineRuleRow(row: Record<string, unknown>): DisciplineRuleRow {
+  return {
+    id: String(row.id),
+    ruleText: String(row.rule_text),
+    enforcement: row.enforcement as "hard" | "proposal_check" | "self",
+    linkedStrategy: row.linked_strategy === null || row.linked_strategy === undefined ? null : String(row.linked_strategy),
+    enabled: Boolean(row.enabled),
+    createdAt: String(row.created_at)
+  };
+}
+
 /**
  * Enabled discipline_rules for this owner. Always empty in practice today
  * (P7 hasn't shipped strategy-memory writes yet) - same "real, owner-filtered
@@ -123,12 +134,23 @@ export function loadDisciplineRules(db: DatabaseSync, ownerId: string): Discipli
     .prepare(`SELECT * FROM discipline_rules WHERE owner_id = ? AND enabled = 1 ORDER BY created_at DESC`)
     .all(ownerId) as Array<Record<string, unknown>>;
 
-  return rows.map((row) => ({
-    id: String(row.id),
-    ruleText: String(row.rule_text),
-    enforcement: row.enforcement as "hard" | "proposal_check" | "self",
-    linkedStrategy: row.linked_strategy === null || row.linked_strategy === undefined ? null : String(row.linked_strategy),
-    enabled: Boolean(row.enabled),
-    createdAt: String(row.created_at)
-  }));
+  return rows.map(mapDisciplineRuleRow);
+}
+
+/**
+ * ALL of this owner's discipline_rules - both enabled AND disabled - enabled
+ * rows first, then newest-first within each group (Task 7, strategy page's
+ * 我的纪律 section, req §1.7). Unlike `loadDisciplineRules` above (the home
+ * page's 纪律速览, which only ever shows *active* rules to keep that summary
+ * short), a member's own strategy page is the authoritative place to see
+ * every rule they've ever set, including ones they've since disabled -
+ * "stopped" is a fact about the rule worth showing its owner, not a reason to
+ * hide it from them.
+ */
+export function loadAllDisciplineRulesForOwner(db: DatabaseSync, ownerId: string): DisciplineRuleRow[] {
+  const rows = db
+    .prepare(`SELECT * FROM discipline_rules WHERE owner_id = ? ORDER BY enabled DESC, created_at DESC`)
+    .all(ownerId) as Array<Record<string, unknown>>;
+
+  return rows.map(mapDisciplineRuleRow);
 }

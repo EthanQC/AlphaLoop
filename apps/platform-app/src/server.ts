@@ -5,10 +5,14 @@ import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 
 import { applySecurityHeaders, createNonce } from "./security.js";
 import { handleHomeRoute } from "./routes/home.js";
+import { handleMemberCardRoute } from "./routes/member-card.js";
 import { handleNewsRoute } from "./routes/news.js";
 import { handlePaperRoute } from "./routes/paper.js";
+import { handleProposalRoute } from "./routes/proposal.js";
 import { handleReportsRoute } from "./routes/reports.js";
+import { handleResearchRoute } from "./routes/research.js";
 import { handleStockRoute } from "./routes/stock.js";
+import { handleStrategyRoute } from "./routes/strategy.js";
 
 export interface PlatformServerDeps {
   /** Trading database handle; used by identity resolution (Task 2) and the
@@ -85,6 +89,22 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         nonce
       )
     ) {
+      return;
+    }
+
+    if (handleStrategyRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
+      return;
+    }
+
+    if (handleMemberCardRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
+      return;
+    }
+
+    if (handleProposalRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
+      return;
+    }
+
+    if (handleResearchRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
       return;
     }
 
