@@ -46,11 +46,20 @@ pnpm paper:submit-official-equity -- buy QQQ.US 1
 - 个股分析：用户指定标的后，每三天 21:00 发送一次批量分析，PDF + 摘要卡片。
 - 官方模拟盘：美股常规交易时段每小时轮询；美股开盘后 30 分钟发送收支变化表。
 
-安装本地 launchd 调度：
+安装本地调度——一台正式部署机通常三条都要跑（详见 `apps/openclaw-config/README.md` 的「Launchd」章节）：
 
 ```bash
+# 日报/周报/个股分析——2026-07-14 起唯一 owner 是 OpenClaw cron 通道
+pnpm openclaw:cron:install
+
+# 官方模拟盘每小时轮询 + 开盘后收支变化表
 pnpm launchd:install-user
+
+# 每日交易数据库备份 + 市场提醒（market-alerts）轮询器
+pnpm launchd:install-backup-alerts
 ```
+
+只跑其中一条会漏装其余任务——例如只跑 `launchd:install-user` 的机器没有日报/周报/个股分析，也没有每日备份或盘中提醒器（`openclaw:runtime:doctor` 的 `launchd-jobs.*.not_loaded` 提示就是在检测这种情况）。这三条命令彼此不会冲突，可以任意顺序、任意次数重跑。
 
 ## 本地接口
 

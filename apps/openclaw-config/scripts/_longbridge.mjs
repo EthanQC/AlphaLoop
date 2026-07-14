@@ -13,20 +13,45 @@ const runtimeRoot = join(repoRoot, "runtime");
 loadLocalEnv(repoRoot);
 mkdirSync(runtimeRoot, { recursive: true });
 
+// Task H7 (2026-07-14 legacy audit): the quote lock is held across the
+// WHOLE execFileSync call below (default CLI timeout 45s), but lockTtlMs
+// used to be a fixed 10s - shorter than the timeout it's supposed to guard.
+// A call running past 10s (slow network, not yet an actual failure) had its
+// lock declared stale and stolen by a concurrent caller (market-alerts-poll,
+// scheduled-report, stock-analysis, official-paper-monitor all share this
+// same lock file), and the original caller's eventual release() then force-
+// deleted the thief's lock, letting a THIRD caller in - cascading concurrent
+// CLI calls that clobber the shared rate-limit state and can burst past
+// Longbridge's real call-rate limit. Fix: derive the TTL from the actual CLI
+// timeout (with a margin for the lock/IPC overhead around the call itself)
+// instead of a hardcoded, independently-drifting constant - this also closes
+// the same gap for `trade` (its previous 40_000 was likewise under the 45s
+// default timeout, just not the specific case the audit named).
+const LONGBRIDGE_CLI_TIMEOUT_MS = Number(process.env.LONGBRIDGE_CLI_TIMEOUT_MS ?? 45_000);
+const LOCK_TTL_MARGIN_MS = 5_000;
+const LOCK_TTL_MS = LONGBRIDGE_CLI_TIMEOUT_MS + LOCK_TTL_MARGIN_MS;
+
 const LONG_BRIDGE_LIMITS = {
   quote: {
     windowMs: 1_000,
     maxCalls: 10,
     minIntervalMs: 100,
-    lockTtlMs: 10_000
+    lockTtlMs: LOCK_TTL_MS
   },
   trade: {
     windowMs: 30_000,
     maxCalls: 30,
     minIntervalMs: 20,
-    lockTtlMs: 40_000
+    lockTtlMs: LOCK_TTL_MS
   }
 };
+
+// Exported for testing the H7 "lock TTL must be >= the CLI timeout it
+// guards" invariant directly (and for any future caller reasoning about the
+// effective lock windows) without reaching into module internals.
+export function getLongbridgeRateLimitConfig() {
+  return LONG_BRIDGE_LIMITS;
+}
 
 export async function runLongbridgeJson(category, args) {
   const payload = parseLongbridgeJson(await runLongbridgeText(category, [...args, "--format", "json"]));
@@ -84,7 +109,11 @@ export async function runLongbridgeText(category, args) {
     return execFileSync(cli, args, {
       encoding: "utf8",
       env: buildLongbridgeCliEnv(),
-      timeout: Number(process.env.LONGBRIDGE_CLI_TIMEOUT_MS ?? 45_000)
+      // Reads the SAME module-level constant the lock TTL is derived from
+      // (see LONGBRIDGE_CLI_TIMEOUT_MS above) rather than re-reading
+      // process.env here - the two must never be able to drift apart, or
+      // the H7 "lock TTL >= CLI timeout" invariant silently breaks again.
+      timeout: LONGBRIDGE_CLI_TIMEOUT_MS
     }).trim();
   } finally {
     release();
@@ -168,10 +197,23 @@ function buildLongbridgeCliEnv() {
   return env;
 }
 
+// Task H7 (2026-07-14 legacy audit): empty/whitespace-only stdout used to be
+// treated as a successful `{}` payload. The alerts poller's quote provider
+// (market-alerts-poll.mjs's defaultQuoteProvider) turns `{}` into
+// `rows=[{}]` -> no symbol -> an empty quotes map, and the engine's guards
+// silently skip every price/prevClose/volume rule on `no_data` - the poll
+// cycle still records a GREEN heartbeat while zero alerts can ever fire.
+// This is the data-side twin of the delivery-blindness bug H1 fixed: a
+// "successful" run that accomplished nothing. Throwing here instead makes
+// runLongbridgeJsonWithRetry's caller see a real failure, which (via every
+// caller's existing error handling - see this task's audit of
+// market-alerts-poll.mjs/official-paper-monitor.mjs/stock-analysis.mjs/
+// scheduled-report.mjs) now correctly feeds H1's run_log + escalation chain
+// instead of a silently-green no-op cycle.
 function parseLongbridgeJson(output) {
   const trimmed = output.trim();
   if (!trimmed) {
-    return {};
+    throw new Error("Longbridge CLI returned empty output (no stdout to parse).");
   }
 
   try {

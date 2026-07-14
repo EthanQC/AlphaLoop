@@ -10,11 +10,18 @@
 // reads only exist to serve the CLI's write-side validation.
 
 import { createId } from "../../../packages/shared-types/dist/index.js";
+import { DEFAULT_HYSTERESIS } from "./market-alerts-engine.mjs";
 
 const DEFAULT_LAST_VALUE = { lastPrice: null, history: [], armedDirection: null };
 
+// Task H4 (phase2.5 hardening): defensive redundancy alongside `enabled = 1`
+// - removeRule always sets both `enabled = 0` and `removed_at` together, so
+// this AND clause is a no-op against every row this codebase's own write
+// paths can produce today. It exists so a future writer that ever sets
+// removed_at without also flipping enabled (or a manual DB fixup) can't
+// silently resurrect a removed rule into evaluation.
 export function listEnabledRules(db) {
-  const rows = db.prepare(`SELECT * FROM alert_rules WHERE enabled = 1`).all();
+  const rows = db.prepare(`SELECT * FROM alert_rules WHERE enabled = 1 AND removed_at IS NULL`).all();
   return rows.map(mapRuleRow);
 }
 
@@ -96,29 +103,44 @@ export function getMemberById(db, memberId) {
 }
 
 // Spec-owner decision (task P2-4 fix round), superseding the original
-// brief's "owner_id = actor" strict gate: stock_analysis_targets is
-// structurally a SINGLE SHARED watchlist, not a per-owner one -
-// `symbol TEXT PRIMARY KEY` means one row per symbol globally, and
-// stock-analysis.mjs's setTargets never writes owner_id, so every existing
-// row has owner_id NULL. The strict gate matched NULL against nothing,
-// making "add an alert for a watchlist symbol I don't yet hold" fail 100%
-// of the time in production. NULL-owner rows ARE the shared pool - not some
-// other member's private data - so they must match for any actor, mirroring
-// the NULL fallback isSymbolInPositions already uses below. A true
-// per-owner watchlist requires a composite-key schema migration and is
-// deferred to a later phase; this is a read-side workaround, not a fix to
-// the underlying schema (DDL is frozen for this task).
+// brief's "owner_id = actor" strict gate: stock_analysis_targets used to be
+// a SINGLE SHARED watchlist, not a per-owner one - `symbol TEXT PRIMARY KEY`
+// meant one row per symbol globally, and stock-analysis.mjs's setTargets
+// never wrote owner_id, so every existing row had owner_id NULL. The strict
+// gate matched NULL against nothing, making "add an alert for a watchlist
+// symbol I don't yet hold" fail 100% of the time in production. NULL-owner
+// rows ARE the shared pool - not some other member's private data - so they
+// had to match for any actor, mirroring the NULL fallback isSymbolInPositions
+// still uses below (that table - official_paper_snapshots - keeps its
+// nullable owner_id; only stock_analysis_targets was rebuilt).
+//
+// Schema v7 (task H3) rebuilt stock_analysis_targets into a genuine
+// per-owner table: composite PRIMARY KEY (symbol, owner_id), owner_id NOT
+// NULL. A NULL owner_id is no longer representable at all - the migration
+// backfilled every pre-v7 NULL row to the sentinel '__legacy_shared__' (see
+// database.ts's v7 step), which this function now matches in place of the
+// old `owner_id IS NULL` branch, preserving the exact same "shared pool,
+// visible to any member" semantics across the schema change. Making
+// setTargets itself owner-aware (a `--owner` CLI flag, per-owner caps, etc.)
+// is deferred to a later task; this is only the read-side adaptation to the
+// new schema's representation of the same shared-pool concept.
 //
 // `active = 1` matches stock-analysis.mjs's own listTargets contract: its
 // setTargets soft-deletes by flipping a replaced row's `active` to 0 (never
 // deleting the row), so a symbol the owner explicitly removed must not stay
 // matchable here just because the row still physically exists. This filter
-// is now load-bearing for the shared pool too: a soft-deleted NULL-owner row
+// is load-bearing for the shared pool too: a soft-deleted legacy-shared row
 // must not be resurrected just because it's globally shared.
+// Exported (not just module-private) so other writers into
+// stock_analysis_targets - namely stock-analysis.mjs's setTargets (task H4)
+// - can guard against ever writing/soft-deleting this sentinel's rows
+// instead of re-declaring the same string literal in a second place.
+export const LEGACY_SHARED_OWNER = "__legacy_shared__";
+
 export function isSymbolWatched(db, ownerId, symbol) {
   const row = db
-    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE (owner_id = ? OR owner_id IS NULL) AND symbol = ? AND active = 1`)
-    .get(ownerId, symbol);
+    .prepare(`SELECT 1 FROM stock_analysis_targets WHERE (owner_id = ? OR owner_id = ?) AND symbol = ? AND active = 1`)
+    .get(ownerId, LEGACY_SHARED_OWNER, symbol);
   return Boolean(row);
 }
 
@@ -203,14 +225,44 @@ export function countRules(db, ownerId, symbol, ruleType) {
   return Number(row?.c ?? 0);
 }
 
+// Task H4 (phase2.5 hardening, invariant push-down): both the hysteresis
+// default and the rearmBand guard used to live ONLY in market-alerts.mjs's
+// runAdd (see that file's "C1 fix" / "Hardening found while verifying the
+// C1 fix" comments) - a caller that reached insertRule directly (bypassing
+// the CLI) got hysteresis 0 and no protection against a threshold at or
+// below the type's hysteresis (which drives rearmBand = threshold -
+// hysteresis to <= 0 - for exposure specifically a PERMANENT latch, since
+// its re-arm check can never be satisfied again once exposureRatio has
+// nowhere negative to go). Both now live here so every future caller
+// inherits them automatically, not just the CLI. The CLI's own duplicate
+// checks (runAdd) stay in place for fast feedback - this is a second,
+// independent line of defense, not a replacement.
 export function insertRule(db, rule) {
   const id = createId("alert_rule");
   const createdAt = new Date().toISOString();
-  const hysteresis = rule.hysteresis ?? 0;
+  const threshold = Number(rule.threshold);
+  const typeHysteresis = DEFAULT_HYSTERESIS[rule.ruleType];
+  // Guard against the EFFECTIVE hysteresis (the value actually inserted),
+  // not the type default - a direct caller passing an explicit
+  // rule.hysteresis larger than the type default could otherwise still
+  // create a permanently-latched rule (threshold <= hysteresis =>
+  // rearmBand <= 0), which is precisely what this push-down exists to stop.
+  const hysteresis = Number(rule.hysteresis ?? typeHysteresis ?? 0);
+
+  if (!(threshold > 0)) {
+    throw new Error(`threshold 必须为正数；收到 ${rule.threshold}。`);
+  }
+  if (hysteresis > 0 && threshold <= hysteresis) {
+    throw new Error(
+      `threshold 太小：必须大于滞回值 ${hysteresis}` +
+      `（否则规则触发一次后将永远无法重新武装）；收到 ${threshold}。`
+    );
+  }
+
   db.prepare(`
     INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, rule.threshold, rule.direction, rule.frequency, hysteresis, createdAt);
+  `).run(id, rule.ownerId, rule.symbol, rule.ruleType, threshold, rule.direction, rule.frequency, hysteresis, createdAt);
   // Built directly from the insert args (matching recordEvents' pattern
   // below) rather than a redundant getRule(db, id) re-fetch - every field
   // returned here is already known, normalized the same way mapRuleRow does.
@@ -219,7 +271,7 @@ export function insertRule(db, rule) {
     ownerId: rule.ownerId,
     symbol: rule.symbol,
     ruleType: rule.ruleType,
-    threshold: Number(rule.threshold),
+    threshold,
     direction: rule.direction,
     frequency: rule.frequency,
     hysteresis: Number(hysteresis),
@@ -339,7 +391,13 @@ export function persistCycle(db, { runtimes, events, quotaBumps }) {
     db.exec("COMMIT");
     return created;
   } catch (error) {
-    db.exec("ROLLBACK");
+    // The ROLLBACK itself can fail (e.g. the connection is already out of a transaction) - that
+    // secondary failure must never replace `error`, the real cause the caller needs to see.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore: best-effort only, `error` below is what matters.
+    }
     throw error;
   }
 }

@@ -63,11 +63,17 @@ function seedMember(db: DatabaseSync, id = "member_1"): void {
 }
 
 function seedTarget(db: DatabaseSync, symbol: string, ownerId: string | null): void {
+  // Schema v7 (task H3) rebuilt stock_analysis_targets with a composite
+  // PRIMARY KEY (symbol, owner_id) and owner_id NOT NULL. A caller passing
+  // `null` here means "seed the legacy shared-pool shape", so normalize it
+  // to the migration's sentinel ('__legacy_shared__') rather than a raw SQL
+  // NULL, which the NOT NULL constraint would now reject outright.
+  const normalizedOwnerId = ownerId ?? "__legacy_shared__";
   db.prepare(`
-    INSERT INTO stock_analysis_targets (symbol, active, created_at, updated_at, owner_id)
-    VALUES (?, 1, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET owner_id = excluded.owner_id
-  `).run(symbol, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z", ownerId);
+    INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+    VALUES (?, ?, 1, ?, ?)
+    ON CONFLICT(symbol, owner_id) DO UPDATE SET active = excluded.active, updated_at = excluded.updated_at
+  `).run(symbol, normalizedOwnerId, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z");
 }
 
 // Runs `rule` against a fixed sequence of samples, threading runtimes/quota
@@ -154,5 +160,131 @@ describe("CLI -> store -> engine seam: hysteresis actually suppresses flapping (
     }));
 
     expect(fireCount).toBe(1);
+  });
+});
+
+// Task H4 (phase2.5 hardening): the two tests above go through the CLI's
+// runAdd, which has ALWAYS explicitly passed `hysteresis: DEFAULT_HYSTERESIS
+// [type]` - so they never actually exercised store.insertRule's OWN
+// defaulting behavior (previously `rule.hysteresis ?? 0`, now pushed down to
+// default from DEFAULT_HYSTERESIS itself). This block bypasses the CLI
+// entirely and calls store.insertRule directly, proving the invariant now
+// lives in the write layer, not just in market-alerts.mjs.
+describe("store.insertRule -> engine.evaluateAll: the STORE (not just the CLI) defaults hysteresis and honors it end to end", () => {
+  it("a rule inserted via the bare store call (no CLI, no explicit hysteresis) still suppresses flapping", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    const rule = store.insertRule(db, {
+      ownerId: "member_1",
+      symbol: "NVDA.US",
+      ruleType: "unrealized_pnl",
+      threshold: 0.06,
+      direction: "both",
+      frequency: engine.RULE_TYPE_FREQUENCY.unrealized_pnl
+      // deliberately no `hysteresis` field
+    });
+    expect(rule.hysteresis).toBe(engine.DEFAULT_HYSTERESIS.unrealized_pnl);
+
+    // Read back through the store exactly as the poller would - proving the
+    // persisted row (not just insertRule's returned object) carries the
+    // default.
+    const stored = store.listEnabledRules(db).find((r: { id: string }) => r.id === rule.id);
+    expect(stored).toBeTruthy();
+
+    const prices = [106.1, 105.9, 106.1, 105.9, 106.1, 105.9, 106.1, 105.9];
+    const fireCount = runFlappingSequence(stored as Record<string, unknown>, (i, atIso, tradingDay) => ({
+      atIso,
+      tradingDay,
+      quotes: { "NVDA.US": { price: prices[i], prevClose: 100, volume: 1000 } },
+      positions: { "NVDA.US": { quantity: 10, costPrice: 100, marketValue: prices[i] * 10 } },
+      exposure: { exposureRatio: null, overBudget: false }
+    }));
+
+    expect(fireCount).toBe(1);
+  });
+
+  it("insertRule itself rejects a threshold at or below the type's hysteresis, with zero rows written", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+
+    expect(() =>
+      store.insertRule(db, {
+        ownerId: "member_1",
+        symbol: "*",
+        ruleType: "exposure",
+        threshold: engine.DEFAULT_HYSTERESIS.exposure,
+        direction: "both",
+        frequency: engine.RULE_TYPE_FREQUENCY.exposure
+      })
+    ).toThrow(/滞回/);
+
+    expect(store.listAllRules(db)).toEqual([]);
+  });
+});
+
+// Task H4 (phase2.5 hardening): stock-analysis.mjs's setTargets writes
+// stock_analysis_targets; market-alerts-store.mjs's isSymbolWatched reads it
+// to gate rule creation. Both were previously tested only in isolation - a
+// unit test on either side alone can't catch a defect that only exists at
+// their seam (the exact class of bug this whole hardening phase is about:
+// writer-side and reader-side each individually "correct" but disagreeing
+// with each other). This drives the REAL CLI command function (no hand-
+// rolled SQL insert, unlike this file's own seedTarget-equivalent) against a
+// real temp db, then reads it back through the real isSymbolWatched.
+const stockAnalysis = await import("./stock-analysis.mjs");
+
+describe("stock-analysis CLI setTargets -> market-alerts-store isSymbolWatched (writer/reader seam)", () => {
+  it("a symbol set via the real --owner CLI path is visible to isSymbolWatched for that owner only", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+
+    const result = stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA"], options);
+    expect(result.ownerId).toBe("member_1");
+    expect(result.saved).toEqual(["NVDA.US"]);
+
+    expect(store.isSymbolWatched(db, "member_1", "NVDA.US")).toBe(true);
+    expect(store.isSymbolWatched(db, "member_2", "NVDA.US")).toBe(false);
+  });
+
+  it("a symbol removed (replaced) by a later setTargets call for the same owner stops matching isSymbolWatched", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA"], options);
+    expect(store.isSymbolWatched(db, "member_1", "NVDA.US")).toBe(true);
+
+    // Replacing the target list with a disjoint symbol soft-deletes NVDA for
+    // this owner only (setTargets' scoped soft-delete).
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "MSFT"], options);
+    expect(store.isSymbolWatched(db, "member_1", "NVDA.US")).toBe(false);
+    expect(store.isSymbolWatched(db, "member_1", "MSFT.US")).toBe(true);
+    expect(db).toBeTruthy();
+  });
+
+  it("rejects a missing --owner instead of silently operating on a global pool", () => {
+    const { options } = makeDb();
+    expect(() => stockAnalysis.runTargetsCommand(["NVDA"], options)).toThrow(/owner/);
+  });
+
+  it("rejects writing to the read-only legacy shared-pool sentinel", () => {
+    const { db, options } = makeDb();
+    expect(() => stockAnalysis.runTargetsCommand(["--owner", "__legacy_shared__", "NVDA"], options)).toThrow();
+    expect(db.prepare("SELECT COUNT(*) AS c FROM stock_analysis_targets").get()).toMatchObject({ c: 0 });
+  });
+
+  it("rejects an owner id that is not an active member", () => {
+    const { options } = makeDb();
+    expect(() => stockAnalysis.runTargetsCommand(["--owner", "no_such_member", "NVDA"], options)).toThrow(/成员/);
+  });
+
+  it("enforces the 20-symbol-per-owner cap", () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    const symbols = Array.from({ length: 21 }, (_, i) => `${String.fromCharCode(65 + i)}${String.fromCharCode(65 + i)}${String.fromCharCode(65 + i)}`);
+
+    expect(() => stockAnalysis.runTargetsCommand(["--owner", "member_1", ...symbols], options)).toThrow(/20/);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM stock_analysis_targets").get()).toMatchObject({ c: 0 });
   });
 });

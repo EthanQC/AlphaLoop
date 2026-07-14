@@ -50,6 +50,49 @@ setInterval(() => {}, 1000);
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  // Task H7 (2026-07-14 legacy audit): `npx -y feishu-user-plugin` (no
+  // version) resolves whatever the registry serves as `latest` at every
+  // cold start, with every Feishu secret in the spawned process's
+  // environment - a broken/compromised publish would run silently under
+  // this repo's own credentials. The wrapper must always pass a pinned
+  // `feishu-user-plugin@<version>` package spec, never the bare name.
+  it("pins feishu-user-plugin to a specific version instead of trusting npx's registry-of-the-day resolution", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "openclaw-feishu-plugin-pin-"));
+    const markerPath = join(tempDir, "argv.log");
+    const fakeNpxPath = join(tempDir, "npx");
+
+    writeFileSync(fakeNpxPath, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+
+writeFileSync(process.env.FAKE_NPX_MARKER, JSON.stringify(process.argv.slice(2)));
+process.exit(0);
+`, "utf8");
+    chmodSync(fakeNpxPath, 0o755);
+
+    const child = spawn(process.execPath, [wrapperPath], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        FAKE_NPX_MARKER: markerPath,
+        PATH: `${tempDir}${delimiter}${process.env.PATH ?? ""}`
+      },
+      stdio: "ignore"
+    });
+
+    try {
+      await waitForExit(child, 3_000);
+      const recordedArgv = JSON.parse(readFileSync(markerPath, "utf8")) as string[];
+      expect(recordedArgv[0]).toBe("-y");
+      expect(recordedArgv[1]).toMatch(/^feishu-user-plugin@\d+\.\d+\.\d+$/u);
+      expect(recordedArgv[1]).not.toBe("feishu-user-plugin");
+    } finally {
+      if (!child.killed) {
+        child.kill("SIGKILL");
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 function waitForMarker(filePath: string, expected: string, timeoutMs: number): Promise<void> {

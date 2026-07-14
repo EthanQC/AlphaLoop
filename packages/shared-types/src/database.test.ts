@@ -36,6 +36,37 @@ describe("versioned migrations", () => {
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
   });
 
+  it("propagates the original migration error instead of a secondary ROLLBACK failure", () => {
+    // A fake DatabaseSync-shaped object: reports user_version=0 (so migrate() attempts the very
+    // first step, whose `run(db)` executes a multi-statement CREATE TABLE ... string), fails that
+    // CREATE TABLE with an ORIGINAL error, and then ALSO fails the ROLLBACK migrate()'s catch
+    // issues in response (a SECONDARY error) - simulating a connection that can no longer roll
+    // back (e.g. already out of a transaction). Before this task's fix, the un-wrapped
+    // `db.exec("ROLLBACK")` would let the SECONDARY error replace the original one that actually
+    // explains what went wrong.
+    const fakeDb = {
+      prepare(sql: string) {
+        if (sql.includes("user_version")) {
+          return { get: () => ({ user_version: 0 }) };
+        }
+        throw new Error(`unexpected prepare() in fake db: ${sql}`);
+      },
+      exec(sql: string) {
+        const trimmed = sql.trim();
+        if (trimmed.startsWith("CREATE TABLE")) {
+          throw new Error("ORIGINAL_FAILURE: disk full while creating table");
+        }
+        if (trimmed === "ROLLBACK") {
+          throw new Error("SECONDARY_FAILURE: cannot rollback - no transaction is active");
+        }
+        // BEGIN / PRAGMA user_version=n / COMMIT: no-op.
+      }
+    } as unknown as DatabaseSync;
+
+    expect(() => migrate(fakeDb)).toThrow(/ORIGINAL_FAILURE/);
+    expect(() => migrate(fakeDb)).not.toThrow(/SECONDARY_FAILURE/);
+  });
+
   it("adopts a legacy db (tables exist, user_version=0) without data loss", () => {
     const db = memoryDb();
     // simulate legacy: baseline tables created the old way, user_version left at 0
@@ -181,6 +212,26 @@ describe("ApiTokenRepository", () => {
     const tokens = new ApiTokenRepository(db);
 
     expect(tokens.verify("not-a-real-token")).toBeNull();
+  });
+
+  it("stores token_hash as a 64-char hex digest, never the plaintext token itself", () => {
+    // P1's core security claim (issue() never persists the plaintext, verify() only ever compares
+    // hashes) had no direct assertion until this task - every other test only exercises the
+    // round-trip through issue()/verify(), which would pass identically even if token_hash held
+    // the plaintext token.
+    const db = memoryDb();
+    migrate(db);
+    const member = seedMember(db);
+    const tokens = new ApiTokenRepository(db);
+
+    const { id, token } = tokens.issue(member.id, "cli");
+
+    const row = db
+      .prepare("SELECT token_hash FROM api_tokens WHERE id = ?")
+      .get(id) as { token_hash: string };
+
+    expect(row.token_hash).not.toBe(token);
+    expect(row.token_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("revoke prevents further verification", () => {
@@ -334,11 +385,13 @@ describe("v5 feishu_context_messages migration", () => {
 });
 
 describe("v6 alert_rules.removed_at migration", () => {
-  it("adds the removed_at column and bumps schema version to 6", () => {
+  it("adds the removed_at column", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(SCHEMA_VERSION).toBe(6);
+    // SCHEMA_VERSION has since moved on to v7 (task H3) - this test only
+    // asserts the removed_at column exists, not any particular version
+    // number.
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const columns = db.prepare("PRAGMA table_info(alert_rules)").all() as Array<{ name: string }>;
@@ -349,8 +402,10 @@ describe("v6 alert_rules.removed_at migration", () => {
     const db = memoryDb();
     // Simulate a legacy db that predates removed_at: build members + alert_rules
     // exactly as the v1/v3 migrations leave them (no removed_at column), seed a
-    // real row, and leave user_version at 5 so migrate() only has to replay the
-    // new v6 step - not the whole history from scratch.
+    // real row, and leave user_version at 5. migrate() replays v6 AND v7 (task
+    // H3) from here - a genuine user_version=5 db already has alert_events and
+    // stock_analysis_targets (created back in v1/v3), so this fixture includes
+    // them too, in their pre-v7 shape, or the v7 step has nothing to rebuild.
     db.exec(`
       CREATE TABLE members (
         id TEXT PRIMARY KEY,
@@ -370,6 +425,12 @@ describe("v6 alert_rules.removed_at migration", () => {
         frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
         hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL);
+      CREATE TABLE alert_events (
+        id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id), owner_id TEXT NOT NULL,
+        triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT);
+      CREATE TABLE stock_analysis_targets (
+        symbol TEXT PRIMARY KEY, owner_id TEXT, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     `);
     db.prepare(`
       INSERT INTO members (id, email, display_name, created_at)
@@ -397,5 +458,317 @@ describe("v6 alert_rules.removed_at migration", () => {
       .prepare("SELECT removed_at FROM alert_rules WHERE id = 'rule_1'")
       .get() as { removed_at: string };
     expect(typeof updatedRow.removed_at).toBe("string");
+  });
+});
+
+describe("v7 schema hardening: per-owner watchlist, CHECK constraints, event ownership", () => {
+  it("bumps schema version to 7 and keeps all four rebuilt tables present", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(SCHEMA_VERSION).toBe(7);
+    expect(getSchemaVersion(db)).toBe(7);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    expect(names).toContain("members");
+    expect(names).toContain("alert_rules");
+    expect(names).toContain("alert_events");
+    expect(names).toContain("stock_analysis_targets");
+  });
+
+  it("is idempotent across repeated calls once at v7", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("a fresh db lands directly at v7 with no manual intervention", () => {
+    const db = memoryDb();
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(7);
+  });
+
+  it("rejects an invalid alert_rules.direction via CHECK", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run("rule_bad_dir", member.id, "AAPL.US", "daily_move", 0.04, "sideways", "once_daily", nowIso())
+    ).toThrow(/CHECK constraint failed/);
+  });
+
+  it("rejects an invalid members.status via CHECK", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO members (id, email, display_name, status, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `)
+        .run("mem_bad_status", "bad-status@example.com", "Bad Status", "pending", nowIso())
+    ).toThrow(/CHECK constraint failed/);
+  });
+
+  it("rejects a NULL alert_events.owner_id", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    db.prepare(`
+      INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, frequency, created_at)
+      VALUES ('rule_1', ?, 'AAPL.US', 'daily_move', 0.04, 'once_daily', ?)
+    `).run(member.id, nowIso());
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value)
+          VALUES ('evt_1', 'rule_1', NULL, ?, 1.5)
+        `)
+        .run(nowIso())
+    ).toThrow(/NOT NULL constraint failed/);
+  });
+
+  it("rejects an alert_events.owner_id that does not reference an existing member (FK)", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    db.prepare(`
+      INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, frequency, created_at)
+      VALUES ('rule_1', ?, 'AAPL.US', 'daily_move', 0.04, 'once_daily', ?)
+    `).run(member.id, nowIso());
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value)
+          VALUES ('evt_1', 'rule_1', 'no_such_member', ?, 1.5)
+        `)
+        .run(nowIso())
+    ).toThrow(/FOREIGN KEY constraint failed/);
+  });
+
+  it("enforces (symbol, owner_id) uniqueness in stock_analysis_targets while allowing the same symbol under different owners", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+      VALUES ('AAPL.US', 'member_1', 1, ?, ?)
+    `).run(now, now);
+
+    // Same symbol, different owner: this is the whole point of the v7
+    // rebuild (per-owner watchlists) - must succeed.
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+          VALUES ('AAPL.US', 'member_2', 1, ?, ?)
+        `)
+        .run(now, now)
+    ).not.toThrow();
+
+    // Same symbol, same owner: must be rejected as a duplicate.
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+          VALUES ('AAPL.US', 'member_1', 1, ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/UNIQUE constraint failed|PRIMARY KEY/);
+  });
+
+  it("rejects an empty-string owner_id in stock_analysis_targets via CHECK", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+          VALUES ('AAPL.US', '', 1, ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/CHECK constraint failed/);
+  });
+
+  it("migrates a populated v6 database to v7 with zero row loss and constraints active afterward", () => {
+    const db = memoryDb();
+
+    // Build the exact v6 shape by hand (mirrors the v6 describe block above)
+    // and seed one row per rebuilt table, plus the owner_id edge cases task
+    // H3 calls out:
+    //  - a stock_analysis_targets row with NULL owner_id (the pre-v7
+    //    single-shared-watchlist shape) -> must backfill to the sentinel
+    //    '__legacy_shared__'.
+    //  - an alert_events row with NULL owner_id whose rule is still alive
+    //    -> must backfill from the rule's owner_id via JOIN.
+    //  - an alert_events row with NULL owner_id whose rule has been deleted
+    //    out from under it -> must NOT be silently dropped; attributed to a
+    //    placeholder member instead.
+    //
+    // alert_events.owner_id has been declared NOT NULL since v3 in this
+    // codebase's actual migration history, so a real production db could
+    // never reach the NULL-owner_id state through the app's own write path
+    // - but the task brief requires the migration to be robust against it
+    // regardless (see database.ts's v7 step comment), so this test builds a
+    // deliberately looser legacy shape (no NOT NULL on owner_id) to exercise
+    // that defense.
+    db.exec(`
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, feishu_open_id TEXT UNIQUE,
+        display_name TEXT NOT NULL, risk_tags TEXT NOT NULL DEFAULT '[]', stock_tags TEXT NOT NULL DEFAULT '[]',
+        show_performance INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+      );
+      CREATE TABLE alert_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+        threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both',
+        frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+        hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, removed_at TEXT);
+      CREATE TABLE alert_events (
+        id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id), owner_id TEXT,
+        triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT);
+      CREATE TABLE stock_analysis_targets (
+        symbol TEXT PRIMARY KEY, owner_id TEXT, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    `);
+
+    const now = nowIso();
+    db.prepare(`INSERT INTO members (id, email, display_name, status, created_at) VALUES ('mem_1', 'legacy@example.com', 'Legacy', 'active', ?)`).run(now);
+    db.prepare(`INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, created_at) VALUES ('rule_1', 'mem_1', 'AAPL.US', 'daily_move', 0.04, 'up', 'once_daily', ?)`).run(now);
+    db.prepare(`INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, created_at) VALUES ('rule_orphan', 'mem_1', 'MSFT.US', 'daily_move', 0.04, 'both', 'once_daily', ?)`).run(now);
+
+    // Normal event: owner_id already set, must survive untouched.
+    db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_normal', 'rule_1', 'mem_1', ?, 1.23)`).run(now);
+    // Backfillable event: NULL owner_id, but its rule (rule_1) is alive -> owner_id comes from the rule via JOIN.
+    db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_backfill', 'rule_1', NULL, ?, 2.34)`).run(now);
+    // Orphaned event: NULL owner_id AND its rule (rule_orphan) is about to be deleted.
+    db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_orphan', 'rule_orphan', NULL, ?, 3.45)`).run(now);
+    // Delete rule_orphan out from under evt_orphan (bypassing the app's own
+    // cascading deleteRule(), simulating either a historical bug or manual
+    // DB surgery). FK must be dropped temporarily for SQLite to allow it.
+    db.exec("PRAGMA foreign_keys = OFF;");
+    db.prepare(`DELETE FROM alert_rules WHERE id = 'rule_orphan'`).run();
+    db.exec("PRAGMA foreign_keys = ON;");
+
+    db.prepare(`INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at) VALUES ('AAPL.US', 'mem_1', 1, ?, ?)`).run(now, now);
+    // Legacy shared-pool row: NULL owner_id, the pre-v7 single-shared-watchlist shape.
+    db.prepare(`INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at) VALUES ('NVDA.US', NULL, 1, ?, ?)`).run(now, now);
+
+    db.exec("PRAGMA user_version = 6");
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // --- zero row loss ---
+    // members: the original 'mem_1' PLUS the '__legacy_system__' placeholder
+    // the migration had to create to anchor evt_orphan's backfilled owner_id.
+    expect((db.prepare("SELECT COUNT(*) c FROM members").get() as { c: number }).c).toBe(2);
+    // alert_rules: rule_orphan was deleted in the test's own setup BEFORE
+    // migrate() ran (simulating pre-existing corruption), not by the
+    // migration itself - only rule_1 survives to be counted here.
+    expect((db.prepare("SELECT COUNT(*) c FROM alert_rules").get() as { c: number }).c).toBe(1);
+    // alert_events: all three rows preserved - none silently dropped.
+    expect((db.prepare("SELECT COUNT(*) c FROM alert_events").get() as { c: number }).c).toBe(3);
+    expect((db.prepare("SELECT COUNT(*) c FROM stock_analysis_targets").get() as { c: number }).c).toBe(2);
+
+    // --- spot values ---
+    const rule1 = db.prepare("SELECT direction FROM alert_rules WHERE id = 'rule_1'").get() as { direction: string };
+    expect(rule1.direction).toBe("up");
+
+    const evtNormal = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_normal'").get() as { owner_id: string };
+    expect(evtNormal.owner_id).toBe("mem_1");
+
+    const evtBackfill = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_backfill'").get() as { owner_id: string };
+    expect(evtBackfill.owner_id).toBe("mem_1");
+
+    const evtOrphan = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_orphan'").get() as { owner_id: string };
+    expect(evtOrphan.owner_id).toBe("__legacy_system__");
+
+    const legacySystemMember = db.prepare("SELECT status FROM members WHERE id = '__legacy_system__'").get() as { status: string };
+    expect(legacySystemMember.status).toBe("revoked");
+
+    const aapl = db.prepare("SELECT owner_id FROM stock_analysis_targets WHERE symbol = 'AAPL.US'").get() as { owner_id: string };
+    expect(aapl.owner_id).toBe("mem_1");
+
+    const nvda = db.prepare("SELECT owner_id FROM stock_analysis_targets WHERE symbol = 'NVDA.US'").get() as { owner_id: string };
+    expect(nvda.owner_id).toBe("__legacy_shared__");
+
+    // --- constraints active afterward ---
+    expect(() =>
+      db.prepare(`INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, created_at) VALUES ('rule_bad', 'mem_1', 'TSLA.US', 'daily_move', 0.04, 'sideways', 'once_daily', ?)`).run(now)
+    ).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      db.prepare(`UPDATE members SET status = 'pending' WHERE id = 'mem_1'`).run()
+    ).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_bad', 'rule_1', NULL, ?, 1)`).run(now)
+    ).toThrow(/NOT NULL constraint failed/);
+    expect(() =>
+      db.prepare(`INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at) VALUES ('AAPL.US', 'mem_1', 1, ?, ?)`).run(now, now)
+    ).toThrow(/UNIQUE constraint failed|PRIMARY KEY/);
+  });
+
+  it("aborts (with rollback) when a legacy alert_events row references a nonexistent member - the FK the rebuild newly declares", () => {
+    const db = memoryDb();
+
+    // The rebuild runs under PRAGMA foreign_keys=OFF, and SQLite never
+    // re-validates existing rows when the pragma comes back on - so without
+    // an explicit gate, a "ghost" owner_id would be committed into a table
+    // whose DDL promises it cannot exist. The gate must fail the migration
+    // loudly and leave the db at v6, untouched.
+    db.exec(`
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, feishu_open_id TEXT UNIQUE,
+        display_name TEXT NOT NULL, risk_tags TEXT NOT NULL DEFAULT '[]', stock_tags TEXT NOT NULL DEFAULT '[]',
+        show_performance INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+      );
+      CREATE TABLE alert_rules (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+        symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+        threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both',
+        frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+        hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, removed_at TEXT);
+      CREATE TABLE alert_events (
+        id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id), owner_id TEXT,
+        triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT);
+      CREATE TABLE stock_analysis_targets (
+        symbol TEXT PRIMARY KEY, owner_id TEXT, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    `);
+    const now = nowIso();
+    db.prepare(`INSERT INTO members (id, email, display_name, status, created_at) VALUES ('mem_1', 'legacy@example.com', 'Legacy', 'active', ?)`).run(now);
+    db.prepare(`INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, frequency, created_at) VALUES ('rule_1', 'mem_1', 'AAPL.US', 'daily_move', 0.04, 'once_daily', ?)`).run(now);
+    // Ghost: owner_id set to a member that does not exist (only reachable via
+    // manual DB surgery - the same class of corruption the orphan-rule path
+    // already defends against).
+    db.prepare(`INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value) VALUES ('evt_ghost', 'rule_1', 'ghost_member', ?, 1.0)`).run(now);
+    db.exec("PRAGMA user_version = 6");
+
+    expect(() => migrate(db)).toThrow(/nonexistent members.*evt_ghost -> ghost_member/);
+
+    // Rolled back: still v6, data untouched, db usable.
+    expect(getSchemaVersion(db)).toBe(6);
+    const evt = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_ghost'").get() as { owner_id: string };
+    expect(evt.owner_id).toBe("ghost_member");
   });
 });

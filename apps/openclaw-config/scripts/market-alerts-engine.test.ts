@@ -1148,7 +1148,11 @@ describe("replay: deterministic multi-day multi-symbol sequence", () => {
     let runtimes: Record<string, any> = {};
     let quotaByOwner: Record<string, number> = {};
     let previousTradingDay: string | null = null;
-    const timeline: Array<{ tick: string; ruleId: string; decision: string; reason: string }> = [];
+    // Item 4 (task P2.5 Task 6): `value` added alongside decision/reason -
+    // the snapshot below used to pin only decision/reason, so a numeric
+    // regression (e.g. a wrong ratio computation that still crosses the same
+    // fire/skip threshold) would silently pass this exhaustive check.
+    const timeline: Array<{ tick: string; ruleId: string; decision: string; reason: string; value: number | null }> = [];
 
     for (const tick of ticks) {
       if (previousTradingDay !== null && previousTradingDay !== tick.tradingDay) {
@@ -1172,7 +1176,7 @@ describe("replay: deterministic multi-day multi-symbol sequence", () => {
       quotaByOwner = newQuotas;
 
       for (const r of results) {
-        timeline.push({ tick: tick.label, ruleId: r.ruleId, decision: r.decision, reason: r.reason });
+        timeline.push({ tick: tick.label, ruleId: r.ruleId, decision: r.decision, reason: r.reason, value: r.value });
       }
     }
 

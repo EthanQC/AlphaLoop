@@ -141,4 +141,54 @@ describe("report quality gate", () => {
     expect(result.failures).toContain("stock.valuation_depth");
     expect(result.failures).toContain("stock.news_source_diversity");
   });
+
+  // Task H7 (2026-07-14 legacy audit): a whole-batch Longbridge-only news
+  // degradation used to be rejected by this exact gate every time, even
+  // though the renderer explicitly discloses it - meaning no report could
+  // ever be delivered during a routine external-news outage.
+  it("passes an explicitly-disclosed Longbridge-only news degradation instead of rejecting it forever", () => {
+    const markdown = [
+      "# OpenClaw 个股分析 2026-07-14",
+      "",
+      "## AAPL",
+      "",
+      "### 基本面分析",
+      "",
+      "- 估值补充：PE 28.10，PB 12.30。",
+      "- 上行潜力：综合上行潜力：中性偏多，需结合估值和目标价确认。",
+      "",
+      "### 市场表现与交易层面",
+      "",
+      "- 均线：20 日 201.00；60 日 195.00；126 日 188.00。",
+      "",
+      "### 期权交割与阻力支撑",
+      "",
+      "- 期权链只读补充：看涨合约较多。",
+      "",
+      "### 近期新闻",
+      "",
+      "- 来源分布：Longbridge 3 条。",
+      "- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。"
+    ].join("\n");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).not.toContain("stock.news_source_diversity");
+  });
+
+  it("still rejects an UNDISCLOSED Longbridge-only report (no explicit degradation notice)", () => {
+    const markdown = [
+      "# OpenClaw 个股分析 2026-07-14",
+      "",
+      "## AAPL",
+      "",
+      "### 近期新闻",
+      "",
+      "- 来源分布：Longbridge 3 条。"
+    ].join("\n");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.news_source_diversity");
+  });
 });

@@ -10,6 +10,7 @@ import {
   openTradingDatabase
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import { getMemberById, LEGACY_SHARED_OWNER } from "./market-alerts-store.mjs";
 import { normalizeNewsPayload, normalizeQuotePayload, normalizeSymbol, toNumber } from "./report-data.mjs";
 import {
   normalizeExternalRssNews,
@@ -37,49 +38,94 @@ const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
 
 const runtimeDir = join(repoRoot, "runtime");
-const dbPath = join(runtimeDir, "trading.sqlite");
+const defaultDbPath = join(runtimeDir, "trading.sqlite");
 const reportsDir = join(repoRoot, "reports", "stock-analysis");
 const statePath = join(runtimeDir, "stock-analysis-state.json");
 mkdirSync(runtimeDir, { recursive: true });
 mkdirSync(reportsDir, { recursive: true });
 
-const [command = "scheduled", ...args] = process.argv.slice(2);
-const db = openTradingDatabase(dbPath);
+// Task H4 (phase2.5 hardening): schema v7 (task H3) rebuilt
+// stock_analysis_targets with a composite PK (symbol, owner_id) so each
+// member maintains their own pool - capped at 20 symbols per the spec.
+// setTargets() fully REPLACES the calling owner's active set in one call (it
+// always has - see the soft-delete-then-reinsert transaction below), so the
+// cap applies directly to the size of the submitted list.
+const MAX_TARGETS_PER_OWNER = 20;
 
-if (command === "targets") {
-  setTargets(args);
-} else if (command === "list-targets") {
-  console.log(JSON.stringify(listTargets(), null, 2));
-} else if (command === "run") {
-  await runAnalysis({ force: args.includes("--force") });
-} else if (command === "prepare") {
-  await runAnalysis({
-    deliver: false,
-    targetsOverride: args.filter((arg) => !arg.startsWith("--"))
-  });
-} else if (command === "scheduled") {
-  await runScheduled(args.includes("--force"));
-} else {
-  throw new Error("Usage: stock-analysis.mjs <targets|list-targets|prepare|run|scheduled> [SYMBOL...] [--force]");
+// ---------------------------------------------------------------------------
+// CLI entry point. Guarded by isMainModule (bottom of file) so importing
+// this module - e.g. market-alerts-seam.test.ts's writer/reader seam test -
+// never opens the real runtime db or dispatches a command as a side effect
+// of `import`. Every db-touching function below takes `db` explicitly instead
+// of closing over a module-level connection, mirroring market-alerts.mjs /
+// market-alerts-poll.mjs's existing testable-CLI pattern.
+// ---------------------------------------------------------------------------
+
+function parseTargetsArgs(argv) {
+  let owner;
+  const symbols = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === "--owner") {
+      owner = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (token.startsWith("--")) {
+      throw new Error(`未知参数：${token}。`);
+    }
+    symbols.push(token);
+  }
+  return { owner, symbols };
 }
 
-function setTargets(symbols) {
+// Follows market-alerts.mjs's --actor validation pattern (runAdd): the
+// caller must be a real, active member - not just any string - before any
+// write happens. The read-only sentinel is rejected explicitly first (it's
+// never a `members` row, so it would fail this check anyway, but a named
+// error is clearer than "not a valid active member" for what is actually a
+// "this pool is shared and read-only" situation).
+function assertActiveOwner(db, ownerId) {
+  if (ownerId === LEGACY_SHARED_OWNER) {
+    throw new Error(`${LEGACY_SHARED_OWNER} 是只读共享池标识，不能作为 --owner 使用，请使用真实成员 id。`);
+  }
+  const member = getMemberById(db, ownerId);
+  if (!member || member.status !== "active") {
+    throw new Error(`owner ${ownerId} 不是有效的在职成员，无法设置个股分析标的池。`);
+  }
+}
+
+// Owner-scoped: only this owner's active rows are soft-deleted (active=0)
+// before the submitted list is (re)inserted as active - a full replace of
+// THIS owner's pool, never touching another owner's rows or the legacy
+// shared-pool sentinel's rows (guarded below; also independently rejected by
+// assertActiveOwner above, since callers are expected to go through
+// runTargetsCommand - this is belt-and-suspenders for any future direct
+// caller of setTargets itself, per this task's invariant-push-down theme).
+export function setTargets(db, ownerId, symbols) {
+  if (ownerId === LEGACY_SHARED_OWNER) {
+    throw new Error(`${LEGACY_SHARED_OWNER} 是只读共享池，setTargets 不能写入或软删除它的行。`);
+  }
+
   const normalized = [...new Set(symbols.map(normalizeSymbol).filter(Boolean))];
   if (normalized.length === 0) {
-    throw new Error("请至少提供一个美股标的，例如：stock-analysis.mjs targets AAPL MSFT NVDA。");
+    throw new Error("请至少提供一个美股标的，例如：stock-analysis.mjs targets --owner member_1 AAPL MSFT NVDA。");
+  }
+  if (normalized.length > MAX_TARGETS_PER_OWNER) {
+    throw new Error(`每位成员最多设置 ${MAX_TARGETS_PER_OWNER} 个标的，本次提交了 ${normalized.length} 个。`);
   }
 
   const now = new Date().toISOString();
   db.exec("BEGIN IMMEDIATE TRANSACTION");
   try {
-    db.prepare("UPDATE stock_analysis_targets SET active = 0, updated_at = ? WHERE active = 1").run(now);
+    db.prepare("UPDATE stock_analysis_targets SET active = 0, updated_at = ? WHERE owner_id = ? AND active = 1").run(now, ownerId);
     const insert = db.prepare(`
-      INSERT INTO stock_analysis_targets (symbol, active, created_at, updated_at)
-      VALUES (?, 1, ?, ?)
-      ON CONFLICT(symbol) DO UPDATE SET active = 1, updated_at = excluded.updated_at
+      INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+      VALUES (?, ?, 1, ?, ?)
+      ON CONFLICT(symbol, owner_id) DO UPDATE SET active = 1, updated_at = excluded.updated_at
     `);
     for (const symbol of normalized) {
-      insert.run(symbol, now, now);
+      insert.run(symbol, ownerId, now, now);
     }
     db.exec("COMMIT");
   } catch (error) {
@@ -87,12 +133,41 @@ function setTargets(symbols) {
     throw error;
   }
 
-  console.log(JSON.stringify({ saved: normalized }, null, 2));
+  return normalized;
 }
 
-async function runScheduled(force = false) {
+// `targets --owner <id> SYMBOL...` is REQUIRED to go through here (not
+// setTargets directly) so the active-member check always runs first. Opens
+// and closes its own db connection - testable in isolation, and matches
+// market-alerts.mjs's runAdd/withDb pattern.
+export function runTargetsCommand(argv, options = {}) {
+  const { owner, symbols } = parseTargetsArgs(argv);
+  const ownerId = String(owner ?? "").trim();
+  if (!ownerId) {
+    throw new Error("缺少 --owner 参数，请指定成员 id，例如：stock-analysis.mjs targets --owner member_1 AAPL MSFT NVDA。");
+  }
+  const db = openTradingDatabase(options.dbPath ?? defaultDbPath);
+  try {
+    assertActiveOwner(db, ownerId);
+    const saved = setTargets(db, ownerId, symbols);
+    return { ownerId, saved };
+  } finally {
+    db.close();
+  }
+}
+
+export function runListTargetsCommand(options = {}) {
+  const db = openTradingDatabase(options.dbPath ?? defaultDbPath);
+  try {
+    return listTargets(db);
+  } finally {
+    db.close();
+  }
+}
+
+async function runScheduled(db, force = false) {
   const state = readState();
-  const targets = listTargets();
+  const targets = listTargets(db);
   if (targets.length === 0) {
     console.log(JSON.stringify({ skipped: true, reason: "no_targets", lastRunAt: state.lastRunAt ?? null }, null, 2));
     return;
@@ -102,33 +177,36 @@ async function runScheduled(force = false) {
     console.log(JSON.stringify({ skipped: true, reason: "not_due", lastRunAt: state.lastRunAt ?? null }, null, 2));
     return;
   }
-  await runAnalysis({ force });
+  await runAnalysis(db, { force });
 }
 
-async function runAnalysis({ deliver = true, targetsOverride = null } = {}) {
+async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) {
   const targets = Array.isArray(targetsOverride) && targetsOverride.length
     ? [...new Set(targetsOverride.map(normalizeSymbol).filter(Boolean))]
-    : listTargets();
+    : listTargets(db);
   if (targets.length === 0) {
-    throw new Error("没有已启用的个股分析标的。先运行：stock-analysis.mjs targets AAPL MSFT。");
+    throw new Error("没有已启用的个股分析标的。先运行：stock-analysis.mjs targets --owner <id> AAPL MSFT。");
   }
 
   const generatedAt = new Date().toISOString();
-  const records = [];
-  for (const symbol of targets) {
-    records.push(await fetchStockAnalysisRecord(symbol));
+  const { records, failedSymbols } = await fetchStockAnalysisRecords(targets);
+  if (records.length === 0) {
+    throw new Error(
+      `全部标的数据获取失败，无法生成个股分析报告：${failedSymbols.map((entry) => `${entry.symbol}（${entry.error}）`).join("；")}`
+    );
   }
 
   const label = generatedAt.slice(0, 10);
-  const markdown = renderBatchStockAnalysis({ label, generatedAt, records });
+  const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
   const markdownPath = join(reportsDir, `${label}.md`);
   const pdfPath = join(reportsDir, `${label}.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
+  const deliveredSymbols = records.map((record) => record.symbol);
   if (!deliver) {
-    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: targets, markdownPath, pdfPath }, null, 2));
+    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
     return;
   }
 
@@ -146,10 +224,34 @@ async function runAnalysis({ deliver = true, targetsOverride = null } = {}) {
   db.prepare(`
     INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(runId, generatedAt, JSON.stringify(targets), markdownPath, pdfPath, JSON.stringify(delivery));
+  `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, pdfPath, JSON.stringify(delivery));
 
-  writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: targets });
-  console.log(JSON.stringify({ delivered: true, runId, symbols: targets, markdownPath, pdfPath }, null, 2));
+  writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols });
+  console.log(JSON.stringify({ delivered: true, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
+}
+
+// Task H7 (2026-07-14 legacy audit): one bad target (delisted/suspended
+// symbol, a typo `normalizeSymbol` happily turns into a bogus ticker, a
+// transient Longbridge quote failure) used to kill the ENTIRE batch with no
+// try/catch anywhere in this loop - every OTHER healthy symbol in the same
+// run also got no report, no delivery, and no state update, repeating every
+// scheduled trigger until a human edited the shared target list. Every
+// OTHER data source in fetchStockAnalysisRecord already degrades per-symbol
+// to an {error} object (history/fundamentals/options/news) - only the quote
+// fetch was fatal. Isolating it here means a bad symbol is disclosed in the
+// rendered output (see renderBatchStockAnalysis's failedSymbols handling)
+// instead of silently taking down every other target's analysis.
+export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchStockAnalysisRecord } = {}) {
+  const records = [];
+  const failedSymbols = [];
+  for (const symbol of targets) {
+    try {
+      records.push(await fetchRecord(symbol));
+    } catch (error) {
+      failedSymbols.push({ symbol, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { records, failedSymbols };
 }
 
 async function fetchStockAnalysisRecord(symbol) {
@@ -230,7 +332,7 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
     ],
     trading: [
       `短线支撑位参考：${formatNumber(historyStats.support ?? support)}；短线阻力位参考：${formatNumber(historyStats.resistance ?? resistance)}。`,
-      `均线：20 日 ${formatNumber(historyStats.ma20)}；60 日 ${formatNumber(historyStats.ma60)}；180 日 ${formatNumber(historyStats.ma180)}。`,
+      `均线：20 日 ${formatNumber(historyStats.ma20)}；60 日 ${formatNumber(historyStats.ma60)}；${historyStats.longWindowDays ?? "180"} 日 ${formatNumber(historyStats.ma180)}。`,
       `日内强弱：${pct === undefined ? "缺少前收数据" : pct >= 0 ? "相对前收偏强" : "相对前收偏弱"}。`,
       "大单、卖压和做空比例必须分开验证，不能用盘口现象直接推断做空。"
     ],
@@ -249,7 +351,7 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
   };
 }
 
-function renderBatchStockAnalysis({ label, generatedAt, records }) {
+export function renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols = [] }) {
   const template = loadStockAnalysisTemplate();
   const lines = [
     `# OpenClaw 个股分析 ${label}`,
@@ -264,6 +366,13 @@ function renderBatchStockAnalysis({ label, generatedAt, records }) {
     "## 本批次结论",
     "",
     ...records.map((record) => `- ${record.symbol}：支撑位 ${extractTradingLevel(record.analysis.trading[0], "support")}；阻力位 ${extractTradingLevel(record.analysis.trading[0], "resistance")}；需要按新闻与成交量继续验证。`),
+    // Task H7: per-symbol isolation (see fetchStockAnalysisRecords) means a
+    // batch can partially fail - disclose exactly which symbols were
+    // skipped and why, instead of the previous all-or-nothing behavior
+    // where a bad symbol silently took the whole report down with it.
+    ...(failedSymbols.length > 0
+      ? [`- 数据缺口：${failedSymbols.map((entry) => `${entry.symbol}（获取失败：${entry.error}）`).join("；")}；已跳过，仅呈现可用标的分析。`]
+      : []),
     ""
   ];
 
@@ -320,10 +429,25 @@ function extractTradingLevel(line, side) {
   return formatNumber(String(line ?? "").match(pattern)?.[1]);
 }
 
-function listTargets() {
+// Task H4: schema v7 (task H3) rebuilt stock_analysis_targets with a
+// composite PK (symbol, owner_id) - two different owners can now both have
+// an active row for the same symbol. This still returns the GLOBAL set of
+// distinct active symbols (used by runAnalysis/runScheduled for the single
+// shared batch report - true per-member reports are P6 territory), but a
+// naive `SELECT symbol WHERE active = 1` would now return the SAME symbol
+// once per owner who has it active, feeding runAnalysis a duplicate and
+// producing a doubled-up report section. The inner GROUP BY collapses that
+// back to one row per symbol (using the most recently updated owner's
+// updated_at for ordering) so a symbol shared by multiple owners' pools
+// still appears exactly once here, matching this function's pre-v7 contract.
+export function listTargets(db) {
   return db.prepare(`
-    SELECT symbol FROM stock_analysis_targets
-    WHERE active = 1
+    SELECT symbol FROM (
+      SELECT symbol, MAX(updated_at) AS updated_at
+      FROM stock_analysis_targets
+      WHERE active = 1
+      GROUP BY symbol
+    )
     ORDER BY updated_at ASC, symbol ASC
   `).all().map((row) => String(row.symbol));
 }
@@ -582,17 +706,31 @@ async function fetchTextWithTimeout(url, extraHeaders = {}) {
   throw lastError;
 }
 
+// Task H7 (2026-07-14 legacy audit): fetchYahooHistory requests range=6mo,
+// which yields at most ~126 daily closes - closes.slice(-180) on a ~126-
+// element array is silently the WHOLE array, so the value rendered/labeled
+// "180 日均线" (and the "偏便宜" verdict derived from it) was never actually
+// a 180-session average; it was a mislabeled full-range mean. Chosen fix:
+// LABEL the actual window truthfully (`longWindowDays`, capped at 180 but
+// reflecting however many sessions are really available) rather than
+// widening the fetch range - ma20/ma60/sixMonthReturn/trendScore all
+// deliberately key off this same 6-month sample, and widening the range
+// would dilute/change those alongside the unrelated bug being fixed here.
+// A future fetch of a full year (closes.slice(-180) on ~250 rows) would
+// make the label consistently "180 日" - either fix is legitimate per this
+// task's brief; this one has zero blast radius outside the mislabeled text.
 function summarizeHistory(history, currentPrice) {
   if (!Array.isArray(history) || history.length === 0) {
     return {
       summary: history?.error ? `历史走势读取失败：${history.error}` : "历史走势暂无可用数据。",
-      cheapness: "180 日均线不可用，便宜程度暂记为待验证",
+      cheapness: "长期均线不可用，便宜程度暂记为待验证",
       trendScore: 0,
       support: undefined,
       resistance: undefined,
       ma20: undefined,
       ma60: undefined,
-      ma180: undefined
+      ma180: undefined,
+      longWindowDays: undefined
     };
   }
 
@@ -602,7 +740,8 @@ function summarizeHistory(history, currentPrice) {
   const sixMonthReturn = first && lastClose ? ((lastClose - first) / first) * 100 : undefined;
   const ma20 = average(closes.slice(-20));
   const ma60 = average(closes.slice(-60));
-  const ma180 = average(closes.slice(-180));
+  const longWindowDays = Math.min(closes.length, 180);
+  const ma180 = average(closes.slice(-longWindowDays));
   const recent = closes.slice(-20);
   const support = recent.length ? Math.min(...recent) : undefined;
   const resistance = recent.length ? Math.max(...recent) : undefined;
@@ -618,16 +757,17 @@ function summarizeHistory(history, currentPrice) {
   return {
     summary: `${history[0]?.date} 到 ${history.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日。`,
     cheapness: vsMa180 === undefined
-      ? "180 日均线不可用，便宜程度待验证"
+      ? "长期均线不可用，便宜程度待验证"
       : vsMa180 < -5
-        ? `现价低于 180 日均线 ${formatPercent(Math.abs(vsMa180))}，按群聊口径偏便宜但需排除基本面恶化`
-        : `现价相对 180 日均线 ${formatPercent(vsMa180)}，不属于明显均线折价`,
+        ? `现价低于 ${longWindowDays} 日均线 ${formatPercent(Math.abs(vsMa180))}，按群聊口径偏便宜但需排除基本面恶化`
+        : `现价相对 ${longWindowDays} 日均线 ${formatPercent(vsMa180)}，不属于明显均线折价`,
     trendScore,
     support,
     resistance,
     ma20,
     ma60,
-    ma180
+    ma180,
+    longWindowDays
   };
 }
 
@@ -696,4 +836,64 @@ function thirdFridayUtc(year, monthIndex) {
   const firstFriday = 1 + ((5 - day + 7) % 7);
   date.setUTCDate(firstFriday + 14);
   return date;
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const [command = "scheduled", ...args] = process.argv.slice(2);
+  // Test/ops-only override (unset in normal operation, where it's a no-op):
+  // lets a live verification run this exact binary against a disposable temp
+  // db instead of the real runtime/trading.sqlite - e.g.
+  // `STOCK_ANALYSIS_DB_PATH=/tmp/x.sqlite node stock-analysis.mjs targets --owner m1 NVDA`.
+  const dbPath = process.env.STOCK_ANALYSIS_DB_PATH ?? defaultDbPath;
+
+  if (command === "targets") {
+    const result = runTargetsCommand(args, { dbPath });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (command === "list-targets") {
+    console.log(JSON.stringify(runListTargetsCommand({ dbPath }), null, 2));
+    return;
+  }
+
+  const db = openTradingDatabase(dbPath);
+  try {
+    if (command === "run") {
+      await runAnalysis(db, { force: args.includes("--force") });
+    } else if (command === "prepare") {
+      await runAnalysis(db, {
+        deliver: false,
+        targetsOverride: args.filter((arg) => !arg.startsWith("--"))
+      });
+    } else if (command === "scheduled") {
+      await runScheduled(db, args.includes("--force"));
+    } else {
+      throw new Error("Usage: stock-analysis.mjs <targets|list-targets|prepare|run|scheduled> [SYMBOL...] [--force]");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+const isMainModule = process.argv[1]
+  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
+
+if (isMainModule) {
+  try {
+    await main();
+  } catch (error) {
+    // Single-line JSON error envelope + non-zero exit, matching
+    // market-alerts.mjs's buildCliResult contract - a control agent (or an
+    // operator) reading this CLI's output must never have to parse a raw
+    // Node stack trace to learn that `--owner` was missing. (Same lesson as
+    // P2's live-binary check: unit tests exercise exported functions, not
+    // the process entry path.)
+    console.error(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    process.exitCode = 1;
+  }
 }

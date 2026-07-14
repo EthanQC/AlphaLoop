@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
+import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const jobs = buildManagedOpenClawCronJobs(repoRoot);
@@ -108,14 +109,11 @@ function retireLegacyLaunchdReportSchedules() {
   if (uid === undefined) {
     return;
   }
-  const labels = [
-    "com.openclaw.trading.report.daily.prepare",
-    "com.openclaw.trading.report.daily.deliver",
-    "com.openclaw.trading.report.weekly.prepare",
-    "com.openclaw.trading.report.weekly.deliver",
-    "com.openclaw.trading.stock-analysis"
-  ];
-  for (const label of labels) {
+  // Task H7 (2026-07-14 legacy audit): single-sourced with
+  // install-user-schedules.mjs via openclaw-report-launchd-jobs.mjs - see
+  // that module's doc comment for why (the two installers used to fight
+  // over this exact list).
+  for (const label of MANAGED_REPORT_LAUNCHD_LABELS) {
     const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
     try {
       execFileSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "ignore" });

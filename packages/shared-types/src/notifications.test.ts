@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   allowReportFallbackDelivery,
   buildFeishuCardPayload,
   buildReportSummaryMarkdown,
+  deliverReportToFeishu,
   isFeishuProseFailure,
   sendInteractiveCard,
   shouldSendFullReportChapters,
@@ -222,6 +226,135 @@ describe("isFeishuProseFailure", () => {
 
   it("does not flag a normal success response", () => {
     expect(isFeishuProseFailure("Message sent (bot): om_123456")).toBe(false);
+  });
+});
+
+// Item 6 (task P2.5 Task 6): trySendFeishuUserPluginBotFile's file-send step
+// used to check `/^error:/iu.test(detail)` directly instead of routing
+// through isFeishuProseFailure (tested standalone above) - the one remaining
+// call site among callFeishuUserPluginTool's several that skipped it. A
+// feishu-user-plugin response that reports failure as "Send failed: ..."
+// prose WITHOUT setting isError (see isFeishuProseFailure's own doc comment -
+// this is a real, observed feishu-user-plugin response shape) fell through
+// that narrower check and was reported as a successful PDF delivery that
+// never actually sent.
+//
+// Exercised end to end through the exported deliverReportToFeishu (rather
+// than importing the unexported trySendFeishuUserPluginBotFile directly) by
+// faking the child process callFeishuUserPluginTool spawns - the
+// FEISHU_USER_PLUGIN_COMMAND/FEISHU_USER_PLUGIN_ARGS env vars are the
+// officially supported override point (see resolveFeishuUserPluginCommand),
+// so this fakes the SAME subprocess boundary the run-feishu-user-plugin
+// wrapper tests fake, just with a scripted JSON-RPC responder instead of a
+// process-signal marker.
+describe("trySendFeishuUserPluginBotFile prose-failure detection (item 6, task P2.5 Task 6)", () => {
+  // A minimal JSON-RPC-over-stdio responder matching exactly what
+  // callFeishuUserPluginTool speaks (see notifications.ts): one line in, one
+  // line out. Responds to `initialize`, ignores the `notifications/initialized`
+  // notification (no `id`, no response expected), and for `tools/call`
+  // reproduces the exact bug scenario: the file-send step's response text
+  // starts with "Send failed:" but does NOT set `isError`.
+  const FAKE_PLUGIN_SCRIPT = `
+import { createInterface } from "node:readline";
+
+const rl = createInterface({ input: process.stdin, terminal: false });
+
+function respond(id, result) {
+  process.stdout.write(\`\${JSON.stringify({ jsonrpc: "2.0", id, result })}\\n\`);
+}
+
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let message;
+  try {
+    message = JSON.parse(trimmed);
+  } catch {
+    return;
+  }
+  if (message.id === undefined) {
+    return;
+  }
+  if (message.method === "initialize") {
+    respond(message.id, {});
+    return;
+  }
+  if (message.method === "tools/call") {
+    const name = message.params?.name;
+    const args = message.params?.arguments ?? {};
+    if (name === "upload_file") {
+      respond(message.id, { content: [{ type: "text", text: "Uploaded: file_fake_abc123" }] });
+      return;
+    }
+    if (name === "send_message_as_bot" && args.msg_type === "file") {
+      respond(message.id, { content: [{ type: "text", text: "Send failed: chat not found" }] });
+      return;
+    }
+    respond(message.id, { content: [{ type: "text", text: "Message sent (bot): om_fake_summary" }] });
+    return;
+  }
+  respond(message.id, {});
+});
+`;
+
+  const envKeys = [
+    "LARK_APP_ID",
+    "LARK_APP_SECRET",
+    "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "FEISHU_USER_PLUGIN_COMMAND",
+    "FEISHU_USER_PLUGIN_ARGS",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "FEISHU_USER_PLUGIN_DISABLED"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+  let tempDir: string | undefined;
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+    if (tempDir) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    }
+  });
+
+  it("treats a 'Send failed' prose response (isError unset) on the file-send step as a failure, not a false success", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-fake-plugin-"));
+    const scriptPath = join(tempDir, "fake-plugin.mjs");
+    writeFileSync(scriptPath, FAKE_PLUGIN_SCRIPT, "utf8");
+    const pdfPath = join(tempDir, "report.pdf");
+    writeFileSync(pdfPath, "%PDF-1.4 fake pdf content", "utf8");
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_test_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+
+    // Pre-fix: the file-send step's "Send failed: ..." response is not
+    // caught (only `/^error:/iu` was checked), so trySendFeishuUserPluginBotFile
+    // reports `sent: true` and deliverReportToFeishu resolves as if the PDF
+    // had genuinely been delivered - this rejection never happens.
+    await expect(
+      deliverReportToFeishu({
+        title: "测试报告",
+        markdown: "# 测试报告\n\n内容",
+        pdfPath
+      })
+    ).rejects.toThrow(/Send failed/);
   });
 });
 

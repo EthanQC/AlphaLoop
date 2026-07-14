@@ -11,6 +11,24 @@ export async function writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdf
   mkdirSync(join(runtimeDir, "report-html"), { recursive: true });
   writeFileSync(htmlPath, renderReportHtml(markdown), "utf8");
 
+  // Task H7 (2026-07-14 legacy audit): runChromePdf's readiness poll only
+  // checks "file exists, is non-empty, and its size is unchanged across N
+  // checks" - a PRE-EXISTING pdfPath from a previous run (same-day re-issue,
+  // agent-driven re-issue, --force backfill) satisfies that within ~1-2
+  // poll intervals regardless of whether THIS Chrome invocation ever
+  // renders anything, so a silent Chrome failure would deliver the
+  // PREVIOUS run's PDF as today's. Deleting the stale target before
+  // rendering removes the ambiguity at the source - there is no file to be
+  // mistaken for "done" until Chrome actually writes one. Combined with the
+  // mtime gate inside runChromePdf below (belt-and-suspenders against any
+  // remaining race).
+  try {
+    rmSync(pdfPath, { force: true });
+  } catch {
+    // Best-effort - if this somehow fails, the mtime gate below still
+    // prevents a stale file from being mistaken for this run's output.
+  }
+
   const chromePath = resolveChromePath();
   const profileDir = mkdtempSync(join(tmpdir(), "openclaw-report-chrome-"));
   try {
@@ -52,9 +70,17 @@ export async function runChromePdf({ chromePath, args, repoRoot, pdfPath }) {
     exit = { code, signal };
   });
 
+  // Task H7: belt-and-suspenders against writeMarkdownPdf's unlink above -
+  // a PDF whose mtime predates this run's start can never count as "ready"
+  // even if somehow still present (e.g. the unlink failed, or a future
+  // caller invokes runChromePdf directly without going through
+  // writeMarkdownPdf). `minMtimeMs` is optional so existing callers/tests
+  // that construct fileState objects by hand (no mtimeMs) keep working
+  // unchanged.
+  const minMtimeMs = startedAt - 1000;
   let stability;
   while (!exit) {
-    stability = updatePdfStabilityState(stability, readPdfFileState(pdfPath), { requiredStableChecks });
+    stability = updatePdfStabilityState(stability, readPdfFileState(pdfPath), { requiredStableChecks, minMtimeMs });
     if (stability.ready) {
       terminateChromeProcessGroup(child, "SIGTERM");
       await waitForChromeExit(child, 2500);
@@ -94,8 +120,17 @@ export function buildChromePdfSpawnOptions(repoRoot) {
 
 export function updatePdfStabilityState(previous, fileState, options = {}) {
   const requiredStableChecks = Math.max(1, Number(options.requiredStableChecks ?? 2));
-  const exists = Boolean(fileState?.exists);
-  const size = Number(fileState?.size ?? 0);
+  // Task H7 (2026-07-14 legacy audit): when set, a file whose mtime is
+  // OLDER than minMtimeMs is treated as if it doesn't exist for readiness
+  // purposes - it's a stale artifact from a previous run, not this run's
+  // output, no matter how "stable" its size looks. `minMtimeMs` is
+  // optional and defaults to "no gate" so existing callers (this file's
+  // own tests) that never pass mtimeMs/minMtimeMs are unaffected.
+  const hasMinMtime = Number.isFinite(options.minMtimeMs);
+  const mtimeMs = Number(fileState?.mtimeMs ?? 0);
+  const isStale = hasMinMtime && Boolean(fileState?.exists) && mtimeMs < options.minMtimeMs;
+  const exists = Boolean(fileState?.exists) && !isStale;
+  const size = exists ? Number(fileState?.size ?? 0) : 0;
   const lastSize = Number(previous?.size ?? -1);
   const stableChecks = exists && size > 0 && size === lastSize
     ? Number(previous?.stableChecks ?? 0) + 1
@@ -110,14 +145,17 @@ export function updatePdfStabilityState(previous, fileState, options = {}) {
 
 function readPdfFileState(pdfPath) {
   try {
+    const stats = statSync(pdfPath);
     return {
       exists: true,
-      size: statSync(pdfPath).size
+      size: stats.size,
+      mtimeMs: stats.mtimeMs
     };
   } catch {
     return {
       exists: false,
-      size: 0
+      size: 0,
+      mtimeMs: 0
     };
   }
 }

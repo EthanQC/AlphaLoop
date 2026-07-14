@@ -36,14 +36,26 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
   return Number(row.user_version);
 }
 
-const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
+// A migration step is normally just a function. Steps that rebuild a table
+// (DROP + CREATE + RENAME, needed to add/change a CHECK or FK - SQLite has no
+// ALTER TABLE for that) must run with `PRAGMA foreign_keys = OFF` for the
+// duration of the rebuild, because SQLite's rebuild-a-table procedure can
+// otherwise choke on other tables' now-momentarily-satisfied-differently FK
+// references to the table being dropped and recreated (see
+// https://www.sqlite.org/lang_altertable.html#otherkindsoftablesc, step 1).
+// `needsForeignKeysOff: true` opts a step into that handling; see migrate().
+type MigrationStep =
+  | ((db: DatabaseSync) => void)
+  | { run: (db: DatabaseSync) => void; needsForeignKeysOff: true };
+
+const MIGRATIONS: MigrationStep[] = [
   (db) => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -254,24 +266,222 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     // timestamp means soft-removed. `enabled` keeps its existing meaning
     // (pause/resume flip it) independent of this column.
     db.exec("ALTER TABLE alert_rules ADD COLUMN removed_at TEXT;");
+  },
+  {
+    needsForeignKeysOff: true,
+    // Task H3 (phase2.5 hardening): closes three structural gaps that would
+    // silently corrupt data the moment P6 brings a second member online.
+    // All four rebuilds below run inside ONE transaction (migrate()'s normal
+    // per-step transaction), following SQLite's documented table-rebuild
+    // recipe: CREATE new -> INSERT ... SELECT -> DROP old -> RENAME. No
+    // secondary indexes existed on any of these four tables pre-v7, so there
+    // is nothing to recreate on that front.
+    run: (db) => {
+      // ----------------------------------------------------------------
+      // 1) members: add CHECK(status IN ('active','revoked')). Column set
+      //    and UNIQUE constraints (email, feishu_open_id) are unchanged.
+      // ----------------------------------------------------------------
+      db.exec(`
+        CREATE TABLE members_new (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE,
+          feishu_open_id TEXT UNIQUE,
+          display_name TEXT NOT NULL,
+          risk_tags TEXT NOT NULL DEFAULT '[]',
+          stock_tags TEXT NOT NULL DEFAULT '[]',
+          show_performance INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked')),
+          created_at TEXT NOT NULL
+        );
+      `);
+      db.exec(`
+        INSERT INTO members_new
+          (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
+        SELECT id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at
+        FROM members;
+      `);
+      db.exec("DROP TABLE members;");
+      db.exec("ALTER TABLE members_new RENAME TO members;");
+
+      // ----------------------------------------------------------------
+      // 2) alert_rules: add CHECK(direction IN ('both','up','down')) so a
+      //    typo'd direction can never again be silently treated as 'both'
+      //    by the engine. Every other column/constraint (including v6's
+      //    removed_at) is preserved verbatim.
+      // ----------------------------------------------------------------
+      db.exec(`
+        CREATE TABLE alert_rules_new (
+          id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+          symbol TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('daily_move','unrealized_pnl','spike_5m','exposure')),
+          threshold REAL NOT NULL, direction TEXT NOT NULL DEFAULT 'both' CHECK(direction IN ('both','up','down')),
+          frequency TEXT NOT NULL CHECK(frequency IN ('once_daily','continuous')),
+          hysteresis REAL NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL, removed_at TEXT
+        );
+      `);
+      db.exec(`
+        INSERT INTO alert_rules_new
+          (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at, removed_at)
+        SELECT id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at, removed_at
+        FROM alert_rules;
+      `);
+      db.exec("DROP TABLE alert_rules;");
+      db.exec("ALTER TABLE alert_rules_new RENAME TO alert_rules;");
+
+      // ----------------------------------------------------------------
+      // 3) alert_events: owner_id becomes a real FK to members(id) (it was
+      //    already NOT NULL, but had no FK). A handful of hardening
+      //    scenarios are guarded against zero data loss:
+      //    - a row whose owner_id is NULL/empty (never possible through
+      //      this app's own write path today, but tolerated defensively -
+      //      see task brief) is backfilled from its OWNING RULE's owner_id
+      //      via a JOIN.
+      //    - if the owning rule is ALSO gone (dangling rule_id, e.g. from
+      //      manual DB surgery predating deleteRule's cascade), there is no
+      //      rule to join against. Silently dropping the event is not
+      //      acceptable, so it is attributed to a dedicated placeholder
+      //      member ('__legacy_system__', status 'revoked' so it never
+      //      shows up as a real/active member) created on demand, only if
+      //      such a row actually exists.
+      // ----------------------------------------------------------------
+      const legacySystemMemberCreatedAt = nowIso();
+      db.prepare(`
+        INSERT OR IGNORE INTO members (id, email, display_name, status, created_at)
+        SELECT '__legacy_system__', '__legacy_system__@alphaloop.invalid',
+               'Legacy System (migration placeholder)', 'revoked', ?
+        WHERE EXISTS (
+          SELECT 1 FROM alert_events e
+          LEFT JOIN alert_rules r ON r.id = e.rule_id
+          WHERE COALESCE(NULLIF(e.owner_id, ''), r.owner_id) IS NULL
+        );
+      `).run(legacySystemMemberCreatedAt);
+
+      db.exec(`
+        CREATE TABLE alert_events_new (
+          id TEXT PRIMARY KEY, rule_id TEXT NOT NULL REFERENCES alert_rules(id),
+          owner_id TEXT NOT NULL REFERENCES members(id),
+          triggered_at TEXT NOT NULL, value REAL NOT NULL, message_id TEXT, feedback TEXT
+        );
+      `);
+      db.exec(`
+        INSERT INTO alert_events_new (id, rule_id, owner_id, triggered_at, value, message_id, feedback)
+        SELECT
+          e.id,
+          e.rule_id,
+          COALESCE(NULLIF(e.owner_id, ''), r.owner_id, '__legacy_system__'),
+          e.triggered_at, e.value, e.message_id, e.feedback
+        FROM alert_events e
+        LEFT JOIN alert_rules r ON r.id = e.rule_id;
+      `);
+      db.exec("DROP TABLE alert_events;");
+      db.exec("ALTER TABLE alert_events_new RENAME TO alert_events;");
+
+      // ----------------------------------------------------------------
+      // 4) stock_analysis_targets: rebuilt for a per-owner watchlist.
+      //    `symbol TEXT PRIMARY KEY` structurally cannot express "each
+      //    member maintains their own pool" (P6 spec) - it becomes
+      //    composite PK (symbol, owner_id). SQLite composite PKs allow
+      //    owner_id to be NULL and NULLs don't dedupe against each other,
+      //    so owner_id MUST be NOT NULL or the uniqueness guarantee is a
+      //    no-op. Existing NULL rows (the single-shared-watchlist era) are
+      //    backfilled to sentinel '__legacy_shared__', interpreted at the
+      //    code layer as "shared pool, visible to any member" (see
+      //    isSymbolWatched in market-alerts-store.mjs). No FK to members:
+      //    the sentinel is not a member. The old table's PK was `symbol`
+      //    alone, so there is at most one row per symbol already - backfill
+      //    can never create a (symbol, owner_id) collision.
+      // ----------------------------------------------------------------
+      db.exec(`
+        CREATE TABLE stock_analysis_targets_new (
+          symbol TEXT NOT NULL,
+          owner_id TEXT NOT NULL CHECK(owner_id <> ''),
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (symbol, owner_id)
+        );
+      `);
+      db.exec(`
+        INSERT INTO stock_analysis_targets_new (symbol, owner_id, active, created_at, updated_at)
+        SELECT symbol, COALESCE(NULLIF(owner_id, ''), '__legacy_shared__'), active, created_at, updated_at
+        FROM stock_analysis_targets;
+      `);
+      db.exec("DROP TABLE stock_analysis_targets;");
+      db.exec("ALTER TABLE stock_analysis_targets_new RENAME TO stock_analysis_targets;");
+
+      // ----------------------------------------------------------------
+      // Post-rebuild integrity gate for the ONE guarantee this step newly
+      // declares: alert_events.owner_id -> members(id). The rebuild runs
+      // with PRAGMA foreign_keys OFF, so a pre-existing "ghost" owner_id
+      // (nonexistent member - unreachable through the app's own write
+      // path, but so was NULL, which we defend against above) would be
+      // copied straight into a table whose DDL now promises it cannot
+      // exist, and SQLite never re-validates existing rows when the
+      // pragma comes back on. Fail loud inside the transaction instead:
+      // the migration rolls back and the operator sees exactly which
+      // rows are bad. Deliberately NOT a blanket foreign_key_check -
+      // dangling rule_id rows are pre-existing corruption the task brief
+      // requires preserving (orphaned events must not be dropped), so
+      // only the newly-declared owner_id edge is enforced here.
+      // ----------------------------------------------------------------
+      const ghostOwners = db.prepare(`
+        SELECT e.id, e.owner_id FROM alert_events e
+        LEFT JOIN members m ON m.id = e.owner_id
+        WHERE m.id IS NULL
+        LIMIT 5
+      `).all() as Array<{ id: string; owner_id: string }>;
+      if (ghostOwners.length > 0) {
+        const detail = ghostOwners.map((r) => `${r.id} -> ${r.owner_id}`).join(", ");
+        throw new Error(
+          `v7 migration aborted: alert_events rows reference nonexistent members (${detail}); ` +
+          `repair the owner_id values (or restore the missing members) and re-run.`
+        );
+      }
+    }
   }
 ];
 
 export function migrate(db: DatabaseSync): void {
   let version = getSchemaVersion(db);
   while (version < MIGRATIONS.length) {
-    db.exec("BEGIN");
+    const entry = MIGRATIONS[version];
+    if (!entry) {
+      throw new Error(`Missing migration step for schema version ${version}`);
+    }
+    const run = typeof entry === "function" ? entry : entry.run;
+    const needsForeignKeysOff = typeof entry === "function" ? false : entry.needsForeignKeysOff;
+
+    // PRAGMA foreign_keys is documented to be a no-op once a transaction is
+    // open, so a step that needs it toggled (table-rebuild steps: DROP a
+    // table other tables hold FK references to) must flip it HERE, outside
+    // the BEGIN/COMMIT below - and flip it back after the transaction ends,
+    // on both the success and failure paths, so a later step never
+    // inherits a disabled pragma.
+    if (needsForeignKeysOff) {
+      db.exec("PRAGMA foreign_keys = OFF;");
+    }
     try {
-      const step = MIGRATIONS[version];
-      if (!step) {
-        throw new Error(`Missing migration step for schema version ${version}`);
+      db.exec("BEGIN");
+      try {
+        run(db);
+        db.exec(`PRAGMA user_version = ${version + 1}`);
+        db.exec("COMMIT");
+      } catch (error) {
+        // The ROLLBACK itself can fail (e.g. the step already ended the transaction, or the
+        // connection is in a bad state) - if it throws here, that secondary failure must never
+        // replace `error` (the actual root cause an operator needs to see and act on) in what
+        // propagates out of migrate().
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Ignore: best-effort only, `error` below is what matters.
+        }
+        throw error;
       }
-      step(db);
-      db.exec(`PRAGMA user_version = ${version + 1}`);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
+    } finally {
+      if (needsForeignKeysOff) {
+        db.exec("PRAGMA foreign_keys = ON;");
+      }
     }
     version += 1;
   }
