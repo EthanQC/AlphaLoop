@@ -6,14 +6,28 @@ import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { isUsRegularMarketHours } from "./trading-schedule.mjs";
 
-// task H2 (Phase 2.5 hardening): the two launchd jobs install-launchd.sh
-// wires up (see that script) - a dev machine legitimately runs neither, so
-// missing either is a warn, not a fail (see `warn()` below - only "error"
-// severity flips `ok` to false).
+// task H2 (Phase 2.5 hardening), extended in Phase 3 Task 8: the launchd
+// jobs install-launchd.sh wires up (see that script) - a dev machine
+// legitimately runs none of them, so missing any one is a warn, not a fail
+// (see `warn()` below - only "error" severity flips `ok` to false).
+// com.alphaloop.platform-app (Phase 3 Task 8) joined the other two once its
+// `.plist.template` was added alongside them - install-launchd.sh's glob
+// (`*.plist.template`) already covers new files without modification, so
+// this list is the only place that needed the addition.
 const REQUIRED_LAUNCHD_JOBS = [
   { label: "com.alphaloop.daily-backup", slug: "daily-backup" },
-  { label: "com.alphaloop.market-alerts", slug: "market-alerts" }
+  { label: "com.alphaloop.market-alerts", slug: "market-alerts" },
+  { label: "com.alphaloop.platform-app", slug: "platform-app" }
 ];
+
+// Phase 3 Task 8 - "platform-app-health" check: platform-app is a KeepAlive
+// server (unlike the periodic backup/alerts jobs above), so "is it loaded"
+// is a weaker signal than "does its /health endpoint actually answer" - this
+// check hits that endpoint directly. Port mirrors src/index.ts's own
+// `process.env.PLATFORM_APP_PORT ?? 4314` fallback exactly, so the doctor
+// checks whatever port the real process would actually bind to.
+const PLATFORM_APP_HEALTH_DEFAULT_PORT = 4314;
+const PLATFORM_APP_HEALTH_TIMEOUT_MS = 1500;
 
 // How stale the market-alerts poller's run_log heartbeat can get before the
 // doctor treats it as "stopped ticking" - only checked while
@@ -28,7 +42,7 @@ const ALERTS_STALE_HEARTBEAT_MS = 30 * 60_000;
 // different read path, not just trusting the poller told someone).
 const ALERTS_CONSECUTIVE_FAILURE_THRESHOLD = 3;
 
-export function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
+export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
   const gatewayPids = distinctPids(snapshot.gatewayListeners);
   const runnerPids = distinctPids(snapshot.cronRunnerListeners);
   const gatewayErrorLines = Array.isArray(snapshot.gatewayErrorLines) ? snapshot.gatewayErrorLines : [];
@@ -48,16 +62,24 @@ export function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
   // calendar (trading-schedule.mjs) - that alone used to take the whole
   // doctor process down with it, printing nothing at all, at exactly the
   // moment (a genuinely stopped poller) this doctor most needs to speak up.
+  //
+  // Phase 3 Task 8: "platform-app-health" is the first check that needs a
+  // network round-trip (a GET against platform-app's /health), so it - and
+  // therefore this whole function and runChecksFailureIsolated below - had
+  // to become async. Every other check here is still a plain synchronous
+  // function; `await`-ing a non-promise return value is a no-op, so mixing
+  // sync and async check.run()s in the same loop is safe.
   const checks = [
     { name: "gateway-listeners", run: () => checkGatewayListeners(gatewayPids) },
     { name: "gateway-restart-storm", run: () => checkGatewayRestartStorm(gatewayErrorLines, nowMs, gatewayErrorWindowMs) },
     { name: "runner-listeners", run: () => checkRunnerListeners(runnerPids) },
     { name: "runner-recent-failures", run: () => checkRecentRunnerFailures(recentRunnerResults) },
     { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot) },
-    { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) }
+    { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
+    { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) }
   ];
 
-  const findings = runChecksFailureIsolated(checks);
+  const findings = await runChecksFailureIsolated(checks);
 
   if (findings.length === 0) {
     findings.push({
@@ -81,11 +103,16 @@ export function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
 // once would kill the ENTIRE report, including every finding already
 // collected from checks that already ran successfully, and every finding
 // from checks still queued after it.
-function runChecksFailureIsolated(checks) {
+//
+// Phase 3 Task 8: `await`-ed rather than plain-called so a check.run() that
+// returns a Promise (platform-app-health) is resolved - and a REJECTED
+// promise from one is caught by the same try/catch as a synchronous throw -
+// before its findings are spread into the shared array.
+async function runChecksFailureIsolated(checks) {
   const findings = [];
   for (const check of checks) {
     try {
-      findings.push(...check.run());
+      findings.push(...(await check.run()));
     } catch (checkError) {
       findings.push(error(
         `doctor.check_failed.${check.name}`,
@@ -204,6 +231,82 @@ function checkLaunchdJobs(snapshot) {
     }
   }
   return findings;
+}
+
+// Phase 3 Task 8 - "platform-app-health" check: launchd-jobs above only
+// proves a job is *loaded*, not that the process it launched is actually
+// answering requests (KeepAlive services can load and then crash-loop, or
+// load fine but deadlock). This hits platform-app's own `/health` route
+// directly over loopback HTTP.
+//
+// Port resolution mirrors apps/platform-app/src/index.ts's own
+// `process.env.PLATFORM_APP_PORT ?? 4314` exactly - `snapshot.platformAppPort`
+// is an additional injection point ahead of both, used only by tests (real
+// callers, i.e. openclaw-runtime-doctor.mjs, never set it, so production
+// behavior is unaffected).
+//
+// Severity split (task brief): a dev machine legitimately does not run this
+// service at all, so connection failure/timeout is only a `warn`, with the
+// hint naming both `pnpm platform:dev` (manual dev run) and
+// `pnpm launchd:install-backup-alerts` (the same install-launchd.sh that
+// installs the other two launchd jobs above - its `*.plist.template` glob
+// already covers com.alphaloop.platform-app.plist.template with no changes
+// needed, see REQUIRED_LAUNCHD_JOBS's own comment). A response that DOES
+// arrive but is wrong (non-200, or a 200 whose body isn't the expected
+// `{ok:true, service:"platform-app"}` shape) means the process is up but
+// broken - that is an `error`, not a warn.
+//
+// Never throws/rejects on its own - every failure path below returns a
+// finding array instead, so this is safe to call directly even without
+// runChecksFailureIsolated's outer safety net (task brief: "don't rely on
+// [failure isolation] alone").
+async function checkPlatformAppHealth(snapshot) {
+  const port = Number(
+    snapshot.platformAppPort ?? process.env.PLATFORM_APP_PORT ?? PLATFORM_APP_HEALTH_DEFAULT_PORT
+  );
+  const url = `http://127.0.0.1:${port}/health`;
+  const timeoutMs = Number(snapshot.platformAppHealthTimeoutMs ?? PLATFORM_APP_HEALTH_TIMEOUT_MS);
+  const fetchImpl = typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch;
+
+  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    response = await fetchImpl(url, { signal: controller.signal });
+  } catch (fetchError) {
+    return [warn(
+      "platform-app-health.unreachable",
+      `platform-app 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上尚未起服务是正常的——本地手动起服务请跑 pnpm platform:dev；需要常驻运行请跑 pnpm launchd:install-backup-alerts 安装 launchd 任务（会一并装上 com.alphaloop.platform-app）。`
+    )];
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    return [error(
+      "platform-app-health.unexpected_status",
+      `platform-app 健康检查返回非预期状态码（${url}）：HTTP ${response.status} ${response.statusText}。进程在跑但可能已经异常，请检查 platform-app 日志。`
+    )];
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch (parseError) {
+    return [error(
+      "platform-app-health.unexpected_body",
+      `platform-app 健康检查响应无法解析为 JSON（${url}）：${describeError(parseError)}。`
+    )];
+  }
+
+  if (!body || body.ok !== true || body.service !== "platform-app") {
+    return [error(
+      "platform-app-health.unexpected_body",
+      `platform-app 健康检查响应内容不符合预期（${url}），期望 {"ok":true,"service":"platform-app"}，实际收到：${JSON.stringify(body)}。`
+    )];
+  }
+
+  return [];
 }
 
 // task H2 (Phase 2.5 hardening) - "alerts-poller-health" check, covering two
