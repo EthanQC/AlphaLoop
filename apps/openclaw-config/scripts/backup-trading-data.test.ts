@@ -110,6 +110,25 @@ describe("backup -> mutate -> restore end-to-end", () => {
     expect(forced.ok).toBe(true);
     expect(forced.schemaVersion).toBe(SCHEMA_VERSION);
   });
+
+  it("--force validates the source is a legal SQLite file BEFORE touching an existing target, instead of clobbering it first", () => {
+    const dbDir = makeTempDir("alphaloop-restore-badsrc-db-");
+    const destDir = makeTempDir("alphaloop-restore-badsrc-dest-");
+    const targetPath = join(dbDir, "target.sqlite");
+    const goodTargetContent = "a perfectly good existing database (stand-in bytes)";
+    writeFileSync(targetPath, goodTargetContent);
+
+    // Not a SQLite file at all - stands in for a truncated/corrupt backup.
+    const corruptBackupPath = join(destDir, "trading-corrupt.sqlite");
+    writeFileSync(corruptBackupPath, "this is not a sqlite database");
+
+    expect(() => restore.runRestore({ from: corruptBackupPath, to: targetPath, force: true }))
+      .toThrow(/not a valid SQLite database/u);
+
+    // The existing target must survive completely untouched - the whole point of validating
+    // BEFORE the copy, not after.
+    expect(readFileSync(targetPath, "utf8")).toBe(goodTargetContent);
+  });
 });
 
 describe("memoryd archiving", () => {
@@ -275,6 +294,94 @@ describe("same-day re-runs", () => {
 
     // No leftover tmp file from the failed re-run.
     expect(existsSync(tmpPath)).toBe(false);
+  });
+});
+
+describe("stale cross-day .tmp cleanup", () => {
+  it("removes a .tmp leftover stamped with a previous day's date, but leaves today's alone", () => {
+    const destDir = makeTempDir("alphaloop-tmp-cleanup-dest-");
+    const staleTmp = join(destDir, "trading-2020-01-01.sqlite.tmp");
+    const staleTarballTmp = join(destDir, "memoryd-2020-01-01.tgz.tmp");
+    const todayTmp = join(destDir, "trading-2026-07-12.sqlite.tmp");
+    writeFileSync(staleTmp, "leftover from a crashed VACUUM INTO run");
+    writeFileSync(staleTarballTmp, "leftover tarball");
+    writeFileSync(todayTmp, "in-flight (maybe another backup run right now)");
+
+    const now = new Date("2026-07-12T01:00:00.000Z");
+    const deleted = backup.applyRetention(destDir, 30, now);
+
+    expect(deleted.sort()).toEqual([staleTmp, staleTarballTmp].sort());
+    expect(existsSync(staleTmp)).toBe(false);
+    expect(existsSync(staleTarballTmp)).toBe(false);
+    expect(existsSync(todayTmp)).toBe(true);
+  });
+
+  it("cleans up a stale cross-day .tmp as part of a full runBackup call, alongside normal retention", () => {
+    const dbDir = makeTempDir("alphaloop-tmp-cleanup-db-");
+    const destDir = makeTempDir("alphaloop-tmp-cleanup-full-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+    const staleTmp = join(destDir, "trading-2020-01-01.sqlite.tmp");
+    writeFileSync(staleTmp, "crash leftover");
+
+    const result = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, now: new Date("2026-07-12T01:00:00.000Z") });
+
+    expect(result.ok).toBe(true);
+    expect(result.deleted).toContain(staleTmp);
+    expect(existsSync(staleTmp)).toBe(false);
+  });
+});
+
+describe("--retention-days validation", () => {
+  it("rejects a negative retentionDays instead of deleting today's fresh backup while reporting ok:true", () => {
+    const dbDir = makeTempDir("alphaloop-negative-retention-db-");
+    const destDir = makeTempDir("alphaloop-negative-retention-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+    const now = new Date("2026-07-12T01:00:00.000Z");
+
+    expect(() => backup.runBackup({ dbPath, dest: destDir, retentionDays: -1, now })).toThrow(/retentionDays/u);
+
+    // Nothing was created or deleted - the invalid value is rejected before any work happens, so
+    // there is no fresh backup to have destroyed in the first place.
+    expect(existsSync(join(destDir, "trading-2026-07-12.sqlite"))).toBe(false);
+  });
+
+  it("applyRetention itself rejects a negative value before touching any file", () => {
+    const destDir = makeTempDir("alphaloop-negative-retention-apply-dest-");
+    const existingBackup = join(destDir, "trading-2026-07-12.sqlite");
+    writeFileSync(existingBackup, "a real backup written moments ago");
+
+    expect(() => backup.applyRetention(destDir, -1, new Date("2026-07-12T01:00:00.000Z"))).toThrow(/retentionDays/u);
+    expect(existsSync(existingBackup)).toBe(true);
+  });
+
+  it("accepts retentionDays: 0 (keep only today's backups)", () => {
+    const destDir = makeTempDir("alphaloop-zero-retention-dest-");
+    const yesterday = join(destDir, "trading-2026-07-11.sqlite");
+    const today = join(destDir, "trading-2026-07-12.sqlite");
+    writeFileSync(yesterday, "yesterday");
+    writeFileSync(today, "today");
+
+    const deleted = backup.applyRetention(destDir, 0, new Date("2026-07-12T01:00:00.000Z"));
+
+    expect(deleted).toEqual([yesterday]);
+    expect(existsSync(today)).toBe(true);
+  });
+});
+
+describe("parseRetentionDaysArg", () => {
+  it("returns the default when the flag was not given at all", () => {
+    expect(backup.parseRetentionDaysArg(undefined, 30)).toBe(30);
+  });
+
+  it("parses a valid numeric string", () => {
+    expect(backup.parseRetentionDaysArg("14", 30)).toBe(14);
+  });
+
+  it("throws instead of silently falling back to the default when the value does not parse as a number", () => {
+    expect(() => backup.parseRetentionDaysArg("not-a-number", 30)).toThrow(/--retention-days/u);
+    expect(() => backup.parseRetentionDaysArg("", 30)).toThrow(/--retention-days/u);
   });
 });
 

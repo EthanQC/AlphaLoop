@@ -935,6 +935,35 @@ describe("persistCycle", () => {
     expect(store.getQuota(db, "member_1", "2026-07-01")).toBe(0);
   });
 
+  it("propagates the original write error instead of a secondary ROLLBACK failure", () => {
+    // A fake db (not a real DatabaseSync) whose ROLLBACK itself throws, simulating a connection
+    // that can no longer roll back - before this task's fix, that SECONDARY error would replace
+    // the ORIGINAL one (the real reason the cycle failed) in what persistCycle throws.
+    const fakeDb = {
+      exec(sql: string) {
+        if (sql === "ROLLBACK") {
+          throw new Error("SECONDARY_FAILURE: cannot rollback - no transaction is active");
+        }
+        // BEGIN IMMEDIATE TRANSACTION / COMMIT: no-op.
+      },
+      prepare() {
+        return {
+          run() {
+            throw new Error("ORIGINAL_FAILURE: disk full while saving runtime state");
+          }
+        };
+      }
+    } as unknown as DatabaseSync;
+
+    expect(() =>
+      store.persistCycle(fakeDb, {
+        runtimes: { rule_1: { armed: true, cooldownUntil: null, lastFiredTradingDay: null, lastValue: null } },
+        events: [],
+        quotaBumps: []
+      })
+    ).toThrow(/ORIGINAL_FAILURE/);
+  });
+
   it("ignores zero/negative quota deltas rather than writing a no-op bump row", () => {
     const { db } = makeDb();
     seedMember(db, "member_1");

@@ -36,6 +36,37 @@ describe("versioned migrations", () => {
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
   });
 
+  it("propagates the original migration error instead of a secondary ROLLBACK failure", () => {
+    // A fake DatabaseSync-shaped object: reports user_version=0 (so migrate() attempts the very
+    // first step, whose `run(db)` executes a multi-statement CREATE TABLE ... string), fails that
+    // CREATE TABLE with an ORIGINAL error, and then ALSO fails the ROLLBACK migrate()'s catch
+    // issues in response (a SECONDARY error) - simulating a connection that can no longer roll
+    // back (e.g. already out of a transaction). Before this task's fix, the un-wrapped
+    // `db.exec("ROLLBACK")` would let the SECONDARY error replace the original one that actually
+    // explains what went wrong.
+    const fakeDb = {
+      prepare(sql: string) {
+        if (sql.includes("user_version")) {
+          return { get: () => ({ user_version: 0 }) };
+        }
+        throw new Error(`unexpected prepare() in fake db: ${sql}`);
+      },
+      exec(sql: string) {
+        const trimmed = sql.trim();
+        if (trimmed.startsWith("CREATE TABLE")) {
+          throw new Error("ORIGINAL_FAILURE: disk full while creating table");
+        }
+        if (trimmed === "ROLLBACK") {
+          throw new Error("SECONDARY_FAILURE: cannot rollback - no transaction is active");
+        }
+        // BEGIN / PRAGMA user_version=n / COMMIT: no-op.
+      }
+    } as unknown as DatabaseSync;
+
+    expect(() => migrate(fakeDb)).toThrow(/ORIGINAL_FAILURE/);
+    expect(() => migrate(fakeDb)).not.toThrow(/SECONDARY_FAILURE/);
+  });
+
   it("adopts a legacy db (tables exist, user_version=0) without data loss", () => {
     const db = memoryDb();
     // simulate legacy: baseline tables created the old way, user_version left at 0
@@ -181,6 +212,26 @@ describe("ApiTokenRepository", () => {
     const tokens = new ApiTokenRepository(db);
 
     expect(tokens.verify("not-a-real-token")).toBeNull();
+  });
+
+  it("stores token_hash as a 64-char hex digest, never the plaintext token itself", () => {
+    // P1's core security claim (issue() never persists the plaintext, verify() only ever compares
+    // hashes) had no direct assertion until this task - every other test only exercises the
+    // round-trip through issue()/verify(), which would pass identically even if token_hash held
+    // the plaintext token.
+    const db = memoryDb();
+    migrate(db);
+    const member = seedMember(db);
+    const tokens = new ApiTokenRepository(db);
+
+    const { id, token } = tokens.issue(member.id, "cli");
+
+    const row = db
+      .prepare("SELECT token_hash FROM api_tokens WHERE id = ?")
+      .get(id) as { token_hash: string };
+
+    expect(row.token_hash).not.toBe(token);
+    expect(row.token_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("revoke prevents further verification", () => {

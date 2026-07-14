@@ -98,11 +98,20 @@ export function recordRunResult(state, runKey, result, nowMs = Date.now(), optio
   // it pending here (rather than after a successful send) so a crash/restart between "halted" and
   // "alert delivered" still leaves a durable pending flag for the next poll cycle to retry.
   const justHalted = !previousJobFailure.halted && halted;
+  // Mirrors justHalted/escalationPending above, for the OTHER alert level getFailureAlertLevel
+  // reports (the 1st-same-class-failure "notice"): a failed notice send used to have no retry
+  // mechanism at all - shouldAlertFailure/recordFailureAlerted only mark it DELIVERED, never
+  // "still owed" - so a notice whose send failed (network blip) was gone forever, unlike the
+  // halt escalation which retries every cycle via escalationPending/getPendingEscalationJobs.
+  // `justNoticed` fires exactly once per fresh same-class streak (consecutiveCount transitioning
+  // to 1), matching getFailureAlertLevel's own `count === 1` check for "notice".
+  const justNoticed = consecutiveCount === 1;
   normalized.jobFailureState[jobName] = {
     failureClass,
     consecutiveCount,
     halted,
     escalationPending: justHalted ? true : previousJobFailure.escalationPending,
+    noticePending: justNoticed ? true : previousJobFailure.noticePending,
     lastResultPath: stringOrUndefined(result?.resultPath) ?? previousJobFailure.lastResultPath
   };
 
@@ -152,6 +161,18 @@ export function clearEscalationPending(state, jobName) {
   return normalized;
 }
 
+// Called by the runner after a notice alert (the 1st-same-class-failure heads-up, or a retry of
+// it) is delivered successfully - the notice-level counterpart to clearEscalationPending above.
+export function clearNoticePending(state, jobName) {
+  const normalized = normalizeRunnerState(state);
+  const name = String(jobName);
+  const existing = normalized.jobFailureState[name];
+  if (existing) {
+    normalized.jobFailureState[name] = { ...existing, noticePending: false };
+  }
+  return normalized;
+}
+
 // Jobs that are halted and whose escalation alert has not yet been confirmed delivered. The
 // runner calls this once per poll cycle (independent of any new run-log activity, since a halted
 // job's shouldAttemptRun gate means it produces no new run results to piggyback a retry on) and
@@ -160,6 +181,16 @@ export function getPendingEscalationJobs(state) {
   const normalized = normalizeRunnerState(state);
   return Object.entries(normalized.jobFailureState)
     .filter(([, jobFailure]) => jobFailure.halted && jobFailure.escalationPending)
+    .map(([jobName, jobFailure]) => ({ jobName, jobFailure }));
+}
+
+// Notice-level counterpart of getPendingEscalationJobs above: jobs whose 1st-same-class-failure
+// notice has not yet been confirmed delivered. Unlike escalation, this is NOT gated on `halted` -
+// a notice fires well before a job reaches the halt threshold.
+export function getPendingNoticeJobs(state) {
+  const normalized = normalizeRunnerState(state);
+  return Object.entries(normalized.jobFailureState)
+    .filter(([, jobFailure]) => jobFailure.noticePending)
     .map(([jobName, jobFailure]) => ({ jobName, jobFailure }));
 }
 
@@ -220,13 +251,23 @@ function normalizeJobFailureState(value) {
       // Missing on state files written before the escalation-retry machine existed: treat as
       // false (no pending escalation) rather than crashing.
       escalationPending: Boolean(raw.escalationPending),
+      // Missing on state files written before the notice-retry machine existed (this task): same
+      // backward-compatible treatment as escalationPending above.
+      noticePending: Boolean(raw.noticePending),
       lastResultPath: stringOrUndefined(raw.lastResultPath)
     }]];
   }));
 }
 
 function createEmptyJobFailureState() {
-  return { failureClass: undefined, consecutiveCount: 0, halted: false, escalationPending: false, lastResultPath: undefined };
+  return {
+    failureClass: undefined,
+    consecutiveCount: 0,
+    halted: false,
+    escalationPending: false,
+    noticePending: false,
+    lastResultPath: undefined
+  };
 }
 
 // The runner always passes the job's stable label via result.job; fall back to the options hint
@@ -245,11 +286,25 @@ function normalizeErrorFirstLine(errorMessage) {
   // Redact secrets/tokens before this text is persisted to the state file or shown in an alert,
   // the same way the Feishu alert body is sanitized.
   const sanitized = sanitizeAlertText(firstLine, 500);
-  return sanitized
+  return stripVolatileTokens(sanitized)
     .toLowerCase()
     .replace(/\s+/gu, " ")
     .trim()
     .slice(0, 80);
+}
+
+// Strips the volatile, run-specific bits (timestamps, retry counters, pids, byte counts, ...) that
+// vary between attempts of the SAME underlying failure but carry no information about WHICH root
+// cause it is. Without this, an error like "Longbridge unavailable at 2026-07-14T10:23:45.123Z"
+// classifies as a DIFFERENT class on every single attempt (a fresh timestamp every time) and the
+// halt-after-3-same-class-failures machine (HALT_THRESHOLD above) can never reach 3, no matter how
+// long the exact same failure persists - the one scenario it exists to catch.
+function stripVolatileTokens(text) {
+  return text
+    // ISO-8601-ish timestamps: date, optional time-of-day, optional fractional seconds/zone.
+    .replace(/\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?)?/giu, "<ts>")
+    // Any other standalone run of digits (ports, pids, byte counts, epoch ms, attempt counters).
+    .replace(/\d+/gu, "<n>");
 }
 
 function uniqueStrings(values) {

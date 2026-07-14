@@ -80,6 +80,23 @@ describe("classifyFailure", () => {
       state.classifyFailure("daily", "Timeout waiting for quote feed")
     );
   });
+
+  it("strips embedded timestamps and other digit runs so the SAME root cause classifies identically across retries (2026-07-14 audit finding)", () => {
+    // Every retry of the exact same underlying failure embeds a FRESH timestamp/attempt counter -
+    // without stripping these, classifyFailure produces a different class key every single time,
+    // and the halt-after-3-same-class-failures machine can never reach 3 no matter how long the
+    // real failure persists.
+    const first = state.classifyFailure("daily", "Longbridge unavailable at 2026-07-14T10:23:45.123Z (attempt 1)");
+    const second = state.classifyFailure("daily", "Longbridge unavailable at 2026-07-14T11:58:02.900Z (attempt 7)");
+    const third = state.classifyFailure("daily", "Longbridge unavailable at 2026-07-15T02:00:00.000Z (attempt 42)");
+
+    expect(first).toBe(second);
+    expect(second).toBe(third);
+
+    // Still distinguishes genuinely different failures - stripping digits must not collapse
+    // every class into one indistinguishable bucket.
+    expect(first).not.toBe(state.classifyFailure("daily", "Timeout waiting for quote feed"));
+  });
 });
 
 describe("halt-after-3-same-class-failures state machine", () => {
@@ -107,6 +124,25 @@ describe("halt-after-3-same-class-failures state machine", () => {
     expect(state.shouldAttemptRun(runnerState, "daily:run-99:finished", farFuture, { jobName: "daily" })).toBe(false);
     // Without the jobName hint, the halt cannot be checked, so this returns true (no crash, degrades safely).
     expect(state.shouldAttemptRun(runnerState, "daily:run-99:finished", farFuture)).toBe(true);
+  });
+
+  it("halts a job after 3 consecutive same-root-cause failures even when each attempt's stderr embeds a different timestamp (2026-07-14 audit finding)", () => {
+    let runnerState = state.normalizeRunnerState({});
+    const timestamps = [
+      "2026-07-01T00:00:00.000Z",
+      "2026-07-01T00:05:12.500Z",
+      "2026-07-01T00:11:47.900Z"
+    ];
+    for (let i = 0; i < 3; i += 1) {
+      runnerState = state.recordRunResult(
+        runnerState,
+        `daily:run-${i}:finished`,
+        { ok: false, job: "daily", error: `Longbridge unavailable at ${timestamps[i]}` },
+        baseNowMs + i * 60_000
+      );
+    }
+
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 3, halted: true });
   });
 
   it("does not accumulate different failure classes into each other's counts", () => {
@@ -257,6 +293,117 @@ describe("escalation alert retry (escalationPending)", () => {
     const normalized = state.normalizeRunnerState(legacyHaltedState);
     expect(normalized.jobFailureState.daily).toMatchObject({ halted: true, escalationPending: false });
     expect(state.getPendingEscalationJobs(normalized)).toEqual([]);
+  });
+});
+
+describe("notice alert retry (noticePending) - 2026-07-14 audit finding", () => {
+  const baseNowMs = Date.parse("2026-07-01T00:00:00.000Z");
+
+  it("marks noticePending true on the 1st same-class failure", () => {
+    const runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable", resultPath: "/tmp/daily-0.json" },
+      baseNowMs
+    );
+
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 1, noticePending: true });
+  });
+
+  it("keeps noticePending true across subsequent same-class failures until explicitly cleared - a failed send is no longer lost forever", () => {
+    let runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs
+    );
+    // Simulate the send failing: nothing clears noticePending.
+    expect(runnerState.jobFailureState.daily.noticePending).toBe(true);
+
+    // A 2nd same-class failure (still not halted) must not have silently lost the still-pending
+    // notice from the 1st.
+    runnerState = state.recordRunResult(
+      runnerState,
+      "daily:run-1:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs + 60_000
+    );
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 2, noticePending: true });
+  });
+
+  it("clearNoticePending marks it delivered, and a later same-class failure does not resurrect it", () => {
+    let runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs
+    );
+    runnerState = state.clearNoticePending(runnerState, "daily");
+    expect(runnerState.jobFailureState.daily.noticePending).toBe(false);
+
+    runnerState = state.recordRunResult(
+      runnerState,
+      "daily:run-1:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs + 60_000
+    );
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 2, noticePending: false });
+  });
+
+  it("getPendingNoticeJobs surfaces jobs with a pending notice, independent of halted status", () => {
+    const runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs
+    );
+
+    expect(state.getPendingNoticeJobs(runnerState)).toEqual([
+      { jobName: "daily", jobFailure: runnerState.jobFailureState.daily }
+    ]);
+
+    const cleared = state.clearNoticePending(runnerState, "daily");
+    expect(state.getPendingNoticeJobs(cleared)).toEqual([]);
+  });
+
+  it("a fresh failure class after a delivered notice starts its own pending notice", () => {
+    let runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs
+    );
+    runnerState = state.clearNoticePending(runnerState, "daily");
+
+    runnerState = state.recordRunResult(
+      runnerState,
+      "daily:run-1:finished",
+      { ok: false, job: "daily", error: "Timeout waiting for quote feed" },
+      baseNowMs + 60_000
+    );
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 1, noticePending: true });
+  });
+
+  it("a success clears noticePending along with the rest of the job failure state", () => {
+    let runnerState = state.recordRunResult(
+      state.normalizeRunnerState({}),
+      "daily:run-0:finished",
+      { ok: false, job: "daily", error: "Longbridge unavailable" },
+      baseNowMs
+    );
+    runnerState = state.recordRunResult(runnerState, "daily:run-1:finished", { ok: true, job: "daily" }, baseNowMs + 60_000);
+    expect(runnerState.jobFailureState.daily).toMatchObject({ consecutiveCount: 0, noticePending: false });
+  });
+
+  it("treats a state file written before this flag existed as noticePending: false (backward compatible)", () => {
+    const legacyState = {
+      jobFailureState: {
+        daily: { failureClass: "daily:longbridge unavailable", consecutiveCount: 1, halted: false }
+      }
+    };
+    const normalized = state.normalizeRunnerState(legacyState);
+    expect(normalized.jobFailureState.daily).toMatchObject({ noticePending: false });
+    expect(state.getPendingNoticeJobs(normalized)).toEqual([]);
   });
 });
 

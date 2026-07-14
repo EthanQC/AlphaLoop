@@ -467,7 +467,15 @@ export function migrate(db: DatabaseSync): void {
         db.exec(`PRAGMA user_version = ${version + 1}`);
         db.exec("COMMIT");
       } catch (error) {
-        db.exec("ROLLBACK");
+        // The ROLLBACK itself can fail (e.g. the step already ended the transaction, or the
+        // connection is in a bad state) - if it throws here, that secondary failure must never
+        // replace `error` (the actual root cause an operator needs to see and act on) in what
+        // propagates out of migrate().
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Ignore: best-effort only, `error` below is what matters.
+        }
         throw error;
       }
     } finally {

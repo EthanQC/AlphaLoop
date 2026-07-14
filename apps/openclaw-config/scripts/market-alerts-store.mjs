@@ -391,7 +391,13 @@ export function persistCycle(db, { runtimes, events, quotaBumps }) {
     db.exec("COMMIT");
     return created;
   } catch (error) {
-    db.exec("ROLLBACK");
+    // The ROLLBACK itself can fail (e.g. the connection is already out of a transaction) - that
+    // secondary failure must never replace `error`, the real cause the caller needs to see.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore: best-effort only, `error` below is what matters.
+    }
     throw error;
   }
 }
