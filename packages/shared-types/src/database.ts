@@ -44,7 +44,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -650,6 +650,136 @@ const MIGRATIONS: MigrationStep[] = [
       CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_owner_idx
         ON official_paper_order_lifecycle(owner_id, lifecycle_stage, submitted_at);
     `);
+  },
+  {
+    needsForeignKeysOff: true,
+    // Phase 7 Task 1 (2026-07-15 plan, strategy memory): schema v12, two
+    // changes bundled into one step (DDL spec-frozen VERBATIM from the plan's
+    // Global Constraints):
+    //
+    //   1) NEW `strategy_cards` table (playbook cards: scene/entry/risk/exit,
+    //      three-tier visibility mirroring theses) + its (owner_id, status)
+    //      index. Purely additive - no rebuild needed for this half, and it
+    //      doesn't itself require needsForeignKeysOff (nothing references it
+    //      yet), but it shares this step's toggle for the same reason v7's
+    //      four-table rebuild shared one toggle across unrelated tables: it's
+    //      one schema-version bump, and the toggle is harmless around a plain
+    //      CREATE TABLE.
+    //
+    //   2) `theses` gains two evidence columns - bull_points/bear_points,
+    //      JSON arrays of the bull/bear case's structured points, each
+    //      `NOT NULL DEFAULT '[]'` so every pre-existing row backfills to "no
+    //      points recorded yet" with zero data loss. SQLite has no
+    //      `ALTER TABLE ... ADD COLUMN ... CHECK`, so this reuses the EXACT
+    //      v7/H3 table-rebuild recipe (CREATE new -> INSERT ... SELECT ->
+    //      DROP old -> RENAME) to preserve theses' v3
+    //      CHECK(direction)/CHECK(visibility)/CHECK(status) constraints and
+    //      its (owner_id, symbol, status) index verbatim while adding the two
+    //      columns. needsForeignKeysOff is REQUIRED for this half:
+    //      thesis_history.thesis_id REFERENCES theses(id), so dropping
+    //      `theses` with the pragma on would choke exactly like v7's rebuild
+    //      of members/alert_rules did on ITS child tables (see that step's
+    //      own comment) - even though thesis_history's own rows are never
+    //      touched here (their thesis_id values are stable across the
+    //      rebuild, since every existing theses.id is carried through
+    //      unchanged by the INSERT ... SELECT below).
+    run: (db) => {
+      // ----------------------------------------------------------------
+      // 1) strategy_cards: brand-new table.
+      // ----------------------------------------------------------------
+      db.exec(`
+        CREATE TABLE strategy_cards (
+          id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+          name TEXT NOT NULL, scene TEXT, entry_condition TEXT, risk_control TEXT, exit_rule TEXT,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','retired')),
+          visibility TEXT NOT NULL DEFAULT 'system' CHECK(visibility IN ('system','public')),
+          memory_slug TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX strategy_cards_owner_status_idx ON strategy_cards(owner_id, status);
+      `);
+
+      // ----------------------------------------------------------------
+      // 2) theses: rebuild to add bull_points/bear_points, preserving every
+      //    v3 column/CHECK/index verbatim.
+      //
+      //    Defensive existence check (same precedent as the v11 step above,
+      //    "a couple of this file's OWN pre-existing migration tests build
+      //    deliberately partial legacy-shape fixtures"): a handful of THIS
+      //    file's hand-built legacy fixtures set `PRAGMA user_version` to a
+      //    pre-v3 value without ever physically creating `theses` (no
+      //    migration step before this one needed to touch it after v3
+      //    created it, so nothing forced those fixtures to be complete).
+      //    Every REAL database has it (MIGRATIONS[2] creates it) - but
+      //    rather than assume that, a missing table is handled by creating
+      //    it directly in its final (v12) shape, equivalent to "there is
+      //    nothing to rebuild", not an error.
+      // ----------------------------------------------------------------
+      const thesesExists = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'theses'`)
+        .get();
+
+      if (!thesesExists) {
+        db.exec(`
+          CREATE TABLE theses (
+            id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+            symbol TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('bull','bear','neutral')),
+            target_low REAL, target_high REAL, invalidation_price REAL,
+            visibility TEXT NOT NULL DEFAULT 'system' CHECK(visibility IN ('system','public')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn','superseded')),
+            memory_slug TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            bull_points TEXT NOT NULL DEFAULT '[]', bear_points TEXT NOT NULL DEFAULT '[]'
+          );
+          CREATE INDEX theses_owner_symbol_idx ON theses(owner_id, symbol, status);
+        `);
+      } else {
+        db.exec(`
+          CREATE TABLE theses_new (
+            id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+            symbol TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('bull','bear','neutral')),
+            target_low REAL, target_high REAL, invalidation_price REAL,
+            visibility TEXT NOT NULL DEFAULT 'system' CHECK(visibility IN ('system','public')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn','superseded')),
+            memory_slug TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            bull_points TEXT NOT NULL DEFAULT '[]', bear_points TEXT NOT NULL DEFAULT '[]'
+          );
+        `);
+        db.exec(`
+          INSERT INTO theses_new
+            (id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+             visibility, status, memory_slug, created_at, updated_at, bull_points, bear_points)
+          SELECT id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+                 visibility, status, memory_slug, created_at, updated_at, '[]', '[]'
+          FROM theses;
+        `);
+        db.exec("DROP TABLE theses;");
+        db.exec("ALTER TABLE theses_new RENAME TO theses;");
+        db.exec("CREATE INDEX theses_owner_symbol_idx ON theses(owner_id, symbol, status);");
+      }
+
+      // ----------------------------------------------------------------
+      // Post-rebuild integrity gate (v7 precedent): theses.owner_id ->
+      // members(id) is an EXISTING guarantee (unchanged by this step - it
+      // was already `NOT NULL REFERENCES members(id)` since v3), but the
+      // rebuild ran with PRAGMA foreign_keys OFF, and SQLite never
+      // re-validates existing rows once the pragma comes back on. A
+      // pre-existing "ghost" owner_id would otherwise be copied straight
+      // through unnoticed. Fail loud inside the transaction instead - the
+      // migration rolls back and the operator sees exactly which rows are
+      // bad (same shape as v7's own alert_events gate).
+      // ----------------------------------------------------------------
+      const ghostOwners = db.prepare(`
+        SELECT t.id, t.owner_id FROM theses t
+        LEFT JOIN members m ON m.id = t.owner_id
+        WHERE m.id IS NULL
+        LIMIT 5
+      `).all() as Array<{ id: string; owner_id: string }>;
+      if (ghostOwners.length > 0) {
+        const detail = ghostOwners.map((r) => `${r.id} -> ${r.owner_id}`).join(", ");
+        throw new Error(
+          `v12 migration aborted: theses rows reference nonexistent members (${detail}); ` +
+          `repair the owner_id values (or restore the missing members) and re-run.`
+        );
+      }
+    }
   }
 ];
 
