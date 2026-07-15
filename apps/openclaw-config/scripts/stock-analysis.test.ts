@@ -693,3 +693,135 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 5 Task 5 (2026-07-15 plan): 平台结论框摘要卡 + deferred minors.
+// ---------------------------------------------------------------------------
+
+describe("toYahooSymbol: strips .US, then converts any remaining dot to a hyphen (minor a)", () => {
+  it("strips the .US suffix from a bare US ticker with no dots", () => {
+    expect(stockAnalysis.toYahooSymbol("AAPL.US")).toBe("AAPL");
+    expect(stockAnalysis.toYahooSymbol("nvda.us")).toBe("NVDA");
+  });
+
+  it("converts a dot-class-share ticker's remaining dot to a hyphen after stripping .US", () => {
+    // normalizeSymbol (report-data.mjs) leaves a dotted class-share ticker
+    // like BRK.B untouched (it never gets a .US suffix appended - it's
+    // neither a bare 1-6-letter ticker nor already dot-suffixed with a
+    // 2-4-letter market code) - so this input never actually carries .US,
+    // but the dot->hyphen conversion still applies.
+    expect(stockAnalysis.toYahooSymbol("BRK.B")).toBe("BRK-B");
+  });
+
+  it("strips .US AND converts a remaining dot to a hyphen when both are present", () => {
+    expect(stockAnalysis.toYahooSymbol("BRK.B.US")).toBe("BRK-B");
+  });
+
+  it("leaves a plain ticker with no dots and no .US suffix unchanged (aside from uppercasing)", () => {
+    expect(stockAnalysis.toYahooSymbol("tsla")).toBe("TSLA");
+  });
+});
+
+describe("nextUsMonthlyOptionExpiry: same-day behavior (minor c)", () => {
+  // 2026-08-21 is the third Friday of August 2026 (verified independently:
+  // Aug 1 2026 is a Saturday, so the first Friday is Aug 7, the third is
+  // Aug 21).
+  const THIRD_FRIDAY_AUG_2026 = "2026-08-21";
+
+  it("returns TODAY when 'now' is later the same day as the third Friday (the bug this task fixes)", () => {
+    // Before this task's fix, comparing full timestamps (candidate is always
+    // midnight UTC, `date` is whatever wall-clock instant the caller passed)
+    // meant any time-of-day past midnight on the expiry day itself rolled
+    // forward to NEXT month instead of returning today.
+    const laterSameDay = new Date(`${THIRD_FRIDAY_AUG_2026}T15:00:00.000Z`);
+    expect(stockAnalysis.nextUsMonthlyOptionExpiry(laterSameDay)).toBe(THIRD_FRIDAY_AUG_2026);
+
+    const almostMidnightSameDay = new Date(`${THIRD_FRIDAY_AUG_2026}T23:59:59.000Z`);
+    expect(stockAnalysis.nextUsMonthlyOptionExpiry(almostMidnightSameDay)).toBe(THIRD_FRIDAY_AUG_2026);
+  });
+
+  it("returns the exact same day at midnight too (edge case, was already correct)", () => {
+    expect(stockAnalysis.nextUsMonthlyOptionExpiry(new Date(`${THIRD_FRIDAY_AUG_2026}T00:00:00.000Z`))).toBe(
+      THIRD_FRIDAY_AUG_2026
+    );
+  });
+
+  it("rolls forward to next month's third Friday the day AFTER expiry", () => {
+    const dayAfter = new Date(`${THIRD_FRIDAY_AUG_2026}T00:00:00.000Z`);
+    dayAfter.setUTCDate(dayAfter.getUTCDate() + 1);
+    expect(stockAnalysis.nextUsMonthlyOptionExpiry(dayAfter)).toBe("2026-09-18");
+  });
+
+  it("still returns the same month's expiry the day BEFORE it", () => {
+    const dayBefore = new Date(`${THIRD_FRIDAY_AUG_2026}T12:00:00.000Z`);
+    dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+    expect(stockAnalysis.nextUsMonthlyOptionExpiry(dayBefore)).toBe(THIRD_FRIDAY_AUG_2026);
+  });
+});
+
+describe("resolveReportPaths: prepare writes -preview files, never the delivered archive name (minor b)", () => {
+  it("resolves the plain <label>.md/.pdf archive name when deliver=true", () => {
+    expect(stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", true)).toEqual({
+      markdownPath: join("/reports/stock-analysis", "2026-07-15.md"),
+      pdfPath: join("/reports/stock-analysis", "2026-07-15.pdf")
+    });
+  });
+
+  it("resolves the <label>-preview.md/.pdf name when deliver=false (prepare dry-run)", () => {
+    expect(stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", false)).toEqual({
+      markdownPath: join("/reports/stock-analysis", "2026-07-15-preview.md"),
+      pdfPath: join("/reports/stock-analysis", "2026-07-15-preview.pdf")
+    });
+  });
+
+  it("the preview path never equals the delivered archive path for the same label", () => {
+    const delivered = stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", true);
+    const preview = stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", false);
+    expect(preview.markdownPath).not.toBe(delivered.markdownPath);
+    expect(preview.pdfPath).not.toBe(delivered.pdfPath);
+  });
+});
+
+describe("persistPredictionsIfDelivered: predictions only ever written for a real delivered run (minor b)", () => {
+  function renderFixture(symbol: string, generatedAt = GENERATED_AT) {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      symbol,
+      stockQuote({ symbol }),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      generatedAt
+    );
+    const markdown = stockAnalysis.renderBatchStockAnalysis({
+      label: generatedAt.slice(0, 10),
+      generatedAt,
+      records: [{ symbol, analysis, news: stockNewsList() }],
+      failedSymbols: []
+    });
+    return { analysis, markdown };
+  }
+
+  it("writes nothing to analysis_predictions when deliver=false (a `prepare` dry-run)", () => {
+    const { db } = makeDb();
+    const { markdown } = renderFixture("AAPL.US");
+    const reportPath = "/tmp/2026-07-15-preview.md";
+
+    stockAnalysis.persistPredictionsIfDelivered(db, false, reportPath, markdown, [{ symbol: "AAPL.US" }]);
+
+    const row = db.prepare("SELECT * FROM analysis_predictions WHERE report_path = ?").get(reportPath);
+    expect(row).toBeUndefined();
+  });
+
+  it("writes the row when deliver=true (a real delivered run), matching persistPredictionsForRecords directly", () => {
+    const { db } = makeDb();
+    const { markdown } = renderFixture("AAPL.US");
+    const reportPath = "/tmp/2026-07-15.md";
+
+    stockAnalysis.persistPredictionsIfDelivered(db, true, reportPath, markdown, [{ symbol: "AAPL.US" }]);
+
+    const row = db.prepare("SELECT * FROM analysis_predictions WHERE report_path = ?").get(reportPath) as
+      | Record<string, unknown>
+      | undefined;
+    expect(row).toBeDefined();
+    expect(row?.symbol).toBe("AAPL.US");
+  });
+});

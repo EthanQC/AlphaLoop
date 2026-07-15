@@ -8,19 +8,38 @@
  * like `<letters/digits/dots>.<2-4 letter exchange suffix>` (or starting
  * with `.`, e.g. an index like `.DJI`) passes through unchanged; a bare
  * 1-6 letter ticker gets `.US` appended (Longbridge's implicit default
- * market); anything else is returned as-is. ONE DELIBERATE DIVERGENCE from
- * the .mjs version: report-data.mjs's own regex charset is
- * `[A-Z0-9.-]` (permits a hyphen); this route's charset is narrower -
- * `[A-Z0-9.]` only (letters, digits, dots) - per this task's explicit brief
- * ("Validate code: uppercase alnum + dots"). Any input containing a
- * character outside that narrower set (before OR after normalization) is
- * rejected -> the route 404s. This also happens to be the path-traversal
- * guard: `/stock/<code>` only ever reaches this validator with a single URL
- * path segment (Node's URL parser already collapses `..`/`%2e%2e` dot-
- * segments before routing ever sees them - verified empirically), and any
- * residual encoded traversal attempt (e.g. a literal `%2f` byte sequence
- * that survives as text in the segment) contains a `%` character that this
- * charset rejects outright.
+ * market); anything else is returned as-is. CHARSET (Phase 5 Task 5,
+ * 2026-07-15 plan): originally this route's charset was `[A-Z0-9.]` only
+ * (letters, digits, dots) - deliberately narrower than report-data.mjs's own
+ * `[A-Z0-9.-]` (which permits a hyphen), per Task 3's brief ("Validate code:
+ * uppercase alnum + dots"). Task 5 widens it to `[A-Z0-9.-]` to align with
+ * report-data.mjs's normalizeSymbol charset - a class-share ticker like
+ * `BRK-B` (Yahoo's own hyphenated convention, see stock-analysis.mjs's
+ * toYahooSymbol) no longer 404s outright. This route still VALIDATES and
+ * rejects anything outside the (now slightly wider) charset -
+ * report-data.mjs itself never rejects anything, it only transforms
+ * best-effort - so that difference in behavior remains. Any input
+ * containing a character outside the charset (before OR after
+ * normalization) is rejected -> the route 404s. This also happens to be the
+ * path-traversal guard: `/stock/<code>` only ever reaches this validator
+ * with a single URL path segment (Node's URL parser already collapses
+ * `..`/`%2e%2e` dot-segments before routing ever sees them - verified
+ * empirically), and any residual encoded traversal attempt (e.g. a literal
+ * `%2f` byte sequence that survives as text in the segment) contains a `%`
+ * character that this charset rejects outright; a bare hyphen is harmless
+ * and was never part of any traversal-shaped input this route needs to
+ * reject.
+ *
+ * SUMMARY CARD (Phase 5 Task 5): `renderPublicSummaryCard` below parses the
+ * newest matching report's own symbol section through
+ * `../reports/conclusion-box.js`'s `parseConclusionBox` (a TS port of
+ * apps/openclaw-config/scripts/conclusion-box.mjs - see that file's own doc
+ * comment for the shared-fixture anti-drift test). A new-format report (one
+ * whose symbol section contains a "### 结论框" block) renders the
+ * structured 核心结论/置信度/合理价值区间/复盘日期; a legacy report (box is
+ * `null`) falls back to the pre-Task-5 first-bullet summary, with an
+ * explicit "旧格式无结论框" note so a viewer never mistakes the fallback for
+ * a structured result that simply happens to be terse.
  */
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -29,6 +48,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { methodNotAllowed, type Member } from "@packages/shared-types";
 
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
@@ -40,10 +60,11 @@ export interface StockRouteDeps {
   now?: () => Date;
 }
 
-/** Only letters, digits, and dots - see module doc for why this is
- * DELIBERATELY narrower than report-data.mjs's own `[A-Z0-9.-]` charset. */
-const SYMBOL_CHARSET_RE = /^[A-Z0-9.]+$/u;
-const SUFFIXED_SYMBOL_RE = /^[A-Z0-9.]+\.[A-Z]{2,4}$/u;
+/** Letters, digits, dots, and hyphens - see module doc's CHARSET section for
+ * why this now matches report-data.mjs's own `[A-Z0-9.-]` charset (Phase 5
+ * Task 5 widened it from an earlier, deliberately narrower `[A-Z0-9.]`). */
+const SYMBOL_CHARSET_RE = /^[A-Z0-9.-]+$/u;
+const SUFFIXED_SYMBOL_RE = /^[A-Z0-9.-]+\.[A-Z]{2,4}$/u;
 const BARE_TICKER_RE = /^[A-Z]{1,6}$/u;
 
 /**
@@ -204,6 +225,11 @@ function extractSectionSummary(sectionBody: string): string {
 interface SymbolReportMatch {
   entry: ReportIndexEntry;
   summary: string;
+  /** The full `## SYMBOL` section body (Phase 5 Task 5) - kept alongside the
+   * already-extracted `summary` so renderPublicSummaryCard can additionally
+   * run it through `parseConclusionBox` without re-reading/re-scanning the
+   * report file a second time. */
+  section: string;
 }
 
 /** All stock-analysis reports (newest first, per scanReports' own ordering)
@@ -222,7 +248,7 @@ function loadSymbolReportMatches(repoRoot: string, symbol: string): SymbolReport
     }
     const section = findSymbolSection(md, symbol);
     if (section !== null) {
-      matches.push({ entry, summary: extractSectionSummary(section) });
+      matches.push({ entry, summary: extractSectionSummary(section), section });
     }
   }
   return matches;
@@ -346,6 +372,20 @@ function renderHeaderCard(symbol: string, latest: SymbolReportMatch | undefined)
   </section>`;
 }
 
+// Phase 5 Task 5 (2026-07-15 plan): confidence -> pill class/style. 高 gets
+// the same "ok" (up-color) pill freshness.ts/paper.ts already use for a
+// healthy state; 中 gets "warn" (amber), same class home.ts/paper.ts use for
+// a degraded-but-not-broken state; 低 has no existing CSS class for a
+// muted/sub-colored pill, so it inline-styles with --card2/--sub, mirroring
+// research.ts's own sub-muted inline-styled pill (see that file's
+// visibilityLabel pill) rather than inventing a fourth global CSS class for
+// a single call site.
+const CONFIDENCE_PILL_HTML: Record<string, Html> = {
+  high: html`<span class="pill ok">${CONFIDENCE_LABELS.high}</span>`,
+  medium: html`<span class="pill warn">${CONFIDENCE_LABELS.medium}</span>`,
+  low: html`<span class="pill" style="background:var(--card2);color:var(--sub)">${CONFIDENCE_LABELS.low}</span>`
+};
+
 function renderPublicSummaryCard(latest: SymbolReportMatch | undefined): Html {
   if (!latest) {
     return html`<section class="card w2 dt-w4">
@@ -353,9 +393,18 @@ function renderPublicSummaryCard(latest: SymbolReportMatch | undefined): Html {
       <p style="font-size:13px;color:var(--sub)">暂无公共分析</p>
     </section>`;
   }
+
+  const box = parseConclusionBox(latest.section);
+  const bodyHtml = box
+    ? html`<p style="font-size:13.5px;line-height:1.7">${box.coreConclusion} ${CONFIDENCE_PILL_HTML[box.confidence]}</p>
+        <p style="font-size:12.5px;color:var(--sub)">合理价值区间：<span class="mono">${box.valueRange.low.toFixed(2)}–${box.valueRange.high.toFixed(2)}</span> 美元</p>
+        <p style="font-size:12.5px;color:var(--sub)">复盘日期：<span class="mono">${box.reviewDate}</span></p>`
+    : html`<p style="font-size:13.5px;line-height:1.7">${latest.summary}</p>
+        <p style="font-size:11.5px;color:var(--sub)">旧格式无结论框</p>`;
+
   return html`<section class="card w2 dt-w4">
     <h2>最新公共分析摘要 <span class="mono" style="font-size:11px;color:var(--sub)">${latest.entry.date}</span></h2>
-    <p style="font-size:13.5px;line-height:1.7">${latest.summary}</p>
+    ${bodyHtml}
     <div style="margin-top:8px"><a href="/${latest.entry.type}/${latest.entry.date}" style="color:var(--accent);font-size:13px">阅读全文 →</a></div>
   </section>`;
 }

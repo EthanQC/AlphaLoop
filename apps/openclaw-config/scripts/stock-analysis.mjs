@@ -228,16 +228,19 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
 
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
-  const markdownPath = join(reportsDir, `${label}.md`);
-  const pdfPath = join(reportsDir, `${label}.pdf`);
+  const { markdownPath, pdfPath } = resolveReportPaths(reportsDir, label, deliver);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
 
-  // Phase 5 Task 2 (2026-07-15 plan): predictions are written "生成时" (at
-  // generation time), same as persistStockFactsForRecords above - not gated
-  // behind `deliver`, so a `prepare` dry-run and a delivered `run` behave
-  // identically here (matching this file's pre-existing, Task 5-deferred
-  // fact that `prepare` writes to the very same markdownPath a `run` would).
-  persistPredictionsForRecords(db, markdownPath, markdown, records);
+  // Phase 5 Task 5 (2026-07-15 plan) minor (b): predictions are written
+  // "生成时" (at generation time) - but ONLY for a real delivered run.
+  // Previously this ran unconditionally (including for a `prepare` dry-run),
+  // which meant every preview render polluted the public analysis_predictions
+  // table with rows for a report that was never actually delivered/archived
+  // (flagged by Task 2's own comment as deferred to this task). Now gated by
+  // `deliver` via persistPredictionsIfDelivered - a `prepare` dry-run writes
+  // its markdown/pdf to the `-preview` path (resolveReportPaths above) purely
+  // for human inspection and writes NOTHING to analysis_predictions.
+  persistPredictionsIfDelivered(db, deliver, markdownPath, markdown, records);
 
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
@@ -448,6 +451,43 @@ export function persistPredictionsForRecords(db, reportPath, markdown, records) 
     }
     throw error;
   }
+}
+
+// Phase 5 Task 5 (2026-07-15 plan) minor (b): the "predictions only on a
+// real delivered run, never for a `prepare` dry-run" gate, extracted as its
+// own pure/network-free function so it is directly unit-testable without
+// exercising runAnalysis's heavier network/PDF/delivery side effects (same
+// convention as persistStockFactsForRecords/attachNarrativeSections above).
+// runAnalysis calls this instead of calling persistPredictionsForRecords
+// directly - see that call site's own comment for why this gate exists.
+export function persistPredictionsIfDelivered(db, deliver, reportPath, markdown, records) {
+  if (!deliver) {
+    return;
+  }
+  persistPredictionsForRecords(db, reportPath, markdown, records);
+}
+
+// Phase 5 Task 5 (2026-07-15 plan) minor (b): a `prepare` dry-run (deliver:
+// false) writes to `<label>-preview.md`/`.pdf` - NEVER `<label>.md`/`.pdf`,
+// which is reserved for a real delivered archive (a `run`/`scheduled`
+// invocation). Previously `prepare` and `run` wrote to the exact same path,
+// so re-running `prepare` for a same-day preview could silently overwrite
+// that day's already-delivered archive file on disk (the delivered Feishu
+// message/PDF attachment itself was unaffected, but the on-disk archive a
+// human or another tool might later open no longer matched what was
+// actually sent). Extracted as its own pure function (reportsDir/label/
+// deliver in, paths out - no fs/db/network) so this exact "-preview never
+// collides with the delivered name" contract is directly unit-testable.
+// scanner.ts's own filename regex (apps/platform-app/src/reports/
+// scanner.ts) already anchors on `<date>.md` exactly, so a `-preview.md`
+// sibling is naturally invisible to the platform's report index without any
+// change there - see that file's own test for the pinned-down proof.
+export function resolveReportPaths(reportsDir, label, deliver) {
+  const suffix = deliver ? "" : "-preview";
+  return {
+    markdownPath: join(reportsDir, `${label}${suffix}.md`),
+    pdfPath: join(reportsDir, `${label}${suffix}.pdf`)
+  };
 }
 
 // Slices the full rendered batch markdown down to just ONE symbol's own
@@ -1185,8 +1225,22 @@ async function fetchTextWithTimeout(url, extraHeaders = {}) {
   throw lastError;
 }
 
-function toYahooSymbol(symbol) {
-  return String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
+// Phase 5 Task 5 (2026-07-15 plan) minor (a): exported (was previously
+// module-local) so this pure, network-free normalization is directly
+// testable - same "exported, network-free, directly testable" convention
+// this file already follows for persistStockFactsForRecords/
+// attachNarrativeSections/persistPredictionsForRecords above. Strips the
+// `.US` suffix (report-data.mjs's normalizeSymbol appends this to every bare
+// US ticker; Yahoo's own APIs never expect it), THEN converts any remaining
+// dot into a hyphen - a dot-class-share ticker like `BRK.B` (normalizeSymbol
+// leaves this exact form untouched: it's neither a bare 1-6-letter ticker
+// nor already `.US`-suffixed, so it never gets a `.US` appended in the first
+// place) becomes `BRK-B`, matching Yahoo's own hyphenated convention for
+// class shares (Yahoo has never recognized the dotted form for its
+// chart/quote/options/search/RSS endpoints this function feeds).
+export function toYahooSymbol(symbol) {
+  const withoutUsSuffix = String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
+  return withoutUsSuffix.replace(/\./gu, "-");
 }
 
 function formatCompactMoney(value) {
@@ -1227,11 +1281,25 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function nextUsMonthlyOptionExpiry(date) {
+// Phase 5 Task 5 (2026-07-15 plan) minor (c): exported (was previously
+// module-local) for direct testability. FIX: this used to compare `candidate`
+// (always midnight UTC on some third Friday, from thirdFridayUtc) against
+// `date` (the real wall-clock instant callers pass - always AT OR AFTER its
+// own midnight, per how `new Date()` works) using full-timestamp `>=`. That
+// meant that on the actual expiry day itself, `date` had almost always
+// already ticked past its own midnight by the time this ran, so
+// `candidate.getTime() >= date.getTime()` was false for TODAY's own expiry
+// and this incorrectly rolled forward to NEXT month - "today is the third
+// Friday" should return today, not skip it. Comparing against `date`
+// truncated to its own UTC midnight (dateAtMidnight) instead fixes this:
+// today's candidate (also at midnight) is `>=` today's midnight regardless
+// of what time of day `date` itself carries.
+export function nextUsMonthlyOptionExpiry(date) {
+  const dateAtMidnight = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
   const cursor = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   for (let monthOffset = 0; monthOffset < 18; monthOffset += 1) {
     const candidate = thirdFridayUtc(cursor.getUTCFullYear(), cursor.getUTCMonth());
-    if (candidate.getTime() >= date.getTime()) {
+    if (candidate.getTime() >= dateAtMidnight) {
       return candidate.toISOString().slice(0, 10);
     }
     cursor.setUTCMonth(cursor.getUTCMonth() + 1, 1);

@@ -5,6 +5,9 @@
 // exact contract every one of those callers depends on: a fixed bullet
 // shape, a round-trip that never lossily mutates the input, and "missing
 // any required key -> null, never guess".
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -13,6 +16,24 @@ import {
   parseConclusionBox,
   renderConclusionBox
 } from "./conclusion-box.mjs";
+
+// Phase 5 Task 5 (2026-07-15 plan): SHARED-FIXTURE anti-drift check. This
+// exact JSON file is also read by apps/platform-app/src/reports/
+// conclusion-box.test.ts - both suites run parseConclusionBox over the SAME
+// inputs and assert deep-equal outputs (including the null cases), so the
+// TS port over there can never silently drift from this .mjs source of
+// truth without a test failing on at least one side.
+interface ConclusionBoxFixtureSample {
+  name: string;
+  input: string;
+  expected: unknown;
+}
+
+const FIXTURES_PATH = fileURLToPath(new URL("./__fixtures__/conclusion-box-samples.json", import.meta.url));
+
+function loadFixtureSamples(): ConclusionBoxFixtureSample[] {
+  return JSON.parse(readFileSync(FIXTURES_PATH, "utf8")) as ConclusionBoxFixtureSample[];
+}
 
 function boxInput(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -145,5 +166,19 @@ describe("parseConclusionBox: missing or invalid required key -> null, never gue
   it("returns null when 复盘触发's embedded 复盘日期 is missing/malformed", () => {
     const markdown = renderConclusionBox(boxInput()).replace("（复盘日期：2026-08-15）", "（复盘日期：未知）");
     expect(parseConclusionBox(markdown)).toBeNull();
+  });
+});
+
+describe("parseConclusionBox: SHARED-FIXTURE anti-drift check (Phase 5 Task 5)", () => {
+  const samples = loadFixtureSamples();
+
+  it("the fixture file itself is non-empty and covers both valid and null cases", () => {
+    expect(samples.length).toBeGreaterThan(0);
+    expect(samples.some((sample) => sample.expected !== null)).toBe(true);
+    expect(samples.some((sample) => sample.expected === null)).toBe(true);
+  });
+
+  it.each(samples.map((sample) => [sample.name, sample] as const))("%s", (_name, sample) => {
+    expect(parseConclusionBox(sample.input)).toEqual(sample.expected);
   });
 });

@@ -115,6 +115,25 @@ describe("scanReports", () => {
     expect(dates).toEqual([...dates].sort().reverse());
   });
 
+  // Phase 5 Task 5 (2026-07-15 plan) minor (b): stock-analysis.mjs's
+  // `prepare` dry-run writes `<label>-preview.md`/`.pdf` instead of
+  // overwriting the delivered `<label>.md`/`.pdf` archive (see stock-
+  // analysis.mjs's resolveReportPaths). PLAIN_DATE_RE is anchored
+  // (`^(\d{4}-\d{2}-\d{2})\.md$`), so a `-preview` suffix already fails to
+  // match by construction - this test pins that down as an explicit,
+  // regression-proof contract rather than an incidental side effect of the
+  // regex's anchoring.
+  it("ignores a stock-analysis <label>-preview.md sibling (prepare dry-run output, never a real report)", () => {
+    writeReport("stock-analysis", "2026-07-15.md", "# 个股分析 2026-07-15\n\n内容。\n");
+    writeReport("stock-analysis", "2026-07-15-preview.md", "# 个股分析 2026-07-15（预览）\n\n内容。\n");
+    writeFileSync(join(reportsDir("stock-analysis"), "2026-07-15-preview.pdf"), "not a real pdf", "utf8");
+
+    const entries = scanReports(repoRoot);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.mdPath).toMatch(/\/2026-07-15\.md$/u);
+  });
+
   it("returns an empty array for a report type whose directory doesn't exist", () => {
     // Only create daily/ - the other three type directories are absent.
     writeReport("daily", "2026-06-19.md", "# 日报\n");
