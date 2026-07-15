@@ -6,7 +6,14 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, createId, migrate, type Member } from "@packages/shared-types";
+import {
+  ApiTokenRepository,
+  CircuitBreakerRepository,
+  MemberRepository,
+  createId,
+  migrate,
+  type Member
+} from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
 
@@ -311,5 +318,67 @@ describe("home route (GET /)", () => {
     expect(body).toContain('href="/daily/2026-07-14"');
     expect(body).toContain("历史存档");
     expect(body).not.toContain("暂无日报");
+  });
+
+  describe("circuit breaker banner (Phase 6 Task 6)", () => {
+    it("omits the banner entirely when the viewer is not paused", async () => {
+      const { token } = seedMemberWithToken();
+      const response = await authed("/", token);
+      const body = await response.text();
+      expect(body).not.toContain("熔断暂停中");
+    });
+
+    it("shows the amber banner with the recovery time, positioned before block ①开始研究, when the viewer IS paused", async () => {
+      const { member, token } = seedMemberWithToken();
+      new CircuitBreakerRepository(db).trip(member.id, {
+        pausedUntil: "2026-07-21T12:00:00.000Z",
+        reason: "本交易周亏损 3.50%，超过熔断阈值 -3%",
+        weeklyLossPct: -3.5
+      });
+
+      const response = await authed("/", token);
+      const body = await response.text();
+
+      expect(body).toContain("⛔ 熔断暂停中");
+      expect(body).toContain("熔断暂停中，至");
+      expect(body).toContain("2026-07-21T12:00:00.000Z");
+      expect(body).toContain("不再生成新提案");
+
+      const bannerIndex = body.indexOf("熔断暂停中，至");
+      const startResearchIndex = body.indexOf("开始研究");
+      expect(bannerIndex).toBeGreaterThan(-1);
+      expect(startResearchIndex).toBeGreaterThan(-1);
+      expect(bannerIndex).toBeLessThan(startResearchIndex);
+    });
+
+    it("does not show a banner once the pause has expired (now >= pausedUntil)", async () => {
+      const { member, token } = seedMemberWithToken();
+      new CircuitBreakerRepository(db).trip(member.id, {
+        pausedUntil: "2026-07-01T00:00:00.000Z", // well before NOW (2026-07-14T12:00:00.000Z)
+        reason: "expired trip",
+        weeklyLossPct: -4
+      });
+
+      const response = await authed("/", token);
+      const body = await response.text();
+      expect(body).not.toContain("熔断暂停中");
+    });
+
+    it("member isolation: member A's pause never shows on member B's home page", async () => {
+      const { member: memberA } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      new CircuitBreakerRepository(db).trip(memberA.id, {
+        pausedUntil: "2026-07-21T12:00:00.000Z",
+        reason: "member A tripped",
+        weeklyLossPct: -5
+      });
+
+      const memberB = makeMember({ id: "member_b", email: "b@example.com" });
+      new MemberRepository(db).upsert(memberB);
+      const tokenB = new ApiTokenRepository(db).issue(memberB.id, "test").token;
+
+      const response = await authed("/", tokenB);
+      const body = await response.text();
+      expect(body).not.toContain("熔断暂停中");
+    });
   });
 });

@@ -8,7 +8,7 @@
 //      that looks identical to a real quote everywhere downstream.
 //   3. audit item (b): the manual `snapshot` path now asserts the paper-
 //      account environment, same as poll/pnl, instead of skipping it.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -230,5 +230,119 @@ describe("runManualSnapshot: audit item (b) - environment assertion is no longer
 
     const count = db.prepare("SELECT COUNT(*) AS c FROM official_paper_snapshots").get() as { c: number };
     expect(count.c).toBe(0);
+  });
+});
+
+// Phase 6 Task 6 (2026-07-15 plan): per-member polling loop. `fetchImpl` is
+// the injection seam named in the task brief ("长桥抓取本身保持可注入
+// (fetchImpl/execFn)...真实多账户 = P10") - every test here supplies a fixture
+// function, never touching a real longbridge CLI/subprocess.
+describe("pollOfficialPaperPerMember", () => {
+  const credentialsRoots: string[] = [];
+
+  function makeCredentialsRoot(): string {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-official-paper-creds-"));
+    credentialsRoots.push(dir);
+    return dir;
+  }
+
+  function seedMemberCredentials(root: string, memberId: string): void {
+    const memberDir = join(root, memberId);
+    mkdirSync(memberDir, { recursive: true });
+    writeFileSync(join(memberDir, "longbridge.env"), `LONGBRIDGE_ACCESS_TOKEN=token-${memberId}\n`, "utf8");
+  }
+
+  afterEach(() => {
+    while (credentialsRoots.length > 0) {
+      const dir = credentialsRoots.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("returns null (H4 single-account fallback signal) when zero active members have credentials", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    const root = makeCredentialsRoot(); // empty - nobody has a longbridge.env file
+
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { credentialsRootDir: root });
+
+    expect(result).toBeNull();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM official_paper_snapshots").get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("returns null when there are zero active members at all", async () => {
+    const { db } = makeDb();
+    const root = makeCredentialsRoot();
+
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { credentialsRootDir: root });
+
+    expect(result).toBeNull();
+  });
+
+  it("2 credentialed members -> 2 owner-tagged snapshot rows, each with THAT member's fetch result", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_1");
+    seedMemberCredentials(root, "member_2");
+
+    const fetchImpl = async (member: { id: string }) =>
+      buildSnapshot({
+        fetchedAt: `2026-07-15T14:00:00.000Z`,
+        primaryAsset: { net_assets: member.id === "member_1" ? "1000" : "2000", total_cash: "0" }
+      });
+
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+
+    expect(result).toHaveLength(2);
+    expect(result?.map((entry: { ownerId: string }) => entry.ownerId).sort()).toEqual(["member_1", "member_2"]);
+
+    const rows = db
+      .prepare("SELECT owner_id, net_assets FROM official_paper_snapshots ORDER BY owner_id ASC")
+      .all() as Array<{ owner_id: string; net_assets: number }>;
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ owner_id: "member_1", net_assets: 1000 });
+    expect(rows[1]).toMatchObject({ owner_id: "member_2", net_assets: 2000 });
+  });
+
+  it("a member with no credentials file is skipped entirely (no snapshot row, not an error)", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_no_account");
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_1");
+    // member_no_account intentionally gets no longbridge.env file.
+
+    const fetchImpl = async () => buildSnapshot();
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+
+    expect(result).toHaveLength(1);
+    expect(result?.[0]).toMatchObject({ ownerId: "member_1" });
+    const rows = db.prepare("SELECT owner_id FROM official_paper_snapshots").all() as Array<{ owner_id: string }>;
+    expect(rows).toEqual([{ owner_id: "member_1" }]);
+  });
+
+  it("passes each member's own env/creds into fetchImpl (never leaks another member's credentials)", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_1");
+    seedMemberCredentials(root, "member_2");
+
+    const seenTokens: string[] = [];
+    const fetchImpl = async (_member: { id: string }, creds: { env: Record<string, string> }) => {
+      seenTokens.push(creds.env.LONGBRIDGE_ACCESS_TOKEN);
+      return buildSnapshot();
+    };
+
+    await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+
+    expect(seenTokens.sort()).toEqual(["token-member_1", "token-member_2"]);
   });
 });

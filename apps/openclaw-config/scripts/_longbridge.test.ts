@@ -12,7 +12,7 @@
 // mechanism this task's live-check instructions name: "stub the longbridge
 // CLI (PATH override to a script printing nothing)") rather than mocking
 // child_process, so they exercise the real execFileSync/lock/parse path.
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -100,5 +100,98 @@ describe("Longbridge rate-limit lock TTL >= CLI timeout it guards (task H7)", ()
     } finally {
       delete process.env.LONGBRIDGE_CLI_TIMEOUT_MS;
     }
+  });
+});
+
+// Phase 6 Task 6 (2026-07-15 plan): region-cache/rate-limit paths accept an
+// optional per-call override, so a per-member subprocess env
+// (member-credentials.mjs) can isolate both without touching the single
+// shared account's files. Every test below stubs the CLI via
+// LONGBRIDGE_CLI_PATH exactly like the existing H7 tests above - no real
+// longbridge binary/subprocess involved.
+describe("per-call overrides (Task 6 multi-account scaffold)", () => {
+  it("isolates the rate-limit state file into options.rateLimitDir instead of the shared runtime dir", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ ok: true }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const rateLimitDir = mkdtempSync(join(tmpdir(), "openclaw-longbridge-ratelimit-"));
+    tempDirs.push(rateLimitDir);
+    const { runLongbridgeJson } = await import("./_longbridge.mjs?ratelimit-override");
+
+    await runLongbridgeJson("trade", ["assets"], { rateLimitDir });
+
+    expect(existsSync(join(rateLimitDir, "longbridge-rate-limit-trade.json"))).toBe(true);
+  });
+
+  it("falls back to env.LONGBRIDGE_RATE_LIMIT_DIR when options.rateLimitDir is not given explicitly", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ ok: true }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const rateLimitDir = mkdtempSync(join(tmpdir(), "openclaw-longbridge-ratelimit-env-"));
+    tempDirs.push(rateLimitDir);
+    const { runLongbridgeJson } = await import("./_longbridge.mjs?ratelimit-env-override");
+
+    await runLongbridgeJson("trade", ["assets"], {
+      env: { ...process.env, LONGBRIDGE_RATE_LIMIT_DIR: rateLimitDir }
+    });
+
+    expect(existsSync(join(rateLimitDir, "longbridge-rate-limit-trade.json"))).toBe(true);
+  });
+
+  it("passes options.env through to the CLI subprocess verbatim", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ seen: process.env.OPENCLAW_TEST_MARKER ?? null }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const { runLongbridgeJson } = await import("./_longbridge.mjs?env-passthrough");
+
+    const result = await runLongbridgeJson("quote", ["quote", "AAPL.US"], {
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, OPENCLAW_TEST_MARKER: "member-value" }
+    });
+
+    expect(result).toEqual({ seen: "member-value" });
+  });
+
+  it("heals the region cache under options.env.HOME instead of the calling process's own HOME", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ connectivity: { global: { ok: true } }, region: { active: "global" } }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const memberHome = mkdtempSync(join(tmpdir(), "openclaw-longbridge-member-home-"));
+    tempDirs.push(memberHome);
+    mkdirSync(join(memberHome, ".longbridge", "openapi"), { recursive: true });
+    const { runLongbridgeJson } = await import("./_longbridge.mjs?region-cache-override");
+
+    await runLongbridgeJson("trade", ["check"], {
+      env: { PATH: process.env.PATH, HOME: memberHome }
+    });
+
+    const regionCachePath = join(memberHome, ".longbridge", "openapi", "region-cache");
+    expect(existsSync(regionCachePath)).toBe(true);
+    expect(readFileSync(regionCachePath, "utf8")).toBe("global");
+  });
+
+  it("two members' rate-limit state files never collide with each other", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ ok: true }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const dirA = mkdtempSync(join(tmpdir(), "openclaw-longbridge-member-a-"));
+    const dirB = mkdtempSync(join(tmpdir(), "openclaw-longbridge-member-b-"));
+    tempDirs.push(dirA, dirB);
+    const { runLongbridgeJson } = await import("./_longbridge.mjs?two-member-ratelimit");
+
+    await runLongbridgeJson("trade", ["assets"], { rateLimitDir: dirA });
+    await runLongbridgeJson("trade", ["assets"], { rateLimitDir: dirB });
+
+    expect(existsSync(join(dirA, "longbridge-rate-limit-trade.json"))).toBe(true);
+    expect(existsSync(join(dirB, "longbridge-rate-limit-trade.json"))).toBe(true);
   });
 });

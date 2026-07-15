@@ -175,13 +175,15 @@ describe("proposal route (GET /proposal/<id>)", () => {
     expect(response.status).toBe(404); // never 403 for a row that doesn't exist
   });
 
-  describe("all five status badges render their Chinese label", () => {
+  describe("all status badges render their Chinese label", () => {
     const cases: Array<{ status: string; label: string }> = [
       { status: "pending", label: "待审批" },
       { status: "approved", label: "已批准" },
+      { status: "approved_half", label: "部分批准" },
       { status: "rejected", label: "已拒绝" },
       { status: "expired", label: "已过期" },
-      { status: "executed", label: "已批准·已成交" }
+      { status: "executed", label: "已批准·已成交" },
+      { status: "failed", label: "熔断暂停" }
     ];
 
     for (const { status, label } of cases) {
@@ -213,5 +215,158 @@ describe("proposal route (GET /proposal/<id>)", () => {
     const body = await response.text();
     expect(body).toContain(`nonce="${nonceMatch?.[1]}"`);
     expect(body).not.toMatch(/https?:\/\//iu);
+  });
+
+  // Phase 6 Task 6 (2026-07-15 plan): approved_half must render distinctly
+  // AND its timeline must show the half-quantity - since the proposals DDL
+  // is frozen, the half quantity is never a stored column; it is recomputed
+  // at display time from the original quantity via Math.max(1,
+  // Math.floor(quantity/2)) (the exact rounding rule the approve-half CLI
+  // command itself applies).
+  describe("approved_half rendering (Phase 6 Task 6)", () => {
+    it("renders the 部分批准 pill distinctly from plain 已批准", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, { ownerId: member.id, status: "approved_half" });
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+      expect(body).toContain("部分批准");
+      expect(body).not.toContain(">已批准<");
+    });
+
+    it("the timeline shows the half quantity computed from the original request (qty=15 -> 7)", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, {
+        ownerId: member.id,
+        quantity: 15,
+        status: "approved_half",
+        decidedAt: "2026-07-10T01:00:00.000Z",
+        decidedBy: "member_admin"
+      });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).toContain("数量减半至 7 股");
+      expect(body).toContain("原申请 15 股");
+    });
+
+    it("qty=1 halves to 1, not 0 (Math.max(1, Math.floor(1/2)))", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, {
+        ownerId: member.id,
+        quantity: 1,
+        status: "approved_half",
+        decidedAt: "2026-07-10T01:00:00.000Z",
+        decidedBy: "member_admin"
+      });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).toContain("数量减半至 1 股");
+    });
+
+    it("a plain 已批准 (not approved_half) proposal shows no half-quantity note", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, {
+        ownerId: member.id,
+        quantity: 15,
+        status: "approved",
+        decidedAt: "2026-07-10T01:00:00.000Z",
+        decidedBy: "member_admin"
+      });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).not.toContain("数量减半");
+    });
+  });
+
+  // Phase 6 Task 6: lifecycle-derived timeline events. The lifecycle row is
+  // located by `ticket_prop_<proposalId>` - the exact same deterministic id
+  // apps/broker-executor/src/server.ts's deriveTicketId produces.
+  describe("timeline: lifecycle events (Phase 6 Task 6)", () => {
+    function seedLifecycleRow(
+      targetDb: DatabaseSync,
+      opts: {
+        proposalId: string;
+        ownerId: string;
+        symbol?: string;
+        side?: string;
+        quantity?: number;
+        brokerStatus?: string;
+        lifecycleStage?: string;
+        submittedAt?: string;
+        lastObservedAt?: string;
+      }
+    ): void {
+      targetDb
+        .prepare(`
+          INSERT INTO official_paper_order_lifecycle
+            (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+             side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+             last_observed_at, raw, notes, owner_id)
+          VALUES (?, ?, NULL, 'longbridge-paper', 'paper', 'paper', ?, 'stock', ?, ?, NULL, ?, 'pending', ?, ?, ?, 'null', '[]', ?)
+        `)
+        .run(
+          createId("lifecycle"),
+          `ticket_prop_${opts.proposalId}`,
+          opts.symbol ?? "NVDA.US",
+          opts.side ?? "buy",
+          opts.quantity ?? 10,
+          opts.brokerStatus ?? "New",
+          opts.lifecycleStage ?? "submitted",
+          opts.submittedAt ?? "2026-07-10T01:05:00.000Z",
+          opts.lastObservedAt ?? "2026-07-10T01:10:00.000Z",
+          opts.ownerId
+        );
+    }
+
+    it("adds a submission event and a latest-observed-state event when a lifecycle row exists", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, { ownerId: member.id, status: "approved" });
+      seedLifecycleRow(db, {
+        proposalId: id,
+        ownerId: member.id,
+        brokerStatus: "New",
+        lifecycleStage: "submitted",
+        submittedAt: "2026-07-10T01:05:00.000Z",
+        lastObservedAt: "2026-07-10T01:10:00.000Z"
+      });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).toContain("2026-07-10T01:05:00.000Z");
+      expect(body).toContain("已提交至券商");
+      expect(body).toContain("2026-07-10T01:10:00.000Z");
+      expect(body).toContain("最新状态");
+      expect(body).toContain("New");
+    });
+
+    it("does not add lifecycle events when no matching lifecycle row exists (e.g. a rejected proposal)", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, { ownerId: member.id, status: "rejected" });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).not.toContain("已提交至券商");
+      expect(body).not.toContain("最新状态");
+    });
+
+    it("does not leak another proposal's lifecycle row (ticket ids are per-proposal)", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedProposal(db, { ownerId: member.id, status: "approved" });
+      const otherId = seedProposal(db, { ownerId: member.id, status: "approved" });
+      seedLifecycleRow(db, { proposalId: otherId, ownerId: member.id, symbol: "TSLA.US" });
+
+      const response = await authed(`/proposal/${id}`, token);
+      const body = await response.text();
+
+      expect(body).not.toContain("已提交至券商");
+      expect(body).not.toContain("TSLA.US");
+    });
   });
 });
