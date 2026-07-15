@@ -25,7 +25,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { methodNotAllowed, type Member } from "@packages/shared-types";
+import {
+  methodNotAllowed,
+  OfficialPaperOrderLifecycleRepository,
+  type Member,
+  type OfficialPaperOrderLifecycle
+} from "@packages/shared-types";
 
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
@@ -226,15 +231,49 @@ function renderEvidenceCard(proposal: ProposalDetailRow): Html {
   </section>`;
 }
 
-function renderApprovalTimelineCard(proposal: ProposalDetailRow): Html {
+// Phase 6 Task 6 (2026-07-15 plan): the approved_half quantity is NEVER
+// stored on the proposal row itself - the proposals table DDL is frozen
+// (plan Global Constraint), and ProposalRepository.consumeApproval only ever
+// writes `status`/`consumed_at`/`decided_at`/`decided_by` (packages/shared-
+// types/src/database.ts). The half-quantity is therefore recomputed at
+// display time from the ORIGINAL requested quantity, using the exact same
+// rounding rule proposals.mjs's approve-half CLI command applies when it
+// actually places the reduced order (plan Global Constraint: "减半量 =
+// Math.max(1, Math.floor(quantity/2))（qty=1 减半=1，文档化）") - so this page
+// always shows the same number the order that actually got sent used.
+function computeHalfApprovedQuantity(originalQuantity: number): number {
+  return Math.max(1, Math.floor(originalQuantity / 2));
+}
+
+function renderApprovalTimelineCard(proposal: ProposalDetailRow, lifecycle: OfficialPaperOrderLifecycle | null): Html {
   const entries: Html[] = [
     html`<div class="alert"><time class="mono">${proposal.createdAt}</time><span>提案创建</span></div>`
   ];
   if (proposal.decidedAt) {
     const decidedByNote = proposal.decidedBy ? ` · 决策人 ${proposal.decidedBy}` : "";
+    const halfNote =
+      proposal.status === "approved_half"
+        ? ` · 数量减半至 ${computeHalfApprovedQuantity(proposal.quantity)} 股（原申请 ${proposal.quantity} 股）`
+        : "";
     entries.push(
-      html`<div class="alert"><time class="mono">${proposal.decidedAt}</time><span>审批决定${decidedByNote}</span></div>`
+      html`<div class="alert"><time class="mono">${proposal.decidedAt}</time><span>审批决定${decidedByNote}${halfNote}</span></div>`
     );
+  }
+  // Lifecycle events (record-before-execute rows keyed by
+  // `ticket_prop_<proposalId>` - apps/broker-executor/src/server.ts's
+  // deriveTicketId): submission time and, when the broker's reply has since
+  // moved the row past that first insert, the latest observed broker state.
+  // A proposal that never reached the executor (rejected/expired/still
+  // pending) has no such row - `lifecycle` is null and neither event renders.
+  if (lifecycle) {
+    entries.push(
+      html`<div class="alert"><time class="mono">${lifecycle.submittedAt}</time><span>已提交至券商（${lifecycle.lifecycleStage}）</span></div>`
+    );
+    if (lifecycle.lastObservedAt !== lifecycle.submittedAt) {
+      entries.push(
+        html`<div class="alert"><time class="mono">${lifecycle.lastObservedAt}</time><span>最新状态：${lifecycle.brokerStatus}（${lifecycle.lifecycleStage}）</span></div>`
+      );
+    }
   }
   if (proposal.consumedAt) {
     entries.push(html`<div class="alert"><time class="mono">${proposal.consumedAt}</time><span>执行完成</span></div>`);
@@ -243,6 +282,15 @@ function renderApprovalTimelineCard(proposal: ProposalDetailRow): Html {
     <h2>审批与执行时间线</h2>
     ${joinHtml(entries)}
   </section>`;
+}
+
+// Mirrors apps/broker-executor/src/server.ts's `deriveTicketId` EXACTLY - a
+// pure, deterministic string format (no DB read) both sides must agree on.
+// Duplicated rather than imported: platform-app has no dependency on the
+// broker-executor app (only on @packages/shared-types, see package.json),
+// and this is a plain string convention, not executor business logic.
+function deriveLifecycleTicketId(proposalId: string): string {
+  return `ticket_prop_${proposalId}`;
 }
 
 function renderOutcomeCard(proposal: ProposalDetailRow): Html {
@@ -263,11 +311,14 @@ function renderProposalPage(
   nonce: string
 ): void {
   const now = currentNow(deps);
+  const lifecycle = new OfficialPaperOrderLifecycleRepository(deps.db).getByTicketId(
+    deriveLifecycleTicketId(proposal.id)
+  );
 
   const bodyHtml = html`<div class="bento">${renderStatusBar(proposal.status)}</div>
     <div class="bento" style="margin-top:10px">${renderOriginalTextCard(proposal)}</div>
     <div class="bento" style="margin-top:10px">${renderDisciplineReportCard(proposal)}${renderEvidenceCard(proposal)}</div>
-    <div class="bento" style="margin-top:10px">${renderApprovalTimelineCard(proposal)}</div>
+    <div class="bento" style="margin-top:10px">${renderApprovalTimelineCard(proposal, lifecycle)}</div>
     <div class="bento" style="margin-top:10px">${renderOutcomeCard(proposal)}</div>`;
 
   const page = renderPage({

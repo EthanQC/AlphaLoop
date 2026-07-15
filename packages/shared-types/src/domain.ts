@@ -8,12 +8,44 @@ export type Environment = "live" | "paper" | "shadow";
 export type OrderSide = "buy" | "sell";
 export type RiskDecisionStatus = "allow" | "block" | "require_review";
 export type ExecutionResultStatus = "accepted" | "rejected" | "submitted" | "pending";
+// Phase 6 Task 4 (2026-07-15 plan) adds three stages to this union, ahead of
+// any broker status ever actually mapping to them (that mapper is Task 5's
+// "broker-status-map" module) - they are written directly by
+// broker-executor's /v1/tickets record-before-execute sequence:
+// "submitting" (Global Constraint ⑤: the lifecycle row inserted BEFORE the
+// broker call, while the CLI invocation hasn't returned yet), "accepted"
+// (an order the broker has acknowledged but not yet filled - reserved for
+// Task 5's status mapper; included here now because Constraint ④'s
+// open-orders budget query already needs to treat it as one of the
+// non-terminal "still counts against the owner's budget" stages), and
+// "submit_unconfirmed" (Constraint ⑥: the CLI call threw or timed out - the
+// order MAY exist at the broker, so this is deliberately NOT "rejected"/
+// "failed"; Task 5's reconciliation is what adjudicates it either way).
+// Phase 6 Task 5 (2026-07-15 plan) adds two more stages, both written by the
+// reconcile rebuild (apps/openclaw-config/scripts/reconcile-official-paper-
+// orders.mjs), never by the broker-status-map itself returning them for a
+// STATUS STRING it did recognize:
+// "unknown_broker_status" - the shared broker-status-map module
+// (broker-status-map.ts/.mjs) returns this for a broker status string it
+// does NOT recognize, deliberately distinct from the pre-existing plain
+// "unknown" (which means "no status string was available at all", e.g. the
+// CLI never returned one) - never silently "accepted".
+// "failed" - reconcile's own submit_unconfirmed adjudication: the CLI
+// call that recorded this row errored/timed out (stage was
+// 'submit_unconfirmed'), and a later reconcile pass found no matching order
+// in the broker's own day-order list after the adjudication timeout window
+// elapsed - distinct from "rejected" (broker explicitly refused it).
 export type OfficialPaperOrderLifecycleStage =
+  | "submitting"
   | "submitted"
+  | "accepted"
   | "pending"
   | "filled"
   | "cancelled"
   | "rejected"
+  | "submit_unconfirmed"
+  | "unknown_broker_status"
+  | "failed"
   | "unknown";
 export type OptionStrategy =
   | "long_call"
@@ -53,6 +85,16 @@ export interface OrderTicket {
   optionContract?: OptionContract;
   marketSnapshot?: MarketSnapshot;
   metadata?: Record<string, JsonValue>;
+  // Phase 6 Task 4 (2026-07-15 plan): every ticket the hardened /v1/tickets
+  // endpoint builds now comes from an approved Proposal, never from a
+  // caller-supplied ticket object - these two fields carry that provenance
+  // through risk evaluation, lifecycle recording, and the executed-proposal
+  // linkage (proposals.markExecuted). Optional on the TYPE (existing
+  // broker-executor unit tests construct bare tickets without them) but
+  // assertOrderTicket below requires them at the one call site that matters:
+  // the executor's own pre-execution sanity check on its server-built ticket.
+  ownerId?: string;
+  proposalId?: string;
 }
 
 export interface RiskDecision {
@@ -81,7 +123,13 @@ export interface ExecutionResult {
 export interface OfficialPaperOrderLifecycle {
   id: string;
   ticketId?: string;
-  externalOrderId: string;
+  // Phase 6 Task 4: the record-before-execute row is INSERTed before the
+  // broker call happens - at that moment there is no external_order_id yet
+  // (that only exists once the broker replies). Was `string` (required);
+  // widened to optional. `external_order_id` in the DDL keeps its UNIQUE
+  // constraint (collisions among REAL broker order ids are still caught) but
+  // drops NOT NULL (migration v11) so this pre-broker-call row can exist.
+  externalOrderId?: string;
   provider: "longbridge-paper";
   environment: "paper";
   accountMode: "paper";
@@ -97,6 +145,57 @@ export interface OfficialPaperOrderLifecycle {
   lastObservedAt: string;
   raw?: JsonValue;
   notes: string[];
+  // Phase 6 Task 4: per-owner ownership already existed as a bare DB column
+  // (v4 migration's ALTER TABLE ... ADD COLUMN owner_id) but was never
+  // surfaced on this domain type - the new record-before-execute writers
+  // (ProposalRepository-linked inserts) need to read/write it, and the
+  // per-owner open-orders budget query (Constraint ④) groups by it.
+  ownerId?: string;
+}
+
+// Phase 6 Task 1 (2026-07-15 plan): mirrors the `proposals` table (v3 DDL,
+// packages/shared-types/src/database.ts) field-for-field. `status` is the
+// state-machine's full value set enforced by that table's CHECK constraint -
+// `consumeApproval` (ProposalRepository) is the ONLY writer allowed to move a
+// row out of 'pending', per the plan's execution-chain invariant ("approval
+// _token 原子消费...唯一的状态跃迁通道").
+export type ProposalConfidence = "low" | "medium" | "high";
+
+export type ProposalStatus =
+  | "pending"
+  | "approved"
+  | "approved_half"
+  | "rejected"
+  | "expired"
+  | "executed"
+  | "failed";
+
+export interface Proposal {
+  id: string;
+  ownerId: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  orderType: string;
+  limitPrice?: number;
+  reason: string;
+  evidence: JsonValue[];
+  strategyRef?: string;
+  disciplineReport: JsonValue[];
+  invalidation?: string;
+  stopLoss?: number;
+  budgetImpact?: number;
+  confidence?: ProposalConfidence;
+  status: ProposalStatus;
+  approvalToken?: string;
+  consumedAt?: string;
+  decidedAt?: string;
+  decidedBy?: string;
+  ticketId?: string;
+  outcome?: string;
+  cardMessageId?: string;
+  createdAt: string;
+  expiresAt: string;
 }
 
 export interface RuleSet {
@@ -170,5 +269,19 @@ export function assertOrderTicket(value: unknown): asserts value is OrderTicket 
 
   if (typeof candidate.notionalUsd !== "number" || candidate.notionalUsd <= 0) {
     throw new Error("Order ticket notionalUsd must be a positive number.");
+  }
+
+  // Phase 6 Task 4 (2026-07-15 plan): every ticket that reaches this
+  // assertion is now built server-side by broker-executor from an approved
+  // Proposal (the old caller-supplied `{ ticket }` HTTP body is retired) -
+  // ownerId/proposalId are therefore always expected to be present, and a
+  // ticket missing either one is a broker-executor construction bug, not a
+  // client input error, so it fails loud here rather than silently
+  // executing without owner-scoped risk/budget attribution.
+  if (typeof candidate.ownerId !== "string" || !candidate.ownerId) {
+    throw new Error("Order ticket missing required ownerId.");
+  }
+  if (typeof candidate.proposalId !== "string" || !candidate.proposalId) {
+    throw new Error("Order ticket missing required proposalId.");
   }
 }

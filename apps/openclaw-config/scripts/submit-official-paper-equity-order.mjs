@@ -1,148 +1,43 @@
 #!/usr/bin/env node
-import { runLongbridgeJson } from "./_longbridge.mjs";
-
+// Phase 6 Task 4 (2026-07-15 plan): this script used to build an OrderTicket
+// by hand (quote lookup, budget check, everything) and POST it directly to
+// broker-executor's /v1/tickets - no proposal, no owner-only approval, no
+// shared secret. That direct path is now permanently closed: the endpoint
+// requires a `proposalId` for an already-approved (approved/approved_half)
+// proposal plus the `X-AlphaLoop-Broker-Secret` header (see
+// apps/broker-executor/src/index.ts's Global Constraints ①/②) - a bare
+// ticket body like this script used to send is rejected with 403 (pinned by
+// apps/broker-executor/src/index.test.ts's "manual script" negative test).
+//
+// This is now a thin shell: it makes NO network call and submits NOTHING.
+// It only prints the two-step replacement flow (create the trade as a
+// proposal, then approve it - approval is what triggers execution) and
+// exits non-zero, so a script or muscle-memory invocation fails loud instead
+// of silently no-op'ing or, worse, appearing to hang waiting on a rejected
+// HTTP call.
 const [sideArg, symbolArg, quantityArg] = process.argv.slice(2);
 
-if (!sideArg || !symbolArg || !quantityArg) {
-  console.error("Usage: submit-official-paper-equity-order.mjs <buy|sell> <SYMBOL> <QUANTITY>");
-  process.exit(1);
+const lines = [
+  "submit-official-paper-equity-order.mjs 不再直接下单。",
+  "Phase 6 起，broker-executor 的 /v1/tickets 要求已批准的提案（proposal），不再接受直接构造的工单。",
+  "请改用两步流程（proposals.mjs）：",
+  "  1) 创建提案：",
+  "     pnpm exec node apps/openclaw-config/scripts/proposals.mjs create \\",
+  "       --owner <memberId> --symbol <SYMBOL> --side <buy|sell> --quantity <N> \\",
+  "       --limit-price <PRICE> --reason \"manual: <人工下单说明>\"",
+  "  2) 批准（owner 本人操作，自动触发执行）：",
+  "     pnpm exec node apps/openclaw-config/scripts/proposals.mjs approve \\",
+  "       --token <create 输出的 approval_token> --actor <memberId>",
+  "approve 命令在批准成功后会自动携带 proposalId 与共享密钥调用 broker-executor 执行；",
+  "执行结果（成交/未确认/被拒）会体现在提案状态与生命周期记录中。"
+];
+
+if (sideArg && symbolArg && quantityArg) {
+  lines.push(
+    "",
+    `（收到的旧式参数 "${sideArg} ${symbolArg} ${quantityArg}" 已无法直接下单，请对照上方流程改用 --side ${sideArg} --symbol ${symbolArg} --quantity ${quantityArg}。）`
+  );
 }
 
-if (process.env.LONGBRIDGE_ACCOUNT_MODE !== "paper") {
-  console.error("Refusing to submit: set LONGBRIDGE_ACCOUNT_MODE=paper after confirming this token is the official Longbridge paper account.");
-  process.exit(1);
-}
-
-if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
-  console.error("Refusing to submit: set LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true after confirming Longbridge Demo A/C is selected.");
-  process.exit(1);
-}
-
-if (process.env.ALLOW_LIVE_EXECUTION !== "false") {
-  console.error("Refusing to submit: ALLOW_LIVE_EXECUTION=false is required for official paper automation.");
-  process.exit(1);
-}
-
-const side = sideArg.toLowerCase();
-if (!["buy", "sell"].includes(side)) {
-  console.error("Side must be buy or sell.");
-  process.exit(1);
-}
-
-const quantity = Number(quantityArg);
-if (!Number.isInteger(quantity) || quantity <= 0) {
-  console.error("Quantity must be a positive integer.");
-  process.exit(1);
-}
-
-const quotePayload = await runLongbridgeJson("quote", ["quote", symbolArg]);
-const quote = Array.isArray(quotePayload) ? quotePayload[0] : quotePayload?.quotes?.[0];
-const [assetsPayload, positionsPayload] = await Promise.all([
-  runLongbridgeJson("trade", ["assets"]),
-  runLongbridgeJson("trade", ["positions"])
-]);
-const accountNetLiq = extractNetAssets(assetsPayload);
-const officialPaperCurrentExposureUsd = estimateCurrentExposure(positionsPayload);
-const price = side === "buy"
-  ? toNumber(quote?.ask_price ?? quote?.askPrice ?? quote?.ask ?? quote?.last_done ?? quote?.last)
-  : toNumber(quote?.bid_price ?? quote?.bidPrice ?? quote?.bid ?? quote?.last_done ?? quote?.last);
-
-if (!price) {
-  throw new Error(`No usable limit price returned for ${symbolArg}`);
-}
-
-if (side === "buy" && accountNetLiq > 0) {
-  const projectedExposure = officialPaperCurrentExposureUsd + price * quantity;
-  const budget = accountNetLiq * 0.1;
-  if (projectedExposure > budget) {
-    throw new Error(`Refusing to submit: projected OpenClaw official paper exposure ${projectedExposure.toFixed(2)} exceeds 10% budget ${budget.toFixed(2)}.`);
-  }
-}
-
-const brokerExecutorUrl = process.env.BROKER_EXECUTOR_URL ?? "http://127.0.0.1:4312";
-const ticket = {
-  id: `manual_${Date.now()}`,
-  source: "manual-official-paper",
-  submittedAt: new Date().toISOString(),
-  environment: "paper",
-  assetClass: guessAssetClass(symbolArg, quote),
-  symbol: symbolArg,
-  side,
-  quantity,
-  conviction: "normal",
-  notionalUsd: price * quantity,
-  marketSnapshot: {
-    bid: toNumber(quote?.bid_price ?? quote?.bidPrice ?? quote?.bid ?? quote?.last_done ?? quote?.last),
-    ask: toNumber(quote?.ask_price ?? quote?.askPrice ?? quote?.ask ?? quote?.last_done ?? quote?.last),
-    last: toNumber(quote?.last_done ?? quote?.lastDone ?? quote?.last),
-    timestamp: new Date().toISOString()
-  },
-  metadata: {
-    eventId: `manual_official_${Date.now()}`,
-    accountMode: "paper",
-    officialPaper: true,
-    demoAccountGuard: "Longbridge Demo A/C plus LONGBRIDGE_ACCOUNT_MODE=paper required.",
-    accountNetLiq,
-    officialPaperCurrentExposureUsd,
-    openclawPaperBudgetPercent: 10,
-    currentOpenIdeas: 0,
-    currentHighConvictionIdeas: 0,
-    dailyNewRiskPercent: 0
-  }
-};
-
-const response = await fetch(`${brokerExecutorUrl}/v1/tickets`, {
-  method: "POST",
-  headers: {
-    "content-type": "application/json"
-  },
-  body: JSON.stringify({ ticket })
-});
-
-const text = await response.text();
-let result;
-try {
-  result = JSON.parse(text);
-} catch {
-  result = { raw: text };
-}
-
-console.log(JSON.stringify(result, null, 2));
-if (!response.ok) {
-  process.exit(1);
-}
-
-function toNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : undefined;
-}
-
-function guessAssetClass(symbol, quoteValue) {
-  const name = String(quoteValue?.name ?? "").toLowerCase();
-  if (name.includes("etf") || symbol.endsWith(".US") && ["SPY.US", "QQQ.US", "IWM.US", "DIA.US"].includes(symbol)) {
-    return "etf";
-  }
-  return "stock";
-}
-
-function extractNetAssets(payload) {
-  const rows = Array.isArray(payload) ? payload : payload?.assets ?? [];
-  const first = rows[0] ?? {};
-  const value = toNumber(first.net_assets ?? first.netAssets);
-  if (!value) {
-    throw new Error("Unable to read official paper net assets from Longbridge assets.");
-  }
-  return value;
-}
-
-function estimateCurrentExposure(payload) {
-  const rows = Array.isArray(payload) ? payload : payload?.positions ?? [];
-  return rows.reduce((sum, row) => {
-    const quantity = toNumber(row?.quantity);
-    if (!quantity) {
-      return sum;
-    }
-    const price = toNumber(row?.market_price ?? row?.marketPrice ?? row?.last_price ?? row?.lastPrice ?? row?.cost_price ?? row?.costPrice);
-    return sum + quantity * (price ?? 0);
-  }, 0);
-}
+console.error(lines.join("\n"));
+process.exit(1);

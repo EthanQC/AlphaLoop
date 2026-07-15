@@ -45,6 +45,84 @@ export function currentUsEasternTradingDay(date = new Date()) {
   return getZonedParts(date, NEW_YORK_TIMEZONE).dateLabel;
 }
 
+// Phase 6 Task 2 (2026-07-15 plan): the ONE shared computation of "which
+// US/Eastern trading week (Monday-Friday) does this instant fall in", used by
+// BOTH circuit-breaker.mjs (weekly-loss window: baseline = last snapshot
+// before Monday 00:00 America/New_York) and discipline-engine.mjs (the
+// 财报周 rule's "is the earnings date inside THIS week" check) - factored
+// here rather than duplicated in each, so the DST-crossing arithmetic below
+// has exactly one implementation to get right and test.
+//
+// DST handling: `getZonedParts` already gives an exact America/New_York
+// weekday/date-label for any instant (Intl does the DST-aware zone math), so
+// finding Monday's CALENDAR date is pure Gregorian day-arithmetic - done by
+// anchoring at T12:00:00Z (noon UTC) before shifting days, which never lands
+// on a different calendar date than intended in any zone within +/-12h of
+// UTC (America/New_York is only -4/-5h), so this step is unaffected by DST.
+// Converting that calendar date's LOCAL MIDNIGHT to a UTC instant, though, DOES
+// depend on which side of a DST transition the date falls on (EST = UTC-5
+// vs EDT = UTC-4) - `nyUtcOffsetMinutes` reads the real offset in effect at
+// that date straight from Intl's `shortOffset` (e.g. "GMT-5"/"GMT-4") rather
+// than hardcoding a fixed offset or the NYSE holiday-calendar's own DST
+// assumptions, so this stays correct across every spring-forward/fall-back
+// boundary without a lookup table. Both are pinned in
+// trading-schedule.test.ts (an EDT Monday and an EST Monday).
+function shiftDateLabel(dateLabel, days) {
+  const anchor = new Date(`${dateLabel}T12:00:00Z`);
+  anchor.setUTCDate(anchor.getUTCDate() + days);
+  const y = anchor.getUTCFullYear();
+  const m = String(anchor.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(anchor.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function nyUtcOffsetMinutes(anchorDate) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: NEW_YORK_TIMEZONE,
+    timeZoneName: "shortOffset"
+  }).formatToParts(anchorDate);
+  const offsetLabel = parts.find((part) => part.type === "timeZoneName")?.value ?? "GMT+0";
+  const match = /GMT([+-])(\d+)(?::(\d+))?/.exec(offsetLabel);
+  if (!match) {
+    return 0;
+  }
+  const sign = match[1] === "-" ? -1 : 1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3] ?? 0);
+  return sign * (hours * 60 + minutes);
+}
+
+// UTC instant for 00:00:00 America/New_York on `dateLabel` ('YYYY-MM-DD').
+function nyMidnightUtcIso(dateLabel) {
+  const offsetMinutes = nyUtcOffsetMinutes(new Date(`${dateLabel}T12:00:00Z`));
+  const utcMillisIfOffsetWereZero = Date.parse(`${dateLabel}T00:00:00Z`);
+  return new Date(utcMillisIfOffsetWereZero - offsetMinutes * 60000).toISOString();
+}
+
+/**
+ * Returns the Monday-Friday US/Eastern trading week containing `date`:
+ * `mondayDateLabel`/`fridayDateLabel` ('YYYY-MM-DD', America/New_York
+ * calendar dates - NOT adjusted for market holidays, this is the calendar
+ * week, matching the plan's literal "Monday 00:00 US/Eastern"), and
+ * `weekStartUtcIso` (that Monday's 00:00:00 America/New_York instant,
+ * expressed as a UTC ISO string, DST-correct - see `nyMidnightUtcIso` above).
+ */
+export function currentUsEasternTradingWeek(date = new Date()) {
+  const parts = getZonedParts(date, NEW_YORK_TIMEZONE);
+  // WEEKDAY_INDEX: Sun=0 .. Sat=6. Days since the most recent Monday: Mon=0,
+  // Tue=1, ..., Sun=6 (Sunday "belongs to" the week that started the
+  // preceding Monday).
+  const daysSinceMonday = (parts.weekday - 1 + 7) % 7;
+  const mondayDateLabel = shiftDateLabel(parts.dateLabel, -daysSinceMonday);
+  const fridayDateLabel = shiftDateLabel(mondayDateLabel, 4);
+
+  return {
+    mondayDateLabel,
+    fridayDateLabel,
+    weekStartUtcIso: nyMidnightUtcIso(mondayDateLabel)
+  };
+}
+
 export function shouldRunReportDelivery(kind, date = new Date()) {
   const parts = getZonedParts(date, SHANGHAI_TIMEZONE);
   if (parts.minute !== 0 || parts.hour !== 20) {

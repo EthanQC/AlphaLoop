@@ -53,10 +53,10 @@ export function getLongbridgeRateLimitConfig() {
   return LONG_BRIDGE_LIMITS;
 }
 
-export async function runLongbridgeJson(category, args) {
-  const payload = parseLongbridgeJson(await runLongbridgeText(category, [...args, "--format", "json"]));
+export async function runLongbridgeJson(category, args, options = {}) {
+  const payload = parseLongbridgeJson(await runLongbridgeText(category, [...args, "--format", "json"], options));
   if (args[0] === "check") {
-    healLongbridgeRegionCacheFromCheck(payload);
+    healLongbridgeRegionCacheFromCheck(payload, options.env);
   }
   return payload;
 }
@@ -64,7 +64,7 @@ export async function runLongbridgeJson(category, args) {
 export async function runLongbridgeJsonWithRetry(category, args, options = {}) {
   const payload = parseLongbridgeJson(await runLongbridgeTextWithRetry(category, [...args, "--format", "json"], options));
   if (args[0] === "check") {
-    healLongbridgeRegionCacheFromCheck(payload);
+    healLongbridgeRegionCacheFromCheck(payload, options.env);
   }
   return payload;
 }
@@ -76,7 +76,7 @@ export async function runLongbridgeTextWithRetry(category, args, options = {}) {
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await runLongbridgeText(category, args);
+      return await runLongbridgeText(category, args, options);
     } catch (error) {
       lastError = error;
       if (attempt >= attempts || !isTransientLongbridgeError(error)) {
@@ -85,7 +85,7 @@ export async function runLongbridgeTextWithRetry(category, args, options = {}) {
 
       await sleep(backoffMs(attempt));
       if (args[0] !== "check") {
-        await healLongbridgeRegionCache(category);
+        await healLongbridgeRegionCache(category, options);
       }
     }
   }
@@ -93,14 +93,31 @@ export async function runLongbridgeTextWithRetry(category, args, options = {}) {
   throw new Error(`Longbridge 只读请求失败（${label}，已尝试 ${attempts} 次）：${sanitizeLongbridgeError(lastError)}`);
 }
 
-export async function runLongbridgeText(category, args) {
+// Task 6 (2026-07-15 phase6 plan, multi-account scaffold): `options.env` /
+// `options.rateLimitDir` are optional per-call overrides so a per-member
+// subprocess (member-credentials.mjs's buildMemberSubprocessEnv) can isolate
+// BOTH the subprocess env (and therefore, via HOME, the real longbridge
+// CLI's own region-cache file - see resolveRegionCachePath below, which
+// reads `options.env.HOME` when given) and this module's own rate-limit
+// state/lock files, without touching the single shared account's files.
+// Omitting `options` (every pre-Task-6 caller) reproduces the exact prior
+// behavior byte-for-byte: `buildLongbridgeCliEnv()`'s own process.env
+// default, and `runtimeRoot` as the rate-limit directory.
+export async function runLongbridgeText(category, args, options = {}) {
   const config = LONG_BRIDGE_LIMITS[category];
   if (!config) {
     throw new Error(`Unsupported Longbridge rate-limit category: ${category}`);
   }
 
-  const statePath = join(runtimeRoot, `longbridge-rate-limit-${category}.json`);
-  const lockPath = join(runtimeRoot, `longbridge-rate-limit-${category}.lock`);
+  // `options.rateLimitDir` wins if given explicitly; otherwise a caller that
+  // only has an already-built subprocess env in hand (buildMemberSubprocessEnv's
+  // return value) can still get isolation via that env's own
+  // LONGBRIDGE_RATE_LIMIT_DIR convention; the module-level shared `runtimeRoot`
+  // is the unchanged default for every existing (non-per-member) caller.
+  const rateLimitDir = options.rateLimitDir ?? options.env?.LONGBRIDGE_RATE_LIMIT_DIR ?? runtimeRoot;
+  mkdirSync(rateLimitDir, { recursive: true });
+  const statePath = join(rateLimitDir, `longbridge-rate-limit-${category}.json`);
+  const lockPath = join(rateLimitDir, `longbridge-rate-limit-${category}.lock`);
   const release = await acquireLock(lockPath, config.lockTtlMs);
 
   try {
@@ -108,7 +125,7 @@ export async function runLongbridgeText(category, args) {
     const cli = resolveLongbridgeCli();
     return execFileSync(cli, args, {
       encoding: "utf8",
-      env: buildLongbridgeCliEnv(),
+      env: buildLongbridgeCliEnv(options.env),
       // Reads the SAME module-level constant the lock TTL is derived from
       // (see LONGBRIDGE_CLI_TIMEOUT_MS above) rather than re-reading
       // process.env here - the two must never be able to drift apart, or
@@ -139,16 +156,22 @@ function sanitizeLongbridgeError(error) {
     .slice(0, 500);
 }
 
-async function healLongbridgeRegionCache(category) {
+async function healLongbridgeRegionCache(category, options = {}) {
   try {
-    const payload = parseLongbridgeJson(await runLongbridgeText(category, ["check", "--format", "json"]));
-    healLongbridgeRegionCacheFromCheck(payload);
+    const payload = parseLongbridgeJson(await runLongbridgeText(category, ["check", "--format", "json"], options));
+    healLongbridgeRegionCacheFromCheck(payload, options.env);
   } catch {
     // The next real attempt decides success; this only shortens repeated region failures.
   }
 }
 
-function healLongbridgeRegionCacheFromCheck(payload) {
+// `env` is the same optional per-call override runLongbridgeText accepts
+// (Task 6): when given, the region cache is read/healed from THAT env's
+// `HOME` (a per-member isolated home directory) instead of the calling
+// process's own `process.env.HOME` - so a member's subprocess and its own
+// on-disk region cache stay together, and healing one member's region cache
+// can never write into another member's (or the shared account's) file.
+function healLongbridgeRegionCacheFromCheck(payload, env) {
   const connectivity = payload?.connectivity;
   if (!connectivity || typeof connectivity !== "object") {
     return;
@@ -162,7 +185,7 @@ function healLongbridgeRegionCacheFromCheck(payload) {
   }
 
   try {
-    writeFileSync(resolveRegionCachePath(), best);
+    writeFileSync(resolveRegionCachePath(env), best);
   } catch {
     // Region healing is an optimization. Do not hide the actual API result behind it.
   }
@@ -176,16 +199,26 @@ function normalizeRegion(value) {
   return "";
 }
 
-function resolveRegionCachePath() {
-  return `${process.env.HOME}/.longbridge/openapi/region-cache`;
+// `env` optional override (Task 6): a per-member env carries its own `HOME`
+// (member-credentials.mjs's buildMemberSubprocessEnv), so that member's
+// region-cache path is derived from ITS `HOME`, not the calling process's.
+// Omitted -> exact prior behavior (`process.env.HOME`).
+function resolveRegionCachePath(env) {
+  const home = env?.HOME ?? process.env.HOME;
+  return `${home}/.longbridge/openapi/region-cache`;
 }
 
 function resolveLongbridgeCli() {
   return process.env.LONGBRIDGE_CLI_PATH ?? `${process.env.HOME}/.local/bin/longbridge`;
 }
 
-function buildLongbridgeCliEnv() {
-  const env = { ...process.env };
+// `overrideEnv` (Task 6): the base to layer the ACCESS_TOKEN sanitization
+// below on top of - a per-member subprocess env (already containing that
+// member's own LONGBRIDGE_ACCESS_TOKEN/HOME/etc., see
+// member-credentials.mjs's buildMemberSubprocessEnv) when given, else the
+// unchanged default `process.env`.
+function buildLongbridgeCliEnv(overrideEnv) {
+  const env = { ...(overrideEnv ?? process.env) };
   for (const key of [
     "LONGBRIDGE_ACCESS_TOKEN",
     "LONGPORT_ACCESS_TOKEN"

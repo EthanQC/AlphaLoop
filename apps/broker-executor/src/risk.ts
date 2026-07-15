@@ -9,6 +9,16 @@ export interface OfficialPaperRiskFacts {
   currentExposureUsd: number;
   fetchedAt: string;
   maxAgeMs?: number;
+  // Phase 6 Task 4 (2026-07-15 plan), Global Constraint ④: the notional of
+  // this owner's OWN still-open lifecycle orders (stage IN submitting/
+  // accepted/pending) - not yet filled/cancelled/rejected, so not yet
+  // reflected in the account snapshot's currentExposureUsd, but real money
+  // already at risk. Added to currentExposureUsd before the 10% budget check
+  // so two sequential 9.5% orders correctly block the SECOND one instead of
+  // both independently reading "under budget" against the same stale
+  // snapshot. Optional (defaults to 0) so every existing caller/test that
+  // never supplies it keeps behaving exactly as before.
+  openOrdersNotionalUsd?: number;
 }
 
 export function evaluateRisk(
@@ -38,14 +48,20 @@ export function evaluateRisk(
   }
 
   if (ticket.environment === "paper" && trustedPaperFacts && ticket.side === "buy") {
-    const projectedOfficialPaperExposureUsd = trustedPaperFacts.currentExposureUsd + ticket.notionalUsd;
+    // Phase 6 Task 4, Global Constraint ④: open (not-yet-filled) orders for
+    // this owner count against the budget too - otherwise two sequential
+    // 9.5% orders would each independently read "under the 10% cap" against
+    // the same account snapshot, when together they are 19%.
+    const openOrdersNotionalUsd = trustedPaperFacts.openOrdersNotionalUsd ?? 0;
+    const projectedOfficialPaperExposureUsd =
+      trustedPaperFacts.currentExposureUsd + openOrdersNotionalUsd + ticket.notionalUsd;
     const projectedOfficialPaperExposurePercent =
       (projectedOfficialPaperExposureUsd / trustedPaperFacts.accountNetLiq) * 100;
 
     if (projectedOfficialPaperExposurePercent > openclawPaperBudgetPercent) {
       status = escalateStatus(status, "block");
       reasons.push(
-        `OpenClaw 官方模拟盘预算 ${projectedOfficialPaperExposurePercent.toFixed(2)}% 超过上限 ${openclawPaperBudgetPercent.toFixed(2)}%；账户 90% 必须保持不动。`
+        `OpenClaw 官方模拟盘预算 ${projectedOfficialPaperExposurePercent.toFixed(2)}% 超过上限 ${openclawPaperBudgetPercent.toFixed(2)}%（含未成交挂单 ${openOrdersNotionalUsd.toFixed(2)} 美元）；账户 90% 必须保持不动。`
       );
     }
   }
@@ -113,6 +129,13 @@ function validateOfficialPaperRiskFacts(facts?: OfficialPaperRiskFacts): Officia
     facts.accountNetLiq <= 0 ||
     !Number.isFinite(facts.currentExposureUsd) ||
     facts.currentExposureUsd < 0
+  ) {
+    return undefined;
+  }
+
+  if (
+    facts.openOrdersNotionalUsd !== undefined &&
+    (!Number.isFinite(facts.openOrdersNotionalUsd) || facts.openOrdersNotionalUsd < 0)
   ) {
     return undefined;
   }

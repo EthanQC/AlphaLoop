@@ -11,6 +11,7 @@ import {
   openTradingDatabase
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import { buildMemberSubprocessEnv, loadMemberCredentials } from "./member-credentials.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
 import { assertOfficialPaperReportEnvironment, normalizeOfficialPaperSnapshot, normalizeQuotePayload, toNumber } from "./report-data.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
@@ -57,6 +58,21 @@ async function pollOfficialPaper(db, forceRun = false) {
     return;
   }
 
+  // Task 6 (2026-07-15 phase6 plan): try per-member polling FIRST. As long as
+  // zero active members have a `<credentials root>/<memberId>/longbridge.env`
+  // file (true in every real deployment today - P10 is when a second real
+  // account's credentials actually get written), `pollOfficialPaperPerMember`
+  // returns `null` and this falls through to the exact H4 single-shared-
+  // account path below, byte-for-byte unchanged (including the strategy
+  // reflection this per-member branch deliberately does NOT generate yet -
+  // per-member reflections are a P7/control-agent concern, out of this
+  // task's scope).
+  const perMemberResults = await pollOfficialPaperPerMember(db);
+  if (perMemberResults) {
+    console.log(JSON.stringify({ polled: true, perMember: true, snapshots: perMemberResults }, null, 2));
+    return;
+  }
+
   assertOfficialPaperReportEnvironment();
   const snapshot = await fetchOfficialPaperSnapshot();
   const snapshotId = saveSnapshot(db, snapshot, "hourly_poll");
@@ -68,6 +84,61 @@ async function pollOfficialPaper(db, forceRun = false) {
   `).run(reflectionId, snapshotId, snapshot.fetchedAt, reflection.summary, JSON.stringify(reflection));
 
   console.log(JSON.stringify({ polled: true, snapshotId, reflectionId, summary: reflection.summary }, null, 2));
+}
+
+// Task 6 (2026-07-15 phase6 plan): per-member polling loop. For every
+// currently-ACTIVE member (MemberRepository.listActive() - same active-only
+// scoping resolveSnapshotOwnerId already uses), tries to load that member's
+// own broker credentials (member-credentials.mjs's loadMemberCredentials).
+// Members with no credentials file are silently skipped (an ordinary
+// member has no linked broker account today) - NOT an error.
+//
+// - Zero credentialed members (the ubiquitous case right now) -> returns
+//   `null`, the explicit "nothing to do here, use the H4 shared-account
+//   path" signal `pollOfficialPaper` above branches on.
+// - One or more credentialed members -> fetches EACH member's OWN snapshot
+//   with THEIR OWN env/cache isolation (buildMemberSubprocessEnv) and saves
+//   it with `owner_id = member.id` (never the resolveSnapshotOwnerId
+//   single-active-member/`'__shared__'` inference H4 uses - a credentialed
+//   member's snapshot is directly attributable, no inference needed).
+//
+// `fetchImpl` is the injection seam (plan: "长桥抓取本身保持可注入
+// (fetchImpl/execFn)...真实多账户 = P10") - tests pass a fixture function
+// `(member, creds) => snapshot` so this loop is fully exercisable without a
+// real longbridge CLI/subprocess. The real default
+// (`fetchOfficialPaperSnapshotForMember`) builds that member's isolated
+// subprocess env and calls the SAME `fetchOfficialPaperSnapshot` the H4
+// shared path uses, just parameterized per member.
+export async function pollOfficialPaperPerMember(db, options = {}) {
+  const { fetchImpl = fetchOfficialPaperSnapshotForMember, credentialsRootDir, reason = "hourly_poll_per_member" } = options;
+
+  const activeMembers = new MemberRepository(db).listActive();
+  const credentialed = activeMembers
+    .map((member) => ({ member, creds: loadMemberCredentials(member.id, { rootDir: credentialsRootDir }) }))
+    .filter((entry) => entry.creds !== null);
+
+  if (credentialed.length === 0) {
+    return null;
+  }
+
+  const results = [];
+  for (const { member, creds } of credentialed) {
+    const snapshot = await fetchImpl(member, creds);
+    const snapshotId = saveSnapshot(db, snapshot, reason, member.id);
+    results.push({ ownerId: member.id, snapshotId });
+  }
+  return results;
+}
+
+// Real (non-test) fetchImpl default for pollOfficialPaperPerMember: builds
+// this member's isolated subprocess env (HOME + rate-limit dir, never
+// mutating global process.env - member-credentials.mjs's
+// buildMemberSubprocessEnv) and reuses fetchOfficialPaperSnapshot's exact
+// check/assets/positions/quotes sequence, just threaded with that env
+// instead of the ambient shared-account one.
+async function fetchOfficialPaperSnapshotForMember(member, creds) {
+  const env = buildMemberSubprocessEnv(creds);
+  return fetchOfficialPaperSnapshot({ env, rateLimitDir: creds.cachePaths.rateLimitDir });
 }
 
 async function sendPnlReport(db, forceRun = false) {
@@ -115,18 +186,27 @@ export async function runManualSnapshot(db) {
   return snapshot;
 }
 
-async function fetchOfficialPaperSnapshot() {
+// Task 6 (2026-07-15 phase6 plan): `execOptions` is an optional
+// `{env, rateLimitDir}` pair forwarded verbatim to every
+// runLongbridgeJsonWithRetry call below (which in turn forwards it to
+// _longbridge.mjs's per-call override params - see that file's Task 6
+// comments). Omitted (every pre-Task-6 caller: pollOfficialPaper/
+// sendPnlReport/runManualSnapshot's default single-shared-account path) -
+// every call uses _longbridge.mjs's own unchanged defaults. Only
+// fetchOfficialPaperSnapshotForMember (this file's per-member fetchImpl
+// default) passes a real `execOptions`.
+async function fetchOfficialPaperSnapshot(execOptions = {}) {
   const fetchedAt = new Date().toISOString();
-  const check = await runLongbridgeJsonWithRetry("trade", ["check"], { label: "Longbridge 连通性/令牌检查" });
+  const check = await runLongbridgeJsonWithRetry("trade", ["check"], { label: "Longbridge 连通性/令牌检查", ...execOptions });
   const [assets, positions] = await Promise.all([
-    runLongbridgeJsonWithRetry("trade", ["assets"], { label: "Longbridge 官方模拟盘资产" }),
-    runLongbridgeJsonWithRetry("trade", ["positions"], { label: "Longbridge 官方模拟盘持仓" })
+    runLongbridgeJsonWithRetry("trade", ["assets"], { label: "Longbridge 官方模拟盘资产", ...execOptions }),
+    runLongbridgeJsonWithRetry("trade", ["positions"], { label: "Longbridge 官方模拟盘持仓", ...execOptions })
   ]);
   const snapshot = normalizeOfficialPaperSnapshot({ check, assets, positions, fetchedAt });
   const quotes = [];
   for (const position of snapshot.positions) {
     try {
-      const payload = await runLongbridgeJsonWithRetry("quote", ["quote", position.symbol], { label: `Longbridge ${position.symbol} 行情` });
+      const payload = await runLongbridgeJsonWithRetry("quote", ["quote", position.symbol], { label: `Longbridge ${position.symbol} 行情`, ...execOptions });
       quotes.push(normalizeQuotePayload(payload, position.symbol));
     } catch (error) {
       quotes.push({ symbol: position.symbol, error: String(error?.message ?? error).slice(0, 160) });
@@ -178,13 +258,18 @@ export function attachPriceSource(positions, quotes) {
   return { positions: priced, degradedSymbols };
 }
 
-export function saveSnapshot(db, snapshot, reason) {
+// Task 6 (2026-07-15 phase6 plan): `explicitOwnerId` lets a per-member caller
+// (pollOfficialPaperPerMember) attribute a snapshot directly to the member it
+// was fetched for - no inference needed, unlike the H4 shared-account path,
+// which must GUESS an owner from `resolveSnapshotOwnerId`'s active-member-
+// count heuristic. Omitted (every H4 caller) -> the exact prior behavior.
+export function saveSnapshot(db, snapshot, reason, explicitOwnerId) {
   const id = createId("official_paper_snapshot");
   const primary = snapshot.primaryAsset ?? {};
   const netAssets = toNumber(primary.net_assets ?? primary.netAssets);
   const totalCash = toNumber(primary.total_cash ?? primary.totalCash);
   const marketValue = estimateMarketValue(snapshot);
-  const ownerId = resolveSnapshotOwnerId(db);
+  const ownerId = explicitOwnerId ?? resolveSnapshotOwnerId(db);
   db.prepare(`
     INSERT INTO official_paper_snapshots
     (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)

@@ -180,6 +180,86 @@ describe("evaluateRisk", () => {
     expect(result.reasons.join(" ")).toMatch(/10\.00%|OpenClaw 官方模拟盘预算/u);
   });
 
+  it("blocks a second 9.5% order once the first's OPEN (not-yet-filled) notional is counted against the same account snapshot (Global Constraint ④)", () => {
+    // The account snapshot alone (currentExposureUsd: 0) would make a lone
+    // 9.5% order look fine - the whole point of this test is that
+    // openOrdersNotionalUsd (the first order's still-open notional) must be
+    // added BEFORE the 10% check, so the second 9.5% order is blocked.
+    const firstOrder = evaluateRisk(
+      {
+        id: "ticket_open_1",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        side: "buy",
+        symbol: "AAPL",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 9_500
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString()
+      }
+    );
+    expect(firstOrder.status).toBe("allow");
+
+    const secondOrder = evaluateRisk(
+      {
+        id: "ticket_open_2",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        side: "buy",
+        symbol: "MSFT",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 9_500
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        openOrdersNotionalUsd: 9_500
+      }
+    );
+
+    expect(secondOrder.status).toBe("block");
+    expect(secondOrder.reasons.join(" ")).toMatch(/含未成交挂单/u);
+  });
+
+  it("treats a negative/non-finite openOrdersNotionalUsd as untrusted facts (falls back to the missing-facts block), same defensive posture as accountNetLiq/currentExposureUsd", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_bad_open_notional",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        side: "buy",
+        symbol: "AAPL",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 100
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        openOrdersNotionalUsd: -1
+      }
+    );
+
+    expect(result.status).toBe("block");
+    expect(result.reasons.join(" ")).toMatch(/官方模拟盘账户快照/u);
+  });
+
   it("does not block de-risking sells only because the official paper budget is already over 10%", () => {
     const result = evaluateRisk(
       {

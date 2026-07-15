@@ -2,6 +2,16 @@
  * Home page (Task 5): `GET /`. Identity-gated like every route past Task 3
  * (resolveIdentity runs first; a null result renders the shared 401 page).
  *
+ * Phase 6 Task 6 (2026-07-15 plan) addition: an amber circuit-breaker banner
+ * renders ABOVE every block below (CircuitBreakerRepository.isPaused(viewer.id,
+ * now) - v10's per-owner circuit_breaker_state table, circuit-breaker.mjs's
+ * engine) whenever the viewer's own proposal generation is currently paused.
+ * Deliberately its own block (not folded into layout.ts's existing
+ * `renderDegradedBanner`/`degraded` mechanism) - that banner is specifically
+ * about snapshot DATA quality (「数据降级提示」), a different concept from "you
+ * cannot get new trade proposals right now", and folding the two together
+ * would mislabel a circuit-breaker pause as a data problem.
+ *
  * Block order is a BINDING part of the plan (Task 5, req §1.2) and must not
  * be reshuffled:
  *   ① 开始研究       - disabled input/button placeholder ("站内研究 P8 上线").
@@ -18,7 +28,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { methodNotAllowed, type Member } from "@packages/shared-types";
+import { CircuitBreakerRepository, methodNotAllowed, type Member } from "@packages/shared-types";
 
 import {
   loadDisciplineRules,
@@ -169,6 +179,25 @@ function computeDailyChange(
 }
 
 // ---------------------------------------------------------------------------
+// 熔断横幅 (Phase 6 Task 6): renders above every block when the viewer's own
+// proposal generation is currently paused by their per-owner circuit breaker.
+// ---------------------------------------------------------------------------
+
+/** `null` (the common case - not paused) renders nothing. Text is the exact
+ * wording the plan specifies: "⛔ 熔断暂停中，至 <恢复时间> 不再生成新提案". */
+function renderCircuitBreakerBanner(pausedUntil: string | null): Html {
+  if (!pausedUntil) {
+    return trustedHtml("");
+  }
+  return html`<div class="bento" style="padding-bottom:0">
+    <section class="card w2 dt-w4 amber" role="alert" aria-label="熔断暂停提示">
+      <h2 style="color:var(--amber)">⛔ 熔断暂停中</h2>
+      <p style="font-size:13px;color:var(--ink)">熔断暂停中，至 <span class="mono">${pausedUntil}</span> 不再生成新提案。</p>
+    </section>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // ① 开始研究
 // ---------------------------------------------------------------------------
 
@@ -244,7 +273,7 @@ function renderTodoBlock(proposals: ProposalRow[]): Html {
   const body =
     proposals.length > 0
       ? joinHtml(proposals.map(renderProposalRow))
-      : html`<p style="font-size:13px;color:var(--sub)">提案审批 P6 上线</p>`;
+      : html`<p style="font-size:13px;color:var(--sub)">暂无待审提案</p>`;
   return html`<section class="card dt-w2">
     <h2>我的待办</h2>
     ${body}
@@ -328,9 +357,11 @@ function renderHomeBody(
   proposals: ProposalRow[],
   alertEvents: ReadonlyArray<AlertEventRow>,
   latestDaily: ReportIndexEntry | undefined,
-  disciplineRules: DisciplineRuleRow[]
+  disciplineRules: DisciplineRuleRow[],
+  circuitPausedUntil: string | null
 ): Html {
-  return html`<div class="bento">
+  return html`${renderCircuitBreakerBanner(circuitPausedUntil)}
+    <div class="bento">
       ${renderStartResearchBlock()}
     </div>
     <div class="bento" style="margin-top:10px">
@@ -364,13 +395,31 @@ export function renderHomePage(
   const freshness = computeHomeFreshness(snapshot, now);
   const degraded = snapshot?.degraded ? [degradedReasonText(snapshot)] : [];
 
+  // Phase 6 Task 6: per-owner circuit breaker (v10's circuit_breaker_state,
+  // never a different member's - CircuitBreakerRepository.isPaused/getState
+  // are both keyed by `member.id`, the viewer's OWN id).
+  const circuitBreakerRepo = new CircuitBreakerRepository(deps.db);
+  const nowIso = now.toISOString();
+  const circuitPausedUntil = circuitBreakerRepo.isPaused(member.id, nowIso)
+    ? (circuitBreakerRepo.getState(member.id)?.pausedUntil ?? null)
+    : null;
+
   const page = renderPage({
     title: "首页",
     nav: "home",
     member: { displayName: member.displayName },
     freshness,
     degraded,
-    bodyHtml: renderHomeBody(snapshot, previousDay, freshness, proposals, alertEvents, latestDaily, disciplineRules),
+    bodyHtml: renderHomeBody(
+      snapshot,
+      previousDay,
+      freshness,
+      proposals,
+      alertEvents,
+      latestDaily,
+      disciplineRules,
+      circuitPausedUntil
+    ),
     nonce,
     now
   });
