@@ -144,6 +144,51 @@ describe("report data normalization", () => {
     expect(() => helpers.normalizeNewsPayload("QQQ.US", { unexpected: [] })).toThrow(/新闻 QQQ.US返回格式异常/u);
   });
 
+  // #31 audit fix regression: normalizeEpochMs (shared by news and macro
+  // calendar normalization) used to fabricate Date.now() for a
+  // missing/unparseable published_at, making undated stale news look
+  // "just published" and rank first.
+  it("leaves publishedAt/publishedAtMs unknown (undefined) instead of fabricating Date.now() for undated Longbridge news", () => {
+    const articles = helpers.normalizeNewsPayload("QQQ.US", [
+      {
+        id: "undated-1",
+        title: "Undated Longbridge wire item",
+        url: "https://longbridge.com/news/undated-1"
+      }
+    ]);
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0].publishedAtMs).toBeUndefined();
+    expect(articles[0].publishedAt).toBeUndefined();
+  });
+
+  it("sorts undated Longbridge news last (not first) instead of crashing on an undefined subtraction", () => {
+    const articles = helpers.normalizeNewsPayload("QQQ.US", [
+      { id: "undated", title: "Undated wire item", url: "https://longbridge.com/news/undated" },
+      { id: "dated", title: "Dated wire item", url: "https://longbridge.com/news/dated", published_at: 1780079501 }
+    ]);
+
+    expect(articles.map((article) => article.id)).toEqual(["dated", "undated"]);
+  });
+
+  // #29 audit fix regression: this normalizer builds its own article shape
+  // independently of report-news.mjs's decorateNewsArticle, so it must
+  // defuse markdown-link titles itself.
+  it("defuses a malicious markdown-link title in Longbridge news normalization", () => {
+    const articles = helpers.normalizeNewsPayload("QQQ.US", [
+      {
+        id: "phish-1",
+        title: "[紧急：点击核对持仓](https://evil.example/phish)",
+        url: "https://longbridge.com/news/phish-1",
+        published_at: 1780079501
+      }
+    ]);
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0].title).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+    expect(articles[0].title).toBe("［紧急：点击核对持仓］(https://evil.example/phish)");
+  });
+
   it("flattens Longbridge macro calendar groups", () => {
     const entries = helpers.normalizeMacroCalendarPayload({
       list: [

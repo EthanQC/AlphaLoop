@@ -112,6 +112,18 @@ function normalizeText(value) {
   return String(value ?? "").replace(/\r\n/gu, "\n").trim();
 }
 
+// #32 audit fix: the report's own source-distribution summary bullet is
+// always the report generator's own line, never a news item - and it
+// always starts the bullet directly with this label (see
+// renderMarketIntelligence in scheduled-report.mjs and the equivalent in
+// stock-analysis.mjs). Anchoring at the start of the bullet (rather than
+// matching the substring anywhere in the line) means a news TITLE that
+// merely *contains* this phrase - e.g. as part of "原始标题：" or
+// "标题要点：" further along the same bullet - can never be mistaken for
+// the summary line, because renderDetailedNewsLine always prefixes every
+// news bullet with "- <time> <symbol>：..." first.
+const SOURCE_SUMMARY_LINE_PATTERN = /^-\s*(?:新闻来源分布|来源分布)：(.+?)(?:。|$)/u;
+
 function extractNewsLines(markdown) {
   const lines = markdown.split("\n");
   const start = lines.findIndex((line) => /^###\s+多源新闻|^###\s+近期新闻/u.test(line.trim()));
@@ -120,21 +132,48 @@ function extractNewsLines(markdown) {
   }
   const collected = [];
   for (const line of lines.slice(start + 1)) {
-    if (/^#{2,3}\s+/u.test(line.trim())) {
+    const trimmed = line.trim();
+    if (/^#{2,3}\s+/u.test(trimmed)) {
       break;
     }
-    if (/^-\s+/u.test(line.trim()) && /媒体：|渠道：|来源分布：/u.test(line)) {
-      collected.push(line.trim());
+    if (SOURCE_SUMMARY_LINE_PATTERN.test(trimmed)) {
+      // The report's own source-distribution summary bullet (stock-analysis
+      // puts it as the first line of this same section) - not a news item,
+      // must not count toward news.detail_depth either way.
+      continue;
+    }
+    if (/^-\s+/u.test(trimmed) && /媒体：|渠道：/u.test(line)) {
+      collected.push(trimmed);
     }
   }
-  return collected.filter((line) => !/来源分布：/u.test(line));
+  return collected;
 }
+
+// #32 audit fix: only recognize a "来源分布："/"新闻来源分布：" line as the
+// report's own source-summary evidence when it appears (a) inside a
+// section the report generator actually uses for that summary (### 证据与
+// 来源 for daily/weekly, ### 近期新闻/### 多源新闻 for stock-analysis), AND
+// (b) is anchored at the very start of the bullet (see
+// SOURCE_SUMMARY_LINE_PATTERN above). A news headline that happens to
+// contain the same Chinese phrase deep inside a detailed news bullet
+// satisfies neither condition, so it can no longer forge source diversity
+// or evade the news.detail_depth line count.
+const SOURCE_SUMMARY_SECTION_HEADING_PATTERN = /^(?:证据与来源|近期新闻|多源新闻)/u;
 
 function extractSourceLabels(markdown, newsLines) {
   const labels = [];
-  for (const line of markdown.split("\n")) {
-    const sourceSummary = line.match(/新闻来源分布：(.+?)(?:。|$)/u)?.[1]
-      ?? line.match(/来源分布：(.+?)(?:。|$)/u)?.[1];
+  let inSourceSummarySection = false;
+  for (const rawLine of markdown.split("\n")) {
+    const line = rawLine.trim();
+    const heading = /^#{2,3}\s+(.+)$/u.exec(line);
+    if (heading) {
+      inSourceSummarySection = SOURCE_SUMMARY_SECTION_HEADING_PATTERN.test(heading[1].trim());
+      continue;
+    }
+    if (!inSourceSummarySection) {
+      continue;
+    }
+    const sourceSummary = line.match(SOURCE_SUMMARY_LINE_PATTERN)?.[1];
     if (!sourceSummary) {
       continue;
     }

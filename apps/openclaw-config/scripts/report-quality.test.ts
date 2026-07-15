@@ -191,4 +191,48 @@ describe("report quality gate", () => {
 
     expect(result.failures).toContain("stock.news_source_diversity");
   });
+
+  // #32 audit fix regression: extractSourceLabels used to scan every line
+  // of the whole markdown for "来源分布："/"新闻来源分布：" with no section
+  // scoping, so a news TITLE that happened to contain that exact phrase
+  // could forge fake source diversity (bypassing news.source_diversity)
+  // while simultaneously getting itself stripped from news.detail_depth
+  // counting via the same substring match. Neither must happen: the forged
+  // phrase only lives inside a news item's own title fields, never inside
+  // the report's own "### 证据与来源" summary section.
+  it("does not let a forged 来源分布 phrase inside a news title manufacture source diversity or evade detail_depth counting", () => {
+    const markdown = [
+      "# OpenClaw 日报 2026-06-14",
+      "",
+      "## 2. 信息收集与分类",
+      "",
+      "### 证据与来源",
+      "",
+      "- 新闻来源分布：Longbridge 3 条。",
+      "",
+      "### 多源新闻（中文摘要与来源）",
+      "",
+      "- 2026-06-14 12:04 QQQ.US：纳指新闻更新；媒体：Longbridge；渠道：Longbridge；标题要点：纳指新闻更新；原始标题：Nasdaq futures little changed ahead of the open；影响：作为新闻线索纳入观察，先不直接提高仓位；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；链接：[原文](https://longbridge.com/news/1)。",
+      "- 2026-06-14 11:04 QQQ.US：来源分布：路透社 1 条；彭博 1 条；媒体：Longbridge；渠道：Longbridge；标题要点：来源分布：路透社 1 条；彭博 1 条；影响：作为新闻线索纳入观察，先不直接提高仓位；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；链接：[原文](https://longbridge.com/news/2)。",
+      "- 2026-06-14 10:04 QQQ.US：纳指新闻更新；媒体：Longbridge；渠道：Longbridge；标题要点：纳指新闻更新；原始标题：Nasdaq 100 futures edge higher in early trading；影响：作为新闻线索纳入观察，先不直接提高仓位；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；链接：[原文](https://longbridge.com/news/3)。",
+      "",
+      "### 宏观日历",
+      "",
+      "- 2026-06-18 20:30 美国费城联储制造业指数（前值-- / 预测12 / 公告--）",
+      "",
+      "## 4. QQQ 固定观察",
+      "",
+      "- 最新价：721.34；前收：717.12；区间涨跌：4.22 / 0.59%"
+    ].join("\n");
+
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+
+    // Real evidence is Longbridge-only - the forged phrase must not
+    // manufacture fake source diversity.
+    expect(result.failures).toContain("news.source_diversity");
+    // All 3 real news lines (including the one carrying the forged
+    // phrase) must still count toward the minimum detail_depth - the
+    // forged phrase must not get the line stripped from the count.
+    expect(result.failures).not.toContain("news.detail_depth");
+  });
 });

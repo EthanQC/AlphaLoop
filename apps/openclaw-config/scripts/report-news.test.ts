@@ -212,4 +212,188 @@ describe("report news aggregation", () => {
     expect(line).toContain("标题要点：英文来源摘要未提供可抽取细节");
     expect(line).not.toContain("href、https、news、google");
   });
+
+  // #30 audit fix regression: a legitimately-escaped RSS title used to
+  // survive as a live tag because xmlText stripped tags BEFORE decoding
+  // entities (nothing to strip yet) and decodeXmlEntities decoded &amp;
+  // first (double-decoding &amp;lt; back into a live "<").
+  it("never lets a legitimately-escaped RSS title become a live <img> tag (decode order)", () => {
+    const articles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>Fed &lt;img src=x onerror=alert(1)&gt; decision</title>
+          <link>https://example.com/fed-decision</link>
+          <pubDate>Sat, 13 Jun 2026 14:30:00 GMT</pubDate>
+          <source>Reuters</source>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0].title).not.toContain("<img");
+    expect(articles[0].title).not.toContain("onerror=");
+    expect(articles[0].title).not.toMatch(/<[^>]+>/u);
+    expect(articles[0].title).toBe("Fed decision");
+
+    const line = news.renderDetailedNewsLine(articles[0]);
+    expect(line).not.toContain("<img");
+    expect(line).not.toMatch(/<[^>]+>/u);
+  });
+
+  it("does not double-decode a doubly-escaped entity into a live tag (decodeXmlEntities decodes &amp; last)", () => {
+    const articles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>Report says &amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt; was quoted verbatim</title>
+          <link>https://example.com/double-escaped</link>
+          <pubDate>Sat, 13 Jun 2026 14:30:00 GMT</pubDate>
+          <source>Reuters</source>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+
+    // A double-escaped entity (&amp;lt; -> the literal text "&lt;") must
+    // resolve to exactly one decode level, never all the way to a live "<".
+    expect(articles[0].title).not.toContain("<script>");
+    expect(articles[0].title).toContain("&lt;script&gt;");
+  });
+
+  // #31 audit fix regression: normalizeEpochMs used to fabricate Date.now()
+  // for a missing/unparseable date, making undated stale news look
+  // "just published".
+  it("leaves publishedAt/publishedAtMs unknown (undefined) instead of fabricating Date.now() when a pubDate is missing", () => {
+    const articles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>Undated wire report about QQQ</title>
+          <link>https://example.com/undated</link>
+          <source>Reuters</source>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0].publishedAtMs).toBeUndefined();
+    expect(articles[0].publishedAt).toBeUndefined();
+  });
+
+  it("leaves publishedAt/publishedAtMs unknown when a pubDate string does not parse", () => {
+    const articles = news.normalizeYahooSearchNews("QQQ.US", {
+      news: [
+        {
+          uuid: "yahoo-undated",
+          title: "Old wire report with a garbled timestamp",
+          link: "https://finance.yahoo.com/news/undated.html",
+          providerPublishTime: "not-a-real-date"
+        }
+      ]
+    });
+
+    expect(articles).toHaveLength(1);
+    expect(articles[0].publishedAtMs).toBeUndefined();
+    expect(articles[0].publishedAt).toBeUndefined();
+  });
+
+  it("labels an unknown-time article honestly as 时间未知 instead of crashing or guessing a time", () => {
+    const line = news.renderDetailedNewsLine({
+      id: "no-date",
+      symbol: "QQQ.US",
+      title: "Undated wire report",
+      publisher: "Reuters",
+      source: "google-news-rss",
+      sourceName: "Google News",
+      url: "https://example.com/undated"
+    });
+
+    expect(line).toContain("- 时间未知 QQQ.US：");
+  });
+
+  it("sorts unknown-time articles last (not first) when merging cross-source news", () => {
+    const merged = news.mergeNewsArticles([
+      {
+        id: "dated",
+        symbol: "QQQ.US",
+        title: "Dated wire report",
+        url: "https://example.com/dated",
+        publishedAt: "2026-06-01T00:00:00.000Z",
+        publishedAtMs: Date.parse("2026-06-01T00:00:00.000Z"),
+        source: "longbridge-news"
+      },
+      {
+        id: "undated",
+        symbol: "QQQ.US",
+        title: "Undated wire report",
+        url: "https://example.com/undated",
+        source: "google-news-rss"
+      }
+    ]);
+
+    expect(merged.map((article) => article.id)).toEqual(["dated", "undated"]);
+  });
+
+  // #29 audit fix regression: a malicious title using markdown link syntax
+  // must never survive normalization intact - both rendering faces
+  // (report-rendering.mjs formatInlineHtml and platform-app markdown.ts)
+  // turn `[text](url)` into a live anchor.
+  it("defuseMarkdownInText neutralizes markdown link syntax deterministically", () => {
+    expect(news.defuseMarkdownInText("[紧急：点击核对持仓](https://evil.example/phish)"))
+      .toBe("［紧急：点击核对持仓］(https://evil.example/phish)");
+    expect(news.defuseMarkdownInText("no markdown link here")).toBe("no markdown link here");
+    expect(news.defuseMarkdownInText(undefined)).toBe("");
+  });
+
+  it("defuses a malicious markdown-link title from every normalizer source path", () => {
+    const maliciousTitle = "[紧急：点击核对持仓](https://evil.example/phish)";
+
+    const rssArticles = news.normalizeExternalRssNews("QQQ.US", `
+      <rss><channel>
+        <item>
+          <title>${maliciousTitle}</title>
+          <link>https://example.com/rss-phish</link>
+          <pubDate>Sat, 13 Jun 2026 14:30:00 GMT</pubDate>
+          <source>Reuters</source>
+        </item>
+      </channel></rss>
+    `, {
+      source: "google-news-rss",
+      sourceName: "Google News"
+    });
+    expect(rssArticles[0].title).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+    expect(rssArticles[0].titleZh).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+
+    const yahooArticles = news.normalizeYahooSearchNews("QQQ.US", {
+      news: [
+        {
+          uuid: "yahoo-phish",
+          title: maliciousTitle,
+          link: "https://finance.yahoo.com/news/phish.html",
+          providerPublishTime: 1780236060
+        }
+      ]
+    });
+    expect(yahooArticles[0].title).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+    expect(yahooArticles[0].titleZh).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+
+    const decorated = news.decorateNewsArticle({
+      id: "direct-phish",
+      symbol: "QQQ.US",
+      title: maliciousTitle,
+      titleZh: maliciousTitle,
+      summary: `See details: ${maliciousTitle}`,
+      url: "https://example.com/direct-phish",
+      source: "yahoo-finance-search"
+    });
+    expect(decorated.title).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+    expect(decorated.titleZh).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+    expect(decorated.summary).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
+  });
 });

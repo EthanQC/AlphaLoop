@@ -50,7 +50,9 @@ export function normalizeExternalRssNews(symbol, xml, options = {}) {
         symbol,
         title,
         url,
-        publishedAt: new Date(publishedAtMs).toISOString(),
+        // #31 audit fix: a missing/unparseable pubDate must stay unknown
+        // (undefined), never fabricated as "now" - see normalizeEpochMs.
+        publishedAt: Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : undefined,
         publishedAtMs,
         publisher,
         summary,
@@ -125,19 +127,26 @@ export function decorateNewsArticle(article) {
   const source = String(article?.source ?? "unknown-news").trim() || "unknown-news";
   const sourceName = article?.sourceName ?? SOURCE_NAMES[source] ?? source;
   const publisher = String(article?.publisher ?? article?.provider ?? article?.media ?? sourceName).trim();
-  const title = singleLine(article?.title, 360);
-  const summary = singleLine(article?.summary ?? article?.description ?? article?.contentSnippet ?? article?.content, 420);
+  // #29 audit fix: every article funnels through decorateNewsArticle before
+  // it can reach any renderer, so defusing title/titleZh/summary here (in
+  // addition to the source-specific normalizers) guarantees no code path
+  // can smuggle a live `[text](url)` markdown link into a report.
+  const title = defuseMarkdownInText(singleLine(article?.title, 360));
+  const summary = defuseMarkdownInText(singleLine(article?.summary ?? article?.description ?? article?.contentSnippet ?? article?.content, 420));
   const publishedAtMs = Number.isFinite(article?.publishedAtMs)
     ? article.publishedAtMs
     : normalizeEpochMs(article?.publishedAt ?? article?.providerPublishTime ?? article?.time);
-  const publishedAt = article?.publishedAt ?? new Date(publishedAtMs).toISOString();
+  // #31 audit fix: publishedAtMs can legitimately be undefined (unknown
+  // time honesty) - never synthesize an ISO string from an undefined ms
+  // value, or Date(undefined).toISOString() throws.
+  const publishedAt = article?.publishedAt ?? (Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : undefined);
   return {
     ...article,
     id: String(article?.id ?? article?.uuid ?? article?.url ?? title).trim(),
     symbol: normalizeSymbol(article?.symbol),
     title,
     summary,
-    titleZh: article?.titleZh ?? translateFinancialHeadlineToChinese(title, article?.symbol),
+    titleZh: defuseMarkdownInText(article?.titleZh ?? translateFinancialHeadlineToChinese(title, article?.symbol)),
     source,
     sourceName,
     publisher,
@@ -148,13 +157,43 @@ export function decorateNewsArticle(article) {
   };
 }
 
+/**
+ * #29 audit fix: neutralizes markdown link syntax `[text](url)` found
+ * inside externally-sourced text (news titles/summaries) so it can never
+ * become a live, attacker-controlled anchor in either rendering face -
+ * report-rendering.mjs's formatInlineHtml (PDF) and platform-app's
+ * markdown.ts renderMarkdown (web) both only recognize the link syntax via
+ * its literal ASCII `[`/`]` brackets immediately followed by `(url)`.
+ *
+ * Deterministic rule: replace the ASCII brackets around the link label
+ * with their full-width equivalents (U+FF3B "［" / U+FF3D "］") whenever
+ * they are immediately followed by `(...)`. This keeps the text
+ * human-readable (the reader still sees the label and the literal URL
+ * text) while making it byte-for-byte impossible for either renderer's
+ * `\[([^\]]+)\]\(...\)`-shaped regex to match - the defused text simply no
+ * longer contains that construct. Exported so later news-pipeline work
+ * (news-engine.mjs, Task 3) can reuse the same rule instead of
+ * reimplementing it.
+ */
+export function defuseMarkdownInText(text) {
+  return String(text ?? "").replace(
+    /\[([^\]]+)\]\(([^)\s]+)\)/gu,
+    (_match, label, url) => `［${label}］(${url})`
+  );
+}
+
 export function renderDetailedNewsLine(article, formatTime = defaultFormatTime) {
   const normalized = decorateNewsArticle(article);
   const impact = summarizeNewsImpact(normalized);
   const shouldShowOriginalTitle = !hasCjk(normalized.title);
   const titlePoint = summarizeDetailedNewsPoint(normalized);
+  // #31 audit fix (Global Constraints: "报告中如出现须标「时间未知」置底"):
+  // an article with no known publish time must be labeled honestly instead
+  // of being formatted through a caller-supplied formatTime (which could
+  // itself synthesize a time, or simply isn't designed for undefined).
+  const timeLabel = normalized.publishedAt ? formatTime(normalized.publishedAt) : "时间未知";
   const pieces = [
-    `- ${formatTime(normalized.publishedAt)} ${normalized.symbol || "市场"}：${normalized.titleZh}`,
+    `- ${timeLabel} ${normalized.symbol || "市场"}：${normalized.titleZh}`,
     `媒体：${normalized.publisher || normalized.sourceName}`,
     `渠道：${normalized.sourceName}`,
     `标题要点：${titlePoint}`,
@@ -303,7 +342,8 @@ function normalizeYahooSearchArticle(symbol, row) {
     symbol: normalizeSymbol(symbol),
     title,
     url: String(row.link ?? row.url ?? "").trim(),
-    publishedAt: new Date(publishedAtMs).toISOString(),
+    // #31 audit fix: same unknown-time honesty as normalizeExternalRssNews.
+    publishedAt: Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : undefined,
     publishedAtMs,
     publisher: String(row.publisher ?? "Yahoo Finance").trim(),
     summary: singleLine(row.summary ?? row.description ?? "", 420),
@@ -537,20 +577,37 @@ function extractXmlTag(xml, tagName) {
 }
 
 function xmlText(value) {
-  return decodeXmlEntities(String(value ?? "")
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gu, "$1")
+  // #30 audit fix: decode entities FIRST, then strip tags. RSS titles
+  // routinely contain legitimately-escaped HTML (e.g. `&lt;img
+  // onerror&gt;`) that is NOT markup in the XML - it's just text that
+  // happens to look tag-shaped once decoded. Stripping tags before
+  // decoding let that text sail straight through untouched (nothing to
+  // strip yet); decoding first means any tag-shaped substring - whether it
+  // came from real inline HTML or from decoded escaping - is caught by the
+  // same tag-strip pass, so no active-looking tag can ever survive into
+  // article.title/summary.
+  const withoutCdata = String(value ?? "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gu, "$1");
+  const decoded = decodeXmlEntities(withoutCdata);
+  return decoded
     .replace(/<[^>]+>/gu, " ")
     .replace(/\s+/gu, " ")
-    .trim());
+    .trim();
 }
 
 function decodeXmlEntities(value) {
+  // #30 audit fix: `&amp;` MUST decode last. Decoding it first would turn a
+  // double-escaped sequence like `&amp;lt;` into `&lt;` and then, on the
+  // very next line, into a live `<` - a double-decode that resurrects
+  // markup the source deliberately double-escaped to keep inert. Decoding
+  // the other entities first and `&amp;` last means a double-escaped
+  // entity resolves to a single-escaped literal (e.g. the text `&lt;`),
+  // never further to `<`.
   return String(value ?? "")
-    .replace(/&amp;/gu, "&")
     .replace(/&lt;/gu, "<")
     .replace(/&gt;/gu, ">")
     .replace(/&quot;/gu, "\"")
-    .replace(/&#39;|&apos;/gu, "'");
+    .replace(/&#39;|&apos;/gu, "'")
+    .replace(/&amp;/gu, "&");
 }
 
 function resolveCompanyName(symbolOrName, text = "") {
@@ -592,7 +649,11 @@ function normalizeEpochMs(value) {
     return number > 10_000_000_000 ? number : number * 1000;
   }
   const parsed = new Date(String(value ?? "")).getTime();
-  return Number.isFinite(parsed) ? parsed : Date.now();
+  // #31 audit fix: missing/unparseable published time must stay honestly
+  // unknown (undefined) - never silently fabricated as Date.now(), which
+  // used to make undated stale news rank as "just published" at the top of
+  // the report.
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function singleLine(value, maxChars = 260) {
@@ -605,5 +666,9 @@ function hasCjk(value) {
 }
 
 function defaultFormatTime(value) {
-  return new Date(String(value)).toISOString().slice(0, 16).replace("T", " ");
+  const ts = new Date(String(value ?? "")).getTime();
+  if (!Number.isFinite(ts)) {
+    return "时间未知";
+  }
+  return new Date(ts).toISOString().slice(0, 16).replace("T", " ");
 }
