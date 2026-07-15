@@ -95,4 +95,51 @@ describe("trading schedule policy", () => {
   it("computes the current US Eastern trading day in winter (EST, UTC-5), crossing midnight from Beijing time", () => {
     expect(schedule.currentUsEasternTradingDay(new Date("2026-01-15T08:00:00+08:00"))).toBe("2026-01-14");
   });
+
+  // Phase 6 Task 2 (circuit breaker / discipline engine's shared week-boundary
+  // helper): a mid-week Wednesday (EDT) resolves to that same week's Monday
+  // and the Friday four calendar days later, and the Monday-midnight instant
+  // is expressed in EDT (UTC-4: 2026-07-13 00:00 America/New_York == 04:00Z).
+  it("currentUsEasternTradingWeek resolves a mid-week EDT instant to its Monday-Friday week", () => {
+    const week = schedule.currentUsEasternTradingWeek(new Date("2026-07-15T18:00:00Z"));
+    expect(week).toEqual({
+      mondayDateLabel: "2026-07-13",
+      fridayDateLabel: "2026-07-17",
+      weekStartUtcIso: "2026-07-13T04:00:00.000Z"
+    });
+  });
+
+  // Winter (EST, UTC-5) case: Monday-midnight is 05:00Z, not 04:00Z - pins
+  // the DST branch currentUsEasternTradingDay's own winter test above covers
+  // for THIS function too, since nyMidnightUtcIso re-derives the offset
+  // independently rather than reusing a cached EDT assumption.
+  it("currentUsEasternTradingWeek resolves a mid-week EST instant to its Monday-Friday week", () => {
+    const week = schedule.currentUsEasternTradingWeek(new Date("2026-01-14T18:00:00Z"));
+    expect(week).toEqual({
+      mondayDateLabel: "2026-01-12",
+      fridayDateLabel: "2026-01-16",
+      weekStartUtcIso: "2026-01-12T05:00:00.000Z"
+    });
+  });
+
+  // A Sunday instant belongs to the PRECEDING Monday's week (the week that is
+  // about to end), not the week that starts the next day - pins the
+  // daysSinceMonday formula's Sunday=6-days-since-Monday branch.
+  it("currentUsEasternTradingWeek resolves a Sunday instant to the week that just ended", () => {
+    const week = schedule.currentUsEasternTradingWeek(new Date("2026-07-19T15:00:00Z"));
+    expect(week.mondayDateLabel).toBe("2026-07-13");
+    expect(week.fridayDateLabel).toBe("2026-07-17");
+  });
+
+  // The two DST-transition weekends themselves (spring-forward 2026-03-08,
+  // fall-back 2026-11-01): the FOLLOWING Monday must report the NEW offset in
+  // its weekStartUtcIso, not the one carried over from the prior week.
+  it("currentUsEasternTradingWeek reports the correct offset for the Monday right after each DST transition", () => {
+    expect(schedule.currentUsEasternTradingWeek(new Date("2026-03-10T12:00:00Z")).weekStartUtcIso).toBe(
+      "2026-03-09T04:00:00.000Z"
+    );
+    expect(schedule.currentUsEasternTradingWeek(new Date("2026-11-03T12:00:00Z")).weekStartUtcIso).toBe(
+      "2026-11-02T05:00:00.000Z"
+    );
+  });
 });
