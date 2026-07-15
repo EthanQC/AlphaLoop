@@ -273,7 +273,7 @@ function renderTodoBlock(proposals: ProposalRow[]): Html {
   const body =
     proposals.length > 0
       ? joinHtml(proposals.map(renderProposalRow))
-      : html`<p style="font-size:13px;color:var(--sub)">提案审批 P6 上线</p>`;
+      : html`<p style="font-size:13px;color:var(--sub)">暂无待审提案</p>`;
   return html`<section class="card dt-w2">
     <h2>我的待办</h2>
     ${body}
