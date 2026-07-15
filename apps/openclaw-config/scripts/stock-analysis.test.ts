@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { parseConclusionBox } from "./conclusion-box.mjs";
+import { REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
 import { validateStockAnalysisMarkdown } from "./report-quality.mjs";
 import { getStockFacts } from "./stock-facts-store.mjs";
 
@@ -581,5 +582,114 @@ describe("persistPredictionsForRecords: parses its OWN rendered output into anal
       stockAnalysis.persistPredictionsForRecords(db, reportPath, brokenMarkdown, [{ symbol: "BAD.US", analysis: {} }])
     ).not.toThrow();
     expect(predictionRow(db, reportPath, "BAD.US")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 Task 3 (2026-07-15 plan): narrative orchestration wiring.
+// attachNarrativeSections is the standalone, exported piece runAnalysis calls
+// (same "test the exported piece, not the CLI orchestrator" convention as
+// persistStockFactsForRecords above) - it needs stock_facts already
+// persisted for the same (tradingDay, symbol), so every test here calls
+// persistStockFactsForRecords first, exactly mirroring runAnalysis's own
+// ordering.
+// ---------------------------------------------------------------------------
+
+function narrativeFixtureRecord(symbol = "AAPL.US", generatedAt = GENERATED_AT) {
+  const analysis = stockAnalysis.buildDeterministicAnalysis(
+    symbol,
+    stockQuote({ symbol }),
+    stockNewsList(),
+    { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+    generatedAt
+  );
+  return { symbol, analysis, news: stockNewsList() };
+}
+
+describe("attachNarrativeSections: default backend (P10-gated) keeps rendered output byte-equivalent except the header disclosure", () => {
+  it("globally degrades, discloses REPORT_DEGRADED_HEADER once per symbol, and leaves every section's bullets identical to the pre-P5 deterministic output", async () => {
+    const { db } = makeDb();
+    const label = GENERATED_AT.slice(0, 10);
+
+    const baseRecord = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, label, [baseRecord]);
+    const baselineMarkdown = stockAnalysis.renderBatchStockAnalysis({
+      label,
+      generatedAt: GENERATED_AT,
+      records: [baseRecord],
+      failedSymbols: []
+    });
+
+    // Run against a FRESH record object (attachNarrativeSections mutates its
+    // input with a `.narrative` field) so `baseRecord`/`baselineMarkdown`
+    // above stay an untouched "what pre-P5 would have rendered" reference.
+    const narrativeRecord = narrativeFixtureRecord();
+    await stockAnalysis.attachNarrativeSections(db, label, [narrativeRecord]);
+
+    expect(narrativeRecord.narrative.degraded).toBe(true);
+    expect(narrativeRecord.narrative.degradedReason).toMatch(/P10 ignition/);
+    expect(narrativeRecord.narrative.degradedSections).toHaveLength(8);
+
+    const withNarrativeMarkdown = stockAnalysis.renderBatchStockAnalysis({
+      label,
+      generatedAt: GENERATED_AT,
+      records: [narrativeRecord],
+      failedSymbols: []
+    });
+
+    expect(withNarrativeMarkdown).toContain(REPORT_DEGRADED_HEADER);
+    // Stripping out EXACTLY the inserted disclosure line (+ its trailing
+    // blank line) must reproduce the pre-P5 baseline byte-for-byte - the
+    // ONLY addition this task makes to an already-degraded run's rendering.
+    const stripped = withNarrativeMarkdown.replace(`> ${REPORT_DEGRADED_HEADER}\n\n`, "");
+    expect(stripped).toBe(baselineMarkdown);
+
+    // The pre-existing quality gate keeps passing on the new output too.
+    expect(validateStockAnalysisMarkdown(withNarrativeMarkdown).ok).toBe(true);
+  });
+
+  it("renderBatchStockAnalysis renders unchanged when `record.narrative` was never attached at all (pre-P5 direct callers)", () => {
+    const record = narrativeFixtureRecord();
+    const label = GENERATED_AT.slice(0, 10);
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+
+    expect(markdown).not.toContain(REPORT_DEGRADED_HEADER);
+  });
+});
+
+describe("attachNarrativeSections: fake backend's validated narrative flows into the rendered markdown", () => {
+  it("replaces one section's rendered bullets with the backend's own text while leaving gate-critical sections/phrases intact", async () => {
+    const { db } = makeDb();
+    const label = GENERATED_AT.slice(0, 10);
+    const record = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, label, [record]);
+
+    const rewrittenCatalysts = "本段已由叙事引擎重写：催化剂整体保持稳健，无需额外担忧。";
+    // Every OTHER section's fake backend call simply echoes its own
+    // deterministicText back verbatim - always mostly-Chinese by
+    // construction (buildDeterministicAnalysis's own prose), so it either
+    // validates as narrative (numbers already trace back to real facts) or,
+    // for any derived (non-raw-fact) number, falls back to that SAME
+    // deterministicText plus a marker bullet - either way the original
+    // content survives untouched, only `catalysts` is genuinely rewritten.
+    const narrativeBackend = async ({ sectionKey, deterministicText }: { sectionKey: string; deterministicText: string }) =>
+      sectionKey === "catalysts" ? { text: rewrittenCatalysts } : { text: deterministicText };
+
+    await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
+
+    expect(record.narrative.degraded).toBe(false);
+    const catalystsResult = record.narrative.sections.find((entry: { key: string }) => entry.key === "catalysts");
+    expect(catalystsResult).toMatchObject({ narrative: true, text: rewrittenCatalysts });
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+
+    expect(markdown).toContain(rewrittenCatalysts);
+    expect(markdown).not.toContain(record.analysis.catalysts[0]);
+    expect(markdown).not.toContain(REPORT_DEGRADED_HEADER);
+    // Gate-critical phrases (PE/PB, 均线：20 日, 期权链只读补充, 综合上行潜力) all
+    // live in sections OTHER than catalysts and survive regardless of
+    // whether their own echoed narrative validated or locally fell back.
+    expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });

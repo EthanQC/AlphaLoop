@@ -23,6 +23,8 @@ import {
 import { assertStockAnalysisQuality } from "./report-quality.mjs";
 import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
 import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
+import { createNarrativeLlmBackend, generateNarrativeSections, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
+import { getStockFacts } from "./stock-facts-store.mjs";
 import { buildYahooOptionChainUrls } from "./stock-analysis-sources.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
@@ -183,7 +185,7 @@ async function runScheduled(db, force = false) {
   await runAnalysis(db, { force });
 }
 
-async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) {
+async function runAnalysis(db, { deliver = true, targetsOverride = null, narrativeBackend = createNarrativeLlmBackend() } = {}) {
   const targets = Array.isArray(targetsOverride) && targetsOverride.length
     ? [...new Set(targetsOverride.map(normalizeSymbol).filter(Boolean))]
     : listTargets(db);
@@ -211,6 +213,18 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) 
   // per-symbol isolation above) - a failedSymbols entry never reaches here,
   // so it correctly gets no facts row instead of a fabricated/stale one.
   persistStockFactsForRecords(db, label, records);
+
+  // Phase 5 Task 3 (2026-07-15 plan): narrative orchestration - runs AFTER
+  // facts are persisted (immediately above) so each record's stock_facts
+  // are already sitting in the db by the time generateNarrativeSections's
+  // numeric pre-check needs them as ground truth. `narrativeBackend`
+  // defaults to createNarrativeLlmBackend() - the P10-gated throw - so
+  // TODAY's production runs always take the global-degrade path (every
+  // section falls back to its own deterministic text unchanged, plus the
+  // REPORT_DEGRADED_HEADER disclosure line renderBatchStockAnalysis adds
+  // right after each `## SYMBOL` heading); only a test-injected fake backend
+  // ever exercises the narrative-adopted path.
+  await attachNarrativeSections(db, label, records, { narrativeBackend });
 
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
@@ -298,6 +312,48 @@ export function persistStockFactsForRecords(db, tradingDay, records) {
       tradingDay
     });
     persistStockFacts(db, tradingDay, record.symbol, facts);
+  }
+}
+
+// Phase 5 Task 3 (2026-07-15 plan): the 8 `buildDeterministicAnalysis`
+// section-array keys narrative orchestration runs over - MUST stay in sync
+// with TITLE_TO_SECTION_KEY's values below (that map is what
+// renderBatchStockAnalysis actually looks narrative results up by, keyed by
+// the frozen Chinese section titles) and with buildDeterministicAnalysis's
+// own returned object shape. `conclusionBox`/`conclusionBoxMarkdown` are
+// deliberately excluded - those are the Task 2 structured block, rendered
+// verbatim, never run through narrative rewriting.
+const NARRATIVE_SECTION_KEYS = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"];
+
+// Mutates each record with a `narrative` field ({sections, degraded,
+// degradedReason, degradedSections, retriesUsed} - generateNarrativeSections'
+// own return shape) built from that symbol's OWN just-persisted stock_facts
+// (getStockFacts(db, tradingDay, record.symbol) - called here, AFTER
+// persistStockFactsForRecords has already written them for this exact
+// tradingDay, so the numeric pre-check always has real ground truth to
+// compare against, never an empty/stale facts map).
+//
+// Exported and network-free beyond the injected `narrativeBackend` itself -
+// same "test the exported piece, not the CLI orchestrator" convention as
+// persistStockFactsForRecords above - so a test can drive this directly with
+// a fake backend and a real (temp) db, without exercising runAnalysis's
+// heavier network/PDF/delivery side effects.
+//
+// A record with no facts at all (should not happen for a real fetch, but
+// defensively handled) still gets a `narrative` result: getStockFacts
+// returns `{}` for a tradingDay/symbol pair with no rows, and
+// generateNarrativeSections' numeric pre-check against an empty facts map
+// simply has nothing to match ANY stated number against - any narrative
+// text containing a number degrades that section, exactly as intended (no
+// fact = no basis to state a number).
+export async function attachNarrativeSections(db, tradingDay, records, { narrativeBackend = createNarrativeLlmBackend() } = {}) {
+  for (const record of records) {
+    const facts = getStockFacts(db, tradingDay, record.symbol);
+    const sections = NARRATIVE_SECTION_KEYS.map((key) => ({
+      key,
+      deterministicText: (record.analysis?.[key] ?? []).join("\n")
+    }));
+    record.narrative = await generateNarrativeSections({ backend: narrativeBackend, symbol: record.symbol, facts, sections });
   }
 }
 
@@ -717,9 +773,23 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
 
   for (const record of records) {
     lines.push(`## ${record.symbol}`, "");
+    // Phase 5 Task 3 (2026-07-15 plan): a GLOBAL narrative degrade (the
+    // backend threw) is disclosed exactly ONCE per symbol, right here -
+    // never per-section (a per-section validation-exhausted fallback is
+    // instead disclosed inline, inside that one section's own bullets - see
+    // sectionValues below). Absent (record.narrative undefined, e.g. a
+    // caller/test that never ran attachNarrativeSections at all) renders
+    // nothing extra, keeping every pre-P5 direct caller of
+    // renderBatchStockAnalysis byte-for-byte unchanged.
+    if (record.narrative?.degraded) {
+      lines.push(`> ${REPORT_DEGRADED_HEADER}`, "");
+    }
+    const narrativeSectionsByKey = record.narrative?.sections
+      ? Object.fromEntries(record.narrative.sections.map((entry) => [entry.key, entry]))
+      : null;
     for (const section of template.sections) {
       lines.push(`### ${section.title}`, "");
-      const values = sectionValues(record.analysis, section.title);
+      const values = sectionValues(record.analysis, section.title, narrativeSectionsByKey);
       for (const value of values) {
         lines.push(`- ${value}`);
       }
@@ -763,18 +833,53 @@ function hasNonLongbridgeNewsSource(article) {
 // key can never independently typo-diverge from each other.
 const CONCLUSION_SECTION_TITLE = "结论与复盘标签";
 
-function sectionValues(analysis, title) {
-  const map = {
-    "标的基本信息": analysis.basic,
-    "投资逻辑": analysis.thesis,
-    "基本面分析": analysis.fundamentals,
-    "催化剂": analysis.catalysts,
-    "风险点": analysis.risks,
-    "市场表现与交易层面": analysis.trading,
-    "期权交割与阻力支撑": analysis.options,
-    [CONCLUSION_SECTION_TITLE]: analysis.conclusion
-  };
-  return map[title] ?? [];
+// Phase 5 Task 3 (2026-07-15 plan): reverse of the map inside sectionValues
+// below - the frozen Chinese section title -> the internal English key
+// NARRATIVE_SECTION_KEYS/generateNarrativeSections/attachNarrativeSections
+// use. Kept as its own named constant (not re-derived inline) so this and
+// sectionValues' map can never independently drift apart on which title
+// corresponds to which section.
+const TITLE_TO_SECTION_KEY = {
+  "标的基本信息": "basic",
+  "投资逻辑": "thesis",
+  "基本面分析": "fundamentals",
+  "催化剂": "catalysts",
+  "风险点": "risks",
+  "市场表现与交易层面": "trading",
+  "期权交割与阻力支撑": "options",
+  [CONCLUSION_SECTION_TITLE]: "conclusion"
+};
+
+// `narrativeSectionsByKey` is generateNarrativeSections' own `sections`
+// array (Task 3), re-keyed by section key - null/undefined for any caller
+// that never ran attachNarrativeSections (every pre-P5 test/call site),
+// which falls straight through to the ORIGINAL deterministic arrays exactly
+// as before (byte-for-byte unchanged rendering when narrative was never
+// attached at all).
+//
+// When a narrative result DOES exist for this section, its own `text` is
+// used verbatim (split back into one bullet per line) INSTEAD of the raw
+// analysis array - this is safe/byte-equivalent for the fallback case
+// specifically because attachNarrativeSections builds each section's
+// `deterministicText` as `analysis[key].join("\n")` in the first place, so
+// splitting an unmodified fallback text by "\n" reproduces the exact same
+// array. A locally-degraded section's text is deterministicText PLUS one
+// trailing marker line (narrative-engine.mjs), which naturally renders as
+// one extra disclosure bullet after the original ones - additive, never
+// replacing the original content.
+function sectionValues(analysis, title, narrativeSectionsByKey) {
+  const key = TITLE_TO_SECTION_KEY[title];
+  const narrativeResult = narrativeSectionsByKey?.[key];
+  if (narrativeResult) {
+    return narrativeResult.text === "" ? [] : narrativeResult.text.split("\n");
+  }
+  // TITLE_TO_SECTION_KEY's values are, by construction, exactly
+  // buildDeterministicAnalysis's own section-array property names (basic/
+  // thesis/fundamentals/catalysts/risks/trading/options/conclusion) - a
+  // single source for "which title reads which array", rather than a
+  // second, independently-typed title->array map that could drift from
+  // TITLE_TO_SECTION_KEY above.
+  return analysis[key] ?? [];
 }
 
 function extractTradingLevel(line, side) {
