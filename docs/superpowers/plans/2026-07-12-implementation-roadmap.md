@@ -12,7 +12,7 @@
 | **P3 站点与平台 ✅(2026-07-15 交付)** | platform-app 身份网关（bearer + Access 邮箱头，JWT 校验=P10 前置）+ 5 页与下钻页服务端渲染（final.html token 逐字节，双主题双端）+ 成员管理 CLI + per-owner 服务端隔离 + launchd/doctor 接线 | ✅ req §7 双账号隔离矩阵全过（403/404/401 实测）+ Playwright 双主题双视口 + 单请求网络审计；942 测试 ×3 | `2026-07-14-phase3-platform.md` |
 | **P4 新闻引擎 ✅(2026-07-15 交付)** | 四项注入修复（摄入层消毒）+ schema v8 三表 + 确定性事件聚类 + L1 多源（RSSHub 冗余/Finnhub 限速脱敏）+ L2/L3 预算编排（真后端=P10）+ daily facts + 质量门四扩展 + 日报聚类段与平台新闻页双面 | ✅ 坏样本全拦截（9 样本逐失败码）+ 聚类 47 测 + seam 贯通 + Playwright 双主题筛选实测；1128 测试 ×3 | `2026-07-15-phase4-news-engine.md` |
 | **P5 个股分析深化 ✅(2026-07-15 交付)** | schema v9 per-stock facts + 结论框三档（同源解析器双侧）+ 预测入库（analysis_predictions 首个写入方）+ 叙事编排（数字预比对/重试≤2/降级纯事实表，真后端=P10）+ 质量门三扩展 + 平台结论框摘要卡 + 三项 minor 清理 | ✅ 坏样本 15/15 逐失败码 + 叙事降级 13/13 + 双侧解析 52/52 + Playwright 双主题卡片零外部请求；1267 测试 ×3 | `2026-07-15-phase5-analysis.md` |
-| P6 提案-审批 | proposals+卡片回调（ocf1）+broker 多账户与服务端审批硬化+熔断 per-owner | 回放与负向测试 | 待写 |
+| **P6 提案-审批 ✅(2026-07-15 交付)** | v10/v11 熔断表+提案仓储原子消费 + 纪律引擎（hard 阻断/proposal_check 标注/self 提示）+ per-owner 熔断（周亏>3%停一周跨重启）+ 提案生命周期（owner-only 三动作/审批卡 ocf1/24h 过期扫）+ executor 硬化（共享密钥/已批准门/幂等 replay/先记录后执行/预算含挂单）+ 对账重建（状态映射单源，根治审计 #1/#2/#5/#6）+ 多账户凭据隔离 | ✅ 全链路回放 seam + 负向矩阵（owner-only/重复消费/预算含挂单/幂等）+ Playwright 熔断横幅；资金路径真库零污染；1547 测试 ×3 | `2026-07-15-phase6-proposals.md` |
 | P7 策略记忆+名片 | memoryd 平台实例集成（per-owner scope）+三档可见性+名片视图+skill 客户端 | 三档端到端本地测试 | 待写 |
 | P8 站内研究 | research_tasks worker+受限 agent+研判页+配额 | 全链路含数据缺失场景 | 待写 |
 | P9 复盘飞轮 | 每人月度复盘+独立回算校验 | 回算一致性单测 | 待写 |
