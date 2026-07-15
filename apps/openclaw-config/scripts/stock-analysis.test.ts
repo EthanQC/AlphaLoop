@@ -15,6 +15,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
 
@@ -270,5 +271,61 @@ describe("listTargets: collapses per-owner duplicates into one global distinct s
     stockAnalysis.runTargetsCommand(["--owner", "member_1", "AAPL", "NVDA"], options);
 
     expect(stockAnalysis.runListTargetsCommand(options)).toEqual(["AAPL.US", "NVDA.US"]);
+  });
+});
+
+// Phase 5 Task 1 (2026-07-15 plan): runAnalysis persists stock_facts per
+// SUCCESSFULLY-fetched record before rendering. Tested here against the
+// standalone, network/PDF-free persistStockFactsForRecords (the exact
+// function runAnalysis calls) rather than runAnalysis itself, which also
+// spawns a real Chrome subprocess for PDF rendering (writeMarkdownPdf) - see
+// this file's existing fetchStockAnalysisRecords/renderBatchStockAnalysis
+// tests for the same "test the exported piece, not the CLI orchestrator"
+// convention.
+describe("persistStockFactsForRecords: writes stock_facts per successful record", () => {
+  function fakeRecord(symbol: string, overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      symbol,
+      quote: { symbol, last: "210.50", prev_close: "208.00", volume: "1000", timestamp: "2026-07-14T20:00:00.000Z" },
+      history: [{ date: "2026-07-13", close: 209 }, { date: "2026-07-14", close: 210.5 }],
+      fundamentals: { sources: ["yahoo-quote"], trailingPE: 28.5 },
+      optionChain: { error: "Yahoo options 期权链接口读取失败" },
+      news: [{ id: "n1", title: "新闻" }],
+      analysis: {},
+      ...overrides
+    };
+  }
+
+  it("writes a stock_facts row set for each record, keyed by its own symbol", () => {
+    const { db } = makeDb();
+
+    stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [
+      fakeRecord("AAPL.US"),
+      fakeRecord("MSFT.US", { quote: { symbol: "MSFT.US", last: "430.10", prev_close: "425.00", volume: "2000", timestamp: "2026-07-14T20:00:00.000Z" } })
+    ]);
+
+    const aaplFacts = getStockFacts(db, "2026-07-14", "AAPL.US");
+    const msftFacts = getStockFacts(db, "2026-07-14", "MSFT.US");
+    expect(aaplFacts["quote.last"].valueNum).toBe(210.5);
+    expect(msftFacts["quote.last"].valueNum).toBe(430.1);
+  });
+
+  it("never writes facts for a symbol that isn't in `records` (failedSymbols are simply absent from the input)", () => {
+    const { db } = makeDb();
+
+    stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [fakeRecord("AAPL.US")]);
+
+    expect(getStockFacts(db, "2026-07-14", "BAD.US")).toEqual({});
+  });
+
+  it("re-persisting one symbol does not touch a sibling symbol's facts for the same trading_day", () => {
+    const { db } = makeDb();
+    const msft = fakeRecord("MSFT.US", { quote: { symbol: "MSFT.US", last: "430.10", prev_close: "425.00", volume: "2000", timestamp: "2026-07-14T20:00:00.000Z" } });
+
+    stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [fakeRecord("AAPL.US"), msft]);
+    // Re-run for AAPL.US alone (e.g. a subsequent single-symbol `prepare`).
+    stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [fakeRecord("AAPL.US")]);
+
+    expect(getStockFacts(db, "2026-07-14", "MSFT.US")["quote.last"].valueNum).toBe(430.1);
   });
 });
