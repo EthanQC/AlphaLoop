@@ -1,0 +1,38 @@
+[
+  { "name": "Filled (exact)", "input": "Filled", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "PartialFilled (exact)", "input": "PartialFilled", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "New (exact)", "input": "New", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "WaitToNew (exact)", "input": "WaitToNew", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "WaitToSubmit (exact)", "input": "WaitToSubmit", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "NotReported (exact)", "input": "NotReported", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "Pending (exact)", "input": "Pending", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "PartialWithdrawal (exact)", "input": "PartialWithdrawal", "expected": { "stage": "cancelled", "localStatus": "accepted" } },
+  { "name": "WaitToCancel (exact) - cancel-in-progress must not be unknown", "input": "WaitToCancel", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "PendingCancel (exact) - cancel-in-progress must not be unknown", "input": "PendingCancel", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "Canceled (US spelling, exact)", "input": "Canceled", "expected": { "stage": "cancelled", "localStatus": "accepted" } },
+  { "name": "Replaced (exact)", "input": "Replaced", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "Rejected (exact)", "input": "Rejected", "expected": { "stage": "rejected", "localStatus": "rejected" } },
+  { "name": "Expired (exact)", "input": "Expired", "expected": { "stage": "rejected", "localStatus": "rejected" } },
+  { "name": "WaitToDeal (exact)", "input": "WaitToDeal", "expected": { "stage": "pending", "localStatus": "pending" } },
+
+  { "name": "case-insensitive lowercase filled", "input": "filled", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "case-insensitive uppercase FILLED", "input": "FILLED", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "case-insensitive mixed WaItToCaNcEl", "input": "WaItToCaNcEl", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "spaced/punctuated 'Wait To Cancel'", "input": "Wait To Cancel", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "snake_case 'pending_cancel'", "input": "pending_cancel", "expected": { "stage": "pending", "localStatus": "pending" } },
+
+  { "name": "pre-existing alias: PartiallyFilled", "input": "PartiallyFilled", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "pre-existing alias: PartialDealt", "input": "PartialDealt", "expected": { "stage": "pending", "localStatus": "pending" } },
+  { "name": "pre-existing alias: WaitToReport", "input": "WaitToReport", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+  { "name": "pre-existing alias: FullFilled", "input": "FullFilled", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Executed", "input": "Executed", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Dealt", "input": "Dealt", "expected": { "stage": "filled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Cancelled (British spelling)", "input": "Cancelled", "expected": { "stage": "cancelled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Withdrawn", "input": "Withdrawn", "expected": { "stage": "cancelled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Deleted", "input": "Deleted", "expected": { "stage": "cancelled", "localStatus": "accepted" } },
+  { "name": "pre-existing alias: Failed", "input": "Failed", "expected": { "stage": "rejected", "localStatus": "rejected" } },
+  { "name": "literal 'Submitted' string", "input": "Submitted", "expected": { "stage": "submitted", "localStatus": "submitted" } },
+
+  { "name": "unrecognized status -> never silently accepted", "input": "SomeBrandNewBrokerStatus", "expected": { "stage": "unknown_broker_status", "localStatus": "unknown" } },
+  { "name": "empty string -> unrecognized", "input": "", "expected": { "stage": "unknown_broker_status", "localStatus": "unknown" } }
+]

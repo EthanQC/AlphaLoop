@@ -21,6 +21,20 @@ export type ExecutionResultStatus = "accepted" | "rejected" | "submitted" | "pen
 // "submit_unconfirmed" (Constraint ⑥: the CLI call threw or timed out - the
 // order MAY exist at the broker, so this is deliberately NOT "rejected"/
 // "failed"; Task 5's reconciliation is what adjudicates it either way).
+// Phase 6 Task 5 (2026-07-15 plan) adds two more stages, both written by the
+// reconcile rebuild (apps/openclaw-config/scripts/reconcile-official-paper-
+// orders.mjs), never by the broker-status-map itself returning them for a
+// STATUS STRING it did recognize:
+// "unknown_broker_status" - the shared broker-status-map module
+// (broker-status-map.ts/.mjs) returns this for a broker status string it
+// does NOT recognize, deliberately distinct from the pre-existing plain
+// "unknown" (which means "no status string was available at all", e.g. the
+// CLI never returned one) - never silently "accepted".
+// "failed" - reconcile's own submit_unconfirmed adjudication: the CLI
+// call that recorded this row errored/timed out (stage was
+// 'submit_unconfirmed'), and a later reconcile pass found no matching order
+// in the broker's own day-order list after the adjudication timeout window
+// elapsed - distinct from "rejected" (broker explicitly refused it).
 export type OfficialPaperOrderLifecycleStage =
   | "submitting"
   | "submitted"
@@ -30,6 +44,8 @@ export type OfficialPaperOrderLifecycleStage =
   | "cancelled"
   | "rejected"
   | "submit_unconfirmed"
+  | "unknown_broker_status"
+  | "failed"
   | "unknown";
 export type OptionStrategy =
   | "long_call"

@@ -9,6 +9,8 @@ import type {
   OrderTicket
 } from "@packages/shared-types";
 
+import { mapBrokerStatusToStage as mapBrokerStatusToStageDetailed } from "./broker-status-map.js";
+
 // Phase 6 Task 4 (2026-07-15 plan): the shape execFileSync itself has, narrowed
 // to exactly what this module calls it with - lets tests inject a fake (no
 // real longbridge CLI, no real subprocess) without reaching for module
@@ -195,30 +197,15 @@ export function extractBrokerStatus(payload: unknown): string | undefined {
   return findStringValue(payload, ["status", "order_status", "orderStatus", "orderStatusText"]);
 }
 
+// Phase 6 Task 5 (2026-07-15 plan): the status table itself now lives in
+// ./broker-status-map.ts (the single source shared with the reconcile
+// rebuild's .mjs port - see that module's doc comment). This wrapper keeps
+// the PRE-Task-5 signature (a bare OfficialPaperOrderLifecycleStage, not the
+// shared module's `{stage, localStatus}` object) so every existing call site
+// and test in this file (`mapBrokerStatusToStage("Pending")).toBe("pending")`
+// etc.) is unaffected - only the table backing it moved.
 export function mapBrokerStatusToStage(status: string): OfficialPaperOrderLifecycleStage {
-  const normalized = status.toLowerCase().replace(/[^a-z0-9]/gu, "");
-
-  if (["notreported", "submitted", "new", "waittosubmit", "waittoreport", "waittonew"].includes(normalized)) {
-    return "submitted";
-  }
-
-  if (["pending", "partialfilled", "partiallyfilled", "partialdealt", "waittodeal"].includes(normalized)) {
-    return "pending";
-  }
-
-  if (["filled", "fullfilled", "executed", "dealt"].includes(normalized)) {
-    return "filled";
-  }
-
-  if (["cancelled", "canceled", "withdrawn", "deleted"].includes(normalized)) {
-    return "cancelled";
-  }
-
-  if (["rejected", "failed", "expired"].includes(normalized)) {
-    return "rejected";
-  }
-
-  return "unknown";
+  return mapBrokerStatusToStageDetailed(status).stage;
 }
 
 function buildLongbridgeCliEnv(): NodeJS.ProcessEnv {

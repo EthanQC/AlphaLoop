@@ -515,6 +515,10 @@ function translateLifecycleStage(stage: NonNullable<ExecutionResult["brokerOrder
     cancelled: "已取消",
     rejected: "已拒绝",
     submit_unconfirmed: "提交未确认",
+    // Phase 6 Task 5 (2026-07-15 plan): reconcile-written stages - see
+    // OfficialPaperOrderLifecycleStage's own doc comment in domain.ts.
+    unknown_broker_status: "未知券商状态",
+    failed: "失败（提交未确认，对账超时未见）",
     unknown: "未知"
   };
   return labels[stage] ?? stage;
