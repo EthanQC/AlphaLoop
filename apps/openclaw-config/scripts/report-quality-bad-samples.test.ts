@@ -50,10 +50,15 @@ function goodNewFormatReport() {
   ].join("\n");
 }
 
+// Phase 4 Task 7: added paper.totalCash (matches goodNewFormatReport's
+// "现金 100,000.00") now that report-quality.mjs's NUMERIC_MATCH_PATTERNS
+// parses it - see report-quality.test.ts's GOOD_SAMPLE_FACTS for the full
+// rationale (T6 gap fixed).
 const GOOD_SAMPLE_FACTS = {
   "qqq.price": { valueNum: 721.34 },
   "qqq.changePct": { valueNum: (4.22 / 717.12) * 100 },
   "paper.netAssets": { valueNum: 122000.0 },
+  "paper.totalCash": { valueNum: 100000.0 },
   "paper.exposurePct": { valueNum: 5.0 },
   "paper.remainingBudget": { valueNum: 6900.0 }
 };

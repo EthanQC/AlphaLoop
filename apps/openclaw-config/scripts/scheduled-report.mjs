@@ -7,11 +7,10 @@ import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import { collectL1News } from "./news-sources.mjs";
-import {
-  renderDetailedNewsLine,
-  selectDiverseNewsArticles,
-  summarizeNewsSourceBreakdown
-} from "./report-news.mjs";
+import { buildEventFromCluster, clusterArticles } from "./news-engine.mjs";
+import { getDailyFacts, upsertEventWithSources } from "./news-store.mjs";
+import { createOpenclawSearchBackend, runL2TopicSearch, runL3DeepDive } from "./news-agent-search.mjs";
+import { selectDiverseNewsArticles, summarizeNewsSourceBreakdown } from "./report-news.mjs";
 import {
   assertOfficialPaperReportEnvironment,
   buildDegradedOfficialPaperSnapshot,
@@ -23,9 +22,19 @@ import {
 } from "./report-data.mjs";
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
-import { assertReportQuality } from "./report-quality.mjs";
+import { assertReportQuality, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";
 import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
+
+// Phase 4 Task 7: news-search budgets/limits (Global Constraints - spec
+// values, not to be changed here). L2 topic search runs for both daily and
+// weekly at different budgets; L3 deep-dive is OFF for daily (07-07 binding
+// decision, see news-agent-search.mjs's own `enabled` default) and ON only
+// for weekly, at its own, larger per-event budget.
+const NEWS_SEARCH_BUDGET = { daily: 30, weekly: 60 };
+const L3_PER_EVENT_BUDGET = 8;
+const L3_MAX_EVENTS = 3;
+const NEWS_CARD_LIMIT = 8;
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
@@ -83,7 +92,7 @@ async function prepareReport(reportKind, info) {
   assertOfficialPaperReportEnvironment();
   const db = openTradingDatabase(dbPath);
   const executionRows = selectExecutionReports(db, info);
-  const marketData = await fetchRequiredReportMarketData(info);
+  const marketData = await fetchRequiredReportMarketData(info, reportKind, db);
 
   // Phase 4 Task 6: build + persist this trading day's daily_facts BEFORE
   // rendering - report-quality.mjs's facts.numeric_match gate
@@ -152,6 +161,27 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
 
   const titlePrefix = reportKind === "daily" ? "OpenClaw 日报" : "OpenClaw 周报";
   assertReportQuality(markdown, { kind: reportKind });
+
+  // Phase 4 Task 7 (T6 leftover wiring): validateReportUrls/
+  // validateNarrativeNumbers were defined by Task 6 but never called from
+  // anywhere - both are strictly opt-in to the new-format marker (see their
+  // own era-compatibility comments in report-quality.mjs), so running them
+  // unconditionally here is safe for legacy-format reports (they no-op).
+  // Matches assertReportQuality's existing failure contract exactly (throw
+  // with the failure-code list) - this codebase has no
+  // regenerate-then-degrade-with-disclosure retry loop anywhere today for a
+  // validateReportMarkdown-family failure to model after, so failing loud
+  // here (same as assertReportQuality above) is the one behavior this can
+  // consistently match rather than inventing new, unspecified retry
+  // machinery at delivery time.
+  const db = openTradingDatabase(dbPath);
+  const urlCheck = await validateReportUrls(markdown, { timeoutMs: 5000 });
+  const dailyFacts = getDailyFacts(db, info.label);
+  const numericCheck = validateNarrativeNumbers(markdown, dailyFacts);
+  if (!urlCheck.ok || !numericCheck.ok) {
+    throw new Error(`报告质量校验失败：${[...urlCheck.failures, ...numericCheck.failures].join(", ")}`);
+  }
+
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
     : await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
@@ -209,6 +239,7 @@ export function renderDailyReport(info, data) {
     "",
     `窗口：${formatWindow(info)}`,
     "",
+    ...renderNewsSearchDegradedHeaderMarker(data),
     "- 语言：中文。",
     "- 投递：飞书摘要卡片 + PDF。",
     "",
@@ -265,6 +296,7 @@ export function renderWeeklyReport(info, data) {
     "",
     `窗口：${formatWindow(info)}`,
     "",
+    ...renderNewsSearchDegradedHeaderMarker(data),
     "- 语言：中文。",
     "- 投递：飞书摘要卡片 + PDF。",
     "",
@@ -368,6 +400,7 @@ function renderDataSourceSummary(data) {
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.longbridgeWarnings?.length ? [`- 长桥降级：${data.longbridgeWarnings.join("；")}；报告继续生成，但任何新增动作必须人工复核。`] : []),
     ...(data.newsWarnings.length ? [`- 新闻降级：${data.newsWarnings.join("；")}。`] : []),
+    ...(data.newsSearchDegraded ? [`- 新闻检索降级：agent 检索不可用（L1-only 模式）；原因：${data.newsSearchReason ?? "原因未知"}；本次仅使用 L1 确定性采集结果，事件聚类不含 L2/L3 补充证据。`] : []),
     `- 宏观与行情：美国二星/三星宏观事件窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天；${formatQuoteTimestamp(data.qqqQuote)}。`,
     ...(data.macroWarnings?.length ? [`- 宏观日历降级：${data.macroWarnings.join("；")}。`] : []),
     `- 审计状态：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；宏观事件 ${data.sourceEvidence.macroEventsCount} 条。`
@@ -675,23 +708,6 @@ function summarizeQqqMove(quote) {
   return `QQQ 最新价 ${formatNumber(last)}，较前收${direction} ${formatNumber(Math.abs(change))}（${formatPercent(Math.abs(change) / prevClose)}）`;
 }
 
-function renderChineseNewsLine(article) {
-  const classification = classifyMarketNews(article);
-  const line = compactReportNewsLink(renderDetailedNewsLine(article, formatReportDateTime));
-  const linkSeparator = line.lastIndexOf("；链接：");
-  const sourceSeparator = line.lastIndexOf("；来源索引：");
-  const separator = Math.max(linkSeparator, sourceSeparator);
-  const extra = `；分类：${classification.bias}；基本面：${classification.fundamentalImpact}`;
-  if (separator === -1) {
-    return line.replace(/。$/u, `${extra}。`);
-  }
-  return `${line.slice(0, separator)}${extra}${line.slice(separator)}`;
-}
-
-function compactReportNewsLink(line) {
-  return String(line ?? "").replace(/链接：(https?:\/\/\S+?)(?=。$|；)/gu, "链接：[原文]($1)");
-}
-
 function summarizeMarketNewsTitle(title) {
   const text = String(title ?? "");
   if (/trade representative|ustr|tariff|trade policy/iu.test(text)) {
@@ -874,10 +890,6 @@ function renderClassifiedNewsLine(article) {
 }
 
 function renderMarketIntelligence(data) {
-  const newsLines = data.marketNews.length > 0
-    ? selectDiverseNewsArticles(data.marketNews, 8).map(renderChineseNewsLine)
-    : ["- 本窗口没有抓取到可用新闻；报告生成会在所有新闻来源同时为空时直接报错。"];
-
   const macroLines = data.macroEvents.length > 0
     ? data.macroEvents.slice(0, 8).map((entry) => {
         const values = entry.values
@@ -891,14 +903,364 @@ function renderMarketIntelligence(data) {
     : ["- 未来宏观日历没有返回高重要性事件。"];
 
   return [
-    "### 多源新闻（中文摘要与来源）",
-    "",
-    ...newsLines,
+    renderClusteredNewsSection(data),
     "",
     "### 宏观日历",
     "",
     ...macroLines
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Task 7: clustered news section ("### 多源新闻（事件聚类）")
+// ---------------------------------------------------------------------------
+//
+// Replaces the pre-Task-7 per-article rendering (selectDiverseNewsArticles +
+// renderChineseNewsLine over data.marketNews) with a per-EVENT rendering
+// over news-engine.mjs's clustered `event` shape: one card per clustered
+// story (中文标题/影响/两行摘要/来源角标+原文链接), plus a mandatory per-event
+// "compat" detail line reusing the SAME dense single-line shape
+// report-quality.mjs's OLD gates (news.detail_depth/news.source_diversity/
+// news.generic_chinese_summary/news.translation) already check for - those
+// gates are UNCONDITIONAL (not gated behind the new-format marker, see that
+// file's own "judged by the old gates AND the new ones" comment), so a
+// new-format report must still satisfy them. The compat line's fields (媒体/
+// 渠道/分类/基本面/标题要点/影响/链接) are derived from the SAME event.impact
+// this card's own "影响" line already shows - one source of truth, not a
+// second independently-computed classification.
+//
+// Section-tail statistics (来源分布/非券商源占比/中文源占比) are the BINDING
+// format Task 6's news.source_diversity_v2/news.chinese_ratio gates parse
+// (see report-quality.mjs's SOURCE_SUMMARY_LINE_PATTERN/
+// CHINESE_RATIO_LINE_PATTERN) - each stat is its OWN bullet line (not merged
+// into one line) because CHINESE_RATIO_LINE_PATTERN is anchored at the start
+// of its bullet.
+
+function resolveNewsEvents(data) {
+  if (Array.isArray(data.newsEvents)) {
+    return data.newsEvents;
+  }
+  // Fallback for callers that supply raw `marketNews` without a precomputed
+  // `newsEvents` field (e.g. direct renderDailyReport/renderWeeklyReport unit
+  // tests) - prepareReport's real data-fetch path always sets `newsEvents`
+  // explicitly (computed once, alongside the DB persist - see
+  // fetchRequiredReportMarketData), so this recomputation only ever runs for
+  // callers that skipped that step.
+  return buildNewsEvents(data.marketNews ?? [], data.trackedSymbols ?? []);
+}
+
+function buildNewsEvents(articles, trackedSymbols) {
+  return clusterArticles(articles).map((cluster) => buildEventFromCluster(cluster, trackedSymbols));
+}
+
+function persistNewsEvents(db, events) {
+  for (const event of events) {
+    if (!event?.clusterKey) {
+      continue;
+    }
+    upsertEventWithSources(
+      db,
+      {
+        clusterKey: event.clusterKey,
+        titleZh: event.titleZh,
+        summaryZh: event.summaryZh,
+        impactDirection: event.impact?.direction,
+        impactAffected: event.impact?.affected,
+        impactReason: event.impact?.reason
+      },
+      event.sources ?? []
+    );
+  }
+}
+
+function hasCjkText(value) {
+  return /[㐀-鿿]/u.test(String(value ?? ""));
+}
+
+function translateImpactDirectionLabel(direction) {
+  if (direction === "bullish") {
+    return "利好";
+  }
+  if (direction === "bearish") {
+    return "利空";
+  }
+  if (direction === "neutral") {
+    return "中性";
+  }
+  return "待验证";
+}
+
+function classifyEventFundamentalImpact(event) {
+  const text = `${event?.titleZh ?? ""} ${event?.summaryZh ?? ""} ${event?.impact?.reason ?? ""}`;
+  return /earnings|revenue|profit|guidance|ai|semiconductor|chip|财报|营收|利润|指引|人工智能|半导体/iu.test(text)
+    ? "可能影响基本面，需原始公告确认"
+    : "更多影响情绪/风险偏好，暂不视为基本面变化";
+}
+
+// Display label per source origin (news-engine.mjs's toSourceRecord sets
+// `origin` from the L1 article's `source` field - see news-sources.mjs's
+// fetchers for which literal strings each source uses).
+const CHANNEL_LABELS = {
+  "rsshub-cls": "财联社电报",
+  "rsshub-wallstreetcn": "华尔街见闻直播",
+  "rsshub-gelonghui": "格隆汇快讯",
+  finnhub: "Finnhub",
+  "yahoo-finance-search": "Yahoo Finance 搜索",
+  "yahoo-finance-rss": "Yahoo Finance RSS",
+  "google-news-rss": "Google News",
+  "longbridge-news": "长桥新闻",
+  "openclaw-l2-search": "OpenClaw 检索"
+};
+
+function deriveChannelLabel(origin) {
+  return CHANNEL_LABELS[String(origin ?? "")] ?? String(origin ?? "未知渠道");
+}
+
+// Sorts by known publishedAt descending; unknown-time entries sort LAST
+// ("未知时间→「时间未知」置底", Global Constraints) rather than being treated
+// as "now".
+function orderByRecencyUnknownLast(list, getIso) {
+  return [...list].sort((left, right) => {
+    const leftMs = getIso(left) ? Date.parse(getIso(left)) : NaN;
+    const rightMs = getIso(right) ? Date.parse(getIso(right)) : NaN;
+    const leftKnown = Number.isFinite(leftMs);
+    const rightKnown = Number.isFinite(rightMs);
+    if (leftKnown && rightKnown) {
+      return rightMs - leftMs;
+    }
+    if (leftKnown !== rightKnown) {
+      return leftKnown ? -1 : 1;
+    }
+    return 0;
+  });
+}
+
+function orderEventsByRecency(events) {
+  return orderByRecencyUnknownLast(events, (event) => event?.lastPublishedAt);
+}
+
+function orderSourcesByRecency(sources) {
+  return orderByRecencyUnknownLast(sources, (source) => source?.publishedAt);
+}
+
+// One "来源角标" bullet per source: media name + Beijing time (or honest
+// "时间未知"), and the original link rendered as a markdown `[原文](url)` -
+// titles/urls reaching this point are already defused (Task 1's
+// defuseMarkdownInText, applied at news-engine.mjs's buildEventFromCluster/
+// toSourceRecord), so it is safe to splice the raw url into the link target.
+function renderSourceBadgeLine(source) {
+  const timeLabel = source.publishedAt ? formatReportDateTime(source.publishedAt) : "时间未知";
+  const link = source.url ? `[原文](${source.url})` : "原文链接未提供";
+  return `- 来源：${source.publisher || deriveChannelLabel(source.origin)}（${timeLabel}）；${link}`;
+}
+
+// The mandatory dense compat-detail line (see section header comment) for
+// one event, keyed off one representative source (preferring one with a
+// URL, so "链接：" is populated rather than falling back to "来源索引：").
+function renderEventDetailCompatLine(event, source) {
+  const bias = translateImpactDirectionLabel(event?.impact?.direction);
+  const fundamentalImpact = classifyEventFundamentalImpact(event);
+  const channelLabel = deriveChannelLabel(source.origin);
+  const timeLabel = source.publishedAt ? formatReportDateTime(source.publishedAt) : "时间未知";
+  const symbolLabel = event?.impact?.affected?.[0] ?? "市场";
+  const shouldShowOriginalTitle = !hasCjkText(source.titleRaw);
+  const pieces = [
+    `- ${timeLabel} ${symbolLabel}：${event.titleZh}`,
+    `媒体：${source.publisher || channelLabel}`,
+    `渠道：${channelLabel}`,
+    `标题要点：${event.titleZh}`,
+    shouldShowOriginalTitle ? `原始标题：${singleLine(source.titleRaw, 200)}` : null,
+    `影响：${event?.impact?.reason || "多源检索线索，先作为可核对信息，不单独触发加仓"}`,
+    `分类：${bias}`,
+    `基本面：${fundamentalImpact}`,
+    source.url ? `链接：[原文](${source.url})` : `来源索引：${channelLabel}`
+  ].filter(Boolean);
+  return `${pieces.join("；")}。`;
+}
+
+function renderNewsEventCard(event, index) {
+  const [summaryLine1 = "", summaryLine2 = ""] = String(event.summaryZh ?? "").split("\n");
+  const biasLabel = translateImpactDirectionLabel(event?.impact?.direction);
+  const affectedLabel = event?.impact?.affected?.length ? event.impact.affected.join("、") : "大盘/宏观";
+  const reasonLabel = event?.impact?.reason || "多源检索线索，先作为可核对信息，不单独触发加仓";
+  const orderedSources = orderSourcesByRecency(event.sources ?? []);
+  const representativeSource = orderedSources.find((source) => source.url) ?? orderedSources[0];
+
+  return [
+    `#### ${index}. ${event.titleZh}`,
+    "",
+    `- 影响：方向 ${biasLabel}；标的 ${affectedLabel}；理由 ${reasonLabel}`,
+    `- 摘要：${summaryLine1}`,
+    ...(summaryLine2 ? [`  ${summaryLine2}`] : []),
+    ...orderedSources.map(renderSourceBadgeLine),
+    ...(representativeSource ? [renderEventDetailCompatLine(event, representativeSource)] : [])
+  ].join("\n");
+}
+
+function summarizeEventSourceBreakdown(sources) {
+  const counts = new Map();
+  for (const source of sources) {
+    const label = source.publisher || deriveChannelLabel(source.origin);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const breakdown = Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([label, count]) => `${label} ${count} 条`)
+    .join("；");
+  return breakdown || "暂无新闻来源";
+}
+
+function computeNonBrokerSourceRatio(sources) {
+  if (sources.length === 0) {
+    return 0;
+  }
+  const nonBroker = sources.filter((source) => source.origin !== "longbridge-news").length;
+  return (nonBroker / sources.length) * 100;
+}
+
+function computeChineseSourceRatio(sources) {
+  if (sources.length === 0) {
+    return 0;
+  }
+  const zh = sources.filter((source) => source.lang === "zh").length;
+  return (zh / sources.length) * 100;
+}
+
+function translateUncertaintyLabel(value) {
+  const labels = { high: "高", medium: "中", low: "低" };
+  return labels[value] ?? "未知";
+}
+
+// L3 deep-dive subsection ("事件-证据-反方证据/not_found-不确定性") - weekly
+// only (news-agent-search.mjs's runL3DeepDive returns
+// `{skipped: true, reason: 'l3_disabled_daily'}` for daily, in which case
+// this renders nothing). Independent of the L2 header/warnings marker: L3
+// carries its OWN degraded flag/reason from its own (possibly-failed)
+// backend calls.
+function renderL3DeepDiveSection(l3Result, events) {
+  if (!l3Result || l3Result.skipped) {
+    return null;
+  }
+
+  const entries = Array.isArray(l3Result.events) ? l3Result.events : [];
+  const eventLines = entries.map((entry) => {
+    const event = events.find((candidate) => candidate.clusterKey === entry.eventClusterKey);
+    const title = event?.titleZh ?? entry.eventClusterKey ?? "未知事件";
+    const evidenceCount = Array.isArray(entry.evidence) ? entry.evidence.length : 0;
+    const counterLabel = Array.isArray(entry.counterEvidence) && entry.counterEvidence.length > 0
+      ? `${entry.counterEvidence.length} 条反方证据`
+      : "not_found（未找到反方证据）";
+    return `- 事件：${title}；证据：${evidenceCount} 条独立佐证；反方证据：${counterLabel}；不确定性：${translateUncertaintyLabel(entry.analysis?.uncertainty)}。`;
+  });
+
+  const degradedNote = l3Result.degraded
+    ? [`- 深度核查在本次运行中降级：${l3Result.degradedReason ?? "原因未知"}；以上为降级前已完成的事件，其余高影响事件未获得独立交叉验证。`]
+    : [];
+
+  return [
+    "### 深度核查（L3，周报专属）",
+    "",
+    ...(eventLines.length > 0 ? eventLines : ["- 本周没有触发深度核查的高影响事件。"]),
+    ...degradedNote
+  ].join("\n");
+}
+
+function renderClusteredNewsSection(data) {
+  const events = resolveNewsEvents(data);
+  if (events.length === 0) {
+    return [
+      "### 多源新闻（事件聚类）",
+      "",
+      "- 本窗口没有聚类出可用新闻事件；多源采集结果全部为空会在数据收集阶段直接报错，因此这通常表示聚类后事件数为零而非采集失败。"
+    ].join("\n");
+  }
+
+  const cardEvents = orderEventsByRecency(events).slice(0, NEWS_CARD_LIMIT);
+  const cards = cardEvents.map((event, index) => renderNewsEventCard(event, index + 1));
+
+  const allSources = events.flatMap((event) => (Array.isArray(event.sources) ? event.sources : []));
+  const sourceBreakdown = summarizeEventSourceBreakdown(allSources);
+  const nonBrokerRatio = computeNonBrokerSourceRatio(allSources);
+  const chineseRatio = computeChineseSourceRatio(allSources);
+
+  const l3Section = renderL3DeepDiveSection(data.l3DeepDive, events);
+
+  return [
+    "### 多源新闻（事件聚类）",
+    "",
+    cards.join("\n\n"),
+    "",
+    `- 新闻来源分布：${sourceBreakdown}。`,
+    `- 非券商源占比：${nonBrokerRatio.toFixed(2)}%。`,
+    `- 中文源占比：${chineseRatio.toFixed(2)}%。`,
+    ...(l3Section ? ["", l3Section] : [])
+  ].join("\n");
+}
+
+// Header disclosure line (Global Constraints / 07-03:213 semantic): when the
+// restricted-agent (L2/L3) search backend is unavailable/throws (today: the
+// P10 placeholder from createOpenclawSearchBackend), the report degrades to
+// an "L1-only" path and must say so at the very top, not just bury it in the
+// evidence section (renderDataSourceSummary carries the matching warnings
+// bullet).
+function renderNewsSearchDegradedHeaderMarker(data) {
+  if (!data.newsSearchDegraded) {
+    return [];
+  }
+  return [`⚠ agent 检索不可用（L1-only 模式）：${data.newsSearchReason ?? "原因未知"}`, ""];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Task 7: L2 topic search wrapper (report-time orchestration)
+// ---------------------------------------------------------------------------
+
+// Wraps createOpenclawSearchBackend()+runL2TopicSearch in a try/catch of its
+// own IN ADDITION to runL2TopicSearch's internal per-call degradation
+// handling (news-agent-search.mjs's executeQueries already catches a
+// searchBackend throw and returns `{degraded: true, ...}` without ever
+// rethrowing) - this outer catch only exists to also cover a hypothetical
+// synchronous throw from constructing the backend itself, so this function
+// can never let a news-search failure crash report generation; the resulting
+// `degraded` state is a first-class part of the render (header marker +
+// warnings bullet), never a lost report.
+async function runNewsAgentSearch({ symbols, l1Titles, budget }) {
+  const backend = createOpenclawSearchBackend();
+  try {
+    const result = await runL2TopicSearch({ searchBackend: backend, budget, symbols, l1Titles });
+    if (result.degraded) {
+      return { degraded: true, reason: result.degradedReason, results: result.results, backend };
+    }
+    return { degraded: false, reason: null, results: result.results, backend };
+  } catch (error) {
+    return { degraded: true, reason: String(error?.message ?? error), results: [], backend };
+  }
+}
+
+// Maps a validated L2 result item (news-agent-search.mjs's schema:
+// {title, publisher, url, publishedAt, summary_zh, impact, evidence_quote})
+// into the L1 article shape news-engine.mjs's clusterArticles/
+// buildEventFromCluster expect, so a genuine L2 finding can merge into an
+// existing L1 cluster (same normalized URL/similar title - and, per
+// deriveImpact's documented precedence, its OWN structured `impact` then
+// wins for that cluster) or seed a brand-new event when it matches nothing
+// already collected.
+function mapL2ResultToArticle(item) {
+  const titleHasCjk = hasCjkText(item.title);
+  return {
+    id: item.url,
+    symbol: Array.isArray(item.impact?.affected) ? item.impact.affected[0] : undefined,
+    title: item.title,
+    titleZh: titleHasCjk ? item.title : item.summary_zh,
+    summary: item.summary_zh,
+    url: item.url,
+    publisher: item.publisher,
+    sourceName: item.publisher,
+    source: "openclaw-l2-search",
+    publishedAt: item.publishedAt ?? undefined,
+    publishedAtMs: item.publishedAt ? Date.parse(item.publishedAt) : undefined,
+    relatedTickers: Array.isArray(item.impact?.affected) ? item.impact.affected : [],
+    impact: item.impact
+  };
 }
 
 function renderOfficialPaperSnapshot(snapshot) {
@@ -983,7 +1345,7 @@ function selectExecutionReports(db, info) {
 }
 
 
-async function fetchRequiredReportMarketData(info) {
+async function fetchRequiredReportMarketData(info, reportKind, db) {
   const fetchedAt = new Date().toISOString();
   const longbridgeWarnings = [];
   const [checkResult, assetsResult, positionsResult, quoteResult] = await Promise.allSettled([
@@ -1015,11 +1377,48 @@ async function fetchRequiredReportMarketData(info) {
   const marketNews = marketNewsResult.articles;
   const macroEvents = macroCalendarResult.entries;
 
+  // Phase 4 Task 7: L2 topic search, budget by report kind (Global
+  // Constraints: daily <=30, weekly <=60). The real OpenClaw backend is a
+  // P10 placeholder (createOpenclawSearchBackend always throws today), so
+  // this degrades on every run until P10 ignition - that degradation is a
+  // first-class, disclosed state (header marker + warnings bullet), not a
+  // crash.
+  const newsSearch = await runNewsAgentSearch({
+    symbols: trackedSymbols,
+    l1Titles: marketNews.map((article) => article.title),
+    budget: NEWS_SEARCH_BUDGET[reportKind] ?? NEWS_SEARCH_BUDGET.daily
+  });
+
+  const combinedArticles = !newsSearch.degraded && newsSearch.results.length > 0
+    ? [...marketNews, ...newsSearch.results.map(mapL2ResultToArticle)]
+    : marketNews;
+
+  // Cluster once, persist once (single writer - report generation and the
+  // platform news page share the same trading db/process host per Global
+  // Constraints) - both render faces (this report, the platform's
+  // listNewsEvents) read the SAME upserted rows.
+  const newsEvents = buildNewsEvents(combinedArticles, trackedSymbols);
+  persistNewsEvents(db, newsEvents);
+
+  // L3 deep-dive: weekly only (07-07 binding decision - daily always passes
+  // enabled:false via runL3DeepDive's own default, see news-agent-search.mjs).
+  const l3DeepDive = await runL3DeepDive({
+    searchBackend: newsSearch.backend,
+    events: newsEvents,
+    perEventBudget: L3_PER_EVENT_BUDGET,
+    maxEvents: L3_MAX_EVENTS,
+    enabled: reportKind === "weekly"
+  });
+
   return {
     officialPaperSnapshot,
     qqqQuote,
     trackedSymbols,
     marketNews,
+    newsEvents,
+    newsSearchDegraded: newsSearch.degraded,
+    newsSearchReason: newsSearch.reason,
+    l3DeepDive,
     newsWarnings: marketNewsResult.warnings,
     longbridgeWarnings,
     macroEvents,

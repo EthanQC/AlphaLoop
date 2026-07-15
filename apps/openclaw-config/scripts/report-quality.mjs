@@ -373,6 +373,14 @@ async function checkUrlReachable(url, { fetchImpl, timeoutMs = 5000 } = {}) {
 const NUMERIC_MATCH_PATTERNS = [
   { factKey: "paper.exposurePct", kind: "pct", pattern: /暴露\s*([0-9][0-9,]*\.?[0-9]*)\s*%/gu },
   { factKey: "paper.netAssets", kind: "price", pattern: /净资产[：:]?\s*([0-9][0-9,]*\.?[0-9]*)/gu },
+  // Phase 4 Task 7 (T6 gap): 现金/paper.totalCash appears in the narrative
+  // (renderCoreSummary's accountSummary "现金 X"; renderOfficialPaperSnapshot's
+  // "现金：X") but had no matching NUMERIC_MATCH_PATTERNS entry - a fabricated
+  // cash figure would sail through undetected. Chosen fix: ADD the pattern
+  // (keep showing 现金 to the reader) rather than remove it from the
+  // narrative, matching the existing 净资产 entry's shape (optional colon,
+  // comma-grouped number).
+  { factKey: "paper.totalCash", kind: "price", pattern: /现金\s*[：:]?\s*([0-9][0-9,]*\.?[0-9]*)/gu },
   { factKey: "paper.remainingBudget", kind: "price", pattern: /剩余(?:[^\n。]*?)预算(?:[^\n0-9]*?)([0-9][0-9,]*\.?[0-9]*)/gu },
   { factKey: "qqq.price", kind: "price", pattern: /最新价[：:]?\s*([0-9][0-9,]*\.?[0-9]*)/gu },
   { factKey: "qqq.changePct", kind: "pct", pattern: /涨跌(?:[^\n%]*?)([0-9]+(?:\.[0-9]+)?)\s*%/gu }

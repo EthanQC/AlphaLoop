@@ -271,10 +271,17 @@ const GOOD_NEW_FORMAT_REPORT = [
   "- 最新价：721.34；前收：717.12；区间涨跌：4.22 / 0.59%"
 ].join("\n");
 
+// Phase 4 Task 7 (T6 gap fixed): added `paper.totalCash` here matching the
+// fixture's "现金 100,000.00" - report-quality.mjs's NUMERIC_MATCH_PATTERNS
+// now also parses 现金 out of the narrative (T6 left this key un-parsed even
+// though the narrative always renders it, so a fabricated cash figure was
+// never caught; Task 7 chose "add the pattern" over "remove 现金 from the
+// narrative" - see report-quality.mjs's own comment on that entry).
 const GOOD_SAMPLE_FACTS = {
   "qqq.price": { valueNum: 721.34 },
   "qqq.changePct": { valueNum: (4.22 / 717.12) * 100 },
   "paper.netAssets": { valueNum: 122000.0 },
+  "paper.totalCash": { valueNum: 100000.0 },
   "paper.exposurePct": { valueNum: 5.0 },
   "paper.remainingBudget": { valueNum: 6900.0 }
 };
