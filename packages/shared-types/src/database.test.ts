@@ -844,16 +844,18 @@ const V7_TABLE_NAMES = [
 // Builds a REAL v7 database (schema produced by the actual migration steps
 // 0..6, not hand-copied DDL that could silently drift out of sync with
 // database.ts) with one seeded row in every table that exists as of v7, then
-// rolls user_version back to 7 so migrate() has exactly one step left to run
-// (the new v8 step). Reuses the production migrate() itself to build the
-// baseline schema/constraints - the v8-only tables it also creates are
-// dropped immediately after, before any data is seeded, so they start this
-// fixture in exactly the same "doesn't exist yet" state a genuine pre-v8
-// production db would be in.
+// rolls user_version back to 7 so migrate() has every later step left to run.
+// Reuses the production migrate() itself to build the baseline schema/
+// constraints - the v8-only AND v9-only tables/indexes it also creates along
+// the way are dropped immediately after, before any data is seeded, so they
+// start this fixture in exactly the same "doesn't exist yet" state a genuine
+// pre-v8 production db would be in.
 function buildSeededV7Database(): DatabaseSync {
   const db = memoryDb();
-  migrate(db); // builds the full v0..v8 schema using the real migration code
+  migrate(db); // builds the full v0..v9 schema using the real migration code
   db.exec(`
+    DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
+    DROP TABLE IF EXISTS stock_facts;
     DROP INDEX IF EXISTS news_event_sources_event_idx;
     DROP TABLE IF EXISTS news_event_sources;
     DROP INDEX IF EXISTS news_events_window_idx;
@@ -983,15 +985,15 @@ function countRows(db: DatabaseSync, table: string): number {
 }
 
 describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
-  it("SCHEMA_VERSION is 8", () => {
-    expect(SCHEMA_VERSION).toBe(8);
-  });
-
-  it("a fresh db lands directly at v8, with all three news tables and both indexes present", () => {
+  // SCHEMA_VERSION has since moved on to v9 (Phase 5 Task 1, per-stock
+  // facts) - this block only asserts the v8-specific tables/indexes/
+  // constraints exist and behave, not any particular version number (same
+  // convention as the v6/v7 describe blocks above).
+  it("a fresh db lands directly at the latest version, with all three news tables and both indexes present", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(8);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
     const names = tables.map((t) => t.name);
@@ -1005,7 +1007,7 @@ describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
     expect(indexNames).toContain("news_event_sources_event_idx");
   });
 
-  it("upgrades a v7 db with data in every pre-existing table to v8 with zero row loss, and is idempotent", () => {
+  it("upgrades a v7 db with data in every pre-existing table to the latest version (through v8 and v9) with zero row loss, and is idempotent", () => {
     const db = buildSeededV7Database();
     expect(getSchemaVersion(db)).toBe(7);
 
@@ -1017,7 +1019,7 @@ describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
 
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(8);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     for (const table of V7_TABLE_NAMES) {
       expect(countRows(db, table)).toBe(countsBefore[table]);
     }
@@ -1026,10 +1028,11 @@ describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
     expect(countRows(db, "news_events")).toBe(0);
     expect(countRows(db, "news_event_sources")).toBe(0);
     expect(countRows(db, "daily_facts")).toBe(0);
+    expect(countRows(db, "stock_facts")).toBe(0);
 
-    // Idempotent: calling migrate() again on an already-v8 db changes nothing.
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
     migrate(db);
-    expect(getSchemaVersion(db)).toBe(8);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     for (const table of V7_TABLE_NAMES) {
       expect(countRows(db, table)).toBe(countsBefore[table]);
     }
@@ -1099,6 +1102,143 @@ describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
         .prepare(`
           INSERT INTO daily_facts (id, trading_day, fact_key, value_num, value_text, unit, source, data_time, created_at)
           VALUES ('fact_3', '2026-07-14', 'net_assets', 100000, NULL, 'USD', 'longbridge', ?, ?)
+        `)
+        .run(now, now)
+    ).not.toThrow();
+  });
+});
+
+// All tables that exist as of v8 (V7_TABLE_NAMES plus the three news-engine
+// tables v8 itself added), keyed the same way V7_TABLE_NAMES is - used by the
+// v9 migration test below to assert the v9 step (stock_facts) is purely
+// additive and touches none of them.
+const V8_TABLE_NAMES = [...V7_TABLE_NAMES, "news_events", "news_event_sources", "daily_facts"];
+
+// Builds a REAL v8 database: starts from buildSeededV7Database() (v0..v7
+// tables seeded, v8/v9 tables absent, user_version=7), runs the real
+// migrate() (which - now that v9 exists - advances through BOTH the v8 and
+// v9 steps in one call), then rolls JUST the v9-only stock_facts
+// table/index back off and resets user_version to 8. This mirrors
+// buildSeededV7Database's own "build via the real migration code, then peel
+// off the newest step" technique one level up, so this fixture stays a
+// faithful v8 snapshot no matter how many later schema versions get added on
+// top in future phases.
+function buildSeededV8Database(): DatabaseSync {
+  const db = buildSeededV7Database();
+  migrate(db);
+  db.exec(`
+    DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
+    DROP TABLE IF EXISTS stock_facts;
+  `);
+  db.exec("PRAGMA user_version = 8");
+
+  const now = nowIso();
+
+  db.prepare(`
+    INSERT INTO news_events
+    (id, cluster_key, title_zh, summary_zh, impact_direction, impact_affected, impact_reason,
+     first_published_at, last_published_at, source_count, zh_source_count, created_at, updated_at)
+    VALUES ('news_event_v8', 'cluster_v8', '标题', NULL, 'neutral', '[]', NULL, ?, ?, 1, 0, ?, ?)
+  `).run(now, now, now, now);
+
+  db.prepare(`
+    INSERT INTO news_event_sources
+    (id, event_id, origin, publisher, url, title_raw, published_at, lang, created_at)
+    VALUES ('news_source_v8', 'news_event_v8', 'wallstreetcn', '华尔街见闻', 'https://example.com/a', '标题原文', ?, 'zh', ?)
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO daily_facts (id, trading_day, fact_key, value_num, value_text, unit, source, data_time, created_at)
+    VALUES ('daily_fact_v8', '2026-07-14', 'qqq.price', 522.31, NULL, 'USD', 'longbridge-quote', ?, ?)
+  `).run(now, now);
+
+  return db;
+}
+
+describe("v9 stock_facts table migration (Phase 5 Task 1)", () => {
+  it("SCHEMA_VERSION is 9", () => {
+    expect(SCHEMA_VERSION).toBe(9);
+  });
+
+  it("a fresh db lands directly at v9, with the stock_facts table and its index present", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(9);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("stock_facts");
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("stock_facts_symbol_day_idx");
+  });
+
+  it("upgrades a v8 db with data in every pre-existing table to v9 with zero row loss, and is idempotent", () => {
+    const db = buildSeededV8Database();
+    expect(getSchemaVersion(db)).toBe(8);
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V8_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      expect(countsBefore[table]).toBeGreaterThan(0);
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(9);
+    for (const table of V8_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // New table exists and starts empty.
+    expect(countRows(db, "stock_facts")).toBe(0);
+
+    // Idempotent: calling migrate() again on an already-v9 db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(9);
+    for (const table of V8_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+
+  it("enforces stock_facts UNIQUE(trading_day, symbol, fact_key), while allowing the same fact_key across different symbols on the same day", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+      VALUES ('fact_1', '2026-07-14', 'AAPL.US', 'quote.last', 210.5, NULL, 'USD', 'longbridge-quote', ?, ?)
+    `).run(now, now);
+
+    // Same (trading_day, symbol, fact_key): rejected as a duplicate.
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+          VALUES ('fact_2', '2026-07-14', 'AAPL.US', 'quote.last', 999.99, NULL, 'USD', 'longbridge-quote', ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/UNIQUE constraint failed/);
+
+    // Same trading_day and fact_key, DIFFERENT symbol: must succeed - the
+    // whole point of scoping the UNIQUE constraint by symbol (unlike
+    // daily_facts' (trading_day, fact_key)-only constraint).
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+          VALUES ('fact_3', '2026-07-14', 'MSFT.US', 'quote.last', 430.1, NULL, 'USD', 'longbridge-quote', ?, ?)
+        `)
+        .run(now, now)
+    ).not.toThrow();
+
+    // Same symbol and fact_key, DIFFERENT trading_day: must also succeed.
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+          VALUES ('fact_4', '2026-07-15', 'AAPL.US', 'quote.last', 212.0, NULL, 'USD', 'longbridge-quote', ?, ?)
         `)
         .run(now, now)
     ).not.toThrow();

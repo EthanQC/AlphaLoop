@@ -92,8 +92,14 @@ describe("normalizeStockSymbol", () => {
     expect(normalizeStockSymbol(".dji")).toBe(".DJI");
   });
 
-  it("rejects a hyphen even though report-data.mjs's own normalizeSymbol regex would allow one (deliberate narrower charset)", () => {
-    expect(normalizeStockSymbol("BRK-B")).toBeNull();
+  it("accepts a hyphen now that the charset is aligned with report-data.mjs's normalizeSymbol (Phase 5 Task 5)", () => {
+    // Bare hyphenated ticker: doesn't match the 1-6-plain-letter bare-ticker
+    // shortcut (so no .US gets appended), and isn't already dot-suffixed -
+    // passes through unchanged, same as report-data.mjs's own normalizeSymbol
+    // would do for this exact input.
+    expect(normalizeStockSymbol("BRK-B")).toBe("BRK-B");
+    // Already-suffixed hyphenated symbol - unchanged (uppercased).
+    expect(normalizeStockSymbol("brk-b.us")).toBe("BRK-B.US");
   });
 
   it("rejects empty/whitespace-only input", () => {
@@ -234,6 +240,74 @@ describe("stock route (GET /stock/<code>)", () => {
     expect(body).not.toContain("290.00");
     expect(body).not.toContain("后续段落不应出现在摘要里");
     expect(body).toContain("2026-06-19"); // newest report's date shown as data time
+  });
+
+  // Phase 5 Task 5 (2026-07-15 plan): the summary card upgrade. A legacy
+  // report (no "### 结论框" in its symbol section) keeps the pre-Task-5
+  // first-bullet behavior, plus an explicit note that no structured box was
+  // found - never silently indistinguishable from a genuinely terse
+  // structured result.
+  it("falls back to the first-bullet summary + 旧格式无结论框 note for a legacy report with no 结论框 block", async () => {
+    const { token } = seedMemberWithToken();
+    writeStockAnalysisReport(
+      repoRoot,
+      "2026-06-19.md",
+      "# OpenClaw 个股分析 2026-06-19\n\n## AAPL.US\n\n### 标的基本信息\n\n- 最新价格：298.01；旧格式。\n"
+    );
+
+    const response = await authed("/stock/AAPL.US", token);
+    const body = await response.text();
+
+    expect(body).toContain("最新价格：298.01；旧格式。");
+    expect(body).toContain("旧格式无结论框");
+  });
+
+  // New-format report: a "### 结论框" block in the symbol's own section
+  // parses through parseConclusionBox and renders the structured fields
+  // instead of the raw first bullet.
+  const NEW_FORMAT_AAPL_SECTION = [
+    "# OpenClaw 个股分析 2026-07-14",
+    "",
+    "## AAPL.US",
+    "",
+    "### 结论与复盘标签",
+    "",
+    "- 上行路径（约 +45.00%）：既有的三路径叙述文字保留在结论框之前。",
+    "",
+    "### 结论框",
+    "",
+    "- 核心结论：短线偏上行：守住支撑位 210.50 美元并放量突破 220.00 美元",
+    "- 置信度：高",
+    "- 合理价值区间：205.12–230.50 美元（依据：近20日支撑位与卖方一年目标价）",
+    "- 当前价格位置：现价 210.50 美元，位于合理区间内",
+    "- 复盘触发：若价格跌破支撑位 205.12 美元，需重新评估当前结论（复盘日期：2026-08-15）"
+  ].join("\n");
+
+  it("renders 核心结论 + confidence badge + 合理价值区间 + 复盘日期 for a new-format report with a 结论框 block", async () => {
+    const { token } = seedMemberWithToken();
+    writeStockAnalysisReport(repoRoot, "2026-07-14.md", NEW_FORMAT_AAPL_SECTION);
+
+    const response = await authed("/stock/AAPL.US", token);
+    const body = await response.text();
+
+    expect(body).toContain("短线偏上行：守住支撑位 210.50 美元并放量突破 220.00 美元");
+    expect(body).toContain('<span class="pill ok">高</span>');
+    expect(body).toContain("205.12");
+    expect(body).toContain("230.50");
+    expect(body).toContain("2026-08-15");
+    expect(body).not.toContain("旧格式无结论框");
+  });
+
+  it("renders the 中 (amber warn) and 低 (sub-muted) confidence badges for their own tiers", async () => {
+    const { token: tokenMedium } = seedMemberWithToken({ id: "m_medium", email: "medium@example.com" });
+    writeStockAnalysisReport(repoRoot, "2026-07-14.md", NEW_FORMAT_AAPL_SECTION.replace("- 置信度：高", "- 置信度：中"));
+    const mediumBody = await (await authed("/stock/AAPL.US", tokenMedium)).text();
+    expect(mediumBody).toContain('<span class="pill warn">中</span>');
+
+    const { token: tokenLow } = seedMemberWithToken({ id: "m_low", email: "low@example.com" });
+    writeStockAnalysisReport(repoRoot, "2026-07-14.md", NEW_FORMAT_AAPL_SECTION.replace("- 置信度：高", "- 置信度：低"));
+    const lowBody = await (await authed("/stock/AAPL.US", tokenLow)).text();
+    expect(lowBody).toContain('<span class="pill" style="background:var(--card2);color:var(--sub)">低</span>');
   });
 
   it("historical analysis list only includes reports that actually mention this symbol, newest first", async () => {

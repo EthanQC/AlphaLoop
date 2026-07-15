@@ -36,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -476,6 +476,37 @@ const MIGRATIONS: MigrationStep[] = [
         value_num REAL, value_text TEXT, unit TEXT, source TEXT NOT NULL,
         data_time TEXT NOT NULL, created_at TEXT NOT NULL,
         UNIQUE(trading_day, fact_key));
+    `);
+  },
+  (db) => {
+    // Phase 5 Task 1 (2026-07-15 plan): stock_facts is the per-stock,
+    // per-trading-day analogue of v8's daily_facts (news-store.mjs's
+    // replaceDailyFacts/getDailyFacts) - it holds every number a per-symbol
+    // stock-analysis report narrative may cite (quote/valuation/history/
+    // options/news/institutional-placeholder facts), keyed by (trading_day,
+    // symbol, fact_key) rather than daily_facts' (trading_day, fact_key),
+    // because these facts are inherently per-symbol, not portfolio-wide. A
+    // brand-new table, no rebuild of anything pre-existing - a plain step
+    // suffices (no needsForeignKeysOff). DDL is spec-frozen verbatim from the
+    // plan; do not hand-edit without updating the plan doc first.
+    //
+    // Unlike daily_facts (whose store does a full-trading-day DELETE+INSERT),
+    // the store for this table (stock-facts-store.mjs's replaceStockFacts)
+    // scopes its DELETE to (trading_day, symbol): a batch run analyzing many
+    // symbols on the same trading_day must never let one symbol's refresh
+    // wipe out its sibling symbols' rows, since they all share that same
+    // trading_day.
+    //
+    // No owner_id: per Global Constraint, stock facts are a public asset (the
+    // stock-analysis pool is shared across the whole member base), not
+    // per-member data - same reasoning v8's news tables already documented.
+    db.exec(`
+      CREATE TABLE stock_facts (
+        id TEXT PRIMARY KEY, trading_day TEXT NOT NULL, symbol TEXT NOT NULL,
+        fact_key TEXT NOT NULL, value_num REAL, value_text TEXT, unit TEXT,
+        source TEXT NOT NULL, data_time TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(trading_day, symbol, fact_key));
+      CREATE INDEX stock_facts_symbol_day_idx ON stock_facts(symbol, trading_day);
     `);
   }
 ];

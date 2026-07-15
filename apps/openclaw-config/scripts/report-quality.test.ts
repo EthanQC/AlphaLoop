@@ -4,8 +4,11 @@ import {
   validateNarrativeNumbers,
   validateReportMarkdown,
   validateReportUrls,
-  validateStockAnalysisMarkdown
+  validateStockAnalysisMarkdown,
+  validateStockNarrativeNumbers
 } from "./report-quality.mjs";
+import { buildStockFacts } from "./report-facts.mjs";
+import { buildDeterministicAnalysis, renderBatchStockAnalysis } from "./stock-analysis.mjs";
 
 describe("report quality gate", () => {
   it("rejects daily or weekly reports that still rely on Longbridge-only generic news", () => {
@@ -521,5 +524,272 @@ describe("Phase 4 Task 6 - validateNarrativeNumbers (facts.numeric_match)", () =
 
     expect(result.ok).toBe(false);
     expect(result.failures.some((failure) => failure.startsWith("facts.numeric_match:qqq.price"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 Task 4 (2026-07-15 plan) - stock analysis quality gates:
+// stock.conclusion_box, stock.facts_coverage, stock.numeric_match. Fixtures
+// below reuse the SAME real production functions (buildDeterministicAnalysis/
+// renderBatchStockAnalysis/buildStockFacts) stock-analysis.test.ts's own
+// fixtures do, rather than hand-typing markdown, so "a well-formed report" is
+// whatever those functions actually produce today, not a second,
+// independently-typed guess at their shape that could silently drift.
+// ---------------------------------------------------------------------------
+
+function stockQuoteFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    symbol: "AAPL.US",
+    last: "213.00",
+    prev_close: "208.00",
+    open: "209.00",
+    high: "215.00",
+    low: "207.50",
+    volume: "50000000",
+    timestamp: "2026-07-15T20:00:00.000Z",
+    ...overrides
+  };
+}
+
+function stockHistoryFixture(days = 130, startClose = 180, dailyDrift = 0.1) {
+  const rows: Array<{ date: string; close: number }> = [];
+  const start = new Date("2026-01-05T00:00:00.000Z").getTime();
+  for (let i = 0; i < days; i += 1) {
+    rows.push({ date: new Date(start + i * 86_400_000).toISOString().slice(0, 10), close: startClose + i * dailyDrift });
+  }
+  return rows;
+}
+
+function stockFundamentalsFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    sources: ["yahoo-quote"],
+    trailingPE: 22,
+    priceToBook: 6,
+    epsTrailingTwelveMonths: 8,
+    marketCap: 1_000_000_000_000,
+    oneYearTarget: 280,
+    ...overrides
+  };
+}
+
+function stockOptionChainFixture() {
+  return {
+    expirationDates: [1755820800],
+    options: [{ calls: [{ openInterest: 1000 }], puts: [{ openInterest: 500 }] }]
+  };
+}
+
+function stockNewsFixture(count = 3) {
+  return Array.from({ length: count }, (_, i) => ({ id: `n${i}`, title: `新闻 ${i}`, source: "longbridge-news" }));
+}
+
+const STOCK_GENERATED_AT = "2026-07-15T13:00:00.000Z";
+
+// Builds one record the same way stock-analysis.mjs's runAnalysis would
+// (deterministic analysis + independently-computed stock_facts from the SAME
+// inputs) - `degraded` mirrors what attachNarrativeSections would actually
+// leave on `record.narrative` for TODAY's default (P10-gated, always-throws)
+// backend, WITHOUT needing a real db/attachNarrativeSections call: per
+// renderBatchStockAnalysis's own branching, `{ degraded: true }` with no
+// `.sections` key renders byte-identically to a real degraded
+// generateNarrativeSections result (both fall through to the untouched
+// deterministic arrays) - see stock-analysis.mjs's own sectionValues comment.
+function buildGoodStockRecord(symbol: string, { quoteOverrides = {}, degraded = false }: { quoteOverrides?: Record<string, unknown>; degraded?: boolean } = {}) {
+  const quote = stockQuoteFixture({ symbol, ...quoteOverrides });
+  const history = stockHistoryFixture();
+  const fundamentals = stockFundamentalsFixture();
+  const optionChain = stockOptionChainFixture();
+  const news = stockNewsFixture();
+  const analysis = buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, STOCK_GENERATED_AT);
+  const facts = buildStockFacts({ symbol, quote, history, fundamentals, optionChain, news, tradingDay: STOCK_GENERATED_AT.slice(0, 10) });
+  const factsByKey = Object.fromEntries(facts.map((fact: { factKey: string }) => [fact.factKey, fact]));
+  const record: Record<string, unknown> = { symbol, analysis, news };
+  if (degraded) {
+    record.narrative = { degraded: true };
+  }
+  return { symbol, analysis, news, factsByKey, record };
+}
+
+function renderStockReport(records: Array<{ record: Record<string, unknown> }>) {
+  return renderBatchStockAnalysis({
+    label: STOCK_GENERATED_AT.slice(0, 10),
+    generatedAt: STOCK_GENERATED_AT,
+    records: records.map((entry) => entry.record),
+    failedSymbols: []
+  });
+}
+
+const LEGACY_STOCK_REPORT = [
+  "# OpenClaw 个股分析 2026-06-14",
+  "",
+  "## AAPL",
+  "",
+  "### 基本面分析",
+  "",
+  "- 估值补充：PE 28.10，PB 12.30。",
+  "- 上行潜力：综合上行潜力：中性偏多，需结合估值和目标价确认。",
+  "",
+  "### 市场表现与交易层面",
+  "",
+  "- 均线：20 日 201.00；60 日 195.00；126 日 188.00。",
+  "",
+  "### 期权交割与阻力支撑",
+  "",
+  "- 期权链只读补充：看涨合约较多。",
+  "",
+  "### 近期新闻",
+  "",
+  "- 来源分布：Longbridge 3 条。",
+  "- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。"
+].join("\n");
+
+describe("Phase 5 Task 4 - era compatibility rule (stock new gates are strictly opt-in)", () => {
+  it("never fires stock.conclusion_box/stock.facts_coverage on a legacy-format stock report", () => {
+    const result = validateStockAnalysisMarkdown(LEGACY_STOCK_REPORT);
+
+    expect(result.failures.some((failure) => failure.startsWith("stock.conclusion_box"))).toBe(false);
+    expect(result.failures.some((failure) => failure.startsWith("stock.facts_coverage"))).toBe(false);
+  });
+
+  it("skips validateStockNarrativeNumbers entirely for a legacy-format stock report, even with an empty facts map", () => {
+    const result = validateStockNarrativeNumbers(LEGACY_STOCK_REPORT, {});
+
+    expect(result).toEqual({ ok: true, failures: [] });
+  });
+
+  it("evaluates every new gate once '### 结论框' is present, and a well-formed new-format report passes all of them", () => {
+    const { record, factsByKey } = buildGoodStockRecord("AAPL.US", { degraded: true });
+    const markdown = renderStockReport([{ record }]);
+
+    const syncResult = validateStockAnalysisMarkdown(markdown);
+    expect(syncResult).toEqual({ ok: true, failures: [] });
+
+    const numericResult = validateStockNarrativeNumbers(markdown, { "AAPL.US": factsByKey });
+    expect(numericResult).toEqual({ ok: true, failures: [] });
+  });
+});
+
+describe("Phase 5 Task 4 - stock.conclusion_box", () => {
+  it("fails for a symbol whose own section has no '### 结论框' at all, while a sibling symbol's intact box keeps the doc new-format", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    // A distinct quote (not just a different symbol) so MSFT.US's rendered
+    // "### 结论框" text is genuinely different from AAPL.US's - both records
+    // otherwise share the same history/fundamentals/optionChain, and the box
+    // itself never interpolates the symbol string, so an identical quote
+    // would render byte-identical boxes for both symbols, making a plain
+    // string .replace() below ambiguous about which one it targets.
+    const broken = buildGoodStockRecord("MSFT.US", { quoteOverrides: { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" } });
+    let markdown = renderStockReport([{ record: good.record }, { record: broken.record }]);
+    markdown = markdown.replace(broken.analysis.conclusionBoxMarkdown, "");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+    expect(result.failures).not.toContain("stock.conclusion_box:AAPL.US");
+  });
+
+  it("fails for a corrupted confidence label ('很高', not one of 高/中/低)", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    // A distinct quote (not just a different symbol) so MSFT.US's rendered
+    // "### 结论框" text is genuinely different from AAPL.US's - both records
+    // otherwise share the same history/fundamentals/optionChain, and the box
+    // itself never interpolates the symbol string, so an identical quote
+    // would render byte-identical boxes for both symbols, making a plain
+    // string .replace() below ambiguous about which one it targets.
+    const broken = buildGoodStockRecord("MSFT.US", { quoteOverrides: { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" } });
+    const corruptedBox = broken.analysis.conclusionBoxMarkdown.replace(/- 置信度：\S+/u, "- 置信度：很高");
+    let markdown = renderStockReport([{ record: good.record }, { record: broken.record }]);
+    markdown = markdown.replace(broken.analysis.conclusionBoxMarkdown, corruptedBox);
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+  });
+
+  it("fails when the 复盘触发 bullet is missing its required 复盘日期 suffix", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    // A distinct quote (not just a different symbol) so MSFT.US's rendered
+    // "### 结论框" text is genuinely different from AAPL.US's - both records
+    // otherwise share the same history/fundamentals/optionChain, and the box
+    // itself never interpolates the symbol string, so an identical quote
+    // would render byte-identical boxes for both symbols, making a plain
+    // string .replace() below ambiguous about which one it targets.
+    const broken = buildGoodStockRecord("MSFT.US", { quoteOverrides: { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" } });
+    const corruptedBox = broken.analysis.conclusionBoxMarkdown.replace(/（复盘日期：\d{4}-\d{2}-\d{2}）$/mu, "");
+    let markdown = renderStockReport([{ record: good.record }, { record: broken.record }]);
+    markdown = markdown.replace(broken.analysis.conclusionBoxMarkdown, corruptedBox);
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+  });
+});
+
+describe("Phase 5 Task 4 - stock.facts_coverage", () => {
+  it("counts an explicit disclosure (估值/历史走势/期权链 all read-failed) toward coverage, not against it", () => {
+    const symbol = "AAPL.US";
+    const quote = stockQuoteFixture({ symbol });
+    const news = stockNewsFixture();
+    const analysis = buildDeterministicAnalysis(symbol, quote, news, {
+      history: { error: "Yahoo chart 读取失败" },
+      fundamentals: { error: "401 Unauthorized" },
+      optionChain: { error: "Yahoo options 读取失败" }
+    }, STOCK_GENERATED_AT);
+    const markdown = renderStockReport([{ record: { symbol, analysis, news } }]);
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures.some((failure) => failure.startsWith("stock.facts_coverage"))).toBe(false);
+  });
+
+  it("fails when 3 of the 8 checkpoints have neither a real value nor an explicit disclosure", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    let markdown = renderStockReport([{ record: good.record }]);
+    // Surgically blank out quote.pct/valuation.pe/history.ma20's own backing
+    // text (leaving every other checkpoint's real value intact) - simulates a
+    // rendering bug/corruption that silently drops a data point without
+    // disclosing why, which is exactly what this gate exists to catch.
+    // "PE X；PB Y；" repeats in every section that embeds
+    // summarizeUpsidePotential's shared string (投资逻辑/基本面分析/结论与复盘标签
+    // all quote it) - a global replace strips every occurrence, otherwise a
+    // sibling section's copy would keep the valuation.pe checkpoint "backed".
+    markdown = markdown
+      .replace(/涨跌幅：[^；]+；/u, "")
+      .replace(/PE\s+[0-9.]+；PB\s+[0-9.]+；/giu, "")
+      .replace(/均线：20 日 [0-9.]+；/u, "");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.facts_coverage:AAPL.US:5/8");
+  });
+});
+
+describe("Phase 5 Task 4 - stock.numeric_match (validateStockNarrativeNumbers)", () => {
+  it("fails, naming the symbol and the fabricated number, when a narrative number mismatches its fact beyond tolerance", () => {
+    const { record, factsByKey } = buildGoodStockRecord("AAPL.US");
+    const markdown = renderStockReport([{ record }]).replace("最新价格：213.00", "最新价格：218.70");
+
+    const result = validateStockNarrativeNumbers(markdown, { "AAPL.US": factsByKey });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.numeric_match:AAPL.US:218.70");
+  });
+
+  it("passes within tolerance (price +-0.01)", () => {
+    const { record, factsByKey } = buildGoodStockRecord("AAPL.US", { degraded: true });
+    const markdown = renderStockReport([{ record }]).replace("最新价格：213.00", "最新价格：213.01");
+
+    const result = validateStockNarrativeNumbers(markdown, { "AAPL.US": factsByKey });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("skips a whole symbol carrying the REPORT_DEGRADED_HEADER disclosure, even with an empty/mismatching facts map", () => {
+    const { record } = buildGoodStockRecord("AAPL.US", { degraded: true, quoteOverrides: { last: "999.99" } });
+    const markdown = renderStockReport([{ record }]);
+
+    const result = validateStockNarrativeNumbers(markdown, {});
+
+    expect(result).toEqual({ ok: true, failures: [] });
   });
 });

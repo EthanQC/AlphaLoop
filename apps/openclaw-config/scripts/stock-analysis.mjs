@@ -20,13 +20,18 @@ import {
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
-import { assertStockAnalysisQuality } from "./report-quality.mjs";
+import { assertStockAnalysisQuality, validateStockNarrativeNumbers } from "./report-quality.mjs";
+import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
+import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
+import { createNarrativeLlmBackend, generateNarrativeSections, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
+import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD, getStockFacts } from "./stock-facts-store.mjs";
 import { buildYahooOptionChainUrls } from "./stock-analysis-sources.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
   extractStockAnalysisStatistics,
   mergeFundamentalSnapshots,
   normalizeNasdaqSummary,
+  summarizeHistory,
   summarizeOptionChainStats,
   summarizeUpsidePotential,
   summarizeValuation
@@ -180,7 +185,7 @@ async function runScheduled(db, force = false) {
   await runAnalysis(db, { force });
 }
 
-async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) {
+async function runAnalysis(db, { deliver = true, targetsOverride = null, narrativeBackend = createNarrativeLlmBackend() } = {}) {
   const targets = Array.isArray(targetsOverride) && targetsOverride.length
     ? [...new Set(targetsOverride.map(normalizeSymbol).filter(Boolean))]
     : listTargets(db);
@@ -189,25 +194,81 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) 
   }
 
   const generatedAt = new Date().toISOString();
-  const { records, failedSymbols } = await fetchStockAnalysisRecords(targets);
+  const label = generatedAt.slice(0, 10);
+  const { records, failedSymbols } = await fetchStockAnalysisRecords(targets, { generatedAt });
   if (records.length === 0) {
     throw new Error(
       `全部标的数据获取失败，无法生成个股分析报告：${failedSymbols.map((entry) => `${entry.symbol}（${entry.error}）`).join("；")}`
     );
   }
 
-  const label = generatedAt.slice(0, 10);
+  // Phase 5 Task 1 (2026-07-15 plan): build + persist this trading day's
+  // per-symbol stock_facts BEFORE rendering, mirroring scheduled-report.mjs's
+  // daily_facts ordering (report-facts.mjs's buildDailyFacts/persistDailyFacts,
+  // see its own "build + persist before render" comment) - a later quality
+  // gate (facts.numeric_match, Task 4) needs an independently-computed
+  // ground truth already sitting in stock_facts by the time anything
+  // downstream inspects the rendered narrative. `records` only ever holds
+  // symbols fetchStockAnalysisRecords successfully fetched (see Task H7's
+  // per-symbol isolation above) - a failedSymbols entry never reaches here,
+  // so it correctly gets no facts row instead of a fabricated/stale one.
+  persistStockFactsForRecords(db, label, records);
+
+  // Phase 5 Task 3 (2026-07-15 plan): narrative orchestration - runs AFTER
+  // facts are persisted (immediately above) so each record's stock_facts
+  // are already sitting in the db by the time generateNarrativeSections's
+  // numeric pre-check needs them as ground truth. `narrativeBackend`
+  // defaults to createNarrativeLlmBackend() - the P10-gated throw - so
+  // TODAY's production runs always take the global-degrade path (every
+  // section falls back to its own deterministic text unchanged, plus the
+  // REPORT_DEGRADED_HEADER disclosure line renderBatchStockAnalysis adds
+  // right after each `## SYMBOL` heading); only a test-injected fake backend
+  // ever exercises the narrative-adopted path.
+  await attachNarrativeSections(db, label, records, { narrativeBackend });
+
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
-  const markdownPath = join(reportsDir, `${label}.md`);
-  const pdfPath = join(reportsDir, `${label}.pdf`);
+  const { markdownPath, pdfPath } = resolveReportPaths(reportsDir, label, deliver);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
+
+  // Phase 5 Task 5 (2026-07-15 plan) minor (b): predictions are written
+  // "生成时" (at generation time) - but ONLY for a real delivered run.
+  // Previously this ran unconditionally (including for a `prepare` dry-run),
+  // which meant every preview render polluted the public analysis_predictions
+  // table with rows for a report that was never actually delivered/archived
+  // (flagged by Task 2's own comment as deferred to this task). Now gated by
+  // `deliver` via persistPredictionsIfDelivered - a `prepare` dry-run writes
+  // its markdown/pdf to the `-preview` path (resolveReportPaths above) purely
+  // for human inspection and writes NOTHING to analysis_predictions.
+  persistPredictionsIfDelivered(db, deliver, markdownPath, markdown, records);
+
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
   const deliveredSymbols = records.map((record) => record.symbol);
   if (!deliver) {
     console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
     return;
+  }
+
+  // Phase 5 Task 4 (2026-07-15 plan) - stock.numeric_match: the LAST line of
+  // defense before delivery, run only at delivery time (not for a `prepare`
+  // dry-run) - mirrors scheduled-report.mjs's deliverReport, which similarly
+  // only runs its own facts-taking numeric gate (validateNarrativeNumbers)
+  // at delivery, never at prepare time (see that function's own comment).
+  // T3's narrative orchestrator already retried (<=2) and honestly degraded
+  // any section it couldn't validate BEFORE this markdown was ever rendered
+  // (attachNarrativeSections, above) - this gate exists to catch what that
+  // upstream defense might have missed (a bug in it, or a hand-edited/
+  // tampered render), reading each delivered symbol's own just-persisted
+  // stock_facts (persistStockFactsForRecords already wrote them earlier in
+  // this exact run, for this exact tradingDay `label`) as ground truth. Era
+  // marker means this genuinely no-ops for a hypothetical caller that
+  // somehow renders a stock-analysis report without a "### 结论框" - not a
+  // real path today, since buildDeterministicAnalysis always emits one.
+  const factsBySymbol = Object.fromEntries(records.map((record) => [record.symbol, getStockFacts(db, label, record.symbol)]));
+  const numericCheck = validateStockNarrativeNumbers(markdown, factsBySymbol);
+  if (!numericCheck.ok) {
+    throw new Error(`个股分析质量校验失败：${numericCheck.failures.join(", ")}`);
   }
 
   const delivery = await deliverReportToFeishu({
@@ -241,12 +302,12 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null } = {}) 
 // fetch was fatal. Isolating it here means a bad symbol is disclosed in the
 // rendered output (see renderBatchStockAnalysis's failedSymbols handling)
 // instead of silently taking down every other target's analysis.
-export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchStockAnalysisRecord } = {}) {
+export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchStockAnalysisRecord, generatedAt } = {}) {
   const records = [];
   const failedSymbols = [];
   for (const symbol of targets) {
     try {
-      records.push(await fetchRecord(symbol));
+      records.push(await fetchRecord(symbol, generatedAt));
     } catch (error) {
       failedSymbols.push({ symbol, error: error instanceof Error ? error.message : String(error) });
     }
@@ -254,7 +315,73 @@ export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchSt
   return { records, failedSymbols };
 }
 
-async function fetchStockAnalysisRecord(symbol) {
+// Phase 5 Task 1 (2026-07-15 plan): builds and persists stock_facts for each
+// SUCCESSFULLY fetched record (never for a failedSymbols entry - those never
+// appear in `records` in the first place, per fetchStockAnalysisRecords'
+// per-symbol isolation above). Exported and kept as a standalone,
+// dependency-injectable-free function (only db + plain data in, no network)
+// so it is directly unit-testable without exercising runAnalysis's heavier
+// network/PDF/delivery side effects - mirrors this file's existing pattern
+// of testing fetchStockAnalysisRecords/renderBatchStockAnalysis in isolation
+// rather than the CLI-facing runAnalysis orchestrator itself.
+export function persistStockFactsForRecords(db, tradingDay, records) {
+  for (const record of records) {
+    const facts = buildStockFacts({
+      symbol: record.symbol,
+      quote: record.quote,
+      history: record.history,
+      fundamentals: record.fundamentals,
+      optionChain: record.optionChain,
+      news: record.news,
+      tradingDay
+    });
+    persistStockFacts(db, tradingDay, record.symbol, facts);
+  }
+}
+
+// Phase 5 Task 3 (2026-07-15 plan): the 8 `buildDeterministicAnalysis`
+// section-array keys narrative orchestration runs over - MUST stay in sync
+// with TITLE_TO_SECTION_KEY's values below (that map is what
+// renderBatchStockAnalysis actually looks narrative results up by, keyed by
+// the frozen Chinese section titles) and with buildDeterministicAnalysis's
+// own returned object shape. `conclusionBox`/`conclusionBoxMarkdown` are
+// deliberately excluded - those are the Task 2 structured block, rendered
+// verbatim, never run through narrative rewriting.
+const NARRATIVE_SECTION_KEYS = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"];
+
+// Mutates each record with a `narrative` field ({sections, degraded,
+// degradedReason, degradedSections, retriesUsed} - generateNarrativeSections'
+// own return shape) built from that symbol's OWN just-persisted stock_facts
+// (getStockFacts(db, tradingDay, record.symbol) - called here, AFTER
+// persistStockFactsForRecords has already written them for this exact
+// tradingDay, so the numeric pre-check always has real ground truth to
+// compare against, never an empty/stale facts map).
+//
+// Exported and network-free beyond the injected `narrativeBackend` itself -
+// same "test the exported piece, not the CLI orchestrator" convention as
+// persistStockFactsForRecords above - so a test can drive this directly with
+// a fake backend and a real (temp) db, without exercising runAnalysis's
+// heavier network/PDF/delivery side effects.
+//
+// A record with no facts at all (should not happen for a real fetch, but
+// defensively handled) still gets a `narrative` result: getStockFacts
+// returns `{}` for a tradingDay/symbol pair with no rows, and
+// generateNarrativeSections' numeric pre-check against an empty facts map
+// simply has nothing to match ANY stated number against - any narrative
+// text containing a number degrades that section, exactly as intended (no
+// fact = no basis to state a number).
+export async function attachNarrativeSections(db, tradingDay, records, { narrativeBackend = createNarrativeLlmBackend() } = {}) {
+  for (const record of records) {
+    const facts = getStockFacts(db, tradingDay, record.symbol);
+    const sections = NARRATIVE_SECTION_KEYS.map((key) => ({
+      key,
+      deterministicText: (record.analysis?.[key] ?? []).join("\n")
+    }));
+    record.narrative = await generateNarrativeSections({ backend: narrativeBackend, symbol: record.symbol, facts, sections });
+  }
+}
+
+async function fetchStockAnalysisRecord(symbol, generatedAt) {
   const quotePayload = await runLongbridgeJsonWithRetry("quote", ["quote", symbol], { label: `Longbridge ${symbol} 行情` });
   const quote = normalizeQuotePayload(quotePayload, symbol);
   const [history, fundamentals, optionChain] = await Promise.all([
@@ -271,11 +398,124 @@ async function fetchStockAnalysisRecord(symbol) {
     fundamentals,
     optionChain,
     news,
-    analysis: buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain })
+    analysis: buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, generatedAt)
   };
 }
 
-function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
+// Phase 5 Task 2 (2026-07-15 plan): writes one analysis_predictions row per
+// record by re-parsing THIS RUN'S OWN rendered markdown (not the pre-render
+// param object buildDeterministicAnalysis assembled) through
+// conclusion-box.mjs's parseConclusionBox - the exact same parser Task 4's
+// stock.conclusion_box gate and Task 5's platform summary card also use, so
+// what gets persisted is guaranteed to match what a reader of the delivered
+// report actually sees, never a theoretically-different pre-render value.
+//
+// Idempotent by report_path: a same-day re-run (`prepare`/`run` against the
+// same label, hence the same markdownPath) deletes this path's
+// previously-written rows first, rather than accumulating duplicates or
+// leaving stale rows behind from an earlier, now-superseded render of the
+// same report - mirrors setTargets'/replaceStockFacts' "delete scoped rows,
+// then insert fresh" transaction shape elsewhere in this codebase.
+//
+// A record whose OWN box fails to parse is simply skipped (no row written)
+// rather than aborting the whole batch's persistence - this run's own
+// deterministic renderer always emits a well-formed box, so this should not
+// happen in practice; Task 4's stock.conclusion_box gate is the hard
+// fail-loud backstop that keeps a genuinely malformed report from ever
+// reaching delivery in the first place.
+export function persistPredictionsForRecords(db, reportPath, markdown, records) {
+  const now = new Date().toISOString();
+  db.exec("BEGIN IMMEDIATE TRANSACTION");
+  try {
+    db.prepare(`DELETE FROM analysis_predictions WHERE report_path = ?`).run(reportPath);
+    const insert = db.prepare(`
+      INSERT INTO analysis_predictions (id, symbol, report_path, conclusion, confidence, review_trigger, review_date, outcome, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    `);
+    for (const record of records) {
+      const section = extractSymbolMarkdownSection(markdown, record.symbol);
+      const box = parseConclusionBox(section);
+      if (!box) {
+        continue;
+      }
+      insert.run(createId("analysis_prediction"), record.symbol, reportPath, box.coreConclusion, box.confidence, box.reviewTrigger, box.reviewDate, now);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    // Same "the real error, not the rollback's" rationale as
+    // stock-facts-store.mjs's replaceStockFacts.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Ignore: best-effort only.
+    }
+    throw error;
+  }
+}
+
+// Phase 5 Task 5 (2026-07-15 plan) minor (b): the "predictions only on a
+// real delivered run, never for a `prepare` dry-run" gate, extracted as its
+// own pure/network-free function so it is directly unit-testable without
+// exercising runAnalysis's heavier network/PDF/delivery side effects (same
+// convention as persistStockFactsForRecords/attachNarrativeSections above).
+// runAnalysis calls this instead of calling persistPredictionsForRecords
+// directly - see that call site's own comment for why this gate exists.
+export function persistPredictionsIfDelivered(db, deliver, reportPath, markdown, records) {
+  if (!deliver) {
+    return;
+  }
+  persistPredictionsForRecords(db, reportPath, markdown, records);
+}
+
+// Phase 5 Task 5 (2026-07-15 plan) minor (b): a `prepare` dry-run (deliver:
+// false) writes to `<label>-preview.md`/`.pdf` - NEVER `<label>.md`/`.pdf`,
+// which is reserved for a real delivered archive (a `run`/`scheduled`
+// invocation). Previously `prepare` and `run` wrote to the exact same path,
+// so re-running `prepare` for a same-day preview could silently overwrite
+// that day's already-delivered archive file on disk (the delivered Feishu
+// message/PDF attachment itself was unaffected, but the on-disk archive a
+// human or another tool might later open no longer matched what was
+// actually sent). Extracted as its own pure function (reportsDir/label/
+// deliver in, paths out - no fs/db/network) so this exact "-preview never
+// collides with the delivered name" contract is directly unit-testable.
+// scanner.ts's own filename regex (apps/platform-app/src/reports/
+// scanner.ts) already anchors on `<date>.md` exactly, so a `-preview.md`
+// sibling is naturally invisible to the platform's report index without any
+// change there - see that file's own test for the pinned-down proof.
+export function resolveReportPaths(reportsDir, label, deliver) {
+  const suffix = deliver ? "" : "-preview";
+  return {
+    markdownPath: join(reportsDir, `${label}${suffix}.md`),
+    pdfPath: join(reportsDir, `${label}${suffix}.pdf`)
+  };
+}
+
+// Slices the full rendered batch markdown down to just ONE symbol's own
+// `## SYMBOL` section (up to the next level-2 heading, or end of the
+// document) - parseConclusionBox must only ever see ONE box, and a full
+// multi-symbol document can contain several.
+function extractSymbolMarkdownSection(markdown, symbol) {
+  const heading = `## ${symbol}\n`;
+  const startIndex = markdown.indexOf(heading);
+  if (startIndex === -1) {
+    return "";
+  }
+  const afterHeading = markdown.slice(startIndex + heading.length);
+  const nextHeadingMatch = afterHeading.match(/\n##\s+/u);
+  return nextHeadingMatch ? afterHeading.slice(0, nextHeadingMatch.index) : afterHeading;
+}
+
+// Phase 5 Task 2 (2026-07-15 plan): exported (was previously module-local)
+// so this pure, network-free function can be exercised directly with
+// controlled quote/history/fundamentals/optionChain/news fixtures - the same
+// "test the exported piece, not the CLI/network orchestrator" convention
+// this file already follows for fetchStockAnalysisRecords/
+// renderBatchStockAnalysis/persistStockFactsForRecords. `generatedAt`
+// defaults to "now" so every pre-existing call shape (and every existing
+// test that constructs a record's `analysis` by hand) keeps working
+// unchanged; only fetchStockAnalysisRecord/runAnalysis thread the real
+// batch-wide generatedAt through.
+export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, generatedAt = new Date().toISOString()) {
   const last = toNumber(quote.last ?? quote.last_done ?? quote.lastDone);
   const open = toNumber(quote.open);
   const high = toNumber(quote.high);
@@ -300,6 +540,23 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
   const bullishProbability = Math.round(Math.min(60, Math.max(20, 35 + (pct ?? 0) + trendBias)));
   const bearishProbability = Math.round(Math.min(55, Math.max(20, 32 - (pct ?? 0) - trendBias)));
   const neutralProbability = Math.max(0, 100 - bullishProbability - bearishProbability);
+
+  const conclusionBoxParams = buildConclusionBoxParams({
+    symbol,
+    quote,
+    news,
+    extraData,
+    last,
+    historyStats,
+    upsidePotential,
+    support,
+    resistance,
+    bullishProbability,
+    neutralProbability,
+    bearishProbability,
+    generatedAt
+  });
+  const conclusionBoxMarkdown = renderConclusionBox(conclusionBoxParams);
 
   return {
     basic: [
@@ -347,7 +604,204 @@ function buildDeterministicAnalysis(symbol, quote, news, extraData = {}) {
       `回撤路径（约 ${formatPercent(bearishProbability)}）：若跌破 ${formatNumber(historyStats.support ?? support)} 且新闻/宏观共振转弱，短线偏回撤。`,
       upsidePotential,
       "复盘标签：stock-analysis、support-resistance、options-expiry-watch、prediction-review。"
-    ]
+    ],
+    // Not rendered as a bullet-per-line array like the sections above -
+    // renderBatchStockAnalysis embeds conclusionBoxMarkdown verbatim inside
+    // the "结论与复盘标签" section, after the conclusion[] bullets (see its
+    // own comment). conclusionBox (the pre-render params) is kept alongside
+    // purely for direct test assertions (e.g. confidence branch fixtures)
+    // without needing to re-parse the rendered markdown.
+    conclusionBox: conclusionBoxParams,
+    conclusionBoxMarkdown
+  };
+}
+
+// Phase 5 Task 2 (2026-07-15 plan): confidence heuristic - deterministic and
+// documented, per the plan's "确定性规则，文档化" requirement (no LLM/narrative
+// involvement - Task 3 is the separate, later, LLM-backed narrative layer).
+//
+// Coverage counts how many of 8 representative stock_facts keys (one
+// checkpoint per quote/valuation/history/options/news data domain) come
+// back with a real (non-null) value from buildStockFacts - the SAME
+// extraction report-facts.mjs's buildStockFacts already performs for
+// persistence (Task 1) and Task 4's stock.facts_coverage gate also inspects,
+// so "covered" can never mean two different things across this heuristic and
+// that later gate. CONFIDENCE_COVERAGE_CHECKPOINTS/_THRESHOLD are imported
+// from stock-facts-store.mjs (not declared here) so both consumers share the
+// literal same constant - see that module's own doc comment for why it lives
+// there instead of here (avoids a report-quality.mjs <-> stock-analysis.mjs
+// circular import plus that file's module-level side effects):
+//   quote.last, quote.pct, valuation.pe, valuation.targetPrice,
+//   history.ma20, history.ma60, options.callOi, news.count
+// A checkpoint's valueNum is null exactly when buildStockFacts already
+// disclosed that domain as degraded/unavailable (its own "数据不可得"
+// convention) - so "coverage >= 6 of 8" and "at least 6 non-degraded
+// checkpoints" are the same condition here, not two separate ones.
+function computeFactsCoverage({ symbol, quote, news, extraData, generatedAt }) {
+  const facts = buildStockFacts({
+    symbol,
+    quote,
+    history: extraData.history,
+    fundamentals: extraData.fundamentals,
+    optionChain: extraData.optionChain,
+    news,
+    tradingDay: String(generatedAt).slice(0, 10)
+  });
+  const byKey = Object.fromEntries(facts.map((fact) => [fact.factKey, fact]));
+  return CONFIDENCE_COVERAGE_CHECKPOINTS.filter((key) => byKey[key]?.valueNum !== null && byKey[key]?.valueNum !== undefined).length;
+}
+
+// "加上行/趋势信号一致→high": the valuation-driven upside label
+// (summarizeUpsidePotential's "偏强"/"中性偏强"/"中性"/"偏弱") and the
+// technical trend score (summarizeHistory's trendScore, positive = price
+// above its short/medium moving averages) must point the SAME direction -
+// both bullish, or both bearish - for the extra "high" tier; a neutral
+// upside label, or a bullish/bearish label pointing opposite the trend
+// score, is treated as "not consistent" and stays at medium.
+function upsideAndTrendConsistent(upsidePotentialText, trendScore) {
+  const label = upsidePotentialText.match(/综合上行潜力：([^；]+)；/u)?.[1] ?? "";
+  const upsideBullish = label.includes("偏强");
+  const upsideBearish = label === "偏弱";
+  const trendBullish = trendScore > 0;
+  const trendBearish = trendScore < 0;
+  return (upsideBullish && trendBullish) || (upsideBearish && trendBearish);
+}
+
+function computeConfidence({ symbol, quote, news, extraData, generatedAt, historyStats, upsidePotential }) {
+  const coverage = computeFactsCoverage({ symbol, quote, news, extraData, generatedAt });
+  if (coverage < CONFIDENCE_COVERAGE_THRESHOLD) {
+    return "low";
+  }
+  return upsideAndTrendConsistent(upsidePotential, historyStats.trendScore) ? "high" : "medium";
+}
+
+// 合理价值区间: bounded by the same short-term support/resistance the
+// existing three-path conclusion text already cites (historyStats.support/
+// resistance, falling back to the day's low/high/last - see `support`/
+// `resistance` in buildDeterministicAnalysis) and the sell-side one-year
+// target price when available. Math.min/max (rather than "support is
+// always low, target is always high") guards the case where the target
+// price implies a value BELOW current support (a genuine downside call) -
+// the range must stay a valid [low, high] pair regardless of which side
+// the target price lands on.
+function computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuationSources }) {
+  const candidateHigh = targetPrice !== undefined ? targetPrice : rangeResistance;
+  const candidates = [rangeSupport, candidateHigh].filter((value) => Number.isFinite(value));
+  if (candidates.length === 0) {
+    return { low: undefined, high: undefined, basis: "近20日支撑位、阻力位与一年目标价均数据不可得" };
+  }
+  const low = Math.min(...candidates);
+  const high = Math.max(...candidates);
+  const basis = targetPrice !== undefined
+    ? `近20日支撑位 ${formatNumber(rangeSupport)} 美元与卖方一年目标价 ${formatNumber(targetPrice)} 美元${valuationSources ? `（来源：${valuationSources}）` : ""}`
+    : `近20日支撑位 ${formatNumber(rangeSupport)} 美元与阻力位 ${formatNumber(rangeResistance)} 美元（目标价数据不可得）`;
+  return { low, high, basis };
+}
+
+function computePricePosition(last, low, high) {
+  if (!Number.isFinite(last)) {
+    return "现价数据不可得";
+  }
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    return `现价 ${formatNumber(last)} 美元，合理价值区间数据不可得`;
+  }
+  if (last < low) {
+    return `现价 ${formatNumber(last)} 美元，低于合理区间下沿（${formatNumber(low)} 美元）`;
+  }
+  if (last > high) {
+    return `现价 ${formatNumber(last)} 美元，高于合理区间上沿（${formatNumber(high)} 美元）`;
+  }
+  return `现价 ${formatNumber(last)} 美元，位于合理区间内（${formatNumber(low)}–${formatNumber(high)} 美元）`;
+}
+
+// 复盘触发: an invalidation-style condition anchored to the SAME support
+// level the value range and three-path conclusion text use - "if price
+// breaks below this level, or the fundamental/news picture reverses
+// direction, the conclusion needs re-evaluating", mirroring the risks[]
+// section's existing "若价格跌破支撑且成交量放大" phrasing rather than
+// inventing a new vocabulary for the same idea.
+function computeReviewTrigger(rangeSupport) {
+  if (!Number.isFinite(rangeSupport)) {
+    return "若基本面或新闻面出现方向性反转，需重新评估当前结论";
+  }
+  return `若价格跌破支撑位 ${formatNumber(rangeSupport)} 美元，或基本面/新闻面出现方向性反转，需重新评估当前结论`;
+}
+
+// reviewDate = generation date + 1 CALENDAR month, on the US Eastern
+// calendar date (per the plan: "生成日 +1 个月（美东日历日）") - not "+30 days"
+// and not the UTC calendar date, since this report analyzes US-listed
+// equities. Date.UTC's month argument is 0-based, so passing the current
+// month's 1-based number directly already IS "+1 month" in UTC-anchored
+// arithmetic (e.g. July = 7 one-based; UTC month index 7 = August) - this
+// keeps the addition a pure calendar operation, immune to any local-TZ/DST
+// step, at the cost of JS Date's ordinary day-overflow normalization for
+// short months (e.g. Jan 31 -> Mar 3), an accepted, documented edge case
+// for a monthly review cadence.
+function computeReviewDate(generatedAt) {
+  const timestamp = new Date(String(generatedAt ?? "")).getTime();
+  if (!Number.isFinite(timestamp)) {
+    return "待确认";
+  }
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date(timestamp));
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const next = new Date(Date.UTC(Number(map.year), Number(map.month), Number(map.day)));
+  return next.toISOString().slice(0, 10);
+}
+
+// 核心结论: picks the highest-probability of the three existing paths
+// (bullish/neutral/bearish, from buildDeterministicAnalysis's own
+// probability model) as the report's single headline stance, phrased with
+// the same support/resistance levels the three-path conclusion[] bullets
+// already cite - the box's core conclusion is a condensed pointer to that
+// existing prose, never a second, independently-derived judgement.
+function computeCoreConclusion({ bullishProbability, neutralProbability, bearishProbability, rangeSupport, rangeResistance }) {
+  const max = Math.max(bullishProbability, neutralProbability, bearishProbability);
+  if (max === bullishProbability) {
+    return `短线偏上行：若守住支撑位 ${formatNumber(rangeSupport)} 美元并放量突破 ${formatNumber(rangeResistance)} 美元，上行概率约 ${formatPercent(bullishProbability)}。`;
+  }
+  if (max === bearishProbability) {
+    return `短线偏回撤：若跌破支撑位 ${formatNumber(rangeSupport)} 美元，回撤概率约 ${formatPercent(bearishProbability)}。`;
+  }
+  return `短线震荡：价格围绕当前区间运行，观察概率约 ${formatPercent(neutralProbability)}。`;
+}
+
+function buildConclusionBoxParams({
+  symbol,
+  quote,
+  news,
+  extraData,
+  last,
+  historyStats,
+  upsidePotential,
+  support,
+  resistance,
+  bullishProbability,
+  neutralProbability,
+  bearishProbability,
+  generatedAt
+}) {
+  const rangeSupport = historyStats.support ?? support;
+  const rangeResistance = historyStats.resistance ?? resistance;
+  const targetPrice = toNumber(extraData.fundamentals?.oneYearTarget);
+  const valuationSources = Array.isArray(extraData.fundamentals?.sources) && extraData.fundamentals.sources.length
+    ? extraData.fundamentals.sources.join("、")
+    : undefined;
+
+  const valueRange = computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuationSources });
+  const confidence = computeConfidence({ symbol, quote, news, extraData, generatedAt, historyStats, upsidePotential });
+
+  return {
+    coreConclusion: computeCoreConclusion({ bullishProbability, neutralProbability, bearishProbability, rangeSupport, rangeResistance }),
+    confidence,
+    valueRange,
+    pricePosition: computePricePosition(last, valueRange.low, valueRange.high),
+    reviewTrigger: computeReviewTrigger(rangeSupport),
+    reviewDate: computeReviewDate(generatedAt)
   };
 }
 
@@ -378,11 +832,34 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
 
   for (const record of records) {
     lines.push(`## ${record.symbol}`, "");
+    // Phase 5 Task 3 (2026-07-15 plan): a GLOBAL narrative degrade (the
+    // backend threw) is disclosed exactly ONCE per symbol, right here -
+    // never per-section (a per-section validation-exhausted fallback is
+    // instead disclosed inline, inside that one section's own bullets - see
+    // sectionValues below). Absent (record.narrative undefined, e.g. a
+    // caller/test that never ran attachNarrativeSections at all) renders
+    // nothing extra, keeping every pre-P5 direct caller of
+    // renderBatchStockAnalysis byte-for-byte unchanged.
+    if (record.narrative?.degraded) {
+      lines.push(`> ${REPORT_DEGRADED_HEADER}`, "");
+    }
+    const narrativeSectionsByKey = record.narrative?.sections
+      ? Object.fromEntries(record.narrative.sections.map((entry) => [entry.key, entry]))
+      : null;
     for (const section of template.sections) {
       lines.push(`### ${section.title}`, "");
-      const values = sectionValues(record.analysis, section.title);
+      const values = sectionValues(record.analysis, section.title, narrativeSectionsByKey);
       for (const value of values) {
         lines.push(`- ${value}`);
+      }
+      // Phase 5 Task 2 (2026-07-15 plan): the structured "### 结论框" block
+      // is embedded INSIDE the existing, frozen "结论与复盘标签" section,
+      // after its existing prose bullets - the section TITLE and the
+      // bullets above are untouched (the quality-gate/template/sectionValues
+      // three-way coupling this section's title is part of stays frozen);
+      // the box is purely additive content within it.
+      if (section.title === CONCLUSION_SECTION_TITLE && record.analysis.conclusionBoxMarkdown) {
+        lines.push("", record.analysis.conclusionBoxMarkdown);
       }
       lines.push("");
     }
@@ -408,18 +885,60 @@ function hasNonLongbridgeNewsSource(article) {
   return sources.some((source) => source && source !== "longbridge-news");
 }
 
-function sectionValues(analysis, title) {
-  const map = {
-    "标的基本信息": analysis.basic,
-    "投资逻辑": analysis.thesis,
-    "基本面分析": analysis.fundamentals,
-    "催化剂": analysis.catalysts,
-    "风险点": analysis.risks,
-    "市场表现与交易层面": analysis.trading,
-    "期权交割与阻力支撑": analysis.options,
-    "结论与复盘标签": analysis.conclusion
-  };
-  return map[title] ?? [];
+// Frozen contract (see stock-analysis-template.mjs/report-quality.mjs): the
+// exact title string coupling this section's title/quality-gate/
+// sectionValues three-way match - kept as one named constant so
+// renderBatchStockAnalysis's conclusion-box embedding above and this map's
+// key can never independently typo-diverge from each other.
+const CONCLUSION_SECTION_TITLE = "结论与复盘标签";
+
+// Phase 5 Task 3 (2026-07-15 plan): reverse of the map inside sectionValues
+// below - the frozen Chinese section title -> the internal English key
+// NARRATIVE_SECTION_KEYS/generateNarrativeSections/attachNarrativeSections
+// use. Kept as its own named constant (not re-derived inline) so this and
+// sectionValues' map can never independently drift apart on which title
+// corresponds to which section.
+const TITLE_TO_SECTION_KEY = {
+  "标的基本信息": "basic",
+  "投资逻辑": "thesis",
+  "基本面分析": "fundamentals",
+  "催化剂": "catalysts",
+  "风险点": "risks",
+  "市场表现与交易层面": "trading",
+  "期权交割与阻力支撑": "options",
+  [CONCLUSION_SECTION_TITLE]: "conclusion"
+};
+
+// `narrativeSectionsByKey` is generateNarrativeSections' own `sections`
+// array (Task 3), re-keyed by section key - null/undefined for any caller
+// that never ran attachNarrativeSections (every pre-P5 test/call site),
+// which falls straight through to the ORIGINAL deterministic arrays exactly
+// as before (byte-for-byte unchanged rendering when narrative was never
+// attached at all).
+//
+// When a narrative result DOES exist for this section, its own `text` is
+// used verbatim (split back into one bullet per line) INSTEAD of the raw
+// analysis array - this is safe/byte-equivalent for the fallback case
+// specifically because attachNarrativeSections builds each section's
+// `deterministicText` as `analysis[key].join("\n")` in the first place, so
+// splitting an unmodified fallback text by "\n" reproduces the exact same
+// array. A locally-degraded section's text is deterministicText PLUS one
+// trailing marker line (narrative-engine.mjs), which naturally renders as
+// one extra disclosure bullet after the original ones - additive, never
+// replacing the original content.
+function sectionValues(analysis, title, narrativeSectionsByKey) {
+  const key = TITLE_TO_SECTION_KEY[title];
+  const narrativeResult = narrativeSectionsByKey?.[key];
+  if (narrativeResult) {
+    return narrativeResult.text === "" ? [] : narrativeResult.text.split("\n");
+  }
+  // TITLE_TO_SECTION_KEY's values are, by construction, exactly
+  // buildDeterministicAnalysis's own section-array property names (basic/
+  // thesis/fundamentals/catalysts/risks/trading/options/conclusion) - a
+  // single source for "which title reads which array", rather than a
+  // second, independently-typed title->array map that could drift from
+  // TITLE_TO_SECTION_KEY above.
+  return analysis[key] ?? [];
 }
 
 function extractTradingLevel(line, side) {
@@ -706,78 +1225,22 @@ async function fetchTextWithTimeout(url, extraHeaders = {}) {
   throw lastError;
 }
 
-// Task H7 (2026-07-14 legacy audit): fetchYahooHistory requests range=6mo,
-// which yields at most ~126 daily closes - closes.slice(-180) on a ~126-
-// element array is silently the WHOLE array, so the value rendered/labeled
-// "180 日均线" (and the "偏便宜" verdict derived from it) was never actually
-// a 180-session average; it was a mislabeled full-range mean. Chosen fix:
-// LABEL the actual window truthfully (`longWindowDays`, capped at 180 but
-// reflecting however many sessions are really available) rather than
-// widening the fetch range - ma20/ma60/sixMonthReturn/trendScore all
-// deliberately key off this same 6-month sample, and widening the range
-// would dilute/change those alongside the unrelated bug being fixed here.
-// A future fetch of a full year (closes.slice(-180) on ~250 rows) would
-// make the label consistently "180 日" - either fix is legitimate per this
-// task's brief; this one has zero blast radius outside the mislabeled text.
-function summarizeHistory(history, currentPrice) {
-  if (!Array.isArray(history) || history.length === 0) {
-    return {
-      summary: history?.error ? `历史走势读取失败：${history.error}` : "历史走势暂无可用数据。",
-      cheapness: "长期均线不可用，便宜程度暂记为待验证",
-      trendScore: 0,
-      support: undefined,
-      resistance: undefined,
-      ma20: undefined,
-      ma60: undefined,
-      ma180: undefined,
-      longWindowDays: undefined
-    };
-  }
-
-  const closes = history.map((row) => row.close).filter((value) => Number.isFinite(value));
-  const first = closes[0];
-  const lastClose = currentPrice ?? closes.at(-1);
-  const sixMonthReturn = first && lastClose ? ((lastClose - first) / first) * 100 : undefined;
-  const ma20 = average(closes.slice(-20));
-  const ma60 = average(closes.slice(-60));
-  const longWindowDays = Math.min(closes.length, 180);
-  const ma180 = average(closes.slice(-longWindowDays));
-  const recent = closes.slice(-20);
-  const support = recent.length ? Math.min(...recent) : undefined;
-  const resistance = recent.length ? Math.max(...recent) : undefined;
-  const vsMa180 = lastClose !== undefined && ma180 !== undefined && ma180 > 0
-    ? ((lastClose - ma180) / ma180) * 100
-    : undefined;
-  const trendScore = [
-    ma20 !== undefined && lastClose !== undefined && lastClose > ma20 ? 4 : -2,
-    ma60 !== undefined && lastClose !== undefined && lastClose > ma60 ? 3 : -1,
-    sixMonthReturn !== undefined ? Math.max(-5, Math.min(5, sixMonthReturn / 8)) : 0
-  ].reduce((sum, value) => sum + value, 0);
-
-  return {
-    summary: `${history[0]?.date} 到 ${history.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日。`,
-    cheapness: vsMa180 === undefined
-      ? "长期均线不可用，便宜程度待验证"
-      : vsMa180 < -5
-        ? `现价低于 ${longWindowDays} 日均线 ${formatPercent(Math.abs(vsMa180))}，按群聊口径偏便宜但需排除基本面恶化`
-        : `现价相对 ${longWindowDays} 日均线 ${formatPercent(vsMa180)}，不属于明显均线折价`,
-    trendScore,
-    support,
-    resistance,
-    ma20,
-    ma60,
-    ma180,
-    longWindowDays
-  };
-}
-
-function average(values) {
-  const clean = values.filter((value) => Number.isFinite(value));
-  return clean.length ? clean.reduce((sum, value) => sum + value, 0) / clean.length : undefined;
-}
-
-function toYahooSymbol(symbol) {
-  return String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
+// Phase 5 Task 5 (2026-07-15 plan) minor (a): exported (was previously
+// module-local) so this pure, network-free normalization is directly
+// testable - same "exported, network-free, directly testable" convention
+// this file already follows for persistStockFactsForRecords/
+// attachNarrativeSections/persistPredictionsForRecords above. Strips the
+// `.US` suffix (report-data.mjs's normalizeSymbol appends this to every bare
+// US ticker; Yahoo's own APIs never expect it), THEN converts any remaining
+// dot into a hyphen - a dot-class-share ticker like `BRK.B` (normalizeSymbol
+// leaves this exact form untouched: it's neither a bare 1-6-letter ticker
+// nor already `.US`-suffixed, so it never gets a `.US` appended in the first
+// place) becomes `BRK-B`, matching Yahoo's own hyphenated convention for
+// class shares (Yahoo has never recognized the dotted form for its
+// chart/quote/options/search/RSS endpoints this function feeds).
+export function toYahooSymbol(symbol) {
+  const withoutUsSuffix = String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
+  return withoutUsSuffix.replace(/\./gu, "-");
 }
 
 function formatCompactMoney(value) {
@@ -818,11 +1281,25 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function nextUsMonthlyOptionExpiry(date) {
+// Phase 5 Task 5 (2026-07-15 plan) minor (c): exported (was previously
+// module-local) for direct testability. FIX: this used to compare `candidate`
+// (always midnight UTC on some third Friday, from thirdFridayUtc) against
+// `date` (the real wall-clock instant callers pass - always AT OR AFTER its
+// own midnight, per how `new Date()` works) using full-timestamp `>=`. That
+// meant that on the actual expiry day itself, `date` had almost always
+// already ticked past its own midnight by the time this ran, so
+// `candidate.getTime() >= date.getTime()` was false for TODAY's own expiry
+// and this incorrectly rolled forward to NEXT month - "today is the third
+// Friday" should return today, not skip it. Comparing against `date`
+// truncated to its own UTC midnight (dateAtMidnight) instead fixes this:
+// today's candidate (also at midnight) is `>=` today's midnight regardless
+// of what time of day `date` itself carries.
+export function nextUsMonthlyOptionExpiry(date) {
+  const dateAtMidnight = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
   const cursor = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   for (let monthOffset = 0; monthOffset < 18; monthOffset += 1) {
     const candidate = thirdFridayUtc(cursor.getUTCFullYear(), cursor.getUTCMonth());
-    if (candidate.getTime() >= date.getTime()) {
+    if (candidate.getTime() >= dateAtMidnight) {
       return candidate.toISOString().slice(0, 10);
     }
     cursor.setUTCMonth(cursor.getUTCMonth() + 1, 1);

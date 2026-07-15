@@ -11,8 +11,12 @@ import { describe, expect, it } from "vitest";
 import {
   validateNarrativeNumbers,
   validateReportMarkdown,
-  validateReportUrls
+  validateReportUrls,
+  validateStockAnalysisMarkdown,
+  validateStockNarrativeNumbers
 } from "./report-quality.mjs";
+import { buildStockFacts } from "./report-facts.mjs";
+import { buildDeterministicAnalysis, renderBatchStockAnalysis } from "./stock-analysis.mjs";
 
 const news = await import("./report-news.mjs");
 const rendering = await import("./report-rendering.mjs");
@@ -258,5 +262,196 @@ describe("bad sample: 死链 (news.url_reachability)", () => {
 
     expect(result.ok).toBe(false);
     expect(result.failures).toContain(`news.url_reachability:${deadUrl}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 Task 4 (2026-07-15 plan) - stock analysis bad-sample group. Every
+// fixture below is built from the SAME real production functions
+// (buildDeterministicAnalysis/renderBatchStockAnalysis/buildStockFacts)
+// stock-analysis.test.ts already exercises, rather than a hand-typed guess at
+// their shape - see report-quality.test.ts's own Phase 5 Task 4 section for
+// the identical fixture-building rationale.
+// ---------------------------------------------------------------------------
+
+function stockQuoteFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    symbol: "AAPL.US",
+    last: "213.00",
+    prev_close: "208.00",
+    open: "209.00",
+    high: "215.00",
+    low: "207.50",
+    volume: "50000000",
+    timestamp: "2026-07-15T20:00:00.000Z",
+    ...overrides
+  };
+}
+
+function stockHistoryFixture(days = 130, startClose = 180, dailyDrift = 0.1) {
+  const rows: Array<{ date: string; close: number }> = [];
+  const start = new Date("2026-01-05T00:00:00.000Z").getTime();
+  for (let i = 0; i < days; i += 1) {
+    rows.push({ date: new Date(start + i * 86_400_000).toISOString().slice(0, 10), close: startClose + i * dailyDrift });
+  }
+  return rows;
+}
+
+function stockFundamentalsFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    sources: ["yahoo-quote"],
+    trailingPE: 22,
+    priceToBook: 6,
+    epsTrailingTwelveMonths: 8,
+    marketCap: 1_000_000_000_000,
+    oneYearTarget: 280,
+    ...overrides
+  };
+}
+
+function stockOptionChainFixture() {
+  return {
+    expirationDates: [1755820800],
+    options: [{ calls: [{ openInterest: 1000 }], puts: [{ openInterest: 500 }] }]
+  };
+}
+
+function stockNewsFixture(count = 3) {
+  return Array.from({ length: count }, (_, i) => ({ id: `n${i}`, title: `新闻 ${i}`, source: "longbridge-news" }));
+}
+
+const STOCK_GENERATED_AT = "2026-07-15T13:00:00.000Z";
+
+function buildGoodStockRecord(symbol: string, quoteOverrides: Record<string, unknown> = {}) {
+  const quote = stockQuoteFixture({ symbol, ...quoteOverrides });
+  const history = stockHistoryFixture();
+  const fundamentals = stockFundamentalsFixture();
+  const optionChain = stockOptionChainFixture();
+  const news = stockNewsFixture();
+  const analysis = buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, STOCK_GENERATED_AT);
+  const facts = buildStockFacts({ symbol, quote, history, fundamentals, optionChain, news, tradingDay: STOCK_GENERATED_AT.slice(0, 10) });
+  const factsByKey = Object.fromEntries(facts.map((fact: { factKey: string }) => [fact.factKey, fact]));
+  return { symbol, analysis, news, factsByKey };
+}
+
+function renderStockReport(records: Array<{ symbol: string; analysis: Record<string, unknown>; news: unknown[] }>) {
+  return renderBatchStockAnalysis({
+    label: STOCK_GENERATED_AT.slice(0, 10),
+    generatedAt: STOCK_GENERATED_AT,
+    records,
+    failedSymbols: []
+  });
+}
+
+const LEGACY_STOCK_REPORT = [
+  "# OpenClaw 个股分析 2026-06-14",
+  "",
+  "## AAPL",
+  "",
+  "### 基本面分析",
+  "",
+  "- 估值补充：PE 28.10，PB 12.30。",
+  "- 上行潜力：综合上行潜力：中性偏多，需结合估值和目标价确认。",
+  "",
+  "### 市场表现与交易层面",
+  "",
+  "- 均线：20 日 201.00；60 日 195.00；126 日 188.00。",
+  "",
+  "### 期权交割与阻力支撑",
+  "",
+  "- 期权链只读补充：看涨合约较多。",
+  "",
+  "### 近期新闻",
+  "",
+  "- 来源分布：Longbridge 3 条。",
+  "- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。"
+].join("\n");
+
+describe("bad sample: 数字造假 (stock.numeric_match)", () => {
+  it("fails stock.numeric_match with the symbol and the fabricated number (218.70 vs facts' quote.last 213.00)", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    const markdown = renderStockReport([good]).replace("最新价格：213.00", "最新价格：218.70");
+
+    const result = validateStockNarrativeNumbers(markdown, { "AAPL.US": good.factsByKey });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.numeric_match:AAPL.US:218.70");
+  });
+});
+
+describe("bad sample: 缺结论框 (stock.conclusion_box)", () => {
+  it("fails stock.conclusion_box for the symbol whose own '### 结论框' block was stripped out", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    // Distinct quote so MSFT.US's box text differs from AAPL.US's - the box
+    // never interpolates the symbol string, so an identical quote would
+    // render byte-identical boxes for both, making the plain-string replace
+    // below ambiguous about which symbol's box it strips.
+    const broken = buildGoodStockRecord("MSFT.US", { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" });
+    const markdown = renderStockReport([good, broken]).replace(broken.analysis.conclusionBoxMarkdown as string, "");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+  });
+});
+
+describe("bad sample: 坏置信度 (stock.conclusion_box)", () => {
+  it("fails stock.conclusion_box when the 置信度 bullet reads '很高' (not one of 高/中/低)", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    const broken = buildGoodStockRecord("MSFT.US", { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" });
+    const corruptedBox = (broken.analysis.conclusionBoxMarkdown as string).replace(/- 置信度：\S+/u, "- 置信度：很高");
+    const markdown = renderStockReport([good, broken]).replace(broken.analysis.conclusionBoxMarkdown as string, corruptedBox);
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+  });
+});
+
+describe("bad sample: 覆盖不足 (stock.facts_coverage)", () => {
+  it("fails stock.facts_coverage when 3 of the 8 checkpoints have neither a real value nor an explicit disclosure", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    let markdown = renderStockReport([good]);
+    // Strip quote.pct/valuation.pe/history.ma20's own backing text (global
+    // for PE/PB - summarizeUpsidePotential's shared string repeats it across
+    // 投资逻辑/基本面分析/结论与复盘标签), leaving the other 5 checkpoints' real
+    // values untouched - simulates a rendering bug that silently drops 3 data
+    // points without disclosing why.
+    markdown = markdown
+      .replace(/涨跌幅：[^；]+；/u, "")
+      .replace(/PE\s+[0-9.]+；PB\s+[0-9.]+；/giu, "")
+      .replace(/均线：20 日 [0-9.]+；/u, "");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.facts_coverage:AAPL.US:5/8");
+  });
+});
+
+describe("bad sample: 结论框缺必填键 (stock.conclusion_box)", () => {
+  it("fails stock.conclusion_box when the 复盘触发 bullet is missing its required 复盘日期 suffix", () => {
+    const good = buildGoodStockRecord("AAPL.US");
+    const broken = buildGoodStockRecord("MSFT.US", { last: "430.00", prev_close: "425.00", open: "428.00", high: "432.00", low: "424.00" });
+    const corruptedBox = (broken.analysis.conclusionBoxMarkdown as string).replace(/（复盘日期：\d{4}-\d{2}-\d{2}）$/mu, "");
+    const markdown = renderStockReport([good, broken]).replace(broken.analysis.conclusionBoxMarkdown as string, corruptedBox);
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.conclusion_box:MSFT.US");
+  });
+});
+
+describe("bad sample: legacy 报告零新门触发 (era compatibility)", () => {
+  it("fires none of the three new stock gates against a legacy-format report (no '### 结论框' marker)", () => {
+    const syncResult = validateStockAnalysisMarkdown(LEGACY_STOCK_REPORT);
+    expect(syncResult.failures.some((failure) => failure.startsWith("stock.conclusion_box"))).toBe(false);
+    expect(syncResult.failures.some((failure) => failure.startsWith("stock.facts_coverage"))).toBe(false);
+
+    const numericResult = validateStockNarrativeNumbers(LEGACY_STOCK_REPORT, {});
+    expect(numericResult).toEqual({ ok: true, failures: [] });
   });
 });

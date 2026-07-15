@@ -1,3 +1,16 @@
+// Phase 5 Task 4 (2026-07-15 plan): the ONLY three project imports this
+// otherwise-zero-dependency module has ever needed. Each is deliberately
+// chosen to avoid a circular import that would loop back INTO this file (see
+// stock-facts-store.mjs's own comment on CONFIDENCE_COVERAGE_CHECKPOINTS for
+// why that constant lives there rather than in stock-analysis.mjs, which
+// already imports assertStockAnalysisQuality from here) and to avoid pulling
+// in any module with project-external side effects at import time (none of
+// conclusion-box.mjs/stock-facts-store.mjs/narrative-engine.mjs touch the
+// filesystem, env, or a db connection merely by being imported).
+import { parseConclusionBox } from "./conclusion-box.mjs";
+import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD } from "./stock-facts-store.mjs";
+import { NON_CHINESE_DEGRADE_MARKER, NUMERIC_DEGRADE_MARKER, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
+
 const GENERIC_NEWS_PATTERN = /媒体报道与.+相关的公司新闻/u;
 const LONG_ENGLISH_WORD_PATTERN = /(?:\b[A-Za-z][A-Za-z'-]{2,}\b[\s,.:;!?()/-]*){18,}/u;
 
@@ -123,6 +136,124 @@ export function assertReportQuality(markdown, options = {}) {
   return result;
 }
 
+// Phase 5 Task 4 (2026-07-15 plan) - era marker for STOCK-ANALYSIS reports,
+// separate constant/function from isNewFormatReport/NEW_FORMAT_SECTION_MARKER
+// above (those are the daily/weekly kind's own marker - a different report
+// family with its own independent era boundary). "### 结论框" is Task 2's
+// structured conclusion box heading (conclusion-box.mjs's renderConclusionBox
+// always emits it) - every stock-analysis report generated before this task
+// shipped (every already-delivered/archived report under
+// reports/stock-analysis/) never contains it, so the three new gates below
+// are strictly opt-in behind this exact marker, identically to the
+// daily/weekly era-compatibility rule: a legacy report is judged ONLY by the
+// 8 pre-existing gates below (unchanged); a new-format report is judged by
+// those AND the new ones.
+const STOCK_CONCLUSION_BOX_MARKER = "### 结论框";
+
+function isNewFormatStockReport(text) {
+  return text.includes(STOCK_CONCLUSION_BOX_MARKER);
+}
+
+// Splits a stock-analysis markdown document into one entry per `## SYMBOL`
+// section (heading text looks like a US ticker - uppercase letters/digits
+// with optional `.`/`-` separators, e.g. "AAPL.US", "BRK.B" - never CJK), so
+// each new gate below can be scoped to exactly ONE symbol's own content, the
+// same way stock-analysis.mjs's own extractSymbolMarkdownSection slices the
+// full rendered batch down to one symbol before persistPredictionsForRecords
+// parses its box. A non-symbol level-2 heading (e.g. "## 本批次结论", the
+// batch-level summary renderBatchStockAnalysis always renders first) is
+// simply excluded - its content belongs to no symbol and is never scanned by
+// any of the three new gates. Failed symbols (fetchStockAnalysisRecords'
+// per-symbol isolation) never get a `## SYMBOL` section rendered for them in
+// the first place (see stock-analysis.mjs's renderBatchStockAnalysis - a
+// failedSymbols entry only ever appears inside the "数据缺口" bullet of "##
+// 本批次结论"), so they are automatically excluded from every per-symbol
+// gate's denominator below - no separate failedSymbols bookkeeping needed
+// here.
+const STOCK_SYMBOL_HEADING_PATTERN = /^[A-Z0-9]+(?:[.-][A-Z0-9]+)*$/u;
+
+function extractStockSymbolSections(markdown) {
+  const lines = markdown.split("\n");
+  const sections = [];
+  let currentSymbol = null;
+  let buffer = [];
+  const flush = () => {
+    if (currentSymbol) {
+      sections.push({ symbol: currentSymbol, section: buffer.join("\n") });
+    }
+    buffer = [];
+  };
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const heading = /^##(?!#)\s+(.+)$/u.exec(line);
+    if (heading) {
+      flush();
+      const headingText = heading[1].trim();
+      currentSymbol = STOCK_SYMBOL_HEADING_PATTERN.test(headingText) ? headingText : null;
+      continue;
+    }
+    if (currentSymbol) {
+      buffer.push(rawLine);
+    }
+  }
+  flush();
+  return sections;
+}
+
+// stock.facts_coverage: one detector pair per CONFIDENCE_COVERAGE_CHECKPOINTS
+// key (imported from stock-facts-store.mjs - the SAME 8-key list Task 2's
+// confidence heuristic uses, see that module's own comment) - `backed`
+// matches the exact phrase buildDeterministicAnalysis/stock-analysis-metrics.mjs
+// render for a REAL value of that key; `disclosed` matches the specific
+// explicit-unavailability phrasing those same deterministic formulas render
+// for that key's failure branch (never just "暂无", which is a plain
+// formatting fallback with no stated reason - "缺数据段显式标注原因" per the
+// plan requires an actual disclosed REASON, not a bare placeholder). Either
+// one counts as "covered" - only a key with NEITHER present (a silent gap:
+// the rendering pipeline dropped a whole data point without disclosing why)
+// counts against the >=6/8 threshold.
+const FACTS_COVERAGE_DETECTORS = {
+  "quote.last": {
+    backed: /最新价格[:：]\s*(?!暂无)[0-9]/u,
+    disclosed: /现价数据不可得/u
+  },
+  "quote.pct": {
+    backed: /涨跌幅[:：]\s*(?!暂无)[+-]?[0-9]/u,
+    disclosed: /缺少前收数据/u
+  },
+  "valuation.pe": {
+    backed: /PE\s+(?!暂无)[0-9,.]+/iu,
+    disclosed: /估值(?:读取失败|数据暂无可用)/u
+  },
+  "valuation.targetPrice": {
+    backed: /一年目标价\s*(?!暂无)[0-9,.]+/u,
+    disclosed: /目标价(?:缺失|数据不可得|均数据不可得)/u
+  },
+  "history.ma20": {
+    backed: /均线[:：]\s*20\s*日\s*(?!暂无)[0-9]/u,
+    disclosed: /历史走势(?:读取失败|暂无可用数据)/u
+  },
+  "history.ma60": {
+    backed: /60\s*日\s*(?!暂无)[0-9]/u,
+    disclosed: /历史走势(?:读取失败|暂无可用数据)/u
+  },
+  "options.callOi": {
+    backed: /Call\s*未平仓约\s*(?!暂无)[0-9]/u,
+    disclosed: /期权链(?:读取失败|暂无可用数据)/u
+  },
+  "news.count": {
+    backed: /(?:媒体|渠道)[:：]/u,
+    disclosed: /暂无新闻来源/u
+  }
+};
+
+function countFactsCoverage(sectionText) {
+  return CONFIDENCE_COVERAGE_CHECKPOINTS.filter((key) => {
+    const detector = FACTS_COVERAGE_DETECTORS[key];
+    return Boolean(detector) && (detector.backed.test(sectionText) || detector.disclosed.test(sectionText));
+  }).length;
+}
+
 export function validateStockAnalysisMarkdown(markdown) {
   const text = normalizeText(markdown);
   const failures = [];
@@ -165,6 +296,35 @@ export function validateStockAnalysisMarkdown(markdown) {
   }
   if (/英文摘要已读取|事件细节待核对/u.test(newsLines.join("\n"))) {
     failures.push("stock.news_translation");
+  }
+
+  // Phase 5 Task 4 (2026-07-15 plan) - new-format-only gates (see
+  // isNewFormatStockReport above for the era-compatibility rule these are
+  // gated behind). Both new gates are scoped PER `## SYMBOL` section
+  // (extractStockSymbolSections) - a batch report can mix a well-formed
+  // symbol with a corrupted one, and each symbol must be judged on its own.
+  if (isNewFormatStockReport(text)) {
+    for (const { symbol, section } of extractStockSymbolSections(text)) {
+      // stock.conclusion_box: parseConclusionBox is the SAME parser Task 2's
+      // prediction persistence and Task 5's platform summary card use (single
+      // source, never re-parsed ad hoc here) - it already enforces "confidence
+      // label must be one of 高/中/低" internally (confidenceFromLabel returns
+      // undefined for anything else, e.g. a hand-edited '很高', and
+      // parseConclusionBox treats that as a missing required key -> null), so
+      // "AND confidence label ∈ 三档" from this gate's spec is satisfied by
+      // composition rather than a second, redundant confidence check here.
+      if (!parseConclusionBox(section)) {
+        failures.push(`stock.conclusion_box:${symbol}`);
+      }
+
+      // stock.facts_coverage: >=6 of the SAME 8 checkpoints Task 2's
+      // confidence heuristic counts, either facts-backed or explicitly
+      // disclosed as unavailable within this symbol's own section text.
+      const covered = countFactsCoverage(section);
+      if (covered < CONFIDENCE_COVERAGE_THRESHOLD) {
+        failures.push(`stock.facts_coverage:${symbol}:${covered}/${CONFIDENCE_COVERAGE_CHECKPOINTS.length}`);
+      }
+    }
   }
 
   return buildResult(failures);
@@ -428,6 +588,156 @@ function parseNarrativeNumber(raw) {
   return Number.isFinite(value) ? value : null;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5 Task 4 (2026-07-15 plan) - stock.numeric_match
+// (validateStockNarrativeNumbers). Kept as its own exported function,
+// separate from validateStockAnalysisMarkdown, for the SAME reason
+// validateNarrativeNumbers above is separate from validateReportMarkdown:
+// it needs a THIRD input (factsBySymbol) that function's other callers don't
+// carry.
+//
+// Matching approach deliberately mirrors narrative-engine.mjs's OWN numeric
+// pre-check (findUnmatchedNumber/extractNumberTokens) rather than
+// validateNarrativeNumbers' phrase-anchored NUMERIC_MATCH_PATTERNS above: a
+// stock-analysis section's prose (deterministic OR, once P10 lands, real
+// narrative) is free-form, not the daily/weekly report's small set of fixed
+// bullet templates, so no small fixed list of phrase patterns could
+// enumerate every number a section might state. Every number token found in
+// non-exempt text must independently prove itself against SOME value in
+// that symbol's own facts (any key, within tolerance) - the same asymmetric
+// "a stated number must be backed by something real" contract in spirit,
+// just decided structurally (like narrative-engine.mjs) instead of via fixed
+// phrases (like validateNarrativeNumbers).
+//
+// Exemptions - each documented because "deterministic templates only
+// interpolate facts values" is the safety argument the plan asks to spell
+// out, and it does NOT apply uniformly to every rendered byte:
+//   1. A whole `## SYMBOL` section carrying narrative-engine.mjs's
+//      REPORT_DEGRADED_HEADER (rendered once, right after the heading, only
+//      when the narrative backend THREW for that symbol - see
+//      stock-analysis.mjs's renderBatchStockAnalysis) is skipped ENTIRELY.
+//      Every one of its 8 sections is then buildDeterministicAnalysis's own
+//      deterministic text, which legitimately states INTERNALLY-COMPUTED
+//      (not literally-a-single-fact-value) numbers - the three-path
+//      bullish/neutral/bearish probabilities, historyStats' trend score and
+//      vs-180-day-average percentage, summarizeUpsidePotential's implied
+//      upside percentage - none of which were ever generated by, or checked
+//      against, a narrative backend in the first place, so re-checking them
+//      here would false-fail a perfectly honest deterministic report.
+//   2. A specific "### ..." block carrying an inline per-section degrade
+//      marker (NUMERIC_DEGRADE_MARKER/NON_CHINESE_DEGRADE_MARKER, both
+//      imported from narrative-engine.mjs - single source, not re-typed) is,
+//      likewise, deterministic fallback text for THAT block only - skipped
+//      the same way, even when sibling blocks in the same symbol section ARE
+//      narrative-adopted (a mixed state: some sections succeeded, this one's
+//      retries were exhausted).
+//   3. The nested "### 结论框" block is NEVER scanned, unconditionally,
+//      regardless of degrade-marker state. It is validated structurally by
+//      the SEPARATE stock.conclusion_box gate above (parseConclusionBox), and
+//      renderBatchStockAnalysis always embeds it verbatim from
+//      buildConclusionBoxParams's own computation (computeValueRange/
+//      computePricePosition) - never narrative-rewritten, regardless of
+//      whether the surrounding "结论与复盘标签" section's OWN prose was
+//      narrative-adopted. Its 合理价值区间/当前价格位置 numbers are legitimately
+//      DERIVED (e.g. a rolling 20-session support/resistance) and do not
+//      literally equal any single stock_facts value_num, so scanning it here
+//      would either duplicate stock.conclusion_box's job or false-fail on a
+//      sound derived number.
+//   4. The "### 近期新闻" block is never scanned - it was never subject to
+//      the narrative/facts-derivation contract at all (raw external news
+//      content, not one of NARRATIVE_SECTION_KEYS), so its dates/headline
+//      numbers are not expected to trace back to stock_facts any more than
+//      the daily/weekly gate's NUMERIC_MATCH_PATTERNS ever scans news bullets.
+const STOCK_ISO_DATE_PATTERN = /\d{4}-\d{2}-\d{2}/gu;
+const STOCK_NUMBER_TOKEN_PATTERN = /-?\d[\d,]*\.?\d*/gu;
+const STOCK_DEGRADE_MARKER_PATTERN = new RegExp(
+  `${escapeRegExp(NUMERIC_DEGRADE_MARKER)}|${escapeRegExp(NON_CHINESE_DEGRADE_MARKER)}`,
+  "u"
+);
+const EXEMPT_STOCK_SUBSECTION_HEADINGS = new Set(["结论框", "近期新闻"]);
+
+function extractStockNumberTokens(text) {
+  const withoutDates = String(text ?? "").replace(STOCK_ISO_DATE_PATTERN, "");
+  const tokens = [];
+  for (const match of withoutDates.matchAll(STOCK_NUMBER_TOKEN_PATTERN)) {
+    const raw = match[0];
+    const value = Number(raw.replace(/,/gu, ""));
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    const rest = withoutDates.slice(match.index + raw.length);
+    const isPercentAdjacent = /^\s?%/u.test(rest);
+    tokens.push({ raw, value, kind: isPercentAdjacent ? "pct" : "price" });
+  }
+  return tokens;
+}
+
+function collectStockFactValues(facts) {
+  return Object.values(facts ?? {})
+    .map((fact) => fact?.valueNum)
+    .filter((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+// Splits ONE symbol's already-extracted section text (extractStockSymbolSections)
+// into its "### ..." sub-blocks, keyed by heading text - same splitting shape
+// as extractStockSymbolSections above, one heading level deeper. Content
+// before the first "###" heading (the whole-symbol REPORT_DEGRADED_HEADER
+// blockquote line, when present) is collected under a `null` heading; callers
+// that already skip the whole section on that marker never reach this
+// leftover bucket in practice, but it is scanned like any other non-exempt
+// block for defensiveness (it carries no numbers under real rendering).
+function splitStockSubsections(sectionText) {
+  const lines = sectionText.split("\n");
+  const blocks = [];
+  let heading = null;
+  let buffer = [];
+  const flush = () => {
+    blocks.push({ heading, body: buffer.join("\n") });
+    buffer = [];
+  };
+  for (const rawLine of lines) {
+    const match = /^###(?!#)\s+(.+)$/u.exec(rawLine.trim());
+    if (match) {
+      flush();
+      heading = match[1].trim();
+      continue;
+    }
+    buffer.push(rawLine);
+  }
+  flush();
+  return blocks;
+}
+
+export function validateStockNarrativeNumbers(markdown, factsBySymbol = {}, { pctTolerance = 0.1, priceTolerance = 0.01 } = {}) {
+  const text = normalizeText(markdown);
+  if (!isNewFormatStockReport(text)) {
+    return buildResult([]);
+  }
+
+  const failures = [];
+  for (const { symbol, section } of extractStockSymbolSections(text)) {
+    if (section.includes(REPORT_DEGRADED_HEADER)) {
+      // Exemption 1 (whole-symbol degrade) - see this function's header.
+      continue;
+    }
+    const factValues = collectStockFactValues(factsBySymbol[symbol]);
+    for (const block of splitStockSubsections(section)) {
+      if (EXEMPT_STOCK_SUBSECTION_HEADINGS.has(block.heading) || STOCK_DEGRADE_MARKER_PATTERN.test(block.body)) {
+        // Exemptions 2/3/4 - see this function's header.
+        continue;
+      }
+      for (const token of extractStockNumberTokens(block.body)) {
+        const tolerance = token.kind === "pct" ? pctTolerance : priceTolerance;
+        const matched = factValues.some((value) => Math.abs(value - token.value) <= tolerance);
+        if (!matched) {
+          pushUnique(failures, `stock.numeric_match:${symbol}:${token.raw}`);
+        }
+      }
+    }
+  }
+  return buildResult(failures);
+}
+
 function minimumNewsLines(kind) {
   return kind === "weekly" ? 3 : 3;
 }
@@ -464,4 +774,12 @@ function pushUnique(values, value) {
   if (!values.includes(value)) {
     values.push(value);
   }
+}
+
+// Same tiny helper conclusion-box.mjs declares locally for the same reason
+// (escaping a known, fixed literal before embedding it in a RegExp) - not
+// imported from there to avoid this file depending on a private, unexported
+// helper.
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
