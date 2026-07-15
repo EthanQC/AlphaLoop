@@ -1706,6 +1706,53 @@ describe("ProposalRepository", () => {
       expect(() => repo.updateCardMessageId("proposal_nope", "om_msg_1")).toThrow(/not found/);
     });
   });
+
+  describe("listByOwner", () => {
+    it("returns only this owner's proposals (never another owner's), regardless of status filter", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      seedMember(db, "mem_other");
+      const repo = new ProposalRepository(db);
+
+      const first = repo.create(baseNewProposal({ symbol: "AAPL.US" }));
+      const second = repo.create(baseNewProposal({ symbol: "MSFT.US" }));
+      repo.create(baseNewProposal({ ownerId: "mem_other", symbol: "TSLA.US" }));
+
+      const results = repo.listByOwner("mem_owner");
+
+      expect(results.map((p) => p.id).sort()).toEqual([first.id, second.id].sort());
+      expect(results.every((p) => p.ownerId === "mem_owner")).toBe(true);
+    });
+
+    it("filters by status when given", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const pending = repo.create(baseNewProposal({ symbol: "AAPL.US" }));
+      const toApprove = repo.create(baseNewProposal({ symbol: "MSFT.US" }));
+      repo.consumeApproval(toApprove.approvalToken!, {
+        decision: "approved",
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+
+      expect(repo.listByOwner("mem_owner", "pending").map((p) => p.id)).toEqual([pending.id]);
+      expect(repo.listByOwner("mem_owner", "approved").map((p) => p.id)).toEqual([toApprove.id]);
+      expect(repo.listByOwner("mem_owner", "rejected")).toEqual([]);
+    });
+
+    it("returns an empty array for an owner with no proposals", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      expect(repo.listByOwner("mem_owner")).toEqual([]);
+    });
+  });
 });
 
 describe("CircuitBreakerRepository", () => {

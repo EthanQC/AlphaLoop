@@ -37,6 +37,7 @@
     "longbridge:quote": "node apps/openclaw-config/scripts/longbridge-quote.mjs",
     "longbridge:reconcile-official-paper": "node apps/openclaw-config/scripts/reconcile-official-paper-orders.mjs",
     "paper:submit-official-equity": "node apps/openclaw-config/scripts/submit-official-paper-equity-order.mjs",
+    "proposals:sweep": "node apps/openclaw-config/scripts/proposals.mjs sweep",
     "openclaw:cron:install": "node apps/openclaw-config/scripts/install-openclaw-cron.mjs",
     "openclaw:runtime:doctor": "node apps/openclaw-config/scripts/openclaw-runtime-doctor.mjs",
     "launchd:install-system": "bash apps/openclaw-config/scripts/install-system-daemons.sh",

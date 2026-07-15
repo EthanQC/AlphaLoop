@@ -9,7 +9,8 @@ describe("managed OpenClaw cron jobs", () => {
     expect(jobs.map((job) => job.name)).toEqual([
       "openclaw-trading-daily-report",
       "openclaw-trading-weekly-report",
-      "openclaw-trading-stock-analysis"
+      "openclaw-trading-stock-analysis",
+      "openclaw-trading-proposal-sweep"
     ]);
     expect(jobs).toEqual([
       expect.objectContaining({
@@ -26,11 +27,15 @@ describe("managed OpenClaw cron jobs", () => {
         cron: "0 21 * * *",
         timezone: "Asia/Shanghai",
         systemEvent: expect.stringContaining("pnpm stock-analysis:scheduled")
+      }),
+      expect.objectContaining({
+        cron: "0 * * * *",
+        timezone: "Asia/Shanghai",
+        systemEvent: expect.stringContaining("pnpm proposals:sweep")
       })
     ]);
     for (const job of jobs) {
       expect(job.systemEvent).toContain("cd /repo");
-      expect(job.systemEvent).toContain("quality");
       expect(job.systemEvent).toContain("schedule marker");
       expect(job).not.toHaveProperty("webhook");
       expect(job.systemEvent).toContain("runner watches this run log");
@@ -38,5 +43,13 @@ describe("managed OpenClaw cron jobs", () => {
       expect(job.session).toBe("main");
       expect(job.wake).toBe("next-heartbeat");
     }
+    // The three original report/analysis jobs each run a report-quality
+    // validation pipeline (their "quality" label is literal); the Task 3
+    // proposal-expiry sweep is a plain atomic-consume sweep, not a quality
+    // pipeline, so it is intentionally excluded from this specific check.
+    for (const job of jobs.slice(0, 3)) {
+      expect(job.systemEvent).toContain("quality");
+    }
+    expect(jobs[3]?.systemEvent).toContain("proposal-expiry sweep");
   });
 });

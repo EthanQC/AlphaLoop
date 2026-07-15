@@ -1105,6 +1105,26 @@ export class ProposalRepository {
       throw new Error(`Proposal ${id} not found.`);
     }
   }
+
+  // Phase 6 Task 3 (proposals.mjs's `list` command) addition - NOT a DDL
+  // change (the plan's "DDL 冻结" only freezes the proposals TABLE shape,
+  // already declared complete by Task 1; this is a plain read method on top
+  // of it, same category as the pre-existing getById/getByToken/
+  // listPendingExpired above). Added here rather than as raw SQL inside
+  // proposals.mjs because every other CLI in this codebase (members.mjs's own
+  // header comment) keeps SQL out of the CLI layer and routes it through a
+  // repository instead.
+  listByOwner(ownerId: string, status?: ProposalStatus): Proposal[] {
+    const rows = status
+      ? (this.db
+          .prepare(`SELECT * FROM proposals WHERE owner_id = ? AND status = ? ORDER BY created_at DESC`)
+          .all(ownerId, status) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(`SELECT * FROM proposals WHERE owner_id = ? ORDER BY created_at DESC`)
+          .all(ownerId) as Array<Record<string, unknown>>);
+
+    return rows.map(mapProposal);
+  }
 }
 
 export interface CircuitBreakerState {
