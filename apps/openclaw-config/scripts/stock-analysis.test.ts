@@ -15,6 +15,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { parseConclusionBox } from "./conclusion-box.mjs";
+import { validateStockAnalysisMarkdown } from "./report-quality.mjs";
 import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
@@ -327,5 +329,257 @@ describe("persistStockFactsForRecords: writes stock_facts per successful record"
     stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [fakeRecord("AAPL.US")]);
 
     expect(getStockFacts(db, "2026-07-14", "MSFT.US")["quote.last"].valueNum).toBe(430.1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 Task 2 (2026-07-15 plan): structured conclusion box + prediction
+// persistence. buildDeterministicAnalysis is pure/network-free (was already
+// module-local, now exported for exactly this reason) - fixtures below are
+// tuned against the REAL summarizeHistory/summarizeUpsidePotential formulas
+// (stock-analysis-metrics.mjs) so the confidence branches are hit for real,
+// not asserted against a re-implementation of the heuristic.
+// ---------------------------------------------------------------------------
+
+function stockQuote(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    symbol: "AAPL.US",
+    last: "210.50",
+    prev_close: "208.00",
+    open: "209.00",
+    high: "211.00",
+    low: "207.50",
+    volume: "50000000",
+    timestamp: "2026-07-14T20:00:00.000Z",
+    ...overrides
+  };
+}
+
+function stockHistorySeries(days: number, startClose: number, dailyDrift: number) {
+  const rows: Array<{ date: string; close: number }> = [];
+  const start = new Date("2026-01-05T00:00:00.000Z").getTime();
+  for (let i = 0; i < days; i += 1) {
+    rows.push({
+      date: new Date(start + i * 86_400_000).toISOString().slice(0, 10),
+      close: startClose + i * dailyDrift
+    });
+  }
+  return rows;
+}
+
+function stockFundamentals(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    sources: ["yahoo-quote"],
+    trailingPE: 22,
+    priceToBook: 6,
+    epsTrailingTwelveMonths: 8,
+    marketCap: 1_000_000_000_000,
+    oneYearTarget: 280,
+    ...overrides
+  };
+}
+
+function stockOptionChain() {
+  return {
+    expirationDates: [1755820800],
+    options: [{ calls: [{ openInterest: 1000 }], puts: [{ openInterest: 500 }] }]
+  };
+}
+
+function stockNewsList(count = 3) {
+  return Array.from({ length: count }, (_, i) => ({ id: `n${i}`, title: `新闻 ${i}`, source: "longbridge-news" }));
+}
+
+const GENERATED_AT = "2026-07-15T13:00:00.000Z";
+
+describe("buildDeterministicAnalysis: conclusion-box confidence heuristic", () => {
+  it("is 'high' when facts coverage >= 6/8 AND the upside label + trend score both point bullish", () => {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      stockQuote({ last: "220.00" }),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      GENERATED_AT
+    );
+
+    expect(analysis.conclusionBox.confidence).toBe("high");
+  });
+
+  it("is 'medium' when facts coverage >= 6/8 but the upside label is neutral (signals not consistent)", () => {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      stockQuote({ last: "200.00", prev_close: "200.00" }),
+      stockNewsList(),
+      {
+        history: stockHistorySeries(130, 200, 0),
+        fundamentals: stockFundamentals({ trailingPE: 20, priceToBook: 5, epsTrailingTwelveMonths: 10, oneYearTarget: 205 }),
+        optionChain: stockOptionChain()
+      },
+      GENERATED_AT
+    );
+
+    expect(analysis.conclusionBox.confidence).toBe("medium");
+  });
+
+  it("is 'low' when facts coverage is below 6/8 (missing quote.last/pct and options.callOi)", () => {
+    const quoteWithoutLast = {
+      symbol: "AAPL.US", prev_close: "208.00", open: "209.00", high: "211.00", low: "207.50",
+      volume: "50000000", timestamp: "2026-07-14T20:00:00.000Z"
+    };
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      quoteWithoutLast,
+      stockNewsList(),
+      {
+        history: stockHistorySeries(130, 180, 0.3),
+        fundamentals: stockFundamentals(),
+        optionChain: { error: "Yahoo options 期权链接口读取失败" }
+      },
+      GENERATED_AT
+    );
+
+    expect(analysis.conclusionBox.confidence).toBe("low");
+  });
+
+  it("derives reviewDate as the generation date + 1 US-Eastern calendar month", () => {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      stockQuote(),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 200, 0.1), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      "2026-07-15T13:00:00.000Z"
+    );
+
+    expect(analysis.conclusionBox.reviewDate).toBe("2026-08-15");
+  });
+});
+
+describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen '结论与复盘标签' section", () => {
+  function renderFixture(symbol: string, generatedAt = GENERATED_AT) {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      symbol,
+      stockQuote({ symbol }),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      generatedAt
+    );
+    const markdown = stockAnalysis.renderBatchStockAnalysis({
+      label: generatedAt.slice(0, 10),
+      generatedAt,
+      records: [{ symbol, analysis, news: stockNewsList() }],
+      failedSymbols: []
+    });
+    return { analysis, markdown };
+  }
+
+  it("places '### 结论框' after the existing prose bullets, before the next section", () => {
+    const { markdown } = renderFixture("AAPL.US");
+
+    const conclusionHeadingIndex = markdown.indexOf("### 结论与复盘标签");
+    const boxHeadingIndex = markdown.indexOf("### 结论框");
+    const newsHeadingIndex = markdown.indexOf("### 近期新闻");
+
+    expect(conclusionHeadingIndex).toBeGreaterThan(-1);
+    expect(boxHeadingIndex).toBeGreaterThan(conclusionHeadingIndex);
+    expect(boxHeadingIndex).toBeLessThan(newsHeadingIndex);
+    // Existing three-path prose bullets stay put, ahead of the box.
+    expect(markdown.indexOf("复盘标签：stock-analysis")).toBeLessThan(boxHeadingIndex);
+  });
+
+  it("still passes validateStockAnalysisMarkdown (existing gates stay green on the new output)", () => {
+    const { markdown } = renderFixture("AAPL.US");
+
+    const result = validateStockAnalysisMarkdown(markdown);
+    expect(result.failures).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("persistPredictionsForRecords: parses its OWN rendered output into analysis_predictions", () => {
+  function renderFixture(symbol: string, generatedAt = GENERATED_AT) {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      symbol,
+      stockQuote({ symbol }),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      generatedAt
+    );
+    const markdown = stockAnalysis.renderBatchStockAnalysis({
+      label: generatedAt.slice(0, 10),
+      generatedAt,
+      records: [{ symbol, analysis, news: stockNewsList() }],
+      failedSymbols: []
+    });
+    return { analysis, markdown };
+  }
+
+  function predictionRow(db: DatabaseSync, reportPath: string, symbol: string) {
+    return db
+      .prepare("SELECT * FROM analysis_predictions WHERE report_path = ? AND symbol = ?")
+      .get(reportPath, symbol) as Record<string, unknown> | undefined;
+  }
+
+  it("writes a row whose fields match parseConclusionBox on the record's own rendered output", () => {
+    const { db } = makeDb();
+    const { analysis, markdown } = renderFixture("AAPL.US");
+    const reportPath = "/tmp/2026-07-15.md";
+    const parsed = parseConclusionBox(markdown);
+    expect(parsed).not.toBeNull();
+
+    stockAnalysis.persistPredictionsForRecords(db, reportPath, markdown, [{ symbol: "AAPL.US", analysis }]);
+
+    const row = predictionRow(db, reportPath, "AAPL.US");
+    expect(row).toBeDefined();
+    expect(row?.symbol).toBe("AAPL.US");
+    expect(row?.report_path).toBe(reportPath);
+    expect(row?.conclusion).toBe(parsed!.coreConclusion);
+    expect(row?.confidence).toBe(parsed!.confidence);
+    expect(row?.review_trigger).toBe(parsed!.reviewTrigger);
+    expect(row?.review_date).toBe(parsed!.reviewDate);
+    expect(row?.outcome).toBeNull();
+  });
+
+  it("is idempotent: re-running against the same report_path replaces rather than duplicates", () => {
+    const { db } = makeDb();
+    const reportPath = "/tmp/2026-07-15.md";
+    const first = renderFixture("AAPL.US");
+
+    stockAnalysis.persistPredictionsForRecords(db, reportPath, first.markdown, [{ symbol: "AAPL.US", analysis: first.analysis }]);
+    // Second render for the SAME symbol/report_path but a different
+    // generatedAt (-> a different reviewDate) - simulates a same-day
+    // re-run (e.g. `prepare` run twice) producing a slightly different box.
+    const second = renderFixture("AAPL.US", "2026-07-15T18:00:00.000Z");
+    stockAnalysis.persistPredictionsForRecords(db, reportPath, second.markdown, [{ symbol: "AAPL.US", analysis: second.analysis }]);
+
+    const rows = db.prepare("SELECT * FROM analysis_predictions WHERE report_path = ?").all(reportPath) as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].review_date).toBe(second.analysis.conclusionBox.reviewDate);
+  });
+
+  it("does not touch a different report_path's rows", () => {
+    const { db } = makeDb();
+    const a = renderFixture("AAPL.US");
+    const m = renderFixture("MSFT.US");
+
+    stockAnalysis.persistPredictionsForRecords(db, "/tmp/aapl.md", a.markdown, [{ symbol: "AAPL.US", analysis: a.analysis }]);
+    stockAnalysis.persistPredictionsForRecords(db, "/tmp/msft.md", m.markdown, [{ symbol: "MSFT.US", analysis: m.analysis }]);
+
+    expect(predictionRow(db, "/tmp/aapl.md", "AAPL.US")).toBeDefined();
+    expect(predictionRow(db, "/tmp/msft.md", "MSFT.US")).toBeDefined();
+
+    // Re-running AAPL's path must not disturb MSFT's row under a different path.
+    stockAnalysis.persistPredictionsForRecords(db, "/tmp/aapl.md", a.markdown, [{ symbol: "AAPL.US", analysis: a.analysis }]);
+    expect(predictionRow(db, "/tmp/msft.md", "MSFT.US")).toBeDefined();
+  });
+
+  it("skips a record whose own section has no parseable box, without throwing", () => {
+    const { db } = makeDb();
+    const reportPath = "/tmp/broken.md";
+    const brokenMarkdown = "## BAD.US\n\n### 结论与复盘标签\n\n- 无结论框。\n";
+
+    expect(() =>
+      stockAnalysis.persistPredictionsForRecords(db, reportPath, brokenMarkdown, [{ symbol: "BAD.US", analysis: {} }])
+    ).not.toThrow();
+    expect(predictionRow(db, reportPath, "BAD.US")).toBeUndefined();
   });
 });
