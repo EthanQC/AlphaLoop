@@ -6,10 +6,8 @@ import { fileURLToPath } from "node:url";
 import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
+import { collectL1News } from "./news-sources.mjs";
 import {
-  normalizeExternalRssNews,
-  mergeNewsArticles,
-  normalizeYahooSearchNews,
   renderDetailedNewsLine,
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
@@ -19,7 +17,6 @@ import {
   buildDegradedOfficialPaperSnapshot,
   buildDegradedQuoteSnapshot,
   buildTrackedSymbols,
-  normalizeNewsPayload,
   normalizeOfficialPaperSnapshot,
   normalizeQuotePayload,
   toNumber
@@ -1086,84 +1083,16 @@ function settledFailureLabel(result, label) {
   return `${label}失败：${singleLine(result.reason?.message ?? result.reason, 140)}`;
 }
 
+// Phase 4 Task 4: fetchMarketNews now delegates to news-sources.mjs's
+// collectL1News instead of hand-rolling its own Promise.allSettled fan-out
+// over 4 hardcoded sources. Behavior-preserving for the four pre-existing
+// sources (same env var semantics, same "throw when everything came back
+// empty" invariant) - RSSHub and Finnhub simply join the same pool as two
+// more entries in collectL1News's source list, so they can only ADD
+// articles/warnings, never change how the four original sources behave.
 async function fetchMarketNews(symbols) {
-  const count = Math.max(1, Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5));
-  const warnings = [];
-  const batches = await Promise.all(symbols.map(async (symbol) => {
-    const [longbridgeResult, yahooResult, yahooRssResult, googleRssResult] = await Promise.allSettled([
-      fetchRequiredLongbridgeJson("quote", ["news", symbol, "--count", String(count)], `Longbridge 新闻 ${symbol}`)
-        .then((payload) => normalizeNewsPayload(symbol, payload)),
-      fetchYahooSearchNews(symbol, count),
-      fetchYahooRssNews(symbol, count),
-      fetchGoogleNewsRss(symbol, count)
-    ]);
-
-    const rows = [];
-    if (longbridgeResult.status === "fulfilled") {
-      rows.push(...longbridgeResult.value);
-    } else {
-      warnings.push(`${symbol} 长桥新闻读取失败：${singleLine(longbridgeResult.reason?.message ?? longbridgeResult.reason, 120)}`);
-    }
-    if (yahooResult.status === "fulfilled") {
-      rows.push(...yahooResult.value);
-    } else {
-      warnings.push(`${symbol} Yahoo Finance 新闻读取失败：${singleLine(yahooResult.reason?.message ?? yahooResult.reason, 120)}`);
-    }
-    if (yahooRssResult.status === "fulfilled") {
-      rows.push(...yahooRssResult.value);
-    } else {
-      warnings.push(`${symbol} Yahoo Finance RSS 读取失败：${singleLine(yahooRssResult.reason?.message ?? yahooRssResult.reason, 120)}`);
-    }
-    if (googleRssResult.status === "fulfilled") {
-      rows.push(...googleRssResult.value);
-    } else {
-      warnings.push(`${symbol} Google News RSS 读取失败：${singleLine(googleRssResult.reason?.message ?? googleRssResult.reason, 120)}`);
-    }
-    return rows;
-  }));
-  const articles = mergeNewsArticles(batches.flat());
-  if (articles.length === 0) {
-    throw new Error("多源新闻返回为空；报告需要至少一条已验证新闻。");
-  }
+  const { articles, warnings } = await collectL1News({ symbols, env: process.env });
   return { articles, warnings };
-}
-
-async function fetchYahooSearchNews(symbol, count) {
-  const yahooSymbol = toYahooSymbol(symbol);
-  const url = new URL("https://query2.finance.yahoo.com/v1/finance/search");
-  url.searchParams.set("q", yahooSymbol);
-  url.searchParams.set("quotesCount", "0");
-  url.searchParams.set("newsCount", String(count));
-  url.searchParams.set("enableFuzzyQuery", "false");
-  const payload = await fetchJsonWithTimeout(url);
-  return normalizeYahooSearchNews(symbol, payload);
-}
-
-async function fetchYahooRssNews(symbol, count) {
-  const yahooSymbol = toYahooSymbol(symbol);
-  const url = new URL("https://feeds.finance.yahoo.com/rss/2.0/headline");
-  url.searchParams.set("s", yahooSymbol);
-  url.searchParams.set("region", "US");
-  url.searchParams.set("lang", "en-US");
-  const xml = await fetchTextWithTimeout(url);
-  return normalizeExternalRssNews(symbol, xml, {
-    source: "yahoo-finance-rss",
-    sourceName: "Yahoo Finance"
-  }).slice(0, count);
-}
-
-async function fetchGoogleNewsRss(symbol, count) {
-  const yahooSymbol = toYahooSymbol(symbol);
-  const url = new URL("https://news.google.com/rss/search");
-  url.searchParams.set("q", `${yahooSymbol} stock OR Nasdaq 100 ETF when:7d`);
-  url.searchParams.set("hl", "en-US");
-  url.searchParams.set("gl", "US");
-  url.searchParams.set("ceid", "US:en");
-  const xml = await fetchTextWithTimeout(url);
-  return normalizeExternalRssNews(symbol, xml, {
-    source: "google-news-rss",
-    sourceName: "Google News"
-  }).slice(0, count);
 }
 
 // Task H7 (2026-07-14 legacy audit): every OTHER required data source
@@ -1351,49 +1280,6 @@ function splitCsv(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
-}
-
-function toYahooSymbol(symbol) {
-  return String(symbol ?? "").toUpperCase().replace(/\.US$/u, "");
-}
-
-async function fetchJsonWithTimeout(url) {
-  return JSON.parse(await fetchTextWithTimeout(url));
-}
-
-async function fetchTextWithTimeout(url) {
-  const attempts = Math.max(1, Number(process.env.REPORT_NEWS_FETCH_ATTEMPTS ?? 2));
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Number(process.env.REPORT_NEWS_FETCH_TIMEOUT_MS ?? 12000));
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/125 Safari/537.36 OpenClaw",
-          "accept": "application/rss+xml,application/json,text/xml,text/plain,*/*",
-          "accept-language": "en-US,en;q=0.9"
-        }
-      });
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-      return await response.text();
-    } catch (error) {
-      lastError = error;
-      if (attempt < attempts) {
-        await sleep(500 * attempt);
-      }
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-  throw lastError;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatOptionalNumber(value, digits = 2) {
