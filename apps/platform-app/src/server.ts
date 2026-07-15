@@ -4,6 +4,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 
 import { applySecurityHeaders, createNonce } from "./security.js";
+import type { MemorydBackend } from "./data/memoryd-mirror.js";
+import { handleApiStrategyRoute } from "./routes/api-strategy.js";
 import { handleHomeRoute } from "./routes/home.js";
 import { handleMemberCardRoute } from "./routes/member-card.js";
 import { handleNewsRoute } from "./routes/news.js";
@@ -22,6 +24,12 @@ export interface PlatformServerDeps {
   repoRoot: string;
   /** Injectable clock for deterministic tests; defaults to wall clock. */
   now?: () => Date;
+  /** Injectable memoryd mirror backend for the bearer-gated strategy write
+   * API (Task 4, routes/api-strategy.ts); defaults to
+   * `createMemorydBackend()`'s P10-gated placeholder (fire-and-forget
+   * degrade - see data/memoryd-mirror.ts) when the real entrypoint
+   * (index.ts) doesn't supply one. */
+  memorydBackend?: MemorydBackend;
 }
 
 /**
@@ -42,6 +50,19 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         return;
       }
       sendJson(res, 200, { ok: true, service: "platform-app" });
+      return;
+    }
+
+    // Bearer-gated JSON write API (Task 4) dispatches BEFORE every GET/HTML
+    // route below - it owns the whole `/api/*` namespace, is never identity-
+    // gated via the Access-email header (bearer only - see api-strategy.ts's
+    // own header), and returns JSON, not an HTML page.
+    if (
+      handleApiStrategyRoute(req, res, url, {
+        db: deps.db,
+        ...(deps.memorydBackend ? { memorydBackend: deps.memorydBackend } : {})
+      })
+    ) {
       return;
     }
 
