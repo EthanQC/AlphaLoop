@@ -1,0 +1,201 @@
+[
+  {
+    "name": "bull: price closer to target -> toward_target",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200, "invalidationPrice": 100 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 180
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "bull: price closer to invalidation -> toward_invalidation",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200, "invalidationPrice": 150 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 155
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 155, "vsTargetPct": -22.5, "vsInvalidationPct": 3.33, "verdict": "toward_invalidation" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "bear: price closer to target (downside aim) -> toward_target",
+    "input": {
+      "thesis": { "direction": "bear", "targetLow": 100, "invalidationPrice": 160 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 110
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 110, "vsTargetPct": 10, "vsInvalidationPct": -31.25, "verdict": "toward_target" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "bear: price closer to invalidation (upside break) -> toward_invalidation",
+    "input": {
+      "thesis": { "direction": "bear", "targetLow": 100, "invalidationPrice": 160 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 150
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 150, "vsTargetPct": 50, "vsInvalidationPct": -6.25, "verdict": "toward_invalidation" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "neutral: price within range -> neutral, vsTargetPct always null",
+    "input": {
+      "thesis": { "direction": "neutral", "targetLow": 100, "targetHigh": 120 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 110
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "neutral: price outside range -> toward_invalidation",
+    "input": {
+      "thesis": { "direction": "neutral", "targetLow": 100, "targetHigh": 120 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 130
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 130, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "toward_invalidation" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "insufficient: bull missing invalidationPrice - vsTargetPct still computed, vsInvalidationPct null",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 190
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 190, "vsTargetPct": -5, "vsInvalidationPct": null, "verdict": "insufficient" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "insufficient: unrecognized direction -> both pct fields null, never guessed",
+    "input": {
+      "thesis": { "direction": "sideways", "targetHigh": 250, "targetLow": 100, "invalidationPrice": 180 },
+      "judgments": [{ "id": "j1" }],
+      "latestPrice": 200
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 200, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "insufficient" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 1 }
+    }
+  },
+  {
+    "name": "no_price: latestPrice null -> every judgment 'no_price', all fields null except judgmentId",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200, "invalidationPrice": 150 },
+      "judgments": [{ "id": "j1" }, { "id": "j2" }],
+      "latestPrice": null
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": null, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "no_price" },
+        { "judgmentId": "j2", "priceAtRender": null, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "no_price" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 2 }
+    }
+  },
+  {
+    "name": "hitRate: fewer than 10 judgments -> insufficient with no reason field",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200, "invalidationPrice": 100 },
+      "judgments": [{ "id": "j1" }, { "id": "j2" }, { "id": "j3" }, { "id": "j4" }, { "id": "j5" }, { "id": "j6" }, { "id": "j7" }, { "id": "j8" }, { "id": "j9" }],
+      "latestPrice": 180
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j2", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j3", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j4", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j5", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j6", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j7", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j8", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j9", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" }
+      ],
+      "hitRate": { "sample": "insufficient", "n": 9 }
+    }
+  },
+  {
+    "name": "hitRate: 10+ judgments, all toward_target -> ok, hitFraction 1",
+    "input": {
+      "thesis": { "direction": "bull", "targetHigh": 200, "invalidationPrice": 100 },
+      "judgments": [{ "id": "j1" }, { "id": "j2" }, { "id": "j3" }, { "id": "j4" }, { "id": "j5" }, { "id": "j6" }, { "id": "j7" }, { "id": "j8" }, { "id": "j9" }, { "id": "j10" }],
+      "latestPrice": 180
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j2", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j3", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j4", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j5", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j6", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j7", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j8", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j9", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" },
+        { "judgmentId": "j10", "priceAtRender": 180, "vsTargetPct": -10, "vsInvalidationPct": 80, "verdict": "toward_target" }
+      ],
+      "hitRate": { "sample": "ok", "n": 10, "hits": 10, "total": 10, "hitFraction": 1 }
+    }
+  },
+  {
+    "name": "hitRate: 10+ judgments but all 'neutral' (zero directional) -> insufficient with a reason",
+    "input": {
+      "thesis": { "direction": "neutral", "targetLow": 100, "targetHigh": 120 },
+      "judgments": [{ "id": "j1" }, { "id": "j2" }, { "id": "j3" }, { "id": "j4" }, { "id": "j5" }, { "id": "j6" }, { "id": "j7" }, { "id": "j8" }, { "id": "j9" }, { "id": "j10" }],
+      "latestPrice": 110
+    },
+    "expected": {
+      "perJudgment": [
+        { "judgmentId": "j1", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j2", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j3", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j4", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j5", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j6", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j7", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j8", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j9", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" },
+        { "judgmentId": "j10", "priceAtRender": 110, "vsTargetPct": null, "vsInvalidationPct": null, "verdict": "neutral" }
+      ],
+      "hitRate": {
+        "sample": "insufficient",
+        "n": 10,
+        "reason": "无法计算方向命中率（缺少最新价格，或论点缺少目标价/失效价，无法判断方向）"
+      }
+    }
+  }
+]

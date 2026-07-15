@@ -240,7 +240,7 @@ describe("member card route (GET /member/<who>)", () => {
     });
   });
 
-  describe("公开策略/论点", () => {
+  describe("公开论点清单", () => {
     it("shows only the subject's PUBLIC theses to a non-self viewer", async () => {
       const subject = makeMember({ id: "member_subject2", email: "subject2@example.com" });
       new MemberRepository(db).upsert(subject);
@@ -269,14 +269,80 @@ describe("member card route (GET /member/<who>)", () => {
       expect(body).toContain("系统可用");
     });
 
-    it("shows 暂无公开策略/论点 when the subject has no public theses", async () => {
+    it("shows 暂无公开论点 when the subject has no public theses", async () => {
       const subject = makeMember({ id: "member_subject3", email: "subject3@example.com" });
       new MemberRepository(db).upsert(subject);
 
       const { token } = seedMemberWithToken();
       const response = await authed("/member/member_subject3", token);
       const body = await response.text();
-      expect(body).toContain("暂无公开策略/论点");
+      expect(body).toContain("暂无公开论点");
+      expect(body).toContain("公开即接受检验");
+    });
+
+    it("renders bull_points/bear_points evidence and a judgment-history outcome backtest ('公开即接受检验')", async () => {
+      const subject = makeMember({ id: "member_subject_evidence", email: "evidence@example.com" });
+      new MemberRepository(db).upsert(subject);
+      const thesisId = createId("thesis");
+      db.prepare(`
+        INSERT INTO theses
+          (id, owner_id, symbol, direction, target_high, invalidation_price, visibility, created_at, updated_at, bull_points, bear_points)
+        VALUES (?, ?, 'NVDA.US', 'bull', 200, 100, 'public', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z', ?, ?)
+      `).run(thesisId, subject.id, JSON.stringify(["算力需求旺盛"]), JSON.stringify(["估值偏高"]));
+      db.prepare(`INSERT INTO thesis_history (id, thesis_id, note, source, created_at) VALUES (?, ?, ?, ?, ?)`).run(
+        createId("thesis_hist"),
+        thesisId,
+        "第一次判断",
+        "self",
+        "2026-07-05T00:00:00.000Z"
+      );
+      db.prepare(`
+        INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, unit, source, data_time, created_at)
+        VALUES (?, '2026-07-13', 'NVDA.US', 'quote.last', 180, 'USD', 'test', '2026-07-13', '2026-07-13')
+      `).run(createId("stock_fact"));
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_evidence", token);
+      const body = await response.text();
+
+      expect(body).toContain("算力需求旺盛");
+      expect(body).toContain("估值偏高");
+      expect(body).toContain("第一次判断");
+      expect(body).toContain("样本不足"); // n=1 < 10
+      expect(body).toContain("公开即接受检验");
+    });
+  });
+
+  describe("公开策略清单", () => {
+    it("shows only the subject's PUBLIC strategy cards to a non-self viewer, with status badges", async () => {
+      const subject = makeMember({ id: "member_subject_cards", email: "cards@example.com" });
+      new MemberRepository(db).upsert(subject);
+      db.prepare(`
+        INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+        VALUES (?, ?, '公开策略卡', 'paused', 'public', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')
+      `).run(createId("strategy_card"), subject.id);
+      db.prepare(`
+        INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+        VALUES (?, ?, '系统策略卡', 'active', 'system', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')
+      `).run(createId("strategy_card"), subject.id);
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_cards", token);
+      const body = await response.text();
+
+      expect(body).toContain("公开策略卡");
+      expect(body).toContain("暂停");
+      expect(body).not.toContain("系统策略卡");
+    });
+
+    it("shows 暂无公开策略卡 when the subject has no public strategy cards", async () => {
+      const subject = makeMember({ id: "member_subject_no_cards", email: "nocards@example.com" });
+      new MemberRepository(db).upsert(subject);
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_no_cards", token);
+      const body = await response.text();
+      expect(body).toContain("暂无公开策略卡");
     });
   });
 

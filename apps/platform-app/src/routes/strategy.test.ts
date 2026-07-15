@@ -34,17 +34,36 @@ function makeMember(overrides: Partial<Member> = {}): Member {
 function seedDisciplineRule(
   db: DatabaseSync,
   opts: { ownerId: string; ruleText: string; enforcement: "hard" | "proposal_check" | "self"; enabled?: boolean; createdAt?: string }
-): void {
+): string {
+  const id = createId("rule");
   db.prepare(`
     INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, enabled, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(
-    createId("rule"),
+    id,
     opts.ownerId,
     opts.ruleText,
     opts.enforcement,
     opts.enabled === false ? 0 : 1,
     opts.createdAt ?? "2026-07-01T00:00:00.000Z"
+  );
+  return id;
+}
+
+function seedProposalWithDisciplineReport(
+  db: DatabaseSync,
+  opts: { ownerId: string; createdAt: string; report: unknown[]; symbol?: string }
+): void {
+  db.prepare(`
+    INSERT INTO proposals (id, owner_id, symbol, side, quantity, order_type, reason, discipline_report, status, created_at, expires_at)
+    VALUES (?, ?, ?, 'buy', 1, 'limit', 'test reason', ?, 'pending', ?, ?)
+  `).run(
+    createId("proposal"),
+    opts.ownerId,
+    opts.symbol ?? "NVDA.US",
+    JSON.stringify(opts.report),
+    opts.createdAt,
+    opts.createdAt
   );
 }
 
@@ -56,20 +75,32 @@ function seedThesis(
     direction?: "bull" | "bear" | "neutral";
     visibility?: "system" | "public";
     createdAt?: string;
+    bullPoints?: string[];
+    bearPoints?: string[];
+    targetLow?: number;
+    targetHigh?: number;
+    invalidationPrice?: number;
   }
 ): string {
   const id = createId("thesis");
   db.prepare(`
-    INSERT INTO theses (id, owner_id, symbol, direction, visibility, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO theses
+      (id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+       visibility, created_at, updated_at, bull_points, bear_points)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     opts.ownerId,
     opts.symbol,
     opts.direction ?? "bull",
+    opts.targetLow ?? null,
+    opts.targetHigh ?? null,
+    opts.invalidationPrice ?? null,
     opts.visibility ?? "system",
     opts.createdAt ?? "2026-07-01T00:00:00.000Z",
-    opts.createdAt ?? "2026-07-01T00:00:00.000Z"
+    opts.createdAt ?? "2026-07-01T00:00:00.000Z",
+    JSON.stringify(opts.bullPoints ?? []),
+    JSON.stringify(opts.bearPoints ?? [])
   );
   return id;
 }
@@ -79,6 +110,25 @@ function seedThesisHistory(db: DatabaseSync, thesisId: string, note: string, sou
     INSERT INTO thesis_history (id, thesis_id, note, source, created_at)
     VALUES (?, ?, ?, ?, ?)
   `).run(createId("thesis_history"), thesisId, note, source, createdAt);
+}
+
+function seedStrategyCard(
+  db: DatabaseSync,
+  opts: { ownerId: string; name: string; status?: "active" | "paused" | "retired"; visibility?: "system" | "public" }
+): string {
+  const id = createId("strategy_card");
+  db.prepare(`
+    INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')
+  `).run(id, opts.ownerId, opts.name, opts.status ?? "active", opts.visibility ?? "system");
+  return id;
+}
+
+function seedStockFact(db: DatabaseSync, opts: { symbol: string; tradingDay: string; valueNum: number }): void {
+  db.prepare(`
+    INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+    VALUES (?, ?, ?, 'quote.last', ?, NULL, 'USD', 'test', ?, ?)
+  `).run(createId("stock_fact"), opts.tradingDay, opts.symbol, opts.valueNum, opts.tradingDay, opts.tradingDay);
 }
 
 describe("strategy route (GET /strategy)", () => {
@@ -122,13 +172,16 @@ describe("strategy route (GET /strategy)", () => {
     expect(response.status).toBe(401);
   });
 
-  it("renders all three placeholder empty states when the viewer has no discipline rules or theses and nobody else has published anything", async () => {
+  it("renders all real (shipped) empty states when the viewer has no rules/cards/theses and nobody else has published anything", async () => {
     const { token } = seedMemberWithToken();
     const response = await authed("/strategy", token);
     expect(response.status).toBe(200);
     const body = await response.text();
-    expect(body).toContain("策略记忆 P7 上线"); // discipline + own-thesis placeholders
+    expect(body).toContain("暂无纪律规则");
+    expect(body).toContain("暂无策略卡");
+    expect(body).toContain("暂无论点");
     expect(body).toContain("圈子暂无公开策略"); // circle section, DIFFERENT wording
+    expect(body).not.toContain("P7 上线"); // no stale placeholder text anywhere
   });
 
   describe("① 我的纪律", () => {
@@ -144,7 +197,8 @@ describe("strategy route (GET /strategy)", () => {
       expect(body).toContain("代码强制");
       expect(body).toContain("提案检查");
       expect(body).toContain("自我约束");
-      expect(body).toContain("统计 P7 上线"); // 近30天遵守 placeholder slot
+      expect(body).toContain("近30天无相关提案"); // real (no-data) 近30天遵守 stat, not a P7 placeholder
+      expect(body).not.toContain("统计 P7 上线");
     });
 
     it("orders enabled rules before disabled ones (enabled first) and still shows disabled rules to their owner", async () => {
@@ -183,6 +237,43 @@ describe("strategy route (GET /strategy)", () => {
       const response = await authed("/strategy", tokenB);
       const body = await response.text();
       expect(body).not.toContain("A的专属规则");
+    });
+
+    it("近30天遵守 renders a real tally computed from this owner's proposals.discipline_report JSON", async () => {
+      const { member, token } = seedMemberWithToken();
+      const ruleId = seedDisciplineRule(db, { ownerId: member.id, ruleText: "仓位≤20%", enforcement: "hard" });
+      seedProposalWithDisciplineReport(db, {
+        ownerId: member.id,
+        createdAt: "2026-07-10T00:00:00.000Z",
+        report: [{ ruleId, ruleText: "仓位≤20%", enforcement: "hard", pass: true, detail: "ok" }]
+      });
+      seedProposalWithDisciplineReport(db, {
+        ownerId: member.id,
+        createdAt: "2026-07-11T00:00:00.000Z",
+        report: [{ ruleId, ruleText: "仓位≤20%", enforcement: "hard", pass: false, detail: "违反" }]
+      });
+
+      const response = await authed("/strategy", token);
+      const body = await response.text();
+      expect(body).toContain("近30天 2 次检查，遵守 1 / 违反 1");
+    });
+
+    it("近30天遵守 ignores another owner's proposals (isolation)", async () => {
+      const memberA = makeMember({ id: "member_a", email: "a@example.com" });
+      new MemberRepository(db).upsert(memberA);
+      const ruleIdA = seedDisciplineRule(db, { ownerId: "member_a", ruleText: "A的规则", enforcement: "hard" });
+      seedProposalWithDisciplineReport(db, {
+        ownerId: "member_a",
+        createdAt: "2026-07-10T00:00:00.000Z",
+        report: [{ ruleId: ruleIdA, ruleText: "A的规则", enforcement: "hard", pass: true, detail: "ok" }]
+      });
+
+      const { member: memberB, token: tokenB } = seedMemberWithToken({ id: "member_b", email: "b@example.com" });
+      seedDisciplineRule(db, { ownerId: memberB.id, ruleText: "B的规则", enforcement: "hard" });
+
+      const response = await authed("/strategy", tokenB);
+      const body = await response.text();
+      expect(body).toContain("近30天无相关提案"); // B's own rule has no matching proposals of its own
     });
   });
 
@@ -234,6 +325,89 @@ describe("strategy route (GET /strategy)", () => {
       const body = await response.text();
       expect(body).toContain("暂无判断历史");
     });
+
+    it("renders bull_points/bear_points as a double column (看多依据/看空依据)", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedThesis(db, {
+        ownerId: member.id,
+        symbol: "NVDA.US",
+        bullPoints: ["算力需求旺盛", "财报超预期"],
+        bearPoints: ["估值偏高"]
+      });
+
+      const response = await authed("/strategy", token);
+      const body = await response.text();
+
+      expect(body).toContain("看多依据");
+      expect(body).toContain("看空依据");
+      expect(body).toContain("算力需求旺盛");
+      expect(body).toContain("财报超预期");
+      expect(body).toContain("估值偏高");
+    });
+
+    it("renders 暂无依据 for a thesis with no recorded bull/bear points", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedThesis(db, { ownerId: member.id, symbol: "QQQ.US" });
+
+      const response = await authed("/strategy", token);
+      const body = await response.text();
+      expect(body).toContain("暂无依据");
+    });
+
+    it("judgment timeline annotates each entry with computeThesisOutcome's verdict, using the latest stock_facts price", async () => {
+      const { member, token } = seedMemberWithToken();
+      const thesisId = seedThesis(db, {
+        ownerId: member.id,
+        symbol: "NVDA.US",
+        direction: "bull",
+        targetHigh: 200,
+        invalidationPrice: 100
+      });
+      seedThesisHistory(db, thesisId, "第一次判断", "self", "2026-07-01T00:00:00.000Z");
+      seedStockFact(db, { symbol: "NVDA.US", tradingDay: "2026-07-13", valueNum: 180 });
+
+      const response = await authed("/strategy", token);
+      const body = await response.text();
+
+      expect(body).toContain("走势偏向目标"); // price 180 closer to target 200 than invalidation 100
+      expect(body).toContain("最新价 180");
+      expect(body).toContain("样本不足"); // n=1 < 10
+    });
+
+    it("strategy cards render name + status badge (活跃/暂停/退役) + visibility pill, before the thesis cards", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedStrategyCard(db, { ownerId: member.id, name: "动量策略", status: "active", visibility: "system" });
+      seedStrategyCard(db, { ownerId: member.id, name: "价值策略", status: "paused", visibility: "public" });
+      seedStrategyCard(db, { ownerId: member.id, name: "退役策略", status: "retired" });
+
+      const response = await authed("/strategy", token);
+      const body = await response.text();
+
+      expect(body).toContain("动量策略");
+      expect(body).toContain("活跃");
+      expect(body).toContain("价值策略");
+      expect(body).toContain("暂停");
+      expect(body).toContain("退役策略");
+      expect(body).toContain("退役");
+
+      const cardsIdx = body.indexOf("我的策略卡与论点");
+      const cardNameIdx = body.indexOf("动量策略");
+      const thesesHeaderIdx = body.indexOf("暂无论点");
+      expect(cardsIdx).toBeGreaterThan(-1);
+      expect(cardNameIdx).toBeGreaterThan(cardsIdx);
+      expect(thesesHeaderIdx).toBeGreaterThan(cardNameIdx); // cards render before theses
+    });
+
+    it("B never sees A's system-visibility strategy card on B's own strategy page", async () => {
+      const memberA = makeMember({ id: "member_a", email: "a@example.com" });
+      new MemberRepository(db).upsert(memberA);
+      seedStrategyCard(db, { ownerId: "member_a", name: "A的私有策略卡", visibility: "system" });
+
+      const { token: tokenB } = seedMemberWithToken({ id: "member_b", email: "b@example.com" });
+      const response = await authed("/strategy", tokenB);
+      const body = await response.text();
+      expect(body).not.toContain("A的私有策略卡");
+    });
   });
 
   describe("③ 圈子公开区: visibility filtering", () => {
@@ -282,6 +456,39 @@ describe("strategy route (GET /strategy)", () => {
       const response = await authed("/strategy", tokenB);
       const body = await response.text();
       expect(body).toContain("圈子暂无公开策略");
+    });
+
+    it("A's public strategy card IS visible in B's 圈子公开区, grouped under A; A's system-only card is not", async () => {
+      const memberA = makeMember({ id: "member_a", email: "a@example.com", displayName: "甲" });
+      new MemberRepository(db).upsert(memberA);
+      seedStrategyCard(db, { ownerId: "member_a", name: "A的公开策略卡", status: "active", visibility: "public" });
+      seedStrategyCard(db, { ownerId: "member_a", name: "A的系统策略卡", visibility: "system" });
+
+      const { token: tokenB } = seedMemberWithToken({ id: "member_b", email: "b@example.com" });
+      const response = await authed("/strategy", tokenB);
+      const body = await response.text();
+
+      expect(body).toContain("甲");
+      expect(body).toContain("A的公开策略卡");
+      expect(body).not.toContain("A的系统策略卡");
+    });
+
+    it("groups A's public theses AND public strategy cards together under A's name", async () => {
+      const memberA = makeMember({ id: "member_a", email: "a@example.com", displayName: "甲" });
+      new MemberRepository(db).upsert(memberA);
+      seedThesis(db, { ownerId: "member_a", symbol: "NVDA.US", visibility: "public" });
+      seedStrategyCard(db, { ownerId: "member_a", name: "A的公开策略卡", visibility: "public" });
+
+      const { token: tokenB } = seedMemberWithToken({ id: "member_b", email: "b@example.com" });
+      const response = await authed("/strategy", tokenB);
+      const body = await response.text();
+
+      const nameIdx = body.indexOf("甲");
+      const cardIdx = body.indexOf("A的公开策略卡");
+      const thesisIdx = body.indexOf("NVDA.US");
+      expect(nameIdx).toBeGreaterThan(-1);
+      expect(cardIdx).toBeGreaterThan(nameIdx);
+      expect(thesisIdx).toBeGreaterThan(nameIdx);
     });
   });
 

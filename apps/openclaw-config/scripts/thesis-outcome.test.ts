@@ -1,6 +1,21 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 const outcome = await import("./thesis-outcome.mjs");
+
+interface ThesisOutcomeFixtureSample {
+  name: string;
+  input: unknown;
+  expected: unknown;
+}
+
+const FIXTURES_PATH = fileURLToPath(new URL("./__fixtures__/thesis-outcome-samples.json", import.meta.url));
+
+function loadFixtureSamples(): ThesisOutcomeFixtureSample[] {
+  return JSON.parse(readFileSync(FIXTURES_PATH, "utf8")) as ThesisOutcomeFixtureSample[];
+}
 
 function judgments(n: number): Array<{ id: string }> {
   return Array.from({ length: n }, (_, i) => ({ id: `thesis_hist_${i + 1}` }));
@@ -238,5 +253,25 @@ describe("computeThesisOutcome: hitRate sample-size gate", () => {
     // All 10 rows are 'neutral' - not toward_target/toward_invalidation, so
     // total (the denominator) is 0 even though n=10 -> insufficient.
     expect(result.hitRate.sample).toBe("insufficient");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SHARED-FIXTURE anti-drift check (Phase 7 Task 5, 2026-07-15 plan) against
+// apps/platform-app/src/data/strategy.ts's `computeThesisOutcome` TS port -
+// same mechanism as conclusion-box.mjs/conclusion-box.ts's shared fixture.
+// Both suites read the exact same JSON and assert the exact same output.
+// ---------------------------------------------------------------------------
+
+describe("computeThesisOutcome: SHARED-FIXTURE anti-drift check against the platform-app TS port", () => {
+  const samples = loadFixtureSamples();
+
+  it("the fixture file itself is non-empty and covers multiple verdicts", () => {
+    expect(samples.length).toBeGreaterThan(0);
+  });
+
+  it.each(samples.map((sample) => [sample.name, sample] as const))("%s", (_name, sample) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(outcome.computeThesisOutcome(sample.input as any)).toEqual(sample.expected);
   });
 });
