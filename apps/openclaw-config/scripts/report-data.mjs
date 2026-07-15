@@ -1,3 +1,5 @@
+import { defuseMarkdownInText } from "./report-news.mjs";
+
 export function normalizeQuotePayload(payload, expectedSymbol) {
   const quote = Array.isArray(payload) ? payload[0] : payload?.quotes?.[0] ?? payload ?? null;
   if (!quote || typeof quote !== "object") {
@@ -122,7 +124,10 @@ export function normalizeNewsPayload(symbol, payload) {
   return rows
     .map((row) => normalizeNewsArticle(symbol, row))
     .filter(Boolean)
-    .sort((a, b) => b.publishedAtMs - a.publishedAtMs);
+    // #31 audit fix: publishedAtMs can now legitimately be undefined
+    // (unknown time honesty) - `?? 0` sorts those articles after every
+    // article with a real (positive) timestamp, i.e. last, not first.
+    .sort((a, b) => (b.publishedAtMs ?? 0) - (a.publishedAtMs ?? 0));
 }
 
 export function normalizeNewsArticle(symbol, row) {
@@ -131,7 +136,10 @@ export function normalizeNewsArticle(symbol, row) {
   }
 
   const id = String(row.id ?? row.news_id ?? row.url ?? "").trim();
-  const title = String(row.title ?? "").replace(/\s+/gu, " ").trim();
+  // #29 audit fix: defuse markdown-link syntax in the raw title before it
+  // can reach any renderer - this normalizer builds its own article shape
+  // and does not go through report-news.mjs's decorateNewsArticle.
+  const title = defuseMarkdownInText(String(row.title ?? "").replace(/\s+/gu, " ").trim());
   if (!id || !title) {
     return null;
   }
@@ -142,7 +150,9 @@ export function normalizeNewsArticle(symbol, row) {
     symbol: normalizeSymbol(symbol),
     title,
     url: String(row.url ?? ""),
-    publishedAt: new Date(publishedAtMs).toISOString(),
+    // #31 audit fix: missing/unparseable published_at must stay unknown
+    // (undefined), never fabricated as "now".
+    publishedAt: Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : undefined,
     publishedAtMs,
     likes: toNumber(row.likes_count ?? row.likes),
     comments: toNumber(row.comments_count ?? row.comments),
@@ -186,7 +196,11 @@ export function normalizeMacroCalendarEntry(groupDate, row) {
     market: String(row.market ?? ""),
     star: toNumber(row.star) ?? 0,
     type: String(row.type ?? "macrodata"),
-    timestamp: new Date(timestampMs).toISOString(),
+    // Defensive: timestampMs is virtually always resolvable here (the
+    // calendar group's own date is a legitimate, known fallback - see
+    // normalizeEpochMs), but guard it the same way as the news paths in
+    // case a future caller ever passes an empty/invalid groupDate.
+    timestamp: Number.isFinite(timestampMs) ? new Date(timestampMs).toISOString() : undefined,
     timestampMs,
     values: Array.isArray(row.data_kv)
       ? row.data_kv.map((entry) => ({
@@ -287,6 +301,17 @@ function normalizeEpochMs(value, fallbackDate) {
   if (Number.isFinite(number) && number > 0) {
     return number > 10_000_000_000 ? number : number * 1000;
   }
-  const fallback = new Date(String(fallbackDate ?? Date.now())).getTime();
-  return Number.isFinite(fallback) ? fallback : Date.now();
+  // #31 audit fix: a caller-supplied fallbackDate (e.g. the macro
+  // calendar's own group date) is a legitimate, already-known substitute -
+  // using it is not fabrication. But when no such fallback is given (the
+  // news path) or it fails to parse, the time is genuinely unknown and
+  // must stay undefined - NEVER silently defaulted to Date.now(), which
+  // used to make undated stale news look "just published".
+  if (fallbackDate !== undefined) {
+    const fallback = new Date(String(fallbackDate)).getTime();
+    if (Number.isFinite(fallback)) {
+      return fallback;
+    }
+  }
+  return undefined;
 }

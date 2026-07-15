@@ -13,6 +13,7 @@
 - `apps/openclaw-config/scripts/run-feishu-user-plugin.mjs`（feishu-user-plugin 子进程启动器）
 - `apps/openclaw-config/scripts/report-data.mjs`（官方模拟盘报告环境校验）
 - `apps/openclaw-config/scripts/_longbridge.mjs`（长桥只读 CLI 限流封装）
+- `apps/openclaw-config/scripts/news-sources.mjs`（L1 新闻源客户端：RSSHub/Finnhub）
 
 新增密钥时：先在 `.env.local.example` 补一行占位 + 注释，再回填本文档对应表格。
 
@@ -66,7 +67,14 @@
 | `FEISHU_USER_PLUGIN_OAUTH_PORT` | 本地 OAuth 回调端口 | `.env.local` | 端口冲突时调整 | — |
 | `FEISHU_USER_PLUGIN_GROUP_NAME` / `FEISHU_USER_PLUGIN_BOT_CHAT_ID` / `FEISHU_USER_PLUGIN_CHAT_ID` / `FEISHU_NOTIFY_CHAT_ID` | 用户插件报告投递目标（群名/群 chat_id/私聊 chat_id，后者互为兜底） | `.env.local` | 目标群/会话变更时手动更新 | 迁移前需现场确认目标群仍存在、机器人仍在群内 |
 
-## 8. 多成员长桥凭据规划（Phase 6，尚未实现）
+## 8. 新闻引擎数据源（Phase 4，L1 源客户端）
+
+| 键名 | 用途 | 存放位置 | 轮换方式 | 迁移注意 |
+|---|---|---|---|---|
+| `FINNHUB_API_KEY` | Finnhub company-news API（`https://finnhub.io/api/v1/company-news`）鉴权，`news-sources.mjs` 以 `X-Finnhub-Token` 请求头发送；未设置时该源整体跳过（`sourceHealth.finnhub = 'skipped_no_key'`），不报错、不阻塞报告 | `.env.local`（可选） | Finnhub 控制台重新生成 | 迁移新机器时若暂不配置，新闻引擎自动降级为不含 Finnhub 的其余源，无需先补齐才能跑通；任何错误消息落地前都经 `news-sources.mjs` 的 `redactSecret` 脱敏，绝不落 key 明文 |
+| `RSSHUB_BASE_URL` | 本机/自建 RSSHub 实例地址，供财联社电报、华尔街见闻快讯、格隆汇快讯三条中文源路由使用；未设置默认 `http://127.0.0.1:1200` | `.env.local`（可选） | 不适用（非密钥，RSSHub 本身不带任何凭据） | 迁移新机器需先起本机 RSSHub Docker 容器（见 `apps/openclaw-config/launchd`，P10 部署）或指向可达的自建实例，否则三条 RSSHub 路由（含各自的第二冗余路由）全部失败，新闻引擎降级为仅剩 Yahoo/Google/Longbridge/Finnhub |
+
+## 9. 多成员长桥凭据规划（Phase 6，尚未实现）
 
 当前阶段（Phase 1）只有单一 Longbridge 凭据集，直接放在根目录 `.env.local` 里，`broker-executor` 全程用同一份 `process.env` 执行。这在多成员平台落地后不再成立：`docs/superpowers/specs/2026-07-12-tech-selection.md` §2.3/2.5 已定下方向——**每个成员一套独立长桥凭据，互不可见，按成员命名隔离**，订单提案/工单带 `owner_id`，executor 按 `owner_id` 加载对应凭据、以子进程级环境变量注入方式执行（长桥 CLI 本就从环境变量读取凭据，因此不需要凭据文件落盘到共享路径）。
 
@@ -79,7 +87,7 @@
 - `official_paper_snapshots` 等表已在 Phase 1 加了 `owner_id` 列（历史行可空），Phase 6 会据此让快照拉取、10% 预算校验、熔断判断全部按 `owner_id` 分别计算。
 - 迁移/新增成员时的密钥管理：新增成员走"生成 token + Access 白名单提示"的成员管理命令（Phase 6 规划），长桥凭据由该成员自行在长桥官方渠道申请后提交，管理员只负责按上述目录结构落盘，不经手复制到聊天记录、报告或 memory。
 
-## 9. 迁移注意事项（通用，适用于所有密钥）
+## 10. 迁移注意事项（通用，适用于所有密钥）
 
 1. **禁止经由 AI 对话或报告传递明文密钥**：本仓库的宪法约束（`AGENTS.md`）明确禁止把经纪商凭据、OAuth token、SSH 私钥写入 memory 或报告；迁移凭据请使用 1Password/scp 等带加密的通道，人工在目标机器上手填 `.env.local`。
 2. **`.env.local` 本身不随 git 迁移**：它被 `.gitignore` 排除，`.env.local.example` 只是键名模板；新机器需要照模板逐项手动重建。

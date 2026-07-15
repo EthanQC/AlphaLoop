@@ -12,6 +12,7 @@ import {
   normalizeOfficialPaperSnapshot,
   normalizeQuotePayload
 } from "./report-data.mjs";
+import { validateNarrativeNumbers, validateReportMarkdown } from "./report-quality.mjs";
 
 const scheduledReport = await import("./scheduled-report.mjs");
 
@@ -38,18 +39,51 @@ function buildFixtureData() {
     "QQQ.US"
   );
 
+  // Phase 4 Task 7: three DISTINCT, non-overlapping stories (rather than the
+  // single article this fixture used to carry) from three different
+  // sources/languages - clusterArticles (news-engine.mjs) groups by raw
+  // title-token similarity, so three unrelated headlines cluster into three
+  // separate events, which in turn is what lets the render tests below
+  // exercise the "### 多源新闻（事件聚类）" section's per-event compat-detail
+  // line (report-quality.mjs's news.detail_depth needs >=3 such lines) and
+  // its source-diversity/chinese-ratio tail stats against realistic data
+  // instead of a single-event edge case.
   const marketNews = [
     {
       id: "news-1",
       symbol: "QQQ.US",
-      title: "Stocks Rally on Hopes for a Truce",
-      titleZh: "美股在停火预期和科技股支撑下反弹",
-      url: "https://finance.yahoo.com/example",
+      title: "美联储维持利率不变",
+      titleZh: "美联储维持利率不变",
+      url: "https://cls.cn/telegraph/1",
       publishedAt: "2026-07-13T21:55:00.000Z",
       publishedAtMs: Date.parse("2026-07-13T21:55:00.000Z"),
+      source: "rsshub-cls",
+      sourceName: "财联社",
+      publisher: "财联社"
+    },
+    {
+      id: "news-2",
+      symbol: "QQQ.US",
+      title: "Wall Street Extends Rally on Tech Strength",
+      titleZh: "美股在科技板块带动下延续上涨",
+      url: "https://finance.yahoo.com/example-2",
+      publishedAt: "2026-07-13T20:30:00.000Z",
+      publishedAtMs: Date.parse("2026-07-13T20:30:00.000Z"),
       source: "yahoo-finance-rss",
       sourceName: "Yahoo Finance",
       publisher: "Barchart"
+    },
+    {
+      id: "news-3",
+      symbol: "NVDA.US",
+      title: "Fed Officials Signal Cautious Approach on Rate Decisions",
+      titleZh: "美联储官员释放谨慎加息信号",
+      url: "https://reuters.com/example-3",
+      publishedAt: "2026-07-13T19:50:00.000Z",
+      publishedAtMs: Date.parse("2026-07-13T19:50:00.000Z"),
+      source: "google-news-rss",
+      sourceName: "Google News",
+      publisher: "Reuters"
     }
   ];
 
@@ -94,7 +128,7 @@ function buildFixtureData() {
       officialPositions: officialPaperSnapshot.positions.length,
       trackedSymbols,
       newsCount: marketNews.length,
-      newsSourceBreakdown: "Barchart 1 条",
+      newsSourceBreakdown: "财联社 1 条；Barchart 1 条；Reuters 1 条",
       newsWarnings: [],
       longbridgeWarnings: [],
       macroEventsCount: macroEvents.length,
@@ -125,6 +159,128 @@ describe("seam test: a genuinely-generated report always satisfies its own compl
 
   it("a report missing even one of the 5 markers is correctly flagged incomplete (the check side still works)", () => {
     expect(scheduledReport.isPreparedReportMarkdownComplete("# OpenClaw 日报 2026-07-14\n\n长桥官方模拟盘 多源新闻 宏观日历 QQQ 行情")).toBe(false);
+  });
+});
+
+describe("Phase 4 Task 7: clustered news section (### 多源新闻（事件聚类）)", () => {
+  it("clusters the 3 fixture articles into 3 events and passes the full quality gate (sync + facts.numeric_match)", async () => {
+    const { buildDailyFacts } = await import("./report-facts.mjs");
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = buildFixtureData();
+    const markdown = scheduledReport.renderDailyReport(info, data);
+
+    expect(markdown).toContain("### 多源新闻（事件聚类）");
+    // 3 distinct, non-overlapping stories -> 3 clustered event cards, each
+    // contributing its own compat-detail line (news.detail_depth's >=3
+    // minimum) and its own source label (news.source_diversity_v2's >=3
+    // minimum).
+    expect(markdown).toContain("#### 1.");
+    expect(markdown).toContain("#### 2.");
+    expect(markdown).toContain("#### 3.");
+    expect(markdown).toContain("- 新闻来源分布：");
+    expect(markdown).toContain("- 非券商源占比：");
+    expect(markdown).toContain("- 中文源占比：");
+
+    const syncResult = validateReportMarkdown(markdown, { kind: "daily" });
+    expect(syncResult.ok).toBe(true);
+    expect(syncResult.failures).toEqual([]);
+
+    // facts.numeric_match: build the SAME daily_facts the real prepareReport
+    // pipeline would persist from this fixture's snapshot/quote, and confirm
+    // the rendered narrative's numbers (净资产/现金/暴露%/剩余预算/QQQ 价与
+    // 涨跌%) agree with them within tolerance - proving the two independent
+    // computations (render vs. facts) never drifted apart for this fixture.
+    const factsArray = buildDailyFacts({
+      snapshot: data.officialPaperSnapshot,
+      qqqQuote: data.qqqQuote,
+      macroEntries: data.macroEvents,
+      tradingDay: info.label
+    });
+    const factsMap = Object.fromEntries(factsArray.map((fact) => [fact.factKey, fact]));
+    const numericResult = validateNarrativeNumbers(markdown, factsMap);
+    expect(numericResult.ok).toBe(true);
+    expect(numericResult.failures).toEqual([]);
+  });
+
+  it("renders the header disclosure marker and evidence-section warnings bullet when news search is degraded", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = {
+      ...buildFixtureData(),
+      newsSearchDegraded: true,
+      newsSearchReason: "OpenClaw restricted-agent search backend requires P10 ignition"
+    };
+    const markdown = scheduledReport.renderDailyReport(info, data);
+
+    // Header marker (Global Constraints / 07-03:213 semantic) - must appear
+    // before the "## 1." section, i.e. near the very top of the document.
+    expect(markdown.indexOf("⚠ agent 检索不可用（L1-only 模式）")).toBeGreaterThan(-1);
+    expect(markdown.indexOf("⚠ agent 检索不可用（L1-only 模式）")).toBeLessThan(markdown.indexOf("## 1."));
+    expect(markdown).toContain("OpenClaw restricted-agent search backend requires P10 ignition");
+    // Matching warnings-entry disclosure inside "### 证据与来源".
+    expect(markdown).toContain("新闻检索降级：agent 检索不可用（L1-only 模式）");
+  });
+
+  it("omits the degradation marker/bullet entirely when news search is not degraded", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, buildFixtureData());
+
+    expect(markdown).not.toContain("⚠ agent 检索不可用");
+    expect(markdown).not.toContain("新闻检索降级");
+  });
+
+  it("renders the weekly-only L3 deep-dive subsection (事件/证据/反方证据/不确定性) when l3DeepDive carries real results", async () => {
+    const info = scheduledReport.resolveReportWindow("weekly", "2026-07-14");
+    const baseData = buildFixtureData();
+    // Cluster the fixture's own articles first so the L3 result's
+    // eventClusterKey lines up with a real rendered card (same clustering
+    // renderWeeklyReport itself will fall back to computing).
+    const newsEngine = await import("./news-engine.mjs");
+    const events = newsEngine
+      .clusterArticles(baseData.marketNews)
+      .map((cluster) => newsEngine.buildEventFromCluster(cluster, baseData.trackedSymbols));
+    const targetEvent = events[0];
+
+    const data = {
+      ...baseData,
+      newsEvents: events,
+      l3DeepDive: {
+        events: [
+          {
+            eventClusterKey: targetEvent.clusterKey,
+            evidence: [{ title: "独立信源核实同一事件", publisher: "示例通讯社", url: "https://example.com/evidence-1" }],
+            analysis: { direction: targetEvent.impact.direction, uncertainty: "medium" },
+            counterEvidence: "not_found"
+          }
+        ],
+        callsUsed: 3,
+        droppedNoUrl: 0,
+        droppedNotChinese: 0,
+        degraded: false,
+        degradedReason: null
+      }
+    };
+    const markdown = scheduledReport.renderWeeklyReport(info, data);
+
+    expect(markdown).toContain("### 深度核查（L3，周报专属）");
+    expect(markdown).toContain(targetEvent.titleZh);
+    expect(markdown).toContain("not_found（未找到反方证据）");
+    expect(markdown).toContain("不确定性：中");
+  });
+
+  it("omits the L3 subsection entirely for the daily report (l3DeepDive.skipped)", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = { ...buildFixtureData(), l3DeepDive: { skipped: true, reason: "l3_disabled_daily" } };
+    const markdown = scheduledReport.renderDailyReport(info, data);
+
+    expect(markdown).not.toContain("### 深度核查");
+  });
+
+  it("shows an honest empty state when no events cluster out of an empty marketNews list", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = { ...buildFixtureData(), marketNews: [], newsWarnings: ["占位：测试用例强制清空新闻"] };
+    const markdown = scheduledReport.renderDailyReport(info, data);
+
+    expect(markdown).toContain("本窗口没有聚类出可用新闻事件");
   });
 });
 

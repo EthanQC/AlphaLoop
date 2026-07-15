@@ -36,7 +36,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -438,6 +438,45 @@ const MIGRATIONS: MigrationStep[] = [
         );
       }
     }
+  },
+  (db) => {
+    // Phase 4 Task 2 (news engine, 2026-07-15 plan): three brand-new tables,
+    // no rebuilds of anything pre-existing - a plain step suffices (no
+    // needsForeignKeysOff). DDL is spec-frozen verbatim from the plan; do not
+    // hand-edit without updating the plan doc first.
+    //
+    // news_events / news_event_sources hold the clustered, multi-source news
+    // events the news engine produces (one row per event, one row per raw
+    // source article feeding that event). daily_facts is the per-trading-day
+    // fact table used to catch fabricated numbers in generated reports (the
+    // facts.numeric_match quality gate, Task 6) - it has no FK to anything
+    // and is populated independently at report-generation time.
+    //
+    // These tables intentionally have no owner_id column: per Global
+    // Constraint in the plan, news is a public asset shared across the whole
+    // stock pool, not per-member data - unlike stock_analysis_targets (v7),
+    // there is no per-owner watchlist semantics to express here.
+    db.exec(`
+      CREATE TABLE news_events (
+        id TEXT PRIMARY KEY, cluster_key TEXT NOT NULL UNIQUE,
+        title_zh TEXT NOT NULL, summary_zh TEXT,
+        impact_direction TEXT CHECK(impact_direction IN ('bullish','bearish','neutral','unknown')),
+        impact_affected TEXT NOT NULL DEFAULT '[]', impact_reason TEXT,
+        first_published_at TEXT, last_published_at TEXT,
+        source_count INTEGER NOT NULL DEFAULT 0, zh_source_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX news_events_window_idx ON news_events(last_published_at);
+      CREATE TABLE news_event_sources (
+        id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES news_events(id),
+        origin TEXT NOT NULL, publisher TEXT NOT NULL, url TEXT, title_raw TEXT NOT NULL,
+        published_at TEXT, lang TEXT NOT NULL DEFAULT 'unknown', created_at TEXT NOT NULL);
+      CREATE INDEX news_event_sources_event_idx ON news_event_sources(event_id);
+      CREATE TABLE daily_facts (
+        id TEXT PRIMARY KEY, trading_day TEXT NOT NULL, fact_key TEXT NOT NULL,
+        value_num REAL, value_text TEXT, unit TEXT, source TEXT NOT NULL,
+        data_time TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(trading_day, fact_key));
+    `);
   }
 ];
 

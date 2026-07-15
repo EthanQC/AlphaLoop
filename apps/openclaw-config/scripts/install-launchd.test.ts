@@ -79,6 +79,20 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
     expect(existsSync(join(destDir, "com.alphaloop.daily-backup.plist"))).toBe(true);
     expect(existsSync(join(destDir, "com.alphaloop.market-alerts.plist"))).toBe(true);
 
+    // Phase 4 Task 8 (news engine deployment wiring): proves
+    // com.alphaloop.rsshub.plist.template is picked up too - the script's
+    // `*.plist.template` glob (see install-launchd.sh's own header comment)
+    // already covers new files with zero script changes, but that claim is
+    // worth verifying against the REAL script/template pair rather than
+    // assuming, exactly like the platform-app template above.
+    const rsshubPlist = join(destDir, "com.alphaloop.rsshub.plist");
+    expect(existsSync(rsshubPlist)).toBe(true);
+    const rsshubRendered = readFileSync(rsshubPlist, "utf8");
+    expect(rsshubRendered).toContain("<string>com.alphaloop.rsshub</string>");
+    expect(rsshubRendered).not.toContain("__REPO_ROOT__");
+    expect(rsshubRendered).toContain(repoRoot);
+    expect(rsshubRendered).toContain("docker start rsshub");
+
     // com.openclaw.gateway.plist is explicitly skipped by the script itself
     // (unrelated to this task) - confirms the fake-HOME run still exercises
     // that real carve-out rather than silently no-op'ing everything.
@@ -86,9 +100,11 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
 
     // The rendered file's destination path was actually handed to `launchctl
     // load` (our stub), not just written to disk - proves the install path,
-    // not only the render step.
+    // not only the render step. Covers both the pre-existing platform-app
+    // template and the new rsshub one added by this task.
     const loadCalls = readFileSync(launchctlLog, "utf8");
     expect(loadCalls).toContain(`load ${platformAppPlist}`);
+    expect(loadCalls).toContain(`load ${rsshubPlist}`);
 
     // The script's final `openclaw gateway install` step still ran to
     // completion (i.e. nothing upstream aborted the script early).

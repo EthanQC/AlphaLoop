@@ -12,7 +12,7 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-user-schedules.mjs`：安装用户级 launchd 调度（日报/周报/个股分析/官方模拟盘轮询）。
-- `scripts/install-launchd.sh`：安装每日数据库备份 + 市场提醒（market-alerts）轮询器 + platform-app 常驻服务这三个 launchd 任务（`com.alphaloop.daily-backup` / `com.alphaloop.market-alerts` / `com.alphaloop.platform-app`），并顺带跑一次 `openclaw gateway install`。
+- `scripts/install-launchd.sh`：安装每日数据库备份 + 市场提醒（market-alerts）轮询器 + platform-app 常驻服务 + rsshub 容器启动这四个 launchd 任务（`com.alphaloop.daily-backup` / `com.alphaloop.market-alerts` / `com.alphaloop.platform-app` / `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 
 ## Feishu
@@ -75,8 +75,9 @@ pnpm launchd:install-backup-alerts
 - 每日交易数据库备份（`com.alphaloop.daily-backup`）。
 - 市场提醒轮询器（`com.alphaloop.market-alerts`）。
 - platform-app 常驻服务（`com.alphaloop.platform-app`，Phase 3 起）——`KeepAlive`（不是周期任务），启动 `pnpm --filter @apps/platform-app start`，日志写到 `logs/platform-app.log` / `.err.log`。
+- rsshub 容器启动包装（`com.alphaloop.rsshub`，Phase 4 起）——`RunAtLoad=true`/`KeepAlive=false`，只跑 `docker start rsshub`（容器本体不由这个任务创建，见下方「新闻引擎」章节），日志写到 `logs/rsshub.log` / `.err.log`。
 
-`pnpm openclaw:runtime:doctor` 会检测这三个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示；另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health` 检查项）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
+`pnpm openclaw:runtime:doctor` 会检测这四个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示；另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health` 检查项）和 rsshub 的 `GET /healthz`（`rsshub-health` 检查项，404 时回退 `/`）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
 
 ### platform-app（Phase 3 多成员 Web 平台）
 
@@ -106,6 +107,28 @@ node apps/openclaw-config/scripts/members.mjs token revoke --token-id <tokenId>
 - `PLATFORM_DB_PATH`：platform-app 进程自己的数据库路径覆盖。
 - `MEMBERS_DB_PATH`：`members.mjs` CLI 自己的数据库路径覆盖（与上面是两个独立变量）。
 - `PLATFORM_APP_PORT`：platform-app 监听端口，默认 `4314`。
+
+### 新闻引擎（Phase 4）
+
+L1 多源采集（RSSHub 中文源 + Finnhub + 既有 Yahoo/Google/Longbridge）→ 事件聚类 → SQLite 持久化（`news_events` / `news_event_sources`，schema v8）。
+
+环境变量（均可选，见 `.env.local.example`）：
+
+- `FINNHUB_API_KEY`：Finnhub company-news API 鉴权（`X-Finnhub-Token` 请求头）；未设置时 Finnhub 源整体跳过（`sourceHealth.finnhub = 'skipped_no_key'`），不报错、不阻塞报告。
+- `RSSHUB_BASE_URL`：本机/自建 RSSHub 实例地址，供财联社电报、华尔街见闻快讯、格隆汇快讯三条中文源路由使用；未设置默认 `http://127.0.0.1:1200`。
+
+本机 RSSHub 容器**不由**任何 launchd 任务创建，只在 P10 首次点火时手动跑一次：
+
+```bash
+docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub
+```
+
+容器创建后，`com.alphaloop.rsshub` launchd 任务（`launchd:install-backup-alerts` 一并安装）负责在每次机器重启后跑 `docker start rsshub`，确保容器继续常驻——它不创建、不重建容器，容器不存在时这一步会失败（`logs/rsshub.err.log` 里会看到 "No such container"），此时需要回去手动跑一遍上面的 `docker run` 命令。
+
+`pnpm openclaw:runtime:doctor` 覆盖两个新闻引擎检查项：
+
+- `rsshub-health`：GET `${RSSHUB_BASE_URL 或默认值}/healthz`（404 时回退 `/`）——容器不可达只是 warn（点名上面的 P10 命令和 `pnpm launchd:install-backup-alerts`），返回非 200 状态码算 error。
+- `news-engine-health`：`news_events` 表最新一条 `last_published_at` 距今超过 48 小时且表内已有数据（非全新库）→ warn「新闻引擎超过 48 小时无新事件」；全新库（0 条事件）不报告。
 
 ### 日报/周报/个股分析调度：已迁移到 OpenClaw cron（2026-07-14）
 
