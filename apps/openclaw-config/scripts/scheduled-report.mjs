@@ -1185,11 +1185,21 @@ function renderClusteredNewsSection(data) {
 
   const l3Section = renderL3DeepDiveSection(data.l3DeepDive, events);
 
+  // Quiet-news-day honesty (pairs with report-quality.mjs's scarcity escape
+  // on news.detail_depth): fewer than 3 clustered events on a genuinely
+  // quiet session must not block the whole report - disclose the scarcity
+  // explicitly instead. The gate only honors this line when events >= 1, so
+  // it cannot be used to ship an empty section.
+  const scarcityDisclosure = cardEvents.length < 3
+    ? [`- 事件稀少提示：本窗口仅聚类出 ${cardEvents.length} 件事件（少于常规 3 件），已全部呈现，无遗漏。`]
+    : [];
+
   return [
     "### 多源新闻（事件聚类）",
     "",
     cards.join("\n\n"),
     "",
+    ...scarcityDisclosure,
     `- 新闻来源分布：${sourceBreakdown}。`,
     `- 非券商源占比：${nonBrokerRatio.toFixed(2)}%。`,
     `- 中文源占比：${chineseRatio.toFixed(2)}%。`,

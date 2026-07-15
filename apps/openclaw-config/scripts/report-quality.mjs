@@ -49,7 +49,16 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
   if (/###\s+利好\/利空\/基本面影响/u.test(text)) {
     failures.push("readability.duplicate_news_classification");
   }
-  if (newsLines.length < minimumNewsLines(kind)) {
+  // Quiet-news-day escape (same honesty contract as the 「来源降级状态」
+  // passthrough below): the new clustered format can legitimately produce
+  // fewer than 3 EVENTS on a quiet day (holiday, weekend-adjacent session),
+  // and blocking the whole report over that would recreate the exact
+  // crash-loop-every-trigger failure H7 fixed for source diversity. A report
+  // that EXPLICITLY discloses the scarcity (「事件稀少提示」, emitted by the
+  // renderer only when it truly clustered <3 events) passes the depth gate;
+  // an undisclosed thin report still fails.
+  const hasScarcityDisclosure = /事件稀少提示/u.test(text);
+  if (newsLines.length < minimumNewsLines(kind) && !(hasScarcityDisclosure && newsLines.length >= 1)) {
     failures.push("news.detail_depth");
   }
   if (new Set(sourceLabels.map((source) => source.toLowerCase())).size < 2 || nonLongbridgeSourceCount === 0) {

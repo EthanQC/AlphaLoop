@@ -72,6 +72,45 @@ describe("report quality gate", () => {
     });
   });
 
+  it("passes a quiet-news-day report (<3 events) that explicitly discloses the scarcity, but never an empty or undisclosed one", () => {
+    const buildQuietDay = ({ withDisclosure, lineCount }: { withDisclosure: boolean; lineCount: number }) => {
+      const newsLines = [
+        "- 2026-06-13 21:55 QQQ.US：美股下周需要关注小盘股和利率信号；媒体：Investor's Business Daily；渠道：Yahoo Finance；标题要点：中文摘要说明小盘股、利率和科技股轮动；原始标题：Stock Market Week Ahead；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：作为风险偏好线索；链接：[原文](https://finance.yahoo.com/example-ibd)。",
+        "- 2026-06-13 04:39 QQQ.US：美股在停火预期和科技股支撑下反弹；媒体：Barchart；渠道：Yahoo Finance；标题要点：中文摘要说明指数反弹与风险情绪改善；原始标题：Stocks Rally；分类：利好；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；影响：偏利好但需成交量确认；链接：[原文](https://finance.yahoo.com/example-barchart)。"
+      ].slice(0, lineCount);
+      return [
+        "# OpenClaw 日报 2026-07-15",
+        "",
+        "- 新闻来源分布：Yahoo Finance/Investor's Business Daily 1 条；Yahoo Finance/Barchart 1 条。",
+        "",
+        "### 多源新闻（中文摘要与来源）",
+        "",
+        ...newsLines,
+        ...(withDisclosure ? ["- 事件稀少提示：本窗口仅聚类出 2 件事件（少于常规 3 件），已全部呈现，无遗漏。"] : []),
+        "",
+        "### 宏观日历",
+        "",
+        "- 2026-07-16 20:30 美国零售销售（前值-- / 预测0.2% / 公告--）",
+        "",
+        "## 3. QQQ 与美股风险温度",
+        "",
+        "- 最新价：740.62；前收：722.51；区间涨跌：18.11 / 2.51%"
+      ].join("\n");
+    };
+
+    // Disclosed scarcity with >=1 real line: detail_depth passes.
+    const disclosed = validateReportMarkdown(buildQuietDay({ withDisclosure: true, lineCount: 2 }), { kind: "daily" });
+    expect(disclosed.failures).not.toContain("news.detail_depth");
+
+    // Same thin report WITHOUT the disclosure: still rejected.
+    const undisclosed = validateReportMarkdown(buildQuietDay({ withDisclosure: false, lineCount: 2 }), { kind: "daily" });
+    expect(undisclosed.failures).toContain("news.detail_depth");
+
+    // Disclosure cannot ship an EMPTY section (zero lines still fails).
+    const empty = validateReportMarkdown(buildQuietDay({ withDisclosure: true, lineCount: 0 }), { kind: "daily" });
+    expect(empty.failures).toContain("news.detail_depth");
+  });
+
   it("rejects reports that repeat template checklists or duplicate news classification blocks", () => {
     const markdown = [
       "# OpenClaw 日报 2026-06-14",
