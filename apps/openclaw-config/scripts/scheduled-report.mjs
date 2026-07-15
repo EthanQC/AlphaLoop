@@ -24,6 +24,7 @@ import {
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
 import { assertReportQuality } from "./report-quality.mjs";
+import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -83,6 +84,21 @@ async function prepareReport(reportKind, info) {
   const db = openTradingDatabase(dbPath);
   const executionRows = selectExecutionReports(db, info);
   const marketData = await fetchRequiredReportMarketData(info);
+
+  // Phase 4 Task 6: build + persist this trading day's daily_facts BEFORE
+  // rendering - report-quality.mjs's facts.numeric_match gate
+  // (validateNarrativeNumbers) needs an independently-computed ground truth
+  // already sitting in daily_facts by the time anything downstream inspects
+  // the rendered narrative. Writing it after render would let a broken or
+  // hand-edited render slip out with no matching facts row to catch it
+  // against.
+  const dailyFacts = buildDailyFacts({
+    snapshot: marketData.officialPaperSnapshot,
+    qqqQuote: marketData.qqqQuote,
+    macroEntries: marketData.macroEvents,
+    tradingDay: info.label
+  });
+  persistDailyFacts(db, info.label, dailyFacts);
 
   const report = reportKind === "daily"
     ? renderDailyReport(info, {
