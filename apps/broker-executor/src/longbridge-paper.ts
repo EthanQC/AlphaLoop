@@ -9,8 +9,28 @@ import type {
   OrderTicket
 } from "@packages/shared-types";
 
+// Phase 6 Task 4 (2026-07-15 plan): the shape execFileSync itself has, narrowed
+// to exactly what this module calls it with - lets tests inject a fake (no
+// real longbridge CLI, no real subprocess) without reaching for module
+// mocking. The real default IS execFileSync; its actual signature is
+// structurally compatible with this narrower one.
+export type LongbridgeExecFn = (
+  command: string,
+  args: readonly string[],
+  options: { encoding: "utf8"; env: NodeJS.ProcessEnv; timeout: number }
+) => string;
+
+// Global Constraint ⑥: execFileSync now always carries an explicit timeout
+// (LONGBRIDGE_CLI_TIMEOUT_MS, default 45s) - previously unbounded, a hung CLI
+// process could block this whole (single-threaded) HTTP server forever.
+function resolveCliTimeoutMs(): number {
+  const raw = Number(process.env.LONGBRIDGE_CLI_TIMEOUT_MS ?? 45_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+}
+
 export function executeLongbridgePaperOrder(
-  ticket: OrderTicket
+  ticket: OrderTicket,
+  execFn: LongbridgeExecFn = execFileSync
 ): ExecutionResult {
   if (ticket.environment !== "paper") {
     return {
@@ -64,110 +84,81 @@ export function executeLongbridgePaperOrder(
     };
   }
 
-  try {
-    const observedAt = new Date().toISOString();
-    const output = execFileSync(resolveLongbridgeCli(), [
-      "order",
-      ticket.side,
-      ticket.symbol,
-      String(ticket.quantity),
-      "--price",
-      price.toFixed(2),
-      "--order-type",
-      "LO",
-      "--tif",
-      "Day",
-      "--remark",
-      `OpenClaw paper ${ticket.id}`.slice(0, 255),
-      "--yes",
-      "--format",
-      "json"
-    ], {
-      encoding: "utf8",
-      env: buildLongbridgeCliEnv()
-    });
-    const submissionPayload = parseLongbridgeOutput(output);
-    const externalOrderId = extractOrderId(submissionPayload);
-    const detailPayload = externalOrderId ? readOrderDetail(externalOrderId) : undefined;
-    const statusPayload = detailPayload ?? submissionPayload;
-    const brokerStatus = extractBrokerStatus(statusPayload);
-    const brokerOrderStage = brokerStatus
-      ? mapBrokerStatusToStage(brokerStatus)
-      : externalOrderId ? "submitted" : "unknown";
-    const status = mapBrokerStageToExecutionStatus(brokerOrderStage, Boolean(externalOrderId));
-    const fillPrice = brokerOrderStage === "filled" ? extractFillPrice(statusPayload) : undefined;
+  // Phase 6 Task 4 (2026-07-15 plan), Global Constraint ⑥: this call is
+  // DELIBERATELY no longer wrapped in a try/catch that salvages a synthetic
+  // "submitted"/"accepted" ExecutionResult out of a non-zero exit code. A
+  // throw here (spawn failure, non-zero exit, or - now that `timeout` is
+  // always passed - a killed-for-timeout process) propagates straight to the
+  // caller: broker-executor's /v1/tickets handler is the one place that
+  // decides what a failed CLI call means for the ALREADY-RECORDED lifecycle
+  // row (record-before-execute: the row exists before this call ever runs),
+  // and per the plan that meaning is uniformly "submit_unconfirmed" - the
+  // order MAY exist at the broker despite the bad exit code, so this module
+  // must not guess "probably fine" from whatever text happened to be in the
+  // failed process's stdout/stderr. `readOrderDetail` below is a SEPARATE,
+  // best-effort call made only after a confirmed-successful submit - its own
+  // internal try/catch (swallow-and-continue) is unchanged, since a detail
+  // lookup failing after a known-good order_id does not cast doubt on the
+  // order's existence the way a failed SUBMIT call does.
+  const observedAt = new Date().toISOString();
+  const output = execFn(resolveLongbridgeCli(), [
+    "order",
+    ticket.side,
+    ticket.symbol,
+    String(ticket.quantity),
+    "--price",
+    price.toFixed(2),
+    "--order-type",
+    "LO",
+    "--tif",
+    "Day",
+    "--remark",
+    `OpenClaw paper ${ticket.id}`.slice(0, 255),
+    "--yes",
+    "--format",
+    "json"
+  ], {
+    encoding: "utf8",
+    env: buildLongbridgeCliEnv(),
+    timeout: resolveCliTimeoutMs()
+  });
+  const submissionPayload = parseLongbridgeOutput(output);
+  const externalOrderId = extractOrderId(submissionPayload);
+  const detailPayload = externalOrderId ? readOrderDetail(externalOrderId, execFn) : undefined;
+  const statusPayload = detailPayload ?? submissionPayload;
+  const brokerStatus = extractBrokerStatus(statusPayload);
+  const brokerOrderStage = brokerStatus
+    ? mapBrokerStatusToStage(brokerStatus)
+    : externalOrderId ? "submitted" : "unknown";
+  const status = mapBrokerStageToExecutionStatus(brokerOrderStage, Boolean(externalOrderId));
+  const fillPrice = brokerOrderStage === "filled" ? extractFillPrice(statusPayload) : undefined;
 
-    return compactExecutionResult({
-      ticketId: ticket.id,
-      environment: "paper",
-      status,
-      provider: "longbridge-paper",
-      externalOrderId,
-      fillPrice,
-      limitPrice: price,
-      brokerStatus,
-      brokerOrderStage,
-      submittedAt: ticket.submittedAt,
-      observedAt,
-      rawBrokerPayload: toJsonValue({
-        submission: submissionPayload,
-        detail: detailPayload ?? null
-      }),
-      reasons: [
-        externalOrderId
-          ? `长桥官方模拟盘订单已通过本地 broker-executor 提交，order_id 为 ${externalOrderId}。`
-          : "长桥官方模拟盘订单命令已完成，但 CLI 输出中没有找到 order_id。",
-        brokerStatus
-          ? `长桥券商状态为 ${brokerStatus}；本地状态为 ${status}。`
-          : `长桥券商状态未返回；本地状态为 ${status}。`,
-        "该路径受 LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true、LONGBRIDGE_ACCOUNT_MODE=paper、ALLOW_LIVE_EXECUTION=false 共同保护。"
-      ]
-    });
-  } catch (error) {
-    const observedAt = new Date().toISOString();
-    const output = collectProcessOutput(error);
-    const payload = parseLongbridgeOutput(output);
-    const externalOrderId = extractOrderId(payload);
-
-    if (externalOrderId) {
-      const brokerStatus = extractBrokerStatus(payload);
-      const brokerOrderStage = brokerStatus ? mapBrokerStatusToStage(brokerStatus) : "submitted";
-      const status = mapBrokerStageToExecutionStatus(brokerOrderStage, true);
-
-      return compactExecutionResult({
-        ticketId: ticket.id,
-        environment: "paper",
-        status,
-        provider: "longbridge-paper",
-        externalOrderId,
-        limitPrice: price,
-        brokerStatus,
-        brokerOrderStage,
-        submittedAt: ticket.submittedAt,
-        observedAt,
-        rawBrokerPayload: toJsonValue(payload),
-        reasons: [
-          `长桥官方模拟盘订单 CLI 返回非零退出码，但输出中找到了 order_id ${externalOrderId}。`,
-          brokerStatus
-            ? `长桥券商状态为 ${brokerStatus}；本地状态为 ${status}。`
-            : `长桥券商状态未返回；本地状态为 ${status}。`
-        ]
-      });
-    }
-
-    return compactExecutionResult({
-      ticketId: ticket.id,
-      environment: "paper",
-      status: "rejected",
-      provider: "longbridge-paper",
-      limitPrice: price,
-      observedAt,
-      rawBrokerPayload: toJsonValue(payload),
-      reasons: [
-        `长桥官方模拟盘订单提交失败：${(error as Error).message}`
-      ]
-    });
-  }
+  return compactExecutionResult({
+    ticketId: ticket.id,
+    environment: "paper",
+    status,
+    provider: "longbridge-paper",
+    externalOrderId,
+    fillPrice,
+    limitPrice: price,
+    brokerStatus,
+    brokerOrderStage,
+    submittedAt: ticket.submittedAt,
+    observedAt,
+    rawBrokerPayload: toJsonValue({
+      submission: submissionPayload,
+      detail: detailPayload ?? null
+    }),
+    reasons: [
+      externalOrderId
+        ? `长桥官方模拟盘订单已通过本地 broker-executor 提交，order_id 为 ${externalOrderId}。`
+        : "长桥官方模拟盘订单命令已完成，但 CLI 输出中没有找到 order_id。",
+      brokerStatus
+        ? `长桥券商状态为 ${brokerStatus}；本地状态为 ${status}。`
+        : `长桥券商状态未返回；本地状态为 ${status}。`,
+      "该路径受 LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true、LONGBRIDGE_ACCOUNT_MODE=paper、ALLOW_LIVE_EXECUTION=false 共同保护。"
+    ]
+  });
 }
 
 export function parseLongbridgeOutput(output: string): unknown {
@@ -265,9 +256,9 @@ function validateOfficialPaperGuard(): string[] | undefined {
   return reasons.length > 0 ? reasons : undefined;
 }
 
-function readOrderDetail(orderId: string): unknown | undefined {
+function readOrderDetail(orderId: string, execFn: LongbridgeExecFn): unknown | undefined {
   try {
-    const output = execFileSync(resolveLongbridgeCli(), [
+    const output = execFn(resolveLongbridgeCli(), [
       "order",
       "detail",
       orderId,
@@ -275,7 +266,8 @@ function readOrderDetail(orderId: string): unknown | undefined {
       "json"
     ], {
       encoding: "utf8",
-      env: buildLongbridgeCliEnv()
+      env: buildLongbridgeCliEnv(),
+      timeout: resolveCliTimeoutMs()
     });
 
     return parseLongbridgeOutput(output);
@@ -428,15 +420,6 @@ function readBalancedJson(text: string, start: number): string | undefined {
   }
 
   return undefined;
-}
-
-function collectProcessOutput(error: unknown): string {
-  const candidate = error as { stdout?: unknown; stderr?: unknown; message?: unknown };
-  const parts = [candidate.stdout, candidate.stderr, candidate.message]
-    .map((value) => typeof value === "string" ? value : Buffer.isBuffer(value) ? value.toString("utf8") : "")
-    .filter(Boolean);
-
-  return parts.join("\n");
 }
 
 function toJsonValue(value: unknown): JsonValue {

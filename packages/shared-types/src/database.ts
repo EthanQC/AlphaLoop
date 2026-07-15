@@ -4,9 +4,14 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type {
+  EquityAssetClass,
+  ExecutionResultStatus,
   ExecutionReport,
+  JsonValue,
   Member,
   OfficialPaperOrderLifecycle,
+  OfficialPaperOrderLifecycleStage,
+  OrderSide,
   Proposal,
   ProposalConfidence,
   ProposalStatus
@@ -39,7 +44,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -538,6 +543,113 @@ const MIGRATIONS: MigrationStep[] = [
         tripped_at TEXT NOT NULL
       );
     `);
+  },
+  (db) => {
+    // Phase 6 Task 4 (2026-07-15 plan): "先记录后执行" (record-before-execute)
+    // requires broker-executor to INSERT a official_paper_order_lifecycle row
+    // BEFORE calling the broker (Global Constraint ⑤) - at that moment there
+    // is no external_order_id yet (the broker hasn't replied). The original
+    // (pre-Phase-6) DDL declared `external_order_id TEXT NOT NULL UNIQUE`,
+    // which makes that pre-broker-call row structurally impossible. This step
+    // is the one DDL change this phase's "此外 DDL 冻结" constraint did not
+    // anticipate when it was written (before Task 4's own record-before-
+    // execute requirement was fully scoped out): without it, the money-path
+    // invariant the whole task exists to harden cannot be implemented at all.
+    // The fix is deliberately narrow - drop NOT NULL, keep everything else
+    // (including UNIQUE - SQLite's UNIQUE already permits multiple NULLs, so
+    // dropping NOT NULL alone is sufficient; a genuine collision between two
+    // REAL external_order_id values is still caught). No other column, no
+    // other table, changes. SQLite has no ALTER COLUMN, so this is the
+    // standard table-rebuild recipe (CREATE new -> INSERT ... SELECT -> DROP
+    // old -> RENAME) already used by the v7 step above. No FK references this
+    // table and this table references nothing, so no needsForeignKeysOff.
+    //
+    // Defensive existence check: a couple of this file's OWN pre-existing
+    // migration tests build deliberately partial legacy-shape fixtures (just
+    // members/alert_rules/alert_events/stock_analysis_targets) that never
+    // created official_paper_order_lifecycle at all, because no migration
+    // step before this one ever needed to touch it. Every REAL database does
+    // have it (MIGRATIONS[0] creates it), but rather than make this step
+    // silently assume that, a missing table is handled by creating it
+    // directly in its final (nullable-external_order_id) shape - equivalent
+    // to "there is nothing to rebuild", not an error.
+    const tableExists = db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'official_paper_order_lifecycle'`)
+      .get();
+
+    if (!tableExists) {
+      db.exec(`
+        CREATE TABLE official_paper_order_lifecycle (
+          id TEXT PRIMARY KEY,
+          ticket_id TEXT,
+          external_order_id TEXT UNIQUE,
+          provider TEXT NOT NULL,
+          environment TEXT NOT NULL,
+          account_mode TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          asset_class TEXT NOT NULL,
+          side TEXT NOT NULL,
+          quantity REAL NOT NULL,
+          limit_price REAL,
+          broker_status TEXT NOT NULL,
+          local_status TEXT NOT NULL,
+          lifecycle_stage TEXT NOT NULL,
+          submitted_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          raw TEXT NOT NULL,
+          notes TEXT NOT NULL,
+          owner_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
+          ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
+        CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_owner_idx
+          ON official_paper_order_lifecycle(owner_id, lifecycle_stage, submitted_at);
+      `);
+      return;
+    }
+
+    db.exec(`
+      CREATE TABLE official_paper_order_lifecycle_new (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT,
+        external_order_id TEXT UNIQUE,
+        provider TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        account_mode TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        asset_class TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        limit_price REAL,
+        broker_status TEXT NOT NULL,
+        local_status TEXT NOT NULL,
+        lifecycle_stage TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        raw TEXT NOT NULL,
+        notes TEXT NOT NULL,
+        owner_id TEXT
+      );
+    `);
+    db.exec(`
+      INSERT INTO official_paper_order_lifecycle_new
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes, owner_id)
+      SELECT
+        id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+        side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+        last_observed_at, raw, notes, owner_id
+      FROM official_paper_order_lifecycle;
+    `);
+    db.exec("DROP TABLE official_paper_order_lifecycle;");
+    db.exec("ALTER TABLE official_paper_order_lifecycle_new RENAME TO official_paper_order_lifecycle;");
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_status_idx
+        ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
+      CREATE INDEX IF NOT EXISTS official_paper_order_lifecycle_owner_idx
+        ON official_paper_order_lifecycle(owner_id, lifecycle_stage, submitted_at);
+    `);
   }
 ];
 
@@ -643,7 +755,12 @@ export class ExecutionReportRepository {
 export class OfficialPaperOrderLifecycleRepository {
   constructor(private readonly db: DatabaseSync) {}
 
-  save(record: OfficialPaperOrderLifecycle): void {
+  // Upsert-by-external_order_id: structurally requires a REAL external order
+  // id (that is the ON CONFLICT key below), so - unlike the domain type,
+  // which widened externalOrderId to optional for the pre-broker-call
+  // "submitting" row (see insertSubmitting below) - this method's own
+  // parameter re-narrows it back to required.
+  save(record: OfficialPaperOrderLifecycle & { externalOrderId: string }): void {
     this.db
       .prepare(`
         INSERT INTO official_paper_order_lifecycle
@@ -697,6 +814,176 @@ export class OfficialPaperOrderLifecycleRepository {
       .all(limit) as Array<Record<string, unknown>>;
 
     return rows.map(mapOfficialPaperOrderLifecycle);
+  }
+
+  // ---- Phase 6 Task 4 additions (2026-07-15 plan): record-before-execute ----
+  // These five methods are the ENTIRE surface broker-executor's /v1/tickets
+  // handler needs for its new sequence; none of them touch `.save()` above
+  // (still the finalized-real-order upsert path other callers may use). All
+  // are keyed by `ticket_id`, not `external_order_id` - deliberately, since
+  // the whole point is that a row can exist (and be looked up) before any
+  // external_order_id is known.
+
+  // Idempotency lookup (Global Constraint ③): the executor derives
+  // `ticket_prop_<proposalId>` BEFORE touching the proposals table at all, and
+  // checks this first - a hit means "already recorded, do not re-execute",
+  // regardless of what the proposal's own status column says.
+  getByTicketId(ticketId: string): OfficialPaperOrderLifecycle | null {
+    const row = this.db
+      .prepare(`SELECT * FROM official_paper_order_lifecycle WHERE ticket_id = ? LIMIT 1`)
+      .get(ticketId) as Record<string, unknown> | undefined;
+
+    return row ? mapOfficialPaperOrderLifecycle(row) : null;
+  }
+
+  // Global Constraint ⑤: INSERT the 'submitting' row BEFORE the broker call.
+  // `id` is the ticket id itself (not `lb_order_<externalOrderId>` - that
+  // scheme, still used by `.save()`, is unavailable here precisely because no
+  // external_order_id exists yet), so it is also naturally the row this
+  // method's siblings below re-fetch/update by ticket id.
+  insertSubmitting(input: {
+    ticketId: string;
+    ownerId: string;
+    symbol: string;
+    assetClass: EquityAssetClass;
+    side: OrderSide;
+    quantity: number;
+    limitPrice?: number;
+    submittedAt: string;
+  }): void {
+    this.db
+      .prepare(`
+        INSERT INTO official_paper_order_lifecycle
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes, owner_id)
+        VALUES (?, ?, NULL, 'longbridge-paper', 'paper', 'paper', ?, ?, ?, ?, ?, 'pending_submission', 'pending', 'submitting', ?, ?, 'null', '[]', ?)
+      `)
+      .run(
+        input.ticketId,
+        input.ticketId,
+        input.symbol,
+        input.assetClass,
+        input.side,
+        input.quantity,
+        input.limitPrice ?? null,
+        input.submittedAt,
+        input.submittedAt,
+        input.ownerId
+      );
+  }
+
+  // Global Constraint ⑥ (throw/timeout branch): the CLI call failed but the
+  // order MAY have reached the broker - stage becomes 'submit_unconfirmed',
+  // deliberately NOT 'rejected'/'failed' (Task 5's reconciliation is what
+  // adjudicates it later against the broker's own order list).
+  markSubmitUnconfirmed(ticketId: string, notes: string[], observedAt: string): void {
+    const result = this.db
+      .prepare(`
+        UPDATE official_paper_order_lifecycle
+        SET lifecycle_stage = 'submit_unconfirmed', local_status = 'pending',
+            broker_status = 'unconfirmed', notes = ?, last_observed_at = ?
+        WHERE ticket_id = ?
+      `)
+      .run(toJson(notes), observedAt, ticketId);
+
+    if (Number(result.changes) === 0) {
+      throw new Error(`No lifecycle row found for ticket ${ticketId} to mark submit_unconfirmed.`);
+    }
+  }
+
+  // Global Constraint ⑦ (success branch): fills in what the broker call
+  // revealed. Still matched by ticket_id (not external_order_id - that column
+  // is exactly what this call is populating for the first time on this row).
+  finalizeExecution(ticketId: string, input: {
+    externalOrderId: string;
+    brokerStatus: string;
+    localStatus: ExecutionResultStatus;
+    lifecycleStage: OfficialPaperOrderLifecycleStage;
+    limitPrice?: number;
+    raw?: JsonValue;
+    notes: string[];
+    observedAt: string;
+  }): void {
+    const result = this.db
+      .prepare(`
+        UPDATE official_paper_order_lifecycle
+        SET external_order_id = ?, broker_status = ?, local_status = ?, lifecycle_stage = ?,
+            limit_price = COALESCE(?, limit_price), raw = ?, notes = ?, last_observed_at = ?
+        WHERE ticket_id = ?
+      `)
+      .run(
+        input.externalOrderId,
+        input.brokerStatus,
+        input.localStatus,
+        input.lifecycleStage,
+        input.limitPrice ?? null,
+        toJson(input.raw ?? null),
+        toJson(input.notes),
+        input.observedAt,
+        ticketId
+      );
+
+    if (Number(result.changes) === 0) {
+      throw new Error(`No lifecycle row found for ticket ${ticketId} to finalize.`);
+    }
+  }
+
+  // Global Constraint ④ (budget gate, open-orders extension): the notional of
+  // this owner's OWN still-open orders (stage IN submitting/accepted/pending -
+  // i.e. not yet filled/cancelled/rejected/unconfirmed-resolved) - added to
+  // the owner's current account exposure before the 10% budget check, so two
+  // sequential 9.5% orders correctly trip the SECOND one instead of both
+  // independently reading "under budget" against a stale account snapshot.
+  // COALESCE(limit_price, 0): an order missing a limit price contributes zero
+  // (there is no price to size notional from) rather than throwing - the
+  // caller-side gate that requires a limit price before recording happens
+  // upstream of this being called at all.
+  sumOpenNotionalForOwner(ownerId: string): number {
+    // "Open" = every non-terminal stage an order can occupy after it has been
+    // sent but before it settles. This list MUST cover every stage
+    // longbridge-paper.ts's mapBrokerStatusToStage / the reconcile mapper can
+    // emit for a live order, or an order sitting in an uncovered stage becomes
+    // invisible to the budget gate - which is exactly the double-commit window
+    // audit finding #3 flags (a broker-side 'submitted'/'New' resting order is
+    // neither in the account snapshot's market_value yet nor counted here).
+    //   - submitting        : this executor's own record-before-execute insert
+    //   - submitted          : broker acknowledged (New/WaitToNew/NotReported/...)
+    //   - pending / accepted : partially filled / reconcile-observed working order
+    //   - submit_unconfirmed : broker call errored/timed out - the order MAY
+    //                          exist at the broker, so it is counted
+    //                          conservatively (over-block beats double-commit).
+    // Terminal stages (filled/cancelled/rejected/expired/unknown) are excluded:
+    // a filled order transitions into the next account snapshot's market_value,
+    // so counting it here too would double-count once the hourly snapshot
+    // catches up.
+    const row = this.db
+      .prepare(`
+        SELECT COALESCE(SUM(quantity * COALESCE(limit_price, 0)), 0) AS notional
+        FROM official_paper_order_lifecycle
+        WHERE owner_id = ?
+          AND lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed')
+      `)
+      .get(ownerId) as { notional: number } | undefined;
+
+    return Number(row?.notional ?? 0);
+  }
+
+  // Server-side dailyNewRiskPercent/openIdeas inputs (plan: "metadata 风险参数
+  // 不再信 body verbatim...服务端算（当日 lifecycle 计数）") - counts today's
+  // lifecycle rows for this owner (any stage: a rejected/failed attempt still
+  // used up part of today's risk budget) rather than trusting anything the
+  // HTTP caller claims about how many ideas are already open today.
+  countSubmittedTodayForOwner(ownerId: string, dayStartIso: string): number {
+    const row = this.db
+      .prepare(`
+        SELECT COUNT(*) AS c
+        FROM official_paper_order_lifecycle
+        WHERE owner_id = ? AND submitted_at >= ?
+      `)
+      .get(ownerId, dayStartIso) as { c: number } | undefined;
+
+    return Number(row?.c ?? 0);
   }
 }
 
@@ -1219,7 +1506,12 @@ function mapOfficialPaperOrderLifecycle(row: Record<string, unknown>): OfficialP
   const lifecycle: OfficialPaperOrderLifecycle = {
     id: String(row.id),
     ...(row.ticket_id ? { ticketId: String(row.ticket_id) } : {}),
-    externalOrderId: String(row.external_order_id),
+    // Phase 6 Task 4: external_order_id is now nullable at the DB layer (v11
+    // migration) - a bare `String(row.external_order_id)` would previously
+    // have stringified SQLite NULL to the literal text "null", silently
+    // corrupting a record-before-execute row's externalOrderId instead of
+    // leaving it unset.
+    ...(row.external_order_id ? { externalOrderId: String(row.external_order_id) } : {}),
     provider: "longbridge-paper",
     environment: "paper",
     accountMode: "paper",
@@ -1233,7 +1525,8 @@ function mapOfficialPaperOrderLifecycle(row: Record<string, unknown>): OfficialP
     submittedAt: String(row.submitted_at),
     lastObservedAt: String(row.last_observed_at),
     raw: fromJson(String(row.raw)),
-    notes: fromJson<string[]>(String(row.notes))
+    notes: fromJson<string[]>(String(row.notes)),
+    ...(row.owner_id ? { ownerId: String(row.owner_id) } : {})
   };
 
   if (limitPrice !== undefined && Number.isFinite(limitPrice)) {

@@ -191,14 +191,18 @@ function computeBudgetPreview(db, ownerId, draft) {
 }
 
 // POSTs the approved/approved_half proposal to broker-executor's /v1/tickets.
-// Task 4 (not yet built as of this task) is what makes the endpoint actually
-// ENFORCE proposalId/sharedSecret - this call is written forward-compatible
-// with that contract (plan: "POST executor /v1/tickets {proposalId,
-// sharedSecret from env}") but today's executor may not validate either yet.
-// An unreachable executor (ECONNREFUSED, DNS failure, non-2xx response) is
-// NOT escalated to a thrown error: the caller (runDecision) turns a
-// `{ok:false}` here into a warning while the proposal stays approved - see
-// that function's own doc comment for the no-rollback rationale.
+// Phase 6 Task 4 (2026-07-15 plan) built the executor side of this contract:
+// the shared secret travels ONLY via the `X-AlphaLoop-Broker-Secret` header
+// (never in the body - the executor does not read a body-level secret, and
+// this call no longer sends one) and the executor now builds the ticket
+// itself from the proposal row it looks up server-side by proposalId; the
+// symbol/side/quantity/limitPrice fields below are sent for
+// operator-visible logging/debugging only - the executor does not trust or
+// read them (money-path fields come only from its own proposals-table
+// lookup). An unreachable executor (ECONNREFUSED, DNS failure, non-2xx
+// response) is NOT escalated to a thrown error: the caller (runDecision)
+// turns a `{ok:false}` here into a warning while the proposal stays approved
+// - see that function's own doc comment for the no-rollback rationale.
 async function submitToExecutor(proposal, options = {}) {
   const executorUrl = options.executorUrl ?? process.env.BROKER_EXECUTOR_URL ?? "http://127.0.0.1:4312";
   const sharedSecret = process.env.BROKER_EXECUTOR_SHARED_SECRET ?? "";
@@ -212,7 +216,6 @@ async function submitToExecutor(proposal, options = {}) {
       },
       body: JSON.stringify({
         proposalId: proposal.id,
-        sharedSecret,
         ownerId: proposal.ownerId,
         symbol: proposal.symbol,
         side: proposal.side,

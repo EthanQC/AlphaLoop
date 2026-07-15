@@ -7,7 +7,8 @@ import {
   MemberRepository,
   ApiTokenRepository,
   ProposalRepository,
-  CircuitBreakerRepository
+  CircuitBreakerRepository,
+  OfficialPaperOrderLifecycleRepository
 } from "./database.js";
 import type { NewProposal } from "./database.js";
 import type { Member } from "./domain.js";
@@ -1280,15 +1281,15 @@ function buildSeededV9Database(): DatabaseSync {
 }
 
 describe("v10 circuit_breaker_state table migration (Phase 6 Task 1)", () => {
-  it("SCHEMA_VERSION is 10", () => {
-    expect(SCHEMA_VERSION).toBe(10);
-  });
+  // SCHEMA_VERSION has since moved on to v11 (Phase 6 Task 4, nullable
+  // official_paper_order_lifecycle.external_order_id) - see the "v11 ..."
+  // describe block below for the current-version assertion.
 
-  it("a fresh db lands directly at v10, with the circuit_breaker_state table present (columns/PK/NOT NULL exactly per the plan's frozen DDL)", () => {
+  it("a fresh db lands at least at v10, with the circuit_breaker_state table present (columns/PK/NOT NULL exactly per the plan's frozen DDL)", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(10);
+    expect(getSchemaVersion(db)).toBeGreaterThanOrEqual(10);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
     expect(tables.map((t) => t.name)).toContain("circuit_breaker_state");
@@ -1849,5 +1850,295 @@ describe("CircuitBreakerRepository", () => {
     expect(() => repo.trip("ghost_member", { pausedUntil: "2026-07-21T00:00:00.000Z", reason: "x" })).toThrow(
       /FOREIGN KEY constraint failed/
     );
+  });
+});
+
+// All tables that exist as of v10 (V9_TABLE_NAMES plus v10's own
+// circuit_breaker_state) - used by the v11 migration test below to assert the
+// v11 step (nullable official_paper_order_lifecycle.external_order_id) loses
+// zero rows anywhere, including in the very table it rebuilds.
+const V10_TABLE_NAMES = [...V9_TABLE_NAMES, "circuit_breaker_state"];
+
+describe("v11 official_paper_order_lifecycle.external_order_id nullable migration (Phase 6 Task 4)", () => {
+  // Global Constraint ⑤ ("先记录后执行"/record-before-execute) requires
+  // broker-executor to INSERT a lifecycle row BEFORE calling the broker, at a
+  // point where no external_order_id exists yet. The table's original DDL
+  // (predating Phase 6) declared external_order_id `NOT NULL UNIQUE`, which
+  // makes that impossible - this migration drops NOT NULL only, and is the
+  // one DDL change Task 4 needed beyond what the plan's "此外 DDL 冻结"
+  // constraint anticipated when it was written (see database.ts's own
+  // migration-step comment for the full rationale).
+
+  it("SCHEMA_VERSION is 11", () => {
+    expect(SCHEMA_VERSION).toBe(11);
+  });
+
+  it("a fresh db lands at v11 with external_order_id nullable (NOT NULL dropped, UNIQUE kept) and the new owner index present", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(11);
+
+    const columns = db.prepare("PRAGMA table_info(official_paper_order_lifecycle)").all() as Array<
+      { name: string; notnull: number }
+    >;
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+    expect(byName.external_order_id.notnull).toBe(0);
+    // Every other column keeps its NOT NULL exactly as before the rebuild.
+    // (`id` itself is excluded here: SQLite does not imply NOT NULL for a
+    // TEXT PRIMARY KEY the way the SQL standard does, so `id.notnull` was
+    // already 0 pre-rebuild too - not something this migration changes.)
+    expect(byName.provider.notnull).toBe(1);
+    expect(byName.symbol.notnull).toBe(1);
+    expect(byName.quantity.notnull).toBe(1);
+    expect(byName.broker_status.notnull).toBe(1);
+    expect(byName.local_status.notnull).toBe(1);
+    expect(byName.lifecycle_stage.notnull).toBe(1);
+    expect(byName.submitted_at.notnull).toBe(1);
+    expect(byName.last_observed_at.notnull).toBe(1);
+    expect(byName.raw.notnull).toBe(1);
+    expect(byName.notes.notnull).toBe(1);
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    const indexNames = indexes.map((i) => i.name);
+    expect(indexNames).toContain("official_paper_order_lifecycle_status_idx");
+    expect(indexNames).toContain("official_paper_order_lifecycle_owner_idx");
+  });
+
+  it("allows multiple rows with a NULL external_order_id (record-before-execute), while still rejecting a duplicate non-null value", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    const insertNullExternalId = (id: string, ticketId: string) =>
+      db.prepare(`
+        INSERT INTO official_paper_order_lifecycle
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes)
+        VALUES (?, ?, NULL, 'longbridge-paper', 'paper', 'paper', 'AAPL.US', 'stock', 'buy', 1, 100,
+                'pending_submission', 'pending', 'submitting', ?, ?, 'null', '[]')
+      `).run(id, ticketId, now, now);
+
+    expect(() => insertNullExternalId("lc_1", "ticket_prop_1")).not.toThrow();
+    expect(() => insertNullExternalId("lc_2", "ticket_prop_2")).not.toThrow();
+
+    const insertRealExternalId = (id: string) =>
+      db.prepare(`
+        INSERT INTO official_paper_order_lifecycle
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes)
+        VALUES (?, NULL, 'ext_dup', 'longbridge-paper', 'paper', 'paper', 'AAPL.US', 'stock', 'buy', 1, 100,
+                'Filled', 'accepted', 'filled', ?, ?, 'null', '[]')
+      `).run(id, now, now);
+
+    insertRealExternalId("lc_3");
+    expect(() => insertRealExternalId("lc_4")).toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("upgrades a v10 db with data in every pre-existing table (through v11) with zero row loss, and is idempotent", () => {
+    const db = buildSeededV9Database();
+    migrate(db); // fixture-build only: advances the underlying schema through v10 and v11
+    db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
+    seedMember(db, "mem_v10");
+    db.prepare(`
+      INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+      VALUES ('mem_v10', ?, 'weekly loss > 3%', -0.05, ?)
+    `).run(nowIso(), nowIso());
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V10_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      expect(countsBefore[table]).toBeGreaterThan(0);
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+});
+
+describe("OfficialPaperOrderLifecycleRepository record-before-execute additions (Phase 6 Task 4)", () => {
+  function setup() {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    return { db, repo: new OfficialPaperOrderLifecycleRepository(db) };
+  }
+
+  it("insertSubmitting writes a stage='submitting' row with no external_order_id, findable by getByTicketId", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "ticket_prop_1",
+      ownerId: "mem_owner",
+      symbol: "AAPL.US",
+      assetClass: "stock",
+      side: "buy",
+      quantity: 5,
+      limitPrice: 100,
+      submittedAt: nowIso()
+    });
+
+    const row = repo.getByTicketId("ticket_prop_1");
+    expect(row?.lifecycleStage).toBe("submitting");
+    expect(row?.externalOrderId).toBeUndefined();
+    expect(row?.ownerId).toBe("mem_owner");
+    expect(row?.quantity).toBe(5);
+    expect(row?.limitPrice).toBe(100);
+  });
+
+  it("getByTicketId returns null when no row exists for that ticket", () => {
+    const { repo } = setup();
+    expect(repo.getByTicketId("ticket_prop_missing")).toBeNull();
+  });
+
+  it("markSubmitUnconfirmed flips stage to submit_unconfirmed without ever setting external_order_id", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "ticket_prop_2",
+      ownerId: "mem_owner",
+      symbol: "AAPL.US",
+      assetClass: "stock",
+      side: "buy",
+      quantity: 1,
+      limitPrice: 100,
+      submittedAt: nowIso()
+    });
+
+    repo.markSubmitUnconfirmed("ticket_prop_2", ["CLI timed out after 45000ms"], nowIso());
+
+    const row = repo.getByTicketId("ticket_prop_2");
+    expect(row?.lifecycleStage).toBe("submit_unconfirmed");
+    expect(row?.externalOrderId).toBeUndefined();
+    expect(row?.notes).toEqual(["CLI timed out after 45000ms"]);
+  });
+
+  it("markSubmitUnconfirmed throws when no matching row exists (never silently no-ops on a bad ticket id)", () => {
+    const { repo } = setup();
+    expect(() => repo.markSubmitUnconfirmed("ticket_prop_missing", [], nowIso())).toThrow(/No lifecycle row/);
+  });
+
+  it("finalizeExecution fills in external_order_id/broker fields on the SAME row insertSubmitting created", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "ticket_prop_3",
+      ownerId: "mem_owner",
+      symbol: "AAPL.US",
+      assetClass: "stock",
+      side: "buy",
+      quantity: 1,
+      limitPrice: 100,
+      submittedAt: nowIso()
+    });
+
+    repo.finalizeExecution("ticket_prop_3", {
+      externalOrderId: "ext_123",
+      brokerStatus: "Filled",
+      localStatus: "accepted",
+      lifecycleStage: "filled",
+      notes: ["order filled"],
+      observedAt: nowIso()
+    });
+
+    const row = repo.getByTicketId("ticket_prop_3");
+    expect(row?.externalOrderId).toBe("ext_123");
+    expect(row?.lifecycleStage).toBe("filled");
+    expect(row?.localStatus).toBe("accepted");
+    expect(row?.notes).toEqual(["order filled"]);
+  });
+
+  it("finalizeExecution throws when no matching row exists", () => {
+    const { repo } = setup();
+    expect(() =>
+      repo.finalizeExecution("ticket_prop_missing", {
+        externalOrderId: "ext_x",
+        brokerStatus: "Filled",
+        localStatus: "accepted",
+        lifecycleStage: "filled",
+        notes: [],
+        observedAt: nowIso()
+      })
+    ).toThrow(/No lifecycle row/);
+  });
+
+  it("sumOpenNotionalForOwner counts every non-terminal broker stage (submitting/submitted/accepted/pending/submit_unconfirmed) for that owner, ignoring other owners and terminal stages", () => {
+    const { db, repo } = setup();
+    seedMember(db, "mem_other");
+
+    repo.insertSubmitting({
+      ticketId: "t_open_1", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 10, limitPrice: 100, submittedAt: nowIso()
+    }); // 1000, stage 'submitting'
+    repo.insertSubmitting({
+      ticketId: "t_open_2", ownerId: "mem_owner", symbol: "MSFT.US", assetClass: "stock",
+      side: "buy", quantity: 5, limitPrice: 200, submittedAt: nowIso()
+    }); // 1000
+    repo.insertSubmitting({
+      ticketId: "t_other_owner", ownerId: "mem_other", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 100, limitPrice: 100, submittedAt: nowIso()
+    });
+
+    // Regression (controller live-check finding): a broker-acknowledged
+    // resting order lands in stage 'submitted' (New/WaitToNew map to it) - it
+    // is NOT yet in the account snapshot's market_value, so if the budget gate
+    // fails to count it, two sequential 9.5% orders both read "under budget"
+    // (audit finding #3). A 'submit_unconfirmed' order MAY exist at the broker
+    // and must be counted conservatively too. Both MUST contribute here.
+    repo.insertSubmitting({
+      ticketId: "t_submitted", ownerId: "mem_owner", symbol: "TSLA.US", assetClass: "stock",
+      side: "buy", quantity: 4, limitPrice: 250, submittedAt: nowIso()
+    }); // 1000
+    repo.finalizeExecution("t_submitted", {
+      externalOrderId: "ext_submitted", brokerStatus: "New", localStatus: "accepted",
+      lifecycleStage: "submitted", notes: [], observedAt: nowIso()
+    });
+    repo.insertSubmitting({
+      ticketId: "t_unconfirmed", ownerId: "mem_owner", symbol: "AMD.US", assetClass: "stock",
+      side: "buy", quantity: 2, limitPrice: 100, submittedAt: nowIso()
+    }); // 200
+    repo.markSubmitUnconfirmed("t_unconfirmed", ["timeout"], nowIso());
+
+    // A terminal-stage (filled) row for mem_owner must NOT count against budget.
+    repo.insertSubmitting({
+      ticketId: "t_terminal", ownerId: "mem_owner", symbol: "NVDA.US", assetClass: "stock",
+      side: "buy", quantity: 1, limitPrice: 900, submittedAt: nowIso()
+    });
+    repo.finalizeExecution("t_terminal", {
+      externalOrderId: "ext_terminal", brokerStatus: "Filled", localStatus: "accepted",
+      lifecycleStage: "filled", notes: [], observedAt: nowIso()
+    });
+
+    // 1000 + 1000 + 1000 (submitted) + 200 (submit_unconfirmed) = 3200
+    expect(repo.sumOpenNotionalForOwner("mem_owner")).toBe(3200);
+    expect(repo.sumOpenNotionalForOwner("mem_other")).toBe(10_000);
+  });
+
+  it("countSubmittedTodayForOwner counts only rows at/after the given day-start for that owner", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "t_today_1", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 1, limitPrice: 100, submittedAt: "2026-07-15T10:00:00.000Z"
+    });
+    repo.insertSubmitting({
+      ticketId: "t_today_2", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 1, limitPrice: 100, submittedAt: "2026-07-15T11:00:00.000Z"
+    });
+    repo.insertSubmitting({
+      ticketId: "t_yesterday", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 1, limitPrice: 100, submittedAt: "2026-07-14T23:00:00.000Z"
+    });
+
+    expect(repo.countSubmittedTodayForOwner("mem_owner", "2026-07-15T00:00:00.000Z")).toBe(2);
   });
 });
