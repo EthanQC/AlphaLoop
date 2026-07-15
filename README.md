@@ -68,6 +68,16 @@ pnpm launchd:install-backup-alerts
 
 `launchd:install-backup-alerts`（Phase 3 起）额外安装 `com.alphaloop.platform-app`——一个常驻 `KeepAlive` launchd 服务（不是周期任务），启动 `pnpm --filter @apps/platform-app start`；`openclaw:runtime:doctor` 同样会检测它是否已加载，以及它的 `/health` 是否可达。
 
+`launchd:install-backup-alerts`（Phase 4 起）还额外安装 `com.alphaloop.rsshub`——`RunAtLoad=true`/`KeepAlive=false`，每次重启只跑一次 `docker start rsshub`；rsshub 容器本体不由这个任务创建，需要先在部署机上手动跑一次 P10 点火命令 `docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub`（详见 `apps/openclaw-config/README.md` 的「新闻引擎」章节）。
+
+## 新闻引擎（Phase 4）
+
+L1 多源采集（RSSHub 中文源 + Finnhub + 既有 Yahoo/Google/Longbridge）→ 事件聚类 → SQLite 持久化，供日报「多源新闻（事件聚类）」段和平台新闻页共用。
+
+- 环境变量（可选，见 `.env.local.example`）：`FINNHUB_API_KEY`（Finnhub company-news 鉴权，未设置时该源整体跳过）、`RSSHUB_BASE_URL`（本机 RSSHub 地址，默认 `http://127.0.0.1:1200`）。
+- RSSHub 容器 P10 点火命令：`docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub`（一次性，之后由 `com.alphaloop.rsshub` launchd 任务负责重启后 `docker start`）。
+- `pnpm openclaw:runtime:doctor` 覆盖 `rsshub-health`（容器 `/healthz` 探活，不可达 warn、非 200 error）和 `news-engine-health`（`news_events` 超过 48 小时无新事件且非全新库 → warn）两个检查项。
+
 ## 本地接口
 
 - `GET http://127.0.0.1:4312/health`

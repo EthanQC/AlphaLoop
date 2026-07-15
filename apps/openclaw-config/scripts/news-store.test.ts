@@ -370,3 +370,47 @@ describe("daily facts", () => {
     expect(facts.market_regime).toMatchObject({ valueNum: null, valueText: "risk-on" });
   });
 });
+
+// Phase 4 Task 8 (news engine deployment wiring): openclaw-runtime-doctor-
+// core.mjs's news-engine-health check needs "how many events, and what's the
+// freshest one" without duplicating SQL outside this store module (per this
+// file's own header - news-engine.mjs and renderers never touch SQL
+// directly; the doctor follows the same rule).
+describe("newsEngineHealthStats", () => {
+  it("reports eventCount 0 and lastPublishedAt null on a freshly migrated, never-fed database", () => {
+    const db = makeDb();
+
+    const stats = store.newsEngineHealthStats(db);
+
+    expect(stats).toEqual({ eventCount: 0, lastPublishedAt: null });
+  });
+
+  it("reports the true event count and the MAX(last_published_at) across all stored events", () => {
+    const db = makeDb();
+
+    store.upsertEventWithSources(db, baseEvent({ clusterKey: "cluster_a" }), [
+      source({ publishedAt: "2026-07-10T00:00:00.000Z" })
+    ]);
+    store.upsertEventWithSources(db, baseEvent({ clusterKey: "cluster_b" }), [
+      source({ publishedAt: "2026-07-14T09:00:00.000Z", url: "https://wallstreetcn.com/articles/456" })
+    ]);
+
+    const stats = store.newsEngineHealthStats(db);
+
+    expect(stats.eventCount).toBe(2);
+    expect(stats.lastPublishedAt).toBe("2026-07-14T09:00:00.000Z");
+  });
+
+  it("reports lastPublishedAt null when every stored event's own last_published_at is unknown (all sources unknown-time)", () => {
+    const db = makeDb();
+
+    store.upsertEventWithSources(db, baseEvent({ clusterKey: "cluster_unknown_time" }), [
+      source({ publishedAt: null })
+    ]);
+
+    const stats = store.newsEngineHealthStats(db);
+
+    expect(stats.eventCount).toBe(1);
+    expect(stats.lastPublishedAt).toBeNull();
+  });
+});

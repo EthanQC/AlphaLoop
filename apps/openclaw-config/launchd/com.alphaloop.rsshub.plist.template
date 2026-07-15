@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Phase 4 Task 8 (news engine deployment wiring): this job wraps
+  `docker start rsshub` only - it does NOT create the rsshub container. The
+  container itself is created once, out of band, at P10 ignition via:
+
+    docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub
+
+  (see docs/superpowers/plans/2026-07-15-phase4-news-engine.md Task 8 and
+  .env.local.example's RSSHUB_BASE_URL entry). This job's only job is making
+  sure that already-created container is started again after a reboot -
+  `docker start` on a container that is already running is a harmless no-op,
+  and on a machine where the container was never created yet (pre-P10, or a
+  fresh checkout) it fails fast with a clear "No such container" message in
+  rsshub.err.log instead of silently doing nothing.
+
+  RunAtLoad=true / KeepAlive=false (deliberately unlike com.alphaloop.
+  platform-app's KeepAlive=true): the container's own process is what stays
+  running - Docker's daemon supervises it, not launchd - so this job's work
+  is done the moment `docker start` returns; launchd must not try to
+  relaunch it every time that one-shot command exits.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.alphaloop.rsshub</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/zsh</string>
+      <string>-lc</string>
+      <string>export PATH="$HOME/.local/node-v24/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; cd "__REPO_ROOT__" &amp;&amp; docker start rsshub</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/rsshub.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/rsshub.err.log</string>
+  </dict>
+</plist>

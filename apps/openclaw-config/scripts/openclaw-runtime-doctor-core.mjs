@@ -3,21 +3,25 @@ import { join } from "node:path";
 
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
+import { newsEngineHealthStats } from "./news-store.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { isUsRegularMarketHours } from "./trading-schedule.mjs";
 
-// task H2 (Phase 2.5 hardening), extended in Phase 3 Task 8: the launchd
-// jobs install-launchd.sh wires up (see that script) - a dev machine
-// legitimately runs none of them, so missing any one is a warn, not a fail
-// (see `warn()` below - only "error" severity flips `ok` to false).
-// com.alphaloop.platform-app (Phase 3 Task 8) joined the other two once its
-// `.plist.template` was added alongside them - install-launchd.sh's glob
-// (`*.plist.template`) already covers new files without modification, so
-// this list is the only place that needed the addition.
+// task H2 (Phase 2.5 hardening), extended in Phase 3 Task 8, extended again
+// in Phase 4 Task 8: the launchd jobs install-launchd.sh wires up (see that
+// script) - a dev machine legitimately runs none of them, so missing any one
+// is a warn, not a fail (see `warn()` below - only "error" severity flips
+// `ok` to false). com.alphaloop.platform-app (Phase 3 Task 8) and
+// com.alphaloop.rsshub (Phase 4 Task 8) each joined this list the moment
+// their own `.plist.template` was added alongside the rest -
+// install-launchd.sh's glob (`*.plist.template`) already covers new files
+// without modification, so this list is the only place that needed the
+// addition either time.
 const REQUIRED_LAUNCHD_JOBS = [
   { label: "com.alphaloop.daily-backup", slug: "daily-backup" },
   { label: "com.alphaloop.market-alerts", slug: "market-alerts" },
-  { label: "com.alphaloop.platform-app", slug: "platform-app" }
+  { label: "com.alphaloop.platform-app", slug: "platform-app" },
+  { label: "com.alphaloop.rsshub", slug: "rsshub" }
 ];
 
 // Phase 3 Task 8 - "platform-app-health" check: platform-app is a KeepAlive
@@ -41,6 +45,31 @@ const ALERTS_STALE_HEARTBEAT_MS = 30 * 60_000;
 // be calling this a hard failure too (independent confirmation via a
 // different read path, not just trusting the poller told someone).
 const ALERTS_CONSECUTIVE_FAILURE_THRESHOLD = 3;
+
+// Phase 4 Task 8 (news engine deployment wiring) - "rsshub-health" check:
+// mirrors news-sources.mjs's own DEFAULT_RSSHUB_BASE_URL / .env.local.example's
+// documented default (both `http://127.0.0.1:1200`) rather than importing
+// that module directly - news-sources.mjs pulls in report-news.mjs/
+// _longbridge.mjs's whole module graph (including _longbridge.mjs's
+// module-load-time loadLocalEnv/mkdirSync side effects), which this doctor
+// has no reason to trigger just to read one constant. Same reasoning as
+// checkPlatformAppHealth's own PLATFORM_APP_HEALTH_DEFAULT_PORT above:
+// mirror the value with a comment, don't import the module.
+const RSSHUB_HEALTH_DEFAULT_BASE_URL = "http://127.0.0.1:1200";
+const RSSHUB_HEALTH_TIMEOUT_MS = 1500;
+// The real, one-time P10 ignition command that creates the container this
+// check is probing (see apps/openclaw-config/launchd/com.alphaloop.rsshub.
+// plist.template's own header comment) - named in the unreachable warning so
+// an operator who has never run P10 yet gets the actual next step, not just
+// "it's down".
+const RSSHUB_P10_CONTAINER_COMMAND = "docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub";
+
+// Phase 4 Task 8 - "news-engine-health" check: news_events going quiet for
+// this long, while the table genuinely already has data (source_count > 0
+// rows exist), means the collection pipeline (RSSHub/Finnhub/openclaw cron)
+// has silently stopped - as opposed to a fresh install that has simply never
+// collected anything yet (eventCount === 0, handled as "nothing to report").
+const NEWS_ENGINE_STALE_THRESHOLD_MS = 48 * 60 * 60_000;
 
 export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
   const gatewayPids = distinctPids(snapshot.gatewayListeners);
@@ -76,7 +105,9 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "runner-recent-failures", run: () => checkRecentRunnerFailures(recentRunnerResults) },
     { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot) },
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
-    { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) }
+    { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
+    { name: "rsshub-health", run: () => checkRsshubHealth(snapshot) },
+    { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) }
   ];
 
   const findings = await runChecksFailureIsolated(checks);
@@ -307,6 +338,132 @@ async function checkPlatformAppHealth(snapshot) {
   }
 
   return [];
+}
+
+// Phase 4 Task 8 (news engine deployment wiring) - "rsshub-health" check:
+// hits the rsshub Docker container's own health route directly over
+// loopback HTTP, exactly mirroring checkPlatformAppHealth's shape above
+// (reachable-ok / reachable-but-broken / unreachable) plus one RSSHub-
+// specific wrinkle: it tries `/healthz` first and falls back to `/` only on
+// a 404 (older RSSHub builds never grew a dedicated health route and only
+// ever answer on `/`) - any OTHER non-200 (500, timeout, etc.) is reported
+// as-is without a fallback attempt, since that already proves the process is
+// reachable but unhealthy rather than "this route doesn't exist here".
+//
+// Base URL resolution mirrors the task's own spec text
+// (`${RSSHUB_BASE_URL ?? http://127.0.0.1:1200}`) and matches how
+// checkPlatformAppHealth resolves its port: `snapshot.rsshubBaseUrl` is a
+// test-only injection point ahead of both (real callers, i.e.
+// openclaw-runtime-doctor.mjs, never set it, so production behavior reads
+// straight from the env var with the documented default).
+//
+// Severity split (task brief): a dev machine legitimately has never run P10
+// (the container doesn't exist yet, or Docker itself isn't running) - that
+// is only a `warn`, naming the actual one-time creation command so an
+// operator gets the real next step instead of a vague "it's down". A
+// response that DOES arrive but isn't 200 (after the `/healthz` -> `/`
+// fallback) means the process is up but broken - that's an `error`.
+//
+// Never throws/rejects on its own, same contract as checkPlatformAppHealth.
+async function checkRsshubHealth(snapshot) {
+  const baseUrl = String(snapshot.rsshubBaseUrl ?? process.env.RSSHUB_BASE_URL ?? RSSHUB_HEALTH_DEFAULT_BASE_URL)
+    .trim()
+    .replace(/\/+$/u, "") || RSSHUB_HEALTH_DEFAULT_BASE_URL;
+  const timeoutMs = Number(snapshot.rsshubHealthTimeoutMs ?? RSSHUB_HEALTH_TIMEOUT_MS);
+  const fetchImpl = typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch;
+
+  async function fetchWithTimeout(path) {
+    const url = `${baseUrl}${path}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return { url, response: await fetchImpl(url, { signal: controller.signal }) };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  let attempt;
+  try {
+    attempt = await fetchWithTimeout("/healthz");
+    if (attempt.response.status === 404) {
+      attempt = await fetchWithTimeout("/");
+    }
+  } catch (fetchError) {
+    return [warn(
+      "rsshub-health.unreachable",
+      `RSSHub 健康检查不可达（${baseUrl}）：${describeError(fetchError)}。如果这台机器还没有创建过 rsshub 容器，请先完成 P10 点火：`
+        + `${RSSHUB_P10_CONTAINER_COMMAND}；如果容器已经创建过、只是这次重启后没跟着起，请跑 pnpm launchd:install-backup-alerts 安装 com.alphaloop.rsshub 任务（负责 docker start rsshub）。`
+    )];
+  }
+
+  if (!attempt.response.ok) {
+    return [error(
+      "rsshub-health.unexpected_status",
+      `RSSHub 健康检查返回非预期状态码（${attempt.url}）：HTTP ${attempt.response.status} ${attempt.response.statusText}。容器进程可能在跑但已经异常，请检查 docker logs rsshub。`
+    )];
+  }
+
+  return [];
+}
+
+// Phase 4 Task 8 (news engine deployment wiring) - "news-engine-health"
+// check: news_events going quiet for 48h+ while the table genuinely already
+// has data means the collection pipeline (RSSHub/Finnhub/openclaw cron) has
+// silently stopped - as opposed to a fresh install that has simply never
+// collected anything yet.
+//
+// Reuses news-store.mjs's newsEngineHealthStats (not raw SQL here) per that
+// module's own header rule that all SQL/JSON access to the news tables
+// funnels through it; opens/closes its own trading-db connection
+// independently of checkAlertsPollerHealth's (failure isolation - one must
+// not depend on, or be starved by, the other).
+//
+// eventCount === 0 (fresh install, migration ran but nothing collected yet)
+// is deliberately NOT a finding at all - "no news yet" and "news stopped
+// arriving" need different signals, and this check only has one to give.
+// A non-empty table whose MAX(last_published_at) is NULL (every stored
+// event's own last_published_at is unknown, i.e. every source's
+// published_at was unknown) is treated as stale too: SQL aggregates ignore
+// NULL, so this is indistinguishable from "we cannot prove freshness" - the
+// same "never assume freshness when time is unknown" principle the plan's
+// Global Constraints apply to report rendering (recency sort/7-day window)
+// applies here too, just inverted (default to "investigate", not "silently
+// pass").
+function checkNewsEngineHealth(snapshot, nowMs) {
+  if (!snapshot.dbPath) {
+    return [];
+  }
+
+  let db;
+  try {
+    db = openTradingDatabase(snapshot.dbPath);
+  } catch (openError) {
+    return [error(
+      "news-engine-health.db_unreachable",
+      `无法打开交易数据库以检查新闻引擎状态：${describeError(openError)}`
+    )];
+  }
+
+  try {
+    const stats = newsEngineHealthStats(db);
+    if (stats.eventCount === 0) {
+      return [];
+    }
+
+    const lastMs = stats.lastPublishedAt ? Date.parse(stats.lastPublishedAt) : NaN;
+    const isStale = !Number.isFinite(lastMs) || nowMs - lastMs > NEWS_ENGINE_STALE_THRESHOLD_MS;
+    if (isStale) {
+      return [warn(
+        "news-engine-health.stale",
+        `新闻引擎超过 48 小时无新事件（news_events 共 ${stats.eventCount} 条事件，最近一次 last_published_at=${stats.lastPublishedAt ?? "未知"}）。请检查 RSSHub/Finnhub 采集与 openclaw cron 是否正常运行。`
+      )];
+    }
+
+    return [];
+  } finally {
+    db.close();
+  }
 }
 
 // task H2 (Phase 2.5 hardening) - "alerts-poller-health" check, covering two

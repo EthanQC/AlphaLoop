@@ -280,6 +280,37 @@ export function listEventsInWindow(db, { sinceIso, symbol, topic } = {}) {
   return events;
 }
 
+// Phase 4 Task 8 (news engine deployment wiring) - the openclaw-runtime-
+// doctor's `news-engine-health` check needs exactly two aggregate numbers
+// ("how many events total", "when did the freshest one last see a source")
+// to decide whether the news engine has gone quiet; this stays in
+// news-store.mjs (not inlined as raw SQL in the doctor) per this file's own
+// header rule that all SQL/JSON access to these tables funnels through here.
+//
+// MAX(last_published_at) mirrors upsertEventWithSources' own aggregate
+// write-back: SQL aggregates ignore NULL, so an all-unknown-time database
+// (every event's last_published_at is NULL) correctly yields `null` here
+// too, rather than accidentally coercing to some other falsy sentinel - the
+// doctor's caller treats a null lastPublishedAt on a non-empty table as
+// "can't prove freshness", not "fresh".
+//
+// eventCount = 0 is the fresh-install case (migration ran, nothing collected
+// yet) - the doctor's caller is expected to treat that as "nothing to report
+// yet", not "stale", so it is returned as a plain fact rather than folded
+// into any staleness judgement here.
+//
+// @param {import('node:sqlite').DatabaseSync} db
+// @returns {{eventCount: number, lastPublishedAt: string|null}}
+export function newsEngineHealthStats(db) {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS event_count, MAX(last_published_at) AS last_published_at FROM news_events`)
+    .get();
+  return {
+    eventCount: Number(row?.event_count ?? 0),
+    lastPublishedAt: row?.last_published_at ?? null
+  };
+}
+
 // ---------------------------------------------------------------------------
 // daily_facts
 // ---------------------------------------------------------------------------

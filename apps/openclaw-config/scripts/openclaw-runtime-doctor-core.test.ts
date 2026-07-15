@@ -9,6 +9,7 @@ import { openTradingDatabase } from "../../../packages/shared-types/dist/index.j
 import { recordJobRun } from "./job-run-log.mjs";
 
 const doctor = await import("./openclaw-runtime-doctor-core.mjs");
+const newsStore = await import("./news-store.mjs");
 
 // Shared "everything else is healthy" listener stub so the new task H2
 // checks below (launchd-jobs / alerts-poller-health) can be asserted on in
@@ -19,11 +20,13 @@ const HEALTHY_LISTENERS = {
 };
 
 // Phase 3 Task 8 added com.alphaloop.platform-app as a third required
-// launchd job alongside the original two from task H2.
+// launchd job alongside the original two from task H2. Phase 4 Task 8 adds
+// com.alphaloop.rsshub as a fourth.
 const ALL_LAUNCHD_JOBS_LOADED = [
   "com.alphaloop.daily-backup",
   "com.alphaloop.market-alerts",
-  "com.alphaloop.platform-app"
+  "com.alphaloop.platform-app",
+  "com.alphaloop.rsshub"
 ];
 
 // Phase 3 Task 8: analyzeOpenClawRuntimeSnapshot now always runs a real HTTP
@@ -35,6 +38,15 @@ const ALL_LAUNCHD_JOBS_LOADED = [
 // often, and this suite must not silently change behavior depending on
 // whether that's true when it runs.
 const PLATFORM_APP_HEALTH_DISABLED = { platformAppPort: 1 };
+
+// Phase 4 Task 8 (news engine deployment wiring): analyzeOpenClawRuntimeSnapshot
+// now also runs a real HTTP check against RSSHub's /healthz (see
+// checkRsshubHealth) - same hermetic-suite concern as
+// PLATFORM_APP_HEALTH_DISABLED above (a dev box legitimately running the
+// rsshub Docker container on its default port 1200 must not change this
+// suite's behavior). Port 1 refuses the connection practically instantly
+// without needing a fake listener.
+const RSSHUB_HEALTH_DISABLED = { rsshubBaseUrl: "http://127.0.0.1:1" };
 
 const tempDirs: string[] = [];
 
@@ -57,6 +69,7 @@ describe("OpenClaw runtime doctor core", () => {
   it("flags gateway restart storms and failed runner results", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [
         { pid: 100, command: "node", endpoint: "127.0.0.1:18789" }
       ],
@@ -82,6 +95,7 @@ describe("OpenClaw runtime doctor core", () => {
   it("accepts the desired steady state", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [],
       cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
@@ -95,6 +109,7 @@ describe("OpenClaw runtime doctor core", () => {
   it("does not keep failing a job after a newer successful runner result", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [],
       cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
@@ -110,6 +125,7 @@ describe("OpenClaw runtime doctor core", () => {
   it("ignores stale gateway restart errors outside the recent window", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       nowMs: Date.parse("2026-06-19T12:10:00.000Z"),
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [
@@ -124,11 +140,12 @@ describe("OpenClaw runtime doctor core", () => {
   });
 });
 
-describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app)", () => {
+describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app, Phase 4 Task 8 with rsshub)", () => {
   it("warns, but does not fail, when none of the required jobs are loaded", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: []
     });
 
@@ -136,14 +153,16 @@ describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app
     expect(report.findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "launchd-jobs.daily-backup.not_loaded", severity: "warn" }),
       expect.objectContaining({ code: "launchd-jobs.market-alerts.not_loaded", severity: "warn" }),
-      expect.objectContaining({ code: "launchd-jobs.platform-app.not_loaded", severity: "warn" })
+      expect.objectContaining({ code: "launchd-jobs.platform-app.not_loaded", severity: "warn" }),
+      expect.objectContaining({ code: "launchd-jobs.rsshub.not_loaded", severity: "warn" })
     ]));
   });
 
-  it("reports nothing for launchd-jobs once all three are loaded", async () => {
+  it("reports nothing for launchd-jobs once all four are loaded", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: [...ALL_LAUNCHD_JOBS_LOADED, "com.openclaw.gateway"]
     });
 
@@ -170,6 +189,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
       // No dbPath at all - this check must work even when the db is the
@@ -197,6 +217,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       dbPath
     });
@@ -218,6 +239,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - outside market hours
       dbPath
@@ -244,6 +266,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-13T15:00:00.000Z"), // Monday 11:00am US Eastern (EDT) - regular market hours
       dbPath
@@ -270,6 +293,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - the multi-day gap is expected off-hours
       dbPath
@@ -286,6 +310,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
     });
@@ -312,6 +337,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot,
       dbPath
@@ -345,6 +371,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2027-01-01T15:00:00.000Z"), // >30min after last run; year 2027 uncovered
       dbPath
@@ -377,6 +404,7 @@ describe("alerts-poller-health check (task H2)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - keeps this isolated from the stale-heartbeat check
       dbPath
@@ -418,6 +446,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
         ...HEALTHY_LISTENERS,
+        ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -439,6 +468,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
         ...HEALTHY_LISTENERS,
+        ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -462,6 +492,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
         ...HEALTHY_LISTENERS,
+        ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -485,6 +516,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       platformAppPort: freedPort,
       platformAppHealthTimeoutMs: 500
@@ -520,6 +552,313 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
   });
 });
 
+// Phase 4 Task 8 (news engine deployment wiring) - "rsshub-health" check:
+// proves the rsshub Docker container's own health endpoint actually answers,
+// mirroring platform-app-health's three-way split (task brief) - reachable-
+// ok, reachable-but-broken (-> error), unreachable (-> warn, naming the P10
+// ignition command since a dev machine legitimately has never created the
+// container at all) - plus the `/healthz` -> `/` fallback RSSHub itself
+// needs (older RSSHub builds only serve `/`, not `/healthz`).
+describe("rsshub-health check (Phase 4 Task 8)", () => {
+  function listenEphemeral(server: ReturnType<typeof createServer>): Promise<number> {
+    return new Promise((resolvePort) => {
+      server.listen(0, "127.0.0.1", () => {
+        resolvePort((server.address() as AddressInfo).port);
+      });
+    });
+  }
+
+  function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+    return new Promise((resolveClose) => server.close(() => resolveClose()));
+  }
+
+  it("reports nothing when /healthz responds 200", async () => {
+    const server = createServer((req, res) => {
+      if (req.url === "/healthz") {
+        res.writeHead(200);
+        res.end("OK");
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        rsshubBaseUrl: `http://127.0.0.1:${port}`
+      });
+
+      expect(report.ok).toBe(true);
+      expect(report.findings.some((finding) => finding.code.startsWith("rsshub-health."))).toBe(false);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("falls back to / when /healthz 404s, and reports nothing when that fallback responds 200", async () => {
+    const server = createServer((req, res) => {
+      if (req.url === "/healthz") {
+        res.writeHead(404);
+        res.end();
+      } else {
+        res.writeHead(200);
+        res.end("rsshub root page");
+      }
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        rsshubBaseUrl: `http://127.0.0.1:${port}`
+      });
+
+      expect(report.ok).toBe(true);
+      expect(report.findings.some((finding) => finding.code.startsWith("rsshub-health."))).toBe(false);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports an error when both /healthz and the / fallback are non-200 (reachable, but unhealthy)", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(404);
+      res.end();
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        rsshubBaseUrl: `http://127.0.0.1:${port}`
+      });
+
+      expect(report.ok).toBe(false);
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "rsshub-health.unexpected_status", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports an error when /healthz responds with a non-404, non-200 status (no fallback attempted)", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(500);
+      res.end();
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        rsshubBaseUrl: `http://127.0.0.1:${port}`
+      });
+
+      expect(report.ok).toBe(false);
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "rsshub-health.unexpected_status", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("warns, but does not fail, when nothing is listening (no container created yet / P10 not run)", async () => {
+    const probe = createServer();
+    const freedPort = await listenEphemeral(probe);
+    await closeServer(probe);
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      rsshubBaseUrl: `http://127.0.0.1:${freedPort}`,
+      rsshubHealthTimeoutMs: 500
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "rsshub-health.unreachable", severity: "warn" })
+    ]));
+    const message = report.findings.find((entry) => entry.code === "rsshub-health.unreachable")?.message;
+    expect(message).toContain("P10");
+    expect(message).toContain("docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub");
+  });
+
+  it("resolves the base URL from process.env.RSSHUB_BASE_URL when no snapshot override is given", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200);
+      res.end("OK");
+    });
+    const port = await listenEphemeral(server);
+    const previousEnv = process.env.RSSHUB_BASE_URL;
+    process.env.RSSHUB_BASE_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+        // Deliberately no rsshubBaseUrl override - must fall through to
+        // process.env.RSSHUB_BASE_URL (the real production resolution path).
+      });
+
+      expect(report.findings.some((finding) => finding.code.startsWith("rsshub-health."))).toBe(false);
+    } finally {
+      await closeServer(server);
+      if (previousEnv === undefined) {
+        delete process.env.RSSHUB_BASE_URL;
+      } else {
+        process.env.RSSHUB_BASE_URL = previousEnv;
+      }
+    }
+  });
+});
+
+// Phase 4 Task 8 (news engine deployment wiring) - "news-engine-health"
+// check: news_events going quiet for 48h+ (while genuinely having data
+// already) means the collection pipeline (RSSHub/Finnhub/openclaw cron) has
+// silently stopped, not that there's simply no news yet.
+describe("news-engine-health check (Phase 4 Task 8)", () => {
+  function seedEvent(db: InstanceType<typeof import("node:sqlite").DatabaseSync>, publishedAt: string | null): void {
+    newsStore.upsertEventWithSources(
+      db,
+      { clusterKey: `cluster-${publishedAt ?? "unknown"}`, titleZh: "美联储维持利率不变" },
+      [{
+        origin: "wallstreetcn",
+        publisher: "华尔街见闻",
+        url: publishedAt ? `https://wallstreetcn.com/articles/${Date.now()}` : null,
+        titleRaw: "美联储维持利率不变",
+        publishedAt,
+        lang: "zh"
+      }]
+    );
+  }
+
+  it("reports nothing when dbPath is not supplied at all", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+      // no dbPath
+    });
+
+    expect(report.findings.some((finding) => finding.code.startsWith("news-engine-health."))).toBe(false);
+  });
+
+  it("reports nothing on a freshly migrated database with zero news_events rows (fresh install)", async () => {
+    const dir = makeTempDir("alphaloop-doctor-news-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      dbPath
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("news-engine-health."))).toBe(false);
+  });
+
+  it("reports nothing when the freshest event's last_published_at is within the last 48 hours", async () => {
+    const dir = makeTempDir("alphaloop-doctor-news-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    seedEvent(db, "2026-07-13T12:00:00.000Z");
+    db.close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // 24h later
+      dbPath
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("news-engine-health."))).toBe(false);
+  });
+
+  it("warns when the freshest event's last_published_at is more than 48 hours old", async () => {
+    const dir = makeTempDir("alphaloop-doctor-news-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    seedEvent(db, "2026-07-10T00:00:00.000Z");
+    db.close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // >48h later
+      dbPath
+    });
+
+    expect(report.ok).toBe(true); // warn only - never flips the overall report to failing
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "news-engine-health.stale", severity: "warn" })
+    ]));
+    const message = report.findings.find((entry) => entry.code === "news-engine-health.stale")?.message;
+    expect(message).toContain("新闻引擎超过 48 小时无新事件");
+  });
+
+  it("treats an all-unknown-time news_events table (count > 0, MAX(last_published_at) NULL) as stale too", async () => {
+    const dir = makeTempDir("alphaloop-doctor-news-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    seedEvent(db, null);
+    db.close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      dbPath
+    });
+
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "news-engine-health.stale", severity: "warn" })
+    ]));
+  });
+
+  it("reports an error (never throws) when the trading db cannot even be opened", async () => {
+    const dir = makeTempDir("alphaloop-doctor-news-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    writeFileSync(dbPath, "not a real sqlite file, just garbage bytes");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      dbPath
+    });
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "news-engine-health.db_unreachable", severity: "error" })
+    ]));
+  });
+});
+
 // task H2 fix round (this task, CRITICAL finding): the doctor is this
 // system's only external observer - if any ONE check throws, the whole
 // process used to die with it, printing NOTHING (not even findings other
@@ -540,6 +879,7 @@ describe("failure isolation across checks (task H2 fix round)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: [],
       recentRunnerResults: [throwingRunnerResult]
     });
