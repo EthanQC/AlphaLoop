@@ -2124,6 +2124,31 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     expect(repo.sumOpenNotionalForOwner("mem_other")).toBe(10_000);
   });
 
+  it("save() upsert protects an already-assigned ticket_id (audit #2 direction): a later same-order write cannot overwrite it, only fill a null one", () => {
+    const { db, repo } = setup();
+    const base = {
+      id: "life_1", externalOrderId: "EXT-1", provider: "longbridge-paper", environment: "paper",
+      accountMode: "paper", symbol: "AAPL.US", assetClass: "stock" as const, side: "buy" as const,
+      quantity: 1, limitPrice: 100, brokerStatus: "New", localStatus: "accepted",
+      lifecycleStage: "submitted" as const, submittedAt: nowIso(), lastObservedAt: nowIso(),
+      raw: null, notes: []
+    };
+    // First write carries the authoritative ticket id.
+    repo.save({ ...base, ticketId: "ticket_correct" });
+    // A later reconcile-style write of the SAME external order guesses a wrong
+    // ticket id - it must NOT overwrite the authoritative one.
+    repo.save({ ...base, ticketId: "ticket_WRONG", brokerStatus: "Filled", lifecycleStage: "filled" });
+    const row = db.prepare("SELECT ticket_id, broker_status FROM official_paper_order_lifecycle WHERE external_order_id = 'EXT-1'").get() as { ticket_id: string; broker_status: string };
+    expect(row.ticket_id).toBe("ticket_correct");
+    expect(row.broker_status).toBe("Filled"); // other fields still update
+
+    // But a currently-null ticket_id IS fillable by a later write.
+    repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2", ticketId: null });
+    repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2", ticketId: "ticket_filled_in" });
+    const row2 = db.prepare("SELECT ticket_id FROM official_paper_order_lifecycle WHERE external_order_id = 'EXT-2'").get() as { ticket_id: string };
+    expect(row2.ticket_id).toBe("ticket_filled_in");
+  });
+
   it("countSubmittedTodayForOwner counts only rows at/after the given day-start for that owner", () => {
     const { repo } = setup();
     repo.insertSubmitting({

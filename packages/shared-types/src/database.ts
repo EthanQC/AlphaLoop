@@ -769,7 +769,14 @@ export class OfficialPaperOrderLifecycleRepository {
          last_observed_at, raw, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(external_order_id) DO UPDATE SET
-          ticket_id = COALESCE(excluded.ticket_id, official_paper_order_lifecycle.ticket_id),
+          -- Protect an already-assigned ticket_id: an existing non-null value
+          -- WINS, and an incoming value only fills a currently-null one. The
+          -- reverse direction (excluded first) was audit finding #2 - a later
+          -- same-order upsert carrying a guessed/wrong ticket overwrote the
+          -- authoritative one. Task 5 rerouted reconcile off this method, but
+          -- it stays a public repository upsert, so the safe direction is
+          -- pinned here (plan Global Constraint: 永不覆盖已有非空 ticket_id).
+          ticket_id = COALESCE(official_paper_order_lifecycle.ticket_id, excluded.ticket_id),
           provider = excluded.provider,
           environment = excluded.environment,
           account_mode = excluded.account_mode,
