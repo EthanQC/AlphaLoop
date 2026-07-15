@@ -6,7 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   ExecutionReport,
   Member,
-  OfficialPaperOrderLifecycle
+  OfficialPaperOrderLifecycle,
+  Proposal,
+  ProposalConfidence,
+  ProposalStatus
 } from "./domain.js";
 import { createId, nowIso } from "./domain.js";
 
@@ -36,7 +39,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -508,6 +511,33 @@ const MIGRATIONS: MigrationStep[] = [
         UNIQUE(trading_day, symbol, fact_key));
       CREATE INDEX stock_facts_symbol_day_idx ON stock_facts(symbol, trading_day);
     `);
+  },
+  (db) => {
+    // Phase 6 Task 1 (2026-07-15 plan): circuit_breaker_state is the
+    // per-owner circuit-breaker's persisted state - a row's mere EXISTENCE
+    // with paused_until in the future means "new proposal generation is
+    // paused for this owner" (Task 2's assertProposalAllowed/isPaused reads
+    // it that way), so a trip survives process restarts. A brand-new table,
+    // no rebuild of anything pre-existing - a plain step suffices (no
+    // needsForeignKeysOff). DDL is spec-frozen VERBATIM from the plan's
+    // Global Constraints (column list/order/types/constraints unchanged;
+    // only whitespace reflowed for readability, matching how v8/v9 already
+    // treat their own spec-frozen DDL) - do not hand-edit without updating
+    // the plan doc first.
+    //
+    // owner_id is the PRIMARY KEY (one row per owner, not history) and a
+    // real FK to members(id) - unlike news/stock_facts tables, this data is
+    // inherently per-member, so there is no shared/sentinel-owner case to
+    // consider here.
+    db.exec(`
+      CREATE TABLE circuit_breaker_state (
+        owner_id TEXT PRIMARY KEY REFERENCES members(id),
+        paused_until TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        weekly_loss_pct REAL,
+        tripped_at TEXT NOT NULL
+      );
+    `);
   }
 ];
 
@@ -845,6 +875,304 @@ export class ApiTokenRepository {
   }
 }
 
+// Input to ProposalRepository.create(): every Proposal field EXCEPT the ones
+// the repository itself computes (id, approvalToken via createId; status
+// always starts 'pending'; consumedAt/decidedAt/decidedBy/ticketId/outcome/
+// cardMessageId all start unset - they are only ever written by the later
+// state-transition methods below; createdAt via nowIso()). expiresAt is
+// deliberately NOT omitted - the plan requires it as a caller-supplied,
+// required field ("expires_at required"): Task 1 does not own the +24h
+// computation policy (that lands with the CLI in Task 3), it only enforces
+// that some expiry is always present. evidence/disciplineReport are widened
+// back to optional (defaulting to `[]`) since most callers building a
+// proposal from scratch have neither yet.
+export type NewProposal = Omit<
+  Proposal,
+  | "id"
+  | "status"
+  | "approvalToken"
+  | "consumedAt"
+  | "decidedAt"
+  | "decidedBy"
+  | "ticketId"
+  | "outcome"
+  | "cardMessageId"
+  | "createdAt"
+  | "evidence"
+  | "disciplineReport"
+> & {
+  evidence?: Proposal["evidence"];
+  disciplineReport?: Proposal["disciplineReport"];
+};
+
+export type ProposalDecision = "approved" | "approved_half" | "rejected" | "expired";
+
+export interface ConsumeApprovalInput {
+  decision: ProposalDecision;
+  decidedBy: string;
+  decidedAt: string;
+}
+
+export interface ConsumeApprovalResult {
+  consumed: boolean;
+  proposal?: Proposal;
+}
+
+// Maps a consumeApproval `decision` to the `proposals.status` value it writes.
+// Written as an explicit switch (not treated as an identity function even
+// though today decision and status values happen to read the same) so a
+// future divergence between the two vocabularies fails to compile instead of
+// silently writing the wrong status.
+function decisionToStatus(decision: ProposalDecision): ProposalStatus {
+  switch (decision) {
+    case "approved":
+      return "approved";
+    case "approved_half":
+      return "approved_half";
+    case "rejected":
+      return "rejected";
+    case "expired":
+      return "expired";
+    default: {
+      const exhaustive: never = decision;
+      throw new Error(`Unknown proposal decision: ${String(exhaustive)}`);
+    }
+  }
+}
+
+export class ProposalRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  create(input: NewProposal): Proposal {
+    if (!input.expiresAt) {
+      throw new Error("Proposal.expiresAt is required.");
+    }
+
+    const id = createId("proposal");
+    const approvalToken = createId("approval");
+    const createdAt = nowIso();
+    const evidence = input.evidence ?? [];
+    const disciplineReport = input.disciplineReport ?? [];
+
+    this.db
+      .prepare(`
+        INSERT INTO proposals
+        (id, owner_id, symbol, side, quantity, order_type, limit_price, reason, evidence, strategy_ref,
+         discipline_report, invalidation, stop_loss, budget_impact, confidence, status, approval_token,
+         consumed_at, decided_at, decided_by, ticket_id, outcome, card_message_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+      `)
+      .run(
+        id,
+        input.ownerId,
+        input.symbol,
+        input.side,
+        input.quantity,
+        input.orderType,
+        input.limitPrice ?? null,
+        input.reason,
+        toJson(evidence),
+        input.strategyRef ?? null,
+        toJson(disciplineReport),
+        input.invalidation ?? null,
+        input.stopLoss ?? null,
+        input.budgetImpact ?? null,
+        input.confidence ?? null,
+        approvalToken,
+        createdAt,
+        input.expiresAt
+      );
+
+    return {
+      id,
+      ownerId: input.ownerId,
+      symbol: input.symbol,
+      side: input.side,
+      quantity: input.quantity,
+      orderType: input.orderType,
+      ...(input.limitPrice !== undefined ? { limitPrice: input.limitPrice } : {}),
+      reason: input.reason,
+      evidence,
+      ...(input.strategyRef !== undefined ? { strategyRef: input.strategyRef } : {}),
+      disciplineReport,
+      ...(input.invalidation !== undefined ? { invalidation: input.invalidation } : {}),
+      ...(input.stopLoss !== undefined ? { stopLoss: input.stopLoss } : {}),
+      ...(input.budgetImpact !== undefined ? { budgetImpact: input.budgetImpact } : {}),
+      ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
+      status: "pending",
+      approvalToken,
+      createdAt,
+      expiresAt: input.expiresAt
+    };
+  }
+
+  getById(id: string): Proposal | null {
+    const row = this.db
+      .prepare(`SELECT * FROM proposals WHERE id = ? LIMIT 1`)
+      .get(id) as Record<string, unknown> | undefined;
+
+    return row ? mapProposal(row) : null;
+  }
+
+  getByToken(token: string): Proposal | null {
+    const row = this.db
+      .prepare(`SELECT * FROM proposals WHERE approval_token = ? LIMIT 1`)
+      .get(token) as Record<string, unknown> | undefined;
+
+    return row ? mapProposal(row) : null;
+  }
+
+  // THE single atomic status-transition channel (plan Global Constraint:
+  // "approval_token 原子消费...唯一的状态跃迁通道") - approval-button clicks, the
+  // CLI's approve/approve-half/reject, and the expiry sweep all route through
+  // this one method, never write `status`/`consumed_at` directly. The UPDATE's
+  // WHERE clause (`approval_token = ? AND consumed_at IS NULL`) is the whole
+  // concurrency guarantee: SQLite executes one write at a time, so of any
+  // number of callers racing to consume the same token, exactly one UPDATE
+  // will find consumed_at still NULL and flip it (changes === 1); every other
+  // racing caller's UPDATE matches zero rows (changes === 0) and gets
+  // `{consumed:false}` back - a duplicate-consumption attempt, not an error.
+  consumeApproval(token: string, input: ConsumeApprovalInput): ConsumeApprovalResult {
+    const status = decisionToStatus(input.decision);
+    const result = this.db
+      .prepare(`
+        UPDATE proposals
+        SET status = ?, consumed_at = ?, decided_at = ?, decided_by = ?
+        WHERE approval_token = ? AND consumed_at IS NULL
+      `)
+      .run(status, input.decidedAt, input.decidedAt, input.decidedBy, token);
+
+    if (Number(result.changes) !== 1) {
+      return { consumed: false };
+    }
+
+    const proposal = this.getByToken(token);
+    return proposal ? { consumed: true, proposal } : { consumed: true };
+  }
+
+  // Idempotent: re-calling with the SAME ticketId after a proposal is already
+  // marked executed with that ticketId is a no-op (the UPDATE just rewrites
+  // the same values) - this matters because the broker-executor's
+  // record-before-execute retry path (Task 4) may call this more than once
+  // for the same successful execution. A DIFFERENT ticketId on an
+  // already-executed proposal is refused loudly: a proposal is "one ticket at
+  // most" (plan: "幂等键=proposal id（一提案至多一单）"), so silently
+  // overwriting would hide a double-execution bug rather than surface it.
+  markExecuted(id: string, ticketId: string): void {
+    const existing = this.getById(id);
+    if (!existing) {
+      throw new Error(`Proposal ${id} not found.`);
+    }
+    if (existing.ticketId !== undefined && existing.ticketId !== ticketId) {
+      throw new Error(
+        `Proposal ${id} already executed with ticket ${existing.ticketId}; refusing to overwrite with ${ticketId}.`
+      );
+    }
+
+    this.db
+      .prepare(`UPDATE proposals SET status = 'executed', ticket_id = ? WHERE id = ?`)
+      .run(ticketId, id);
+  }
+
+  markFailed(id: string, reason: string): void {
+    const result = this.db
+      .prepare(`UPDATE proposals SET status = 'failed', outcome = ? WHERE id = ?`)
+      .run(reason, id);
+
+    if (Number(result.changes) === 0) {
+      throw new Error(`Proposal ${id} not found.`);
+    }
+  }
+
+  // `nowIso` here is a caller-supplied comparison timestamp (the sweep's
+  // "now"), not this module's `nowIso()` clock helper - it shadows that
+  // import within this method's body only, which is safe because this
+  // method never needs to call the clock itself.
+  listPendingExpired(nowIso: string): Proposal[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM proposals WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at ASC`)
+      .all(nowIso) as Array<Record<string, unknown>>;
+
+    return rows.map(mapProposal);
+  }
+
+  updateCardMessageId(id: string, messageId: string): void {
+    const result = this.db
+      .prepare(`UPDATE proposals SET card_message_id = ? WHERE id = ?`)
+      .run(messageId, id);
+
+    if (Number(result.changes) === 0) {
+      throw new Error(`Proposal ${id} not found.`);
+    }
+  }
+}
+
+export interface CircuitBreakerState {
+  ownerId: string;
+  pausedUntil: string;
+  reason: string;
+  weeklyLossPct?: number;
+  trippedAt: string;
+}
+
+export interface TripCircuitBreakerInput {
+  pausedUntil: string;
+  reason: string;
+  weeklyLossPct?: number;
+}
+
+export class CircuitBreakerRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  getState(ownerId: string): CircuitBreakerState | null {
+    const row = this.db
+      .prepare(`SELECT * FROM circuit_breaker_state WHERE owner_id = ? LIMIT 1`)
+      .get(ownerId) as Record<string, unknown> | undefined;
+
+    return row ? mapCircuitBreakerState(row) : null;
+  }
+
+  // Upsert: one row per owner (owner_id is the PRIMARY KEY), so re-tripping
+  // an already-paused owner (e.g. a later, worse weekly-loss reading) simply
+  // replaces the prior pause window/reason/trippedAt rather than erroring.
+  trip(ownerId: string, input: TripCircuitBreakerInput): void {
+    const trippedAt = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(owner_id) DO UPDATE SET
+          paused_until = excluded.paused_until,
+          reason = excluded.reason,
+          weekly_loss_pct = excluded.weekly_loss_pct,
+          tripped_at = excluded.tripped_at
+      `)
+      .run(ownerId, input.pausedUntil, input.reason, input.weeklyLossPct ?? null, trippedAt);
+  }
+
+  // Deletes a stale (already-expired) pause row outright, rather than
+  // leaving it around with a past paused_until - isPaused's own
+  // `paused_until > now` check would already treat an expired row as "not
+  // paused", but a stale row left in place would misreport the OWNER's last
+  // trip reason/timestamp indefinitely to anything reading getState()
+  // directly (e.g. a platform "last circuit trip" history view).
+  clearIfExpired(ownerId: string, now: string): boolean {
+    const result = this.db
+      .prepare(`DELETE FROM circuit_breaker_state WHERE owner_id = ? AND paused_until <= ?`)
+      .run(ownerId, now);
+
+    return Number(result.changes) > 0;
+  }
+
+  isPaused(ownerId: string, now: string): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 FROM circuit_breaker_state WHERE owner_id = ? AND paused_until > ? LIMIT 1`)
+      .get(ownerId, now);
+
+    return row !== undefined;
+  }
+}
+
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -893,4 +1221,46 @@ function mapOfficialPaperOrderLifecycle(row: Record<string, unknown>): OfficialP
   }
 
   return lifecycle;
+}
+
+function mapProposal(row: Record<string, unknown>): Proposal {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    symbol: String(row.symbol),
+    side: String(row.side) as Proposal["side"],
+    quantity: Number(row.quantity),
+    orderType: String(row.order_type),
+    ...(row.limit_price !== null && row.limit_price !== undefined ? { limitPrice: Number(row.limit_price) } : {}),
+    reason: String(row.reason),
+    evidence: fromJson<Proposal["evidence"]>(String(row.evidence)) ?? [],
+    ...(row.strategy_ref ? { strategyRef: String(row.strategy_ref) } : {}),
+    disciplineReport: fromJson<Proposal["disciplineReport"]>(String(row.discipline_report)) ?? [],
+    ...(row.invalidation ? { invalidation: String(row.invalidation) } : {}),
+    ...(row.stop_loss !== null && row.stop_loss !== undefined ? { stopLoss: Number(row.stop_loss) } : {}),
+    ...(row.budget_impact !== null && row.budget_impact !== undefined ? { budgetImpact: Number(row.budget_impact) } : {}),
+    ...(row.confidence ? { confidence: String(row.confidence) as ProposalConfidence } : {}),
+    status: String(row.status) as Proposal["status"],
+    ...(row.approval_token ? { approvalToken: String(row.approval_token) } : {}),
+    ...(row.consumed_at ? { consumedAt: String(row.consumed_at) } : {}),
+    ...(row.decided_at ? { decidedAt: String(row.decided_at) } : {}),
+    ...(row.decided_by ? { decidedBy: String(row.decided_by) } : {}),
+    ...(row.ticket_id ? { ticketId: String(row.ticket_id) } : {}),
+    ...(row.outcome ? { outcome: String(row.outcome) } : {}),
+    ...(row.card_message_id ? { cardMessageId: String(row.card_message_id) } : {}),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at)
+  };
+}
+
+function mapCircuitBreakerState(row: Record<string, unknown>): CircuitBreakerState {
+  return {
+    ownerId: String(row.owner_id),
+    pausedUntil: String(row.paused_until),
+    reason: String(row.reason),
+    ...(row.weekly_loss_pct !== null && row.weekly_loss_pct !== undefined
+      ? { weeklyLossPct: Number(row.weekly_loss_pct) }
+      : {}),
+    trippedAt: String(row.tripped_at)
+  };
 }

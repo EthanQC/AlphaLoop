@@ -5,8 +5,11 @@ import {
   getSchemaVersion,
   SCHEMA_VERSION,
   MemberRepository,
-  ApiTokenRepository
+  ApiTokenRepository,
+  ProposalRepository,
+  CircuitBreakerRepository
 } from "./database.js";
+import type { NewProposal } from "./database.js";
 import type { Member } from "./domain.js";
 import { nowIso } from "./domain.js";
 
@@ -852,8 +855,9 @@ const V7_TABLE_NAMES = [
 // pre-v8 production db would be in.
 function buildSeededV7Database(): DatabaseSync {
   const db = memoryDb();
-  migrate(db); // builds the full v0..v9 schema using the real migration code
+  migrate(db); // builds the full v0..v10 schema using the real migration code
   db.exec(`
+    DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
     DROP TABLE IF EXISTS stock_facts;
     DROP INDEX IF EXISTS news_event_sources_event_idx;
@@ -1127,6 +1131,7 @@ function buildSeededV8Database(): DatabaseSync {
   const db = buildSeededV7Database();
   migrate(db);
   db.exec(`
+    DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
     DROP TABLE IF EXISTS stock_facts;
   `);
@@ -1156,15 +1161,14 @@ function buildSeededV8Database(): DatabaseSync {
 }
 
 describe("v9 stock_facts table migration (Phase 5 Task 1)", () => {
-  it("SCHEMA_VERSION is 9", () => {
-    expect(SCHEMA_VERSION).toBe(9);
-  });
-
-  it("a fresh db lands directly at v9, with the stock_facts table and its index present", () => {
+  // SCHEMA_VERSION has since moved on to v10 (Phase 6 Task 1, circuit breaker
+  // state) - see the "v10 circuit_breaker_state" describe block below for the
+  // current-version assertion.
+  it("a fresh db lands directly at the latest version, with the stock_facts table and its index present", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(9);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
     expect(tables.map((t) => t.name)).toContain("stock_facts");
@@ -1173,7 +1177,7 @@ describe("v9 stock_facts table migration (Phase 5 Task 1)", () => {
     expect(indexes.map((i) => i.name)).toContain("stock_facts_symbol_day_idx");
   });
 
-  it("upgrades a v8 db with data in every pre-existing table to v9 with zero row loss, and is idempotent", () => {
+  it("upgrades a v8 db with data in every pre-existing table to the latest version (through v9 and v10) with zero row loss, and is idempotent", () => {
     const db = buildSeededV8Database();
     expect(getSchemaVersion(db)).toBe(8);
 
@@ -1185,17 +1189,18 @@ describe("v9 stock_facts table migration (Phase 5 Task 1)", () => {
 
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(9);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     for (const table of V8_TABLE_NAMES) {
       expect(countRows(db, table)).toBe(countsBefore[table]);
     }
 
-    // New table exists and starts empty.
+    // New tables exist and start empty.
     expect(countRows(db, "stock_facts")).toBe(0);
+    expect(countRows(db, "circuit_breaker_state")).toBe(0);
 
-    // Idempotent: calling migrate() again on an already-v9 db changes nothing.
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
     migrate(db);
-    expect(getSchemaVersion(db)).toBe(9);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     for (const table of V8_TABLE_NAMES) {
       expect(countRows(db, table)).toBe(countsBefore[table]);
     }
@@ -1242,5 +1247,560 @@ describe("v9 stock_facts table migration (Phase 5 Task 1)", () => {
         `)
         .run(now, now)
     ).not.toThrow();
+  });
+});
+
+// All tables that exist as of v9 (V8_TABLE_NAMES plus v9's own stock_facts) -
+// used by the v10 migration test below to assert the v10 step
+// (circuit_breaker_state) is purely additive and touches none of them.
+const V9_TABLE_NAMES = [...V8_TABLE_NAMES, "stock_facts"];
+
+// Builds a REAL v9 database: starts from buildSeededV8Database() (v0..v8
+// tables seeded, v9/v10 tables absent, user_version=8), runs the real
+// migrate() (which - now that v10 exists - advances through BOTH the v9 and
+// v10 steps in one call), then rolls JUST the v10-only circuit_breaker_state
+// table back off and resets user_version to 9. Same "build via the real
+// migration code, then peel off the newest step" technique buildSeededV7/
+// V8Database already use, kept one level up so this fixture stays a faithful
+// v9 snapshot no matter how many later schema versions get added on top.
+function buildSeededV9Database(): DatabaseSync {
+  const db = buildSeededV8Database();
+  migrate(db);
+  db.exec(`DROP TABLE IF EXISTS circuit_breaker_state;`);
+  db.exec("PRAGMA user_version = 9");
+
+  const now = nowIso();
+
+  db.prepare(`
+    INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+    VALUES ('stock_fact_v9', '2026-07-14', 'AAPL.US', 'quote.last', 210.5, NULL, 'USD', 'longbridge-quote', ?, ?)
+  `).run(now, now);
+
+  return db;
+}
+
+describe("v10 circuit_breaker_state table migration (Phase 6 Task 1)", () => {
+  it("SCHEMA_VERSION is 10", () => {
+    expect(SCHEMA_VERSION).toBe(10);
+  });
+
+  it("a fresh db lands directly at v10, with the circuit_breaker_state table present (columns/PK/NOT NULL exactly per the plan's frozen DDL)", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(10);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("circuit_breaker_state");
+
+    const columns = db.prepare("PRAGMA table_info(circuit_breaker_state)").all() as Array<
+      { name: string; notnull: number; pk: number }
+    >;
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+    expect(Object.keys(byName).sort()).toEqual(
+      ["owner_id", "paused_until", "reason", "weekly_loss_pct", "tripped_at"].sort()
+    );
+    expect(byName.owner_id.pk).toBe(1);
+    expect(byName.paused_until.notnull).toBe(1);
+    expect(byName.reason.notnull).toBe(1);
+    expect(byName.weekly_loss_pct.notnull).toBe(0);
+    expect(byName.tripped_at.notnull).toBe(1);
+  });
+
+  it("upgrades a v9 db with data in every pre-existing table to v10 with zero row loss, and is idempotent", () => {
+    const db = buildSeededV9Database();
+    expect(getSchemaVersion(db)).toBe(9);
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V9_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      expect(countsBefore[table]).toBeGreaterThan(0);
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V9_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // New table exists and starts empty.
+    expect(countRows(db, "circuit_breaker_state")).toBe(0);
+
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V9_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+
+  it("enforces circuit_breaker_state.owner_id FK to members(id)", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+          VALUES ('ghost_member', ?, 'weekly loss > 3%', -0.05, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/FOREIGN KEY constraint failed/);
+
+    db.prepare(`
+      INSERT INTO members (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
+      VALUES ('mem_cb_fk', 'cb-fk@example.com', NULL, 'CB FK Member', '[]', '[]', 1, 'active', ?)
+    `).run(now);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+          VALUES ('mem_cb_fk', ?, 'weekly loss > 3%', -0.05, ?)
+        `)
+        .run(now, now)
+    ).not.toThrow();
+  });
+});
+
+function seedMember(db: DatabaseSync, id: string): void {
+  db
+    .prepare(`
+      INSERT INTO members (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
+      VALUES (?, ?, ?, ?, '[]', '[]', 1, 'active', ?)
+    `)
+    .run(id, `${id}@example.com`, `ou_${id}`, id, nowIso());
+}
+
+function baseNewProposal(overrides: Partial<NewProposal> = {}): NewProposal {
+  return {
+    ownerId: "mem_owner",
+    symbol: "AAPL.US",
+    side: "buy",
+    quantity: 10,
+    orderType: "market",
+    reason: "seed reason",
+    expiresAt: "2026-07-16T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+describe("ProposalRepository", () => {
+  describe("create", () => {
+    it("writes a pending row with a generated id/approval_token and round-trips via getById", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal());
+
+      expect(proposal.status).toBe("pending");
+      expect(proposal.id).toMatch(/^proposal_/);
+      expect(proposal.approvalToken).toMatch(/^approval_/);
+      expect(proposal.consumedAt).toBeUndefined();
+      expect(proposal.decidedAt).toBeUndefined();
+      expect(proposal.ticketId).toBeUndefined();
+      expect(proposal.evidence).toEqual([]);
+      expect(proposal.disciplineReport).toEqual([]);
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded).toEqual(proposal);
+    });
+
+    it("round-trips optional fields (limitPrice/strategyRef/invalidation/stopLoss/budgetImpact/confidence/evidence/disciplineReport) when supplied", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(
+        baseNewProposal({
+          orderType: "limit",
+          limitPrice: 123.45,
+          strategyRef: "strategy_1",
+          invalidation: "breaks below 100",
+          stopLoss: 95,
+          budgetImpact: 0.02,
+          confidence: "high",
+          evidence: ["https://example.com/a"],
+          disciplineReport: [{ ruleId: "rule_1", pass: true }]
+        })
+      );
+
+      expect(proposal.limitPrice).toBe(123.45);
+      expect(proposal.strategyRef).toBe("strategy_1");
+      expect(proposal.invalidation).toBe("breaks below 100");
+      expect(proposal.stopLoss).toBe(95);
+      expect(proposal.budgetImpact).toBe(0.02);
+      expect(proposal.confidence).toBe("high");
+      expect(proposal.evidence).toEqual(["https://example.com/a"]);
+      expect(proposal.disciplineReport).toEqual([{ ruleId: "rule_1", pass: true }]);
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded).toEqual(proposal);
+    });
+
+    it("requires expiresAt", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      expect(() => repo.create(baseNewProposal({ expiresAt: "" }))).toThrow(/expiresAt is required/);
+    });
+
+    it("rejects an owner_id that does not reference an existing member (FK)", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      expect(() => repo.create(baseNewProposal({ ownerId: "ghost_member" }))).toThrow(
+        /FOREIGN KEY constraint failed/
+      );
+    });
+  });
+
+  describe("getById / getByToken", () => {
+    it("return null for an unknown id/token", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      expect(repo.getById("proposal_nope")).toBeNull();
+      expect(repo.getByToken("approval_nope")).toBeNull();
+    });
+
+    it("getByToken finds the same row getById does", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal());
+      expect(repo.getByToken(proposal.approvalToken!)).toEqual(proposal);
+    });
+  });
+
+  describe("consumeApproval", () => {
+    it("atomically transitions pending -> approved, sets consumed_at/decided_at/decided_by, and returns the reloaded proposal", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal());
+      const decidedAt = nowIso();
+
+      const result = repo.consumeApproval(proposal.approvalToken!, {
+        decision: "approved",
+        decidedBy: "mem_owner",
+        decidedAt
+      });
+
+      expect(result.consumed).toBe(true);
+      expect(result.proposal?.status).toBe("approved");
+      expect(result.proposal?.consumedAt).toBe(decidedAt);
+      expect(result.proposal?.decidedAt).toBe(decidedAt);
+      expect(result.proposal?.decidedBy).toBe("mem_owner");
+    });
+
+    it.each([
+      ["approved", "approved"],
+      ["approved_half", "approved_half"],
+      ["rejected", "rejected"],
+      ["expired", "expired"]
+    ] as const)("maps decision %s to status %s", (decision, expectedStatus) => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal());
+      const result = repo.consumeApproval(proposal.approvalToken!, {
+        decision,
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+
+      expect(result.consumed).toBe(true);
+      expect(result.proposal?.status).toBe(expectedStatus);
+    });
+
+    it("returns {consumed:false} for an unknown token", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      const result = repo.consumeApproval("approval_nope", {
+        decision: "approved",
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+
+      expect(result).toEqual({ consumed: false });
+    });
+
+    // CONCURRENCY (plan Task 1 requirement): two consumeApproval calls
+    // against the SAME token. SQLite serializes writes on a single
+    // connection, so this exercises the exact guarantee the atomic
+    // `WHERE approval_token = ? AND consumed_at IS NULL` UPDATE provides -
+    // of any number of racing consumers, exactly one observes changes===1.
+    it("of two consumeApproval calls racing on the same token, exactly one succeeds - the second is a rejected duplicate, not an error, and does not overwrite the first decision", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal());
+
+      const first = repo.consumeApproval(proposal.approvalToken!, {
+        decision: "approved",
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+      const second = repo.consumeApproval(proposal.approvalToken!, {
+        decision: "rejected",
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+
+      expect(first.consumed).toBe(true);
+      expect(second.consumed).toBe(false);
+      expect(second.proposal).toBeUndefined();
+
+      // The second (losing) call's decision never took effect.
+      const final = repo.getById(proposal.id);
+      expect(final?.status).toBe("approved");
+    });
+  });
+
+  describe("markExecuted", () => {
+    it("sets status executed and ticket_id", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.markExecuted(proposal.id, "ticket_1");
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.status).toBe("executed");
+      expect(reloaded?.ticketId).toBe("ticket_1");
+    });
+
+    it("is idempotent: re-calling with the SAME ticketId is a no-op", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.markExecuted(proposal.id, "ticket_1");
+      expect(() => repo.markExecuted(proposal.id, "ticket_1")).not.toThrow();
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.status).toBe("executed");
+      expect(reloaded?.ticketId).toBe("ticket_1");
+    });
+
+    it("throws when re-called with a DIFFERENT ticketId", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.markExecuted(proposal.id, "ticket_1");
+      expect(() => repo.markExecuted(proposal.id, "ticket_2")).toThrow(/already executed with ticket ticket_1/);
+
+      // Original ticket_id is preserved, not overwritten by the refused call.
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.ticketId).toBe("ticket_1");
+    });
+
+    it("throws for an unknown proposal id", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      expect(() => repo.markExecuted("proposal_nope", "ticket_1")).toThrow(/not found/);
+    });
+  });
+
+  describe("markFailed", () => {
+    it("sets status failed and outcome", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.markFailed(proposal.id, "broker executor unreachable");
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.status).toBe("failed");
+      expect(reloaded?.outcome).toBe("broker executor unreachable");
+    });
+
+    it("throws for an unknown proposal id", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      expect(() => repo.markFailed("proposal_nope", "x")).toThrow(/not found/);
+    });
+  });
+
+  describe("listPendingExpired", () => {
+    it("returns only pending rows whose expires_at <= the given now, ordered by expires_at ascending", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const expired1 = repo.create(baseNewProposal({ symbol: "AAPL.US", expiresAt: "2026-07-14T00:00:00.000Z" }));
+      const expired2 = repo.create(baseNewProposal({ symbol: "MSFT.US", expiresAt: "2026-07-13T00:00:00.000Z" }));
+      const notYetExpired = repo.create(
+        baseNewProposal({ symbol: "TSLA.US", expiresAt: "2026-07-20T00:00:00.000Z" })
+      );
+      const alreadyDecided = repo.create(
+        baseNewProposal({ symbol: "NVDA.US", expiresAt: "2026-07-10T00:00:00.000Z" })
+      );
+      repo.consumeApproval(alreadyDecided.approvalToken!, {
+        decision: "approved",
+        decidedBy: "mem_owner",
+        decidedAt: nowIso()
+      });
+
+      const results = repo.listPendingExpired("2026-07-15T00:00:00.000Z");
+
+      expect(results.map((p) => p.id)).toEqual([expired2.id, expired1.id]);
+      expect(results.map((p) => p.id)).not.toContain(notYetExpired.id);
+      expect(results.map((p) => p.id)).not.toContain(alreadyDecided.id);
+    });
+  });
+
+  describe("updateCardMessageId", () => {
+    it("updates card_message_id", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.updateCardMessageId(proposal.id, "om_msg_1");
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.cardMessageId).toBe("om_msg_1");
+    });
+
+    it("throws for an unknown proposal id", () => {
+      const db = memoryDb();
+      migrate(db);
+      const repo = new ProposalRepository(db);
+
+      expect(() => repo.updateCardMessageId("proposal_nope", "om_msg_1")).toThrow(/not found/);
+    });
+  });
+});
+
+describe("CircuitBreakerRepository", () => {
+  it("getState returns null when no row exists", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    expect(repo.getState("mem_owner")).toBeNull();
+  });
+
+  it("trip creates a paused row that getState/isPaused observe", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    repo.trip("mem_owner", { pausedUntil: "2026-07-21T00:00:00.000Z", reason: "周亏超过 3%", weeklyLossPct: -0.041 });
+
+    const state = repo.getState("mem_owner");
+    expect(state?.ownerId).toBe("mem_owner");
+    expect(state?.pausedUntil).toBe("2026-07-21T00:00:00.000Z");
+    expect(state?.reason).toBe("周亏超过 3%");
+    expect(state?.weeklyLossPct).toBe(-0.041);
+    expect(state?.trippedAt).toBeTruthy();
+
+    expect(repo.isPaused("mem_owner", "2026-07-15T00:00:00.000Z")).toBe(true);
+    expect(repo.isPaused("mem_owner", "2026-07-22T00:00:00.000Z")).toBe(false);
+  });
+
+  it("isPaused returns false when no row exists at all", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    expect(repo.isPaused("mem_owner", nowIso())).toBe(false);
+  });
+
+  it("trip upserts: re-tripping an already-paused owner replaces the prior window/reason, one row per owner", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    repo.trip("mem_owner", { pausedUntil: "2026-07-21T00:00:00.000Z", reason: "first trip", weeklyLossPct: -0.031 });
+    repo.trip("mem_owner", { pausedUntil: "2026-07-28T00:00:00.000Z", reason: "second trip", weeklyLossPct: -0.05 });
+
+    const state = repo.getState("mem_owner");
+    expect(state?.pausedUntil).toBe("2026-07-28T00:00:00.000Z");
+    expect(state?.reason).toBe("second trip");
+    expect(state?.weeklyLossPct).toBe(-0.05);
+
+    const count = (
+      db.prepare(`SELECT COUNT(*) c FROM circuit_breaker_state WHERE owner_id = 'mem_owner'`).get() as { c: number }
+    ).c;
+    expect(count).toBe(1);
+  });
+
+  it("clearIfExpired deletes a stale (already-expired) row and returns true", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    repo.trip("mem_owner", { pausedUntil: "2026-07-14T00:00:00.000Z", reason: "old trip" });
+
+    const cleared = repo.clearIfExpired("mem_owner", "2026-07-15T00:00:00.000Z");
+
+    expect(cleared).toBe(true);
+    expect(repo.getState("mem_owner")).toBeNull();
+  });
+
+  it("clearIfExpired leaves an active (not-yet-expired) pause untouched and returns false", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    const repo = new CircuitBreakerRepository(db);
+
+    repo.trip("mem_owner", { pausedUntil: "2026-07-21T00:00:00.000Z", reason: "active trip" });
+
+    const cleared = repo.clearIfExpired("mem_owner", "2026-07-15T00:00:00.000Z");
+
+    expect(cleared).toBe(false);
+    expect(repo.getState("mem_owner")).not.toBeNull();
+  });
+
+  it("rejects an owner_id that does not reference an existing member (FK)", () => {
+    const db = memoryDb();
+    migrate(db);
+    const repo = new CircuitBreakerRepository(db);
+
+    expect(() => repo.trip("ghost_member", { pausedUntil: "2026-07-21T00:00:00.000Z", reason: "x" })).toThrow(
+      /FOREIGN KEY constraint failed/
+    );
   });
 });

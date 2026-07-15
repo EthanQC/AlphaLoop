@@ -99,6 +99,51 @@ export interface OfficialPaperOrderLifecycle {
   notes: string[];
 }
 
+// Phase 6 Task 1 (2026-07-15 plan): mirrors the `proposals` table (v3 DDL,
+// packages/shared-types/src/database.ts) field-for-field. `status` is the
+// state-machine's full value set enforced by that table's CHECK constraint -
+// `consumeApproval` (ProposalRepository) is the ONLY writer allowed to move a
+// row out of 'pending', per the plan's execution-chain invariant ("approval
+// _token 原子消费...唯一的状态跃迁通道").
+export type ProposalConfidence = "low" | "medium" | "high";
+
+export type ProposalStatus =
+  | "pending"
+  | "approved"
+  | "approved_half"
+  | "rejected"
+  | "expired"
+  | "executed"
+  | "failed";
+
+export interface Proposal {
+  id: string;
+  ownerId: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  orderType: string;
+  limitPrice?: number;
+  reason: string;
+  evidence: JsonValue[];
+  strategyRef?: string;
+  disciplineReport: JsonValue[];
+  invalidation?: string;
+  stopLoss?: number;
+  budgetImpact?: number;
+  confidence?: ProposalConfidence;
+  status: ProposalStatus;
+  approvalToken?: string;
+  consumedAt?: string;
+  decidedAt?: string;
+  decidedBy?: string;
+  ticketId?: string;
+  outcome?: string;
+  cardMessageId?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export interface RuleSet {
   version: string;
   scope: "live" | "paper";
