@@ -498,12 +498,14 @@ describe("v6 alert_rules.removed_at migration", () => {
 });
 
 describe("v7 schema hardening: per-owner watchlist, CHECK constraints, event ownership", () => {
-  it("bumps schema version to 7 and keeps all four rebuilt tables present", () => {
+  it("keeps all four rebuilt tables present (SCHEMA_VERSION has since moved on to v8, task P4-2)", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(SCHEMA_VERSION).toBe(7);
-    expect(getSchemaVersion(db)).toBe(7);
+    // SCHEMA_VERSION has since moved on to v8 (Phase 4 Task 2, news engine) -
+    // this test only asserts the v7-rebuilt tables exist, not any particular
+    // version number (same convention as the v6 describe block above).
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
     const names = tables.map((t) => t.name);
@@ -513,17 +515,17 @@ describe("v7 schema hardening: per-owner watchlist, CHECK constraints, event own
     expect(names).toContain("stock_analysis_targets");
   });
 
-  it("is idempotent across repeated calls once at v7", () => {
+  it("is idempotent across repeated calls once at the latest version", () => {
     const db = memoryDb();
     migrate(db);
     migrate(db);
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
   });
 
-  it("a fresh db lands directly at v7 with no manual intervention", () => {
+  it("a fresh db lands directly at the latest version with no manual intervention", () => {
     const db = memoryDb();
     migrate(db);
-    expect(getSchemaVersion(db)).toBe(7);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
   });
 
   it("rejects an invalid alert_rules.direction via CHECK", () => {
@@ -806,5 +808,299 @@ describe("v7 schema hardening: per-owner watchlist, CHECK constraints, event own
     expect(getSchemaVersion(db)).toBe(6);
     const evt = db.prepare("SELECT owner_id FROM alert_events WHERE id = 'evt_ghost'").get() as { owner_id: string };
     expect(evt.owner_id).toBe("ghost_member");
+  });
+});
+
+// All 22 tables that exist as of v7, keyed by table name -> row count this
+// helper seeds. Used both to build the "every pre-existing table has data"
+// fixture below and to assert none of those counts move when the v8 step
+// runs (it is purely additive: three CREATE TABLEs and two CREATE INDEXes,
+// touching nothing else - see database.ts's v8 migration step comment).
+const V7_TABLE_NAMES = [
+  "audit_log",
+  "execution_reports",
+  "notification_targets",
+  "official_paper_order_lifecycle",
+  "official_paper_snapshots",
+  "paper_strategy_reflections",
+  "stock_analysis_targets",
+  "stock_analysis_runs",
+  "members",
+  "api_tokens",
+  "discipline_rules",
+  "theses",
+  "thesis_history",
+  "proposals",
+  "alert_rules",
+  "alert_events",
+  "alert_runtime_state",
+  "alert_daily_quota",
+  "analysis_predictions",
+  "research_tasks",
+  "run_log",
+  "feishu_context_messages"
+];
+
+// Builds a REAL v7 database (schema produced by the actual migration steps
+// 0..6, not hand-copied DDL that could silently drift out of sync with
+// database.ts) with one seeded row in every table that exists as of v7, then
+// rolls user_version back to 7 so migrate() has exactly one step left to run
+// (the new v8 step). Reuses the production migrate() itself to build the
+// baseline schema/constraints - the v8-only tables it also creates are
+// dropped immediately after, before any data is seeded, so they start this
+// fixture in exactly the same "doesn't exist yet" state a genuine pre-v8
+// production db would be in.
+function buildSeededV7Database(): DatabaseSync {
+  const db = memoryDb();
+  migrate(db); // builds the full v0..v8 schema using the real migration code
+  db.exec(`
+    DROP INDEX IF EXISTS news_event_sources_event_idx;
+    DROP TABLE IF EXISTS news_event_sources;
+    DROP INDEX IF EXISTS news_events_window_idx;
+    DROP TABLE IF EXISTS news_events;
+    DROP TABLE IF EXISTS daily_facts;
+  `);
+  db.exec("PRAGMA user_version = 7");
+
+  const now = nowIso();
+
+  db.prepare(`
+    INSERT INTO members (id, email, feishu_open_id, display_name, risk_tags, stock_tags, show_performance, status, created_at)
+    VALUES ('mem_v7', 'v7-seed@example.com', 'ou_v7_seed', 'V7 Seed Member', '[]', '[]', 1, 'active', ?)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO api_tokens (id, member_id, token_hash, label, revoked_at, created_at)
+    VALUES ('token_v7', 'mem_v7', 'deadbeef', 'seed', NULL, ?)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, linked_strategy, enabled, created_at, disabled_at)
+    VALUES ('rule_v7', 'mem_v7', 'no revenge trading', 'hard', NULL, 1, ?, NULL)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO theses (id, owner_id, symbol, direction, target_low, target_high, invalidation_price, visibility, status, memory_slug, created_at, updated_at)
+    VALUES ('thesis_v7', 'mem_v7', 'AAPL.US', 'bull', 100, 200, 90, 'system', 'active', NULL, ?, ?)
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO thesis_history (id, thesis_id, note, source, created_at)
+    VALUES ('thesis_hist_v7', 'thesis_v7', 'initial note', 'seed', ?)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO proposals (id, owner_id, symbol, side, quantity, order_type, limit_price, reason, evidence, strategy_ref, discipline_report, invalidation, stop_loss, budget_impact, confidence, status, approval_token, consumed_at, decided_at, decided_by, ticket_id, outcome, card_message_id, created_at, expires_at)
+    VALUES ('proposal_v7', 'mem_v7', 'AAPL.US', 'buy', 10, 'market', NULL, 'seed reason', '[]', NULL, '[]', NULL, NULL, NULL, NULL, 'pending', 'approval_token_v7', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO alert_rules (id, owner_id, symbol, rule_type, threshold, direction, frequency, hysteresis, enabled, created_at, removed_at)
+    VALUES ('alert_rule_v7', 'mem_v7', 'AAPL.US', 'daily_move', 0.04, 'both', 'once_daily', 0, 1, ?, NULL)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO alert_events (id, rule_id, owner_id, triggered_at, value, message_id, feedback)
+    VALUES ('alert_event_v7', 'alert_rule_v7', 'mem_v7', ?, 0.05, NULL, NULL)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO alert_runtime_state (rule_id, armed, last_value, cooldown_until, last_fired_trading_day)
+    VALUES ('alert_rule_v7', 1, '{}', NULL, NULL)
+  `).run();
+
+  db.prepare(`
+    INSERT INTO alert_daily_quota (owner_id, trading_day, fired_count)
+    VALUES ('mem_v7', '2026-07-14', 1)
+  `).run();
+
+  db.prepare(`
+    INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at)
+    VALUES ('AAPL.US', 'mem_v7', 1, ?, ?)
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
+    VALUES ('run_v7', ?, '["AAPL.US"]', '/tmp/report.md', '/tmp/report.pdf', '{}')
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO official_paper_order_lifecycle
+    (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class, side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at, last_observed_at, raw, notes, owner_id)
+    VALUES ('order_v7', NULL, 'ext_order_v7', 'longbridge-paper', 'paper', 'paper', 'AAPL.US', 'equity', 'buy', 10, NULL, 'filled', 'filled', 'closed', ?, ?, '{}', '[]', 'mem_v7')
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO official_paper_snapshots (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
+    VALUES ('snap_v7', ?, 'scheduled', 1000, 500, 500, '[]', '{}', 'mem_v7')
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO paper_strategy_reflections (id, snapshot_id, created_at, summary, payload, owner_id)
+    VALUES ('reflection_v7', 'snap_v7', ?, 'seed summary', '{}', 'mem_v7')
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO analysis_predictions (id, symbol, report_path, conclusion, confidence, review_trigger, review_date, outcome, created_at)
+    VALUES ('prediction_v7', 'AAPL.US', '/tmp/report.md', 'bullish', 'medium', NULL, NULL, NULL, ?)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, result_path, visibility, created_at, finished_at)
+    VALUES ('research_v7', 'mem_v7', 'why did AAPL move', 'done', '[]', 1, NULL, 'private', ?, NULL)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO run_log (id, job, started_at, finished_at, ok, inputs, actions, failed_step, retries, call_count, evidence)
+    VALUES ('run_log_v7', 'daily-report', ?, ?, 1, '[]', '[]', NULL, 0, 1, '[]')
+  `).run(now, now);
+
+  db.prepare(`
+    INSERT INTO audit_log (id, category, action, payload, created_at)
+    VALUES ('audit_v7', 'seed', 'seed', '{}', 1)
+  `).run();
+
+  db.prepare(`
+    INSERT INTO execution_reports (id, category, title, body, metadata, created_at)
+    VALUES ('exec_report_v7', 'daily', 'seed report', 'body', '{}', ?)
+  `).run(now);
+
+  db.prepare(`
+    INSERT INTO notification_targets (channel, target_type, target_id, source, updated_at)
+    VALUES ('feishu', 'chat_id', 'chat_v7', 'seed', 1)
+  `).run();
+
+  db.prepare(`
+    INSERT INTO feishu_context_messages (id, created_at, channel_id, chat_id, sender_id, sender_name, text)
+    VALUES ('feishu_msg_v7', ?, 'feishu', 'chat_v7', 'user_v7', 'Seed User', 'hello')
+  `).run(now);
+
+  return db;
+}
+
+function countRows(db: DatabaseSync, table: string): number {
+  return (db.prepare(`SELECT COUNT(*) c FROM ${table}`).get() as { c: number }).c;
+}
+
+describe("v8 news engine tables migration (Phase 4 Task 2)", () => {
+  it("SCHEMA_VERSION is 8", () => {
+    expect(SCHEMA_VERSION).toBe(8);
+  });
+
+  it("a fresh db lands directly at v8, with all three news tables and both indexes present", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(8);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    expect(names).toContain("news_events");
+    expect(names).toContain("news_event_sources");
+    expect(names).toContain("daily_facts");
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    const indexNames = indexes.map((i) => i.name);
+    expect(indexNames).toContain("news_events_window_idx");
+    expect(indexNames).toContain("news_event_sources_event_idx");
+  });
+
+  it("upgrades a v7 db with data in every pre-existing table to v8 with zero row loss, and is idempotent", () => {
+    const db = buildSeededV7Database();
+    expect(getSchemaVersion(db)).toBe(7);
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V7_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      expect(countsBefore[table]).toBeGreaterThan(0);
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(8);
+    for (const table of V7_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // New tables exist and start empty.
+    expect(countRows(db, "news_events")).toBe(0);
+    expect(countRows(db, "news_event_sources")).toBe(0);
+    expect(countRows(db, "daily_facts")).toBe(0);
+
+    // Idempotent: calling migrate() again on an already-v8 db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(8);
+    for (const table of V7_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+
+  it("rejects an invalid news_events.impact_direction via CHECK", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO news_events
+          (id, cluster_key, title_zh, summary_zh, impact_direction, impact_affected, impact_reason, source_count, zh_source_count, created_at, updated_at)
+          VALUES ('evt_bad', 'cluster_bad', '标题', NULL, 'sideways', '[]', NULL, 0, 0, ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/CHECK constraint failed/);
+  });
+
+  it("enforces news_events.cluster_key UNIQUE", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO news_events
+      (id, cluster_key, title_zh, impact_affected, source_count, zh_source_count, created_at, updated_at)
+      VALUES ('evt_1', 'cluster_dup', '标题一', '[]', 0, 0, ?, ?)
+    `).run(now, now);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO news_events
+          (id, cluster_key, title_zh, impact_affected, source_count, zh_source_count, created_at, updated_at)
+          VALUES ('evt_2', 'cluster_dup', '标题二', '[]', 0, 0, ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("enforces daily_facts UNIQUE(trading_day, fact_key)", () => {
+    const db = memoryDb();
+    migrate(db);
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO daily_facts (id, trading_day, fact_key, value_num, value_text, unit, source, data_time, created_at)
+      VALUES ('fact_1', '2026-07-14', 'qqq_price', 522.31, NULL, 'USD', 'longbridge', ?, ?)
+    `).run(now, now);
+
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO daily_facts (id, trading_day, fact_key, value_num, value_text, unit, source, data_time, created_at)
+          VALUES ('fact_2', '2026-07-14', 'qqq_price', 999.99, NULL, 'USD', 'longbridge', ?, ?)
+        `)
+        .run(now, now)
+    ).toThrow(/UNIQUE constraint failed/);
+
+    // Same trading_day, different fact_key: must succeed - the UNIQUE
+    // constraint is compound, not on trading_day alone.
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO daily_facts (id, trading_day, fact_key, value_num, value_text, unit, source, data_time, created_at)
+          VALUES ('fact_3', '2026-07-14', 'net_assets', 100000, NULL, 'USD', 'longbridge', ?, ?)
+        `)
+        .run(now, now)
+    ).not.toThrow();
   });
 });
