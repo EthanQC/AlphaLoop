@@ -20,11 +20,11 @@ import {
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
-import { assertStockAnalysisQuality } from "./report-quality.mjs";
+import { assertStockAnalysisQuality, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
 import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
 import { createNarrativeLlmBackend, generateNarrativeSections, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
-import { getStockFacts } from "./stock-facts-store.mjs";
+import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD, getStockFacts } from "./stock-facts-store.mjs";
 import { buildYahooOptionChainUrls } from "./stock-analysis-sources.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
@@ -245,6 +245,27 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   if (!deliver) {
     console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
     return;
+  }
+
+  // Phase 5 Task 4 (2026-07-15 plan) - stock.numeric_match: the LAST line of
+  // defense before delivery, run only at delivery time (not for a `prepare`
+  // dry-run) - mirrors scheduled-report.mjs's deliverReport, which similarly
+  // only runs its own facts-taking numeric gate (validateNarrativeNumbers)
+  // at delivery, never at prepare time (see that function's own comment).
+  // T3's narrative orchestrator already retried (<=2) and honestly degraded
+  // any section it couldn't validate BEFORE this markdown was ever rendered
+  // (attachNarrativeSections, above) - this gate exists to catch what that
+  // upstream defense might have missed (a bug in it, or a hand-edited/
+  // tampered render), reading each delivered symbol's own just-persisted
+  // stock_facts (persistStockFactsForRecords already wrote them earlier in
+  // this exact run, for this exact tradingDay `label`) as ground truth. Era
+  // marker means this genuinely no-ops for a hypothetical caller that
+  // somehow renders a stock-analysis report without a "### 结论框" - not a
+  // real path today, since buildDeterministicAnalysis always emits one.
+  const factsBySymbol = Object.fromEntries(records.map((record) => [record.symbol, getStockFacts(db, label, record.symbol)]));
+  const numericCheck = validateStockNarrativeNumbers(markdown, factsBySymbol);
+  if (!numericCheck.ok) {
+    throw new Error(`个股分析质量校验失败：${numericCheck.failures.join(", ")}`);
   }
 
   const delivery = await deliverReportToFeishu({
@@ -563,21 +584,19 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
 // checkpoint per quote/valuation/history/options/news data domain) come
 // back with a real (non-null) value from buildStockFacts - the SAME
 // extraction report-facts.mjs's buildStockFacts already performs for
-// persistence (Task 1) and Task 4's stock.facts_coverage gate will also
-// inspect, so "covered" can never mean two different things across this
-// heuristic and that later gate:
+// persistence (Task 1) and Task 4's stock.facts_coverage gate also inspects,
+// so "covered" can never mean two different things across this heuristic and
+// that later gate. CONFIDENCE_COVERAGE_CHECKPOINTS/_THRESHOLD are imported
+// from stock-facts-store.mjs (not declared here) so both consumers share the
+// literal same constant - see that module's own doc comment for why it lives
+// there instead of here (avoids a report-quality.mjs <-> stock-analysis.mjs
+// circular import plus that file's module-level side effects):
 //   quote.last, quote.pct, valuation.pe, valuation.targetPrice,
 //   history.ma20, history.ma60, options.callOi, news.count
 // A checkpoint's valueNum is null exactly when buildStockFacts already
 // disclosed that domain as degraded/unavailable (its own "数据不可得"
 // convention) - so "coverage >= 6 of 8" and "at least 6 non-degraded
 // checkpoints" are the same condition here, not two separate ones.
-const CONFIDENCE_COVERAGE_CHECKPOINTS = [
-  "quote.last", "quote.pct", "valuation.pe", "valuation.targetPrice",
-  "history.ma20", "history.ma60", "options.callOi", "news.count"
-];
-const CONFIDENCE_COVERAGE_THRESHOLD = 6;
-
 function computeFactsCoverage({ symbol, quote, news, extraData, generatedAt }) {
   const facts = buildStockFacts({
     symbol,

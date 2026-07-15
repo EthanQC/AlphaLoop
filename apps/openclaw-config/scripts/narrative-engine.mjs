@@ -74,8 +74,16 @@ const MAX_RETRIES_PER_SECTION = 2;
 // failed validation on every attempt) - distinct from the GLOBAL degrade
 // disclosure (REPORT_DEGRADED_HEADER) a backend THROW produces, which the
 // caller (stock-analysis.mjs) renders once per symbol, not per section.
-const NUMERIC_DEGRADE_MARKER = "（叙事降级：数字比对未通过）";
-const NON_CHINESE_DEGRADE_MARKER = "（叙事降级：后端输出非中文）";
+//
+// Exported (Phase 5 Task 4, 2026-07-15 plan): report-quality.mjs's
+// stock.numeric_match gate (validateStockNarrativeNumbers) needs to
+// recognize a locally-degraded "### ..." block by this SAME literal text so
+// it can skip re-scanning deterministic fallback prose for facts-derived (but
+// not literally fact-value) numbers - importing the two exact strings here
+// keeps that a single source rather than a second, independently-typed copy
+// of the same marker text.
+export const NUMERIC_DEGRADE_MARKER = "（叙事降级：数字比对未通过）";
+export const NON_CHINESE_DEGRADE_MARKER = "（叙事降级：后端输出非中文）";
 
 // Caller-facing header line for a GLOBAL degrade (backend threw) - exported
 // so stock-analysis.mjs (and its tests) reference the exact same literal

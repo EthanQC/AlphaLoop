@@ -14,6 +14,30 @@
 
 import { createId, nowIso } from "../../../packages/shared-types/dist/index.js";
 
+// Phase 5 Task 4 (2026-07-15 plan): the confidence heuristic's 8-key
+// "coverage" checklist (stock-analysis.mjs's computeFactsCoverage, Task 2)
+// and report-quality.mjs's stock.facts_coverage gate (Task 4) must count
+// "how many of 8 representative stock_facts keys came back with a real
+// value" the SAME way - two independently-typed 8-item lists could silently
+// drift apart, defeating the whole point of a shared denominator. This
+// constant lives HERE (not in stock-analysis.mjs, where the heuristic that
+// first needed it was written) for two concrete reasons: (1) stock-analysis.mjs
+// already imports assertStockAnalysisQuality FROM report-quality.mjs, so
+// report-quality.mjs importing this constant back from stock-analysis.mjs
+// would be circular - safe in Node ESM only as long as neither side reads it
+// at module-top-level, which is a fragile invariant to lean on; (2)
+// stock-analysis.mjs's own module top level has real side effects
+// (loadLocalEnv, two mkdirSync calls) that every test importing
+// report-quality.mjs would otherwise silently start incurring. This module
+// has neither problem (no project-external side effects beyond the pure
+// createId/nowIso helpers above), and it is already the natural domain home
+// for a list of stock_facts.fact_key literals.
+export const CONFIDENCE_COVERAGE_CHECKPOINTS = [
+  "quote.last", "quote.pct", "valuation.pe", "valuation.targetPrice",
+  "history.ma20", "history.ma60", "options.callOi", "news.count"
+];
+export const CONFIDENCE_COVERAGE_THRESHOLD = 6;
+
 // Replaces the facts for ONE (tradingDay, symbol) pair in a single
 // transaction (DELETE scoped to that exact pair, then INSERT-all) -
 // deliberately NOT a whole-trading-day delete like news-store.mjs's
