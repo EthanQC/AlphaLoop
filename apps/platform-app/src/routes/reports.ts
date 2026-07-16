@@ -9,14 +9,27 @@
  * page. There is no per-owner filtering needed for reports themselves
  * (report content isn't member-scoped data), but the login gate still
  * applies like every other page past Task 3.
+ *
+ * Phase 8 Task 4 (2026-07-16 plan) addition: `?type=研判` is no longer a
+ * disabled placeholder chip - it now lists the VIEWER's own done/degraded
+ * `research_tasks` rows (owner-scoped: `ResearchTaskRepository.listForOwner
+ * (member.id)`, never another member's), each card linking to `/research/
+ * <id>`. This is a DB-backed list living alongside (not merged into) the
+ * on-disk `scanReports` entries - `研判` was never a `ReportType` the
+ * scanner produces, so it gets its own sentinel query value
+ * (`RESEARCH_TYPE_PARAM = "研判"`) and its own branch through
+ * `renderReportsListBody`, rather than trying to force research tasks into
+ * `ReportIndexEntry`'s on-disk shape. `复盘` stays the one remaining
+ * disabled/"P9 上线" chip.
  */
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { methodNotAllowed, type Member } from "@packages/shared-types";
+import { ResearchTaskRepository, methodNotAllowed, type Member, type ResearchTask } from "@packages/shared-types";
 
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderMarkdown, type MarkdownRenderResult } from "../reports/markdown.js";
 import { scanReports, type ReportIndexEntry, type ReportType } from "../reports/scanner.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
@@ -43,14 +56,17 @@ const TYPE_LABELS: Record<ReportType, string> = {
 
 const TYPE_ORDER: readonly ReportType[] = ["daily", "weekly", "stock-analysis", "official-paper"];
 
-// Chips for report kinds that don't exist yet (plan Task 4: "研判/复盘筛选片
-// 存在但空态标注「P8/P9 上线」"). These are not ReportType values - there is
-// nothing to scan or filter for them, they exist purely so the filter row's
-// shape matches the plan's eventual six-chip layout.
-const DISABLED_TYPE_CHIPS: ReadonlyArray<{ label: string; note: string }> = [
-  { label: "研判", note: "P8 上线" },
-  { label: "复盘", note: "P9 上线" }
-];
+// Sentinel `?type=` value for the (now real, DB-backed) 研判 chip - see
+// module header. Not a `ReportType`: nothing under reports/scanner.ts's
+// on-disk types is ever "研判".
+const RESEARCH_TYPE_PARAM = "研判";
+
+// Chip for a report kind that doesn't exist yet (plan Task 4/5: "复盘筛选片
+// 存在但空态标注「P9 上线」"). Not a ReportType value - there is nothing to
+// scan or filter for it, it exists purely so the filter row's shape matches
+// the plan's eventual six-chip layout. 研判 (Phase 8 Task 4) is no longer in
+// this list - it is a real, clickable chip now (`renderResearchChip` below).
+const DISABLED_TYPE_CHIPS: ReadonlyArray<{ label: string; note: string }> = [{ label: "复盘", note: "P9 上线" }];
 
 const DATE_PARAM_RE = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -161,8 +177,14 @@ function renderReportsListPage(
 ): void {
   const now = currentNow(deps);
   const typeParam = url.searchParams.get("type");
-  const entries = scanReports(deps.repoRoot);
-  const filtered = typeParam ? entries.filter((entry) => entry.type === typeParam) : entries;
+  const isResearchView = typeParam === RESEARCH_TYPE_PARAM;
+
+  // 研判 is a DB-backed, owner-scoped list (never scanned from disk) - see
+  // module header. Every other `?type=` value (or none) keeps the original
+  // on-disk `scanReports` behavior unchanged.
+  const entries = isResearchView ? [] : scanReports(deps.repoRoot);
+  const filtered = !isResearchView && typeParam ? entries.filter((entry) => entry.type === typeParam) : entries;
+  const researchTasks = isResearchView ? loadOwnerResearchArchive(deps.db, member.id) : [];
 
   const page = renderPage({
     title: "报告库",
@@ -170,11 +192,24 @@ function renderReportsListPage(
     member: { displayName: member.displayName },
     freshness: "最新",
     degraded: [],
-    bodyHtml: renderReportsListBody(filtered, typeParam),
+    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks),
     nonce,
     now
   });
   sendHtml(res, 200, page);
+}
+
+// Owner's own done/degraded research tasks (plan Task 4: "「研判」筛选片从
+// research_tasks（owner 的 done/degraded）列表") - `ownerId` is always the
+// resolved VIEWER's own id (never a query/body value), so member B can never
+// see member A's research archive through this list. `listForOwner` takes a
+// single optional status filter, not a set, so "done OR degraded" is applied
+// client-side over the (per-owner, inherently small) full list rather than
+// issuing two separate queries.
+function loadOwnerResearchArchive(db: DatabaseSync, ownerId: string): ResearchTask[] {
+  return new ResearchTaskRepository(db)
+    .listForOwner(ownerId)
+    .filter((task) => task.status === "done" || task.status === "degraded");
 }
 
 function renderTypeChip(type: ReportType, label: string, activeType: string | null): Html {
@@ -184,6 +219,18 @@ function renderTypeChip(type: ReportType, label: string, activeType: string | nu
     : "background:var(--card);color:var(--ink);border-color:var(--line)";
   const href = active ? "/reports" : `/reports?type=${type}`;
   return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;${extraStyle}">${label}</a>`;
+}
+
+// Real, clickable chip for the (now shipped) 研判 archive - same visual
+// treatment as renderTypeChip's active/inactive states, just keyed off the
+// RESEARCH_TYPE_PARAM sentinel instead of a ReportType.
+function renderResearchChip(activeType: string | null): Html {
+  const active = activeType === RESEARCH_TYPE_PARAM;
+  const extraStyle = active
+    ? "background:var(--accent-soft);color:var(--accent);border-color:var(--accent-border);font-weight:600"
+    : "background:var(--card);color:var(--ink);border-color:var(--line)";
+  const href = active ? "/reports" : `/reports?type=${encodeURIComponent(RESEARCH_TYPE_PARAM)}`;
+  return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;${extraStyle}">研判</a>`;
 }
 
 function renderDisabledChip(label: string, note: string): Html {
@@ -204,14 +251,41 @@ function renderReportCard(entry: ReportIndexEntry): Html {
     </a>`;
 }
 
-function renderReportsListBody(entries: ReportIndexEntry[], activeType: string | null): Html {
+// Research archive card (plan Task 4: "列表卡 = title||question + 置信度 +
+// 日期 + /research/<id> 链接").
+function renderResearchArchiveCard(task: ResearchTask): Html {
+  const label = task.title ?? task.question;
+  const confidenceBadge = task.confidence
+    ? html`<span class="pill ${task.confidence === "high" ? "ok" : task.confidence === "medium" ? "warn" : ""}">${CONFIDENCE_LABELS[task.confidence]}</span>`
+    : trustedHtml("");
+  const finishedDate = task.finishedAt ? formatBeijingDate(new Date(task.finishedAt)) : "—";
+  return html`<a class="card" href="/research/${task.id}" style="display:block">
+      <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--sub)">
+        <span class="pill" style="background:var(--accent-soft);color:var(--accent)">研判</span>
+        <span class="mono">${finishedDate}</span>
+        ${confidenceBadge}
+      </div>
+      <div style="margin-top:8px;font-size:14.5px;font-weight:650;color:var(--ink)">${label}</div>
+    </a>`;
+}
+
+function renderReportsListBody(
+  entries: ReportIndexEntry[],
+  activeType: string | null,
+  researchTasks: ResearchTask[]
+): Html {
   const chips = joinHtml([
     ...TYPE_ORDER.map((type) => renderTypeChip(type, TYPE_LABELS[type], activeType)),
+    renderResearchChip(activeType),
     ...DISABLED_TYPE_CHIPS.map((chip) => renderDisabledChip(chip.label, chip.note))
   ]);
 
-  const cards =
-    entries.length > 0
+  const isResearchView = activeType === RESEARCH_TYPE_PARAM;
+  const cards = isResearchView
+    ? researchTasks.length > 0
+      ? joinHtml(researchTasks.map(renderResearchArchiveCard))
+      : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无研判。</p>`
+    : entries.length > 0
       ? joinHtml(entries.map(renderReportCard))
       : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无报告。</p>`;
 

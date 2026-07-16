@@ -153,7 +153,6 @@ describe("home route (GET /)", () => {
 
     const expectedOrder = [
       "开始研究",
-      "站内研究 P8 上线",
       "我的模拟盘概览",
       "暂无快照数据——模拟盘接入后显示",
       "我的待办",
@@ -175,12 +174,15 @@ describe("home route (GET /)", () => {
     }
   });
 
-  it("renders a disabled input/button for the start-research block", async () => {
+  it("renders a real question-box form posting to /api/research (Phase 8 Task 4 - no longer disabled)", async () => {
     const { token } = seedMemberWithToken();
     const response = await authed("/", token);
     const body = await response.text();
-    expect(body).toMatch(/<input[^>]*disabled[^>]*>/u);
-    expect(body).toMatch(/<button[^>]*disabled[^>]*>开始研究<\/button>/u);
+    expect(body).toMatch(/<form method="post" action="\/api\/research">/u);
+    expect(body).toMatch(/<input[^>]*name="question"[^>]*>/u);
+    expect(body).not.toMatch(/<input[^>]*disabled[^>]*>/u);
+    expect(body).toMatch(/<button[^>]*type="submit"[^>]*>开始研究<\/button>/u);
+    expect(body).not.toContain("站内研究 P8 上线");
   });
 
   it("renders real snapshot net assets and today's change when both today's and yesterday's snapshots exist", async () => {

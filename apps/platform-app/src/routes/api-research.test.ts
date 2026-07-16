@@ -92,6 +92,45 @@ describe("research submission/promotion API (POST /api/research*)", () => {
     return { "cf-access-authenticated-user-email": email };
   }
 
+  /** Mirrors exactly what a real `<form method="post" action="/api/research">`
+   * (home.ts's question box, Phase 8 Task 4) submits: an
+   * `application/x-www-form-urlencoded` body, no `Accept` override - a
+   * `fetch` with `redirect: 'manual'` so the 303 itself can be asserted
+   * rather than transparently followed. */
+  function postForm(path: string, fields: Record<string, string>, headers: Record<string, string> = {}): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
+      body: new URLSearchParams(fields).toString()
+    });
+  }
+
+  describe("POST /api/research via a form submission (Phase 8 Task 4 home.ts question box)", () => {
+    it("303-redirects to /research/<id> instead of returning JSON", async () => {
+      await startServer();
+      const response = await postForm("/api/research", { question: "AAPL 最近怎么样" }, withBearer(tokenA));
+      expect(response.status).toBe(303);
+      const taskId = new ResearchTaskRepository(db).listForOwner(memberA.id)[0]?.id;
+      expect(taskId).toBeDefined();
+      expect(response.headers.get("location")).toBe(`/research/${taskId}`);
+    });
+
+    it("works via the Access-email identity chain too (the real home.ts caller)", async () => {
+      await startServer();
+      const response = await postForm("/api/research", { question: "AAPL 最近怎么样" }, withAccessEmail(memberA.email));
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toMatch(/^\/research\/.+/u);
+    });
+
+    it("a plain JSON caller (skill/bearer) still gets the original {ok, taskId, redirect} JSON shape, unaffected", async () => {
+      await startServer();
+      const response = await post("/api/research", { question: "AAPL 最近怎么样" }, withBearer(tokenA));
+      expect(response.status).toBe(201);
+      expect(response.headers.get("content-type")).toContain("application/json");
+    });
+  });
+
   describe("POST /api/research", () => {
     it("401s with neither a bearer token nor an Access email header", async () => {
       await startServer();

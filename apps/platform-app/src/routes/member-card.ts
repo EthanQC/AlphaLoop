@@ -37,7 +37,13 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { MemberRepository, methodNotAllowed, type Member } from "@packages/shared-types";
+import {
+  MemberRepository,
+  ResearchTaskRepository,
+  methodNotAllowed,
+  type Member,
+  type ResearchTask
+} from "@packages/shared-types";
 
 import { computePaperKpis, loadSnapshotSeriesForOwner, type PaperKpis } from "../data/snapshots.js";
 import {
@@ -51,6 +57,7 @@ import {
   type ThesisHistoryRow
 } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
@@ -343,55 +350,41 @@ function renderThesesSection(
 }
 
 // ---------------------------------------------------------------------------
-// 公开研判
+// 公开研判 (Phase 8 Task 4, 2026-07-16 plan: real rendering, replacing the
+// pre-P8 status-only placeholder)
 // ---------------------------------------------------------------------------
 
-interface ResearchTaskRow {
-  id: string;
-  question: string;
-  status: string;
-  createdAt: string;
+/** `subject`'s PUBLIC, done/degraded research_tasks only - own-card visitors
+ * don't get a private-included view here the way theses do (req §1.8 lists
+ * this as "本人选择公开的研判", i.e. always the public subset, even for the
+ * subject themselves - unlike 战绩/论点 there's no "audit my own private
+ * rows" case called for on this page). Filtered to done/degraded (not just
+ * any visibility='public' row, whatever its status) because this section
+ * renders a conclusion + confidence badge - a queued/running/failed task has
+ * no `resultJson` to show one from. Uses the SAME `ResearchTaskRepository.
+ * listForOwner` reader research.ts/reports.ts use (Task 1), rather than this
+ * page's own ad hoc SQL - `listForOwner` takes a single optional status
+ * filter, not a set, so "done OR degraded" is applied client-side over the
+ * (per-subject, inherently small) full list. */
+function loadSubjectPublicResearch(db: DatabaseSync, subjectId: string): ResearchTask[] {
+  return new ResearchTaskRepository(db)
+    .listForOwner(subjectId)
+    .filter((task) => task.visibility === "public" && (task.status === "done" || task.status === "degraded"));
 }
 
-const RESEARCH_STATUS_LABELS: Record<string, string> = {
-  queued: "排队中",
-  running: "进行中",
-  done: "已完成",
-  degraded: "降级",
-  failed: "失败"
-};
-
-/** `subject`'s PUBLIC research_tasks only - own-card visitors don't get a
- * private-included view here the way theses do (req §1.8 lists this as
- * "本人选择公开的研判", i.e. always the public subset, even for the subject
- * themselves - unlike 战绩/论点 there's no "audit my own private rows" case
- * called for on this page). */
-function loadSubjectPublicResearch(db: DatabaseSync, subjectId: string): ResearchTaskRow[] {
-  const rows = db
-    .prepare(`
-      SELECT id, question, status, created_at
-      FROM research_tasks
-      WHERE owner_id = ? AND visibility = 'public'
-      ORDER BY created_at DESC
-    `)
-    .all(subjectId) as Array<Record<string, unknown>>;
-  return rows.map((row) => ({
-    id: String(row.id),
-    question: String(row.question),
-    status: String(row.status),
-    createdAt: String(row.created_at)
-  }));
-}
-
-function renderResearchRow(task: ResearchTaskRow): Html {
-  const label = RESEARCH_STATUS_LABELS[task.status] ?? task.status;
-  return html`<div class="alert">
-    <time class="mono">${task.createdAt}</time>
-    <span><a href="/research/${task.id}" style="color:var(--accent)">${task.question}</a> <span style="color:var(--sub)">· ${label}</span></span>
+function renderResearchRow(task: ResearchTask): Html {
+  const label = task.title ?? task.question;
+  const conclusion = task.resultJson?.conclusion ?? "";
+  const confidenceBadge = task.confidence
+    ? html`<span class="pill ${task.confidence === "high" ? "ok" : task.confidence === "medium" ? "warn" : ""}" style="margin-left:6px">${CONFIDENCE_LABELS[task.confidence]}</span>`
+    : trustedHtml("");
+  return html`<div class="disc" style="margin-bottom:10px;padding-bottom:8px;border-bottom:1px dashed var(--line)">
+    <a href="/research/${task.id}" style="color:var(--accent);font-weight:600">${label}</a>${confidenceBadge}
+    ${conclusion ? html`<div style="font-size:12.5px;color:var(--ink);margin-top:4px">${conclusion}</div>` : trustedHtml("")}
   </div>`;
 }
 
-function renderResearchSection(tasks: ResearchTaskRow[]): Html {
+function renderResearchSection(tasks: ResearchTask[]): Html {
   const body =
     tasks.length > 0
       ? joinHtml(tasks.map(renderResearchRow))

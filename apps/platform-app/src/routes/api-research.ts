@@ -38,6 +38,35 @@
  * produces is caught and merely logged (worker.ts's own `tick()` already
  * guarantees it never rejects in the first place - this catch is pure
  * defense-in-depth against a future change to that contract).
+ *
+ * TWO SUBMISSION SHAPES (Phase 8 Task 4, 2026-07-16 plan): the home page's
+ * question box (routes/home.ts) is now a real `<form method="post"
+ * action="/api/research">`, which a browser submits as a full-page
+ * navigation with an `application/x-www-form-urlencoded` body - not JSON.
+ * The skill/bearer caller this endpoint already served keeps sending JSON.
+ * `handleSubmit` branches on the REQUEST's `Content-Type` (not the `Accept`
+ * header - a plain `curl`/test client sends `Accept: *\/*` by default, which
+ * would make an Accept-based branch indistinguishable from "any API caller",
+ * whereas a browser `<form>` post's Content-Type is deterministically
+ * `application/x-www-form-urlencoded` unless `enctype` is overridden, which
+ * home.ts's form never does):
+ *   - `application/x-www-form-urlencoded` body -> a browser form post. On
+ *     success, respond `303 See Other` with `Location: /research/<id>` (a
+ *     303 - not 302 - so the browser's follow-up request is forced to GET
+ *     regardless of the original method, the standard "POST then redirect to
+ *     a GET page" pattern). This is a full navigation, so JSON in the body
+ *     would just be plain text dumped in the browser - a redirect is the
+ *     only reasonable response shape here.
+ *   - anything else (including no body / JSON / missing Content-Type) -> the
+ *     original `{ok, taskId, redirect}` JSON shape, unchanged, for the
+ *     skill/bearer caller and every existing test.
+ * Error responses (400 empty question, 429 quota) are NOT branched the same
+ * way - both callers still get the same JSON error body on those paths. A
+ * browser form submission that somehow hits one of those (the `required`
+ * attribute on home.ts's input makes an empty submit unreachable in
+ * practice; quota exhaustion is a real but rare edge someone can hit) will
+ * see the raw JSON error rather than a rendered page - a known, accepted gap
+ * for this task (no error-banner UI was in scope), not a silent failure.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
@@ -109,7 +138,31 @@ function unauthorized(res: ServerResponse): void {
   });
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+const FORM_URLENCODED_CONTENT_TYPE = "application/x-www-form-urlencoded";
+
+/** True for a browser `<form method="post">` submission (home.ts's question
+ * box) - see module header's "TWO SUBMISSION SHAPES". Matched as a prefix,
+ * not an exact string, since a real browser sends
+ * `application/x-www-form-urlencoded;charset=UTF-8` (a `;charset=` suffix),
+ * not the bare MIME type. */
+function isFormUrlEncoded(req: IncomingMessage): boolean {
+  const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+  return contentType.startsWith(FORM_URLENCODED_CONTENT_TYPE);
+}
+
+async function readRawBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readBody(req: IncomingMessage, formEncoded: boolean): Promise<Record<string, unknown>> {
+  if (formEncoded) {
+    const raw = await readRawBody(req);
+    return Object.fromEntries(new URLSearchParams(raw).entries());
+  }
   try {
     const parsed = await readJsonBody<unknown>(req);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
@@ -129,7 +182,8 @@ async function handleSubmit(req: IncomingMessage, res: ServerResponse, deps: Api
     return;
   }
 
-  const body = await readBody(req);
+  const isFormSubmit = isFormUrlEncoded(req);
+  const body = await readBody(req, isFormSubmit);
 
   // `question` is the ONLY body field this endpoint reads - see module
   // header: any `ownerId` field the caller sends is silently ignored, never
@@ -164,7 +218,17 @@ async function handleSubmit(req: IncomingMessage, res: ServerResponse, deps: Api
     });
   }
 
-  sendJson(res, 201, { ok: true, taskId: result.task.id, redirect: `/research/${result.task.id}` });
+  const redirect = `/research/${result.task.id}`;
+  if (isFormSubmit) {
+    // See module header's "TWO SUBMISSION SHAPES" - 303 (not 302) so the
+    // browser's follow-up request is a GET regardless of the original
+    // method.
+    res.writeHead(303, { Location: redirect });
+    res.end();
+    return;
+  }
+
+  sendJson(res, 201, { ok: true, taskId: result.task.id, redirect });
 }
 
 // ---------------------------------------------------------------------------
