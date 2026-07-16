@@ -1,0 +1,473 @@
+<title>AlphaLoop P10 点火清单</title>
+<style>
+  :root {
+    --bg:#F2F5FA; --card:#FFFFFF; --card2:#F7FAFE; --ink:#12233F; --sub:#5A6B87;
+    --accent:#1E40AF; --accent-soft:#EAF0FB; --accent-border:#C8D6F2;
+    --amber:#B45309; --amber-bg:#FFF7E8; --amber-border:#F0DFBB;
+    --up:#12805C; --up-bg:#E8F3EE; --down:#D5342B; --down-bg:#FBEBEA;
+    --line:#E1E8F2; --frame:#D5DDEA;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    --shadow:0 18px 44px rgba(30,50,90,.10);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#0A0E1A; --card:#101627; --card2:#151C30; --ink:#E8ECF5; --sub:#98A2BB;
+      --accent:#38BDF8; --accent-soft:#12213A; --accent-border:#24304F;
+      --amber:#F5B84B; --amber-bg:#1D1A10; --amber-border:#3D3420;
+      --up:#34D399; --up-bg:#0E271F; --down:#FF5C5C; --down-bg:#2A1414;
+      --line:#1E2740; --frame:#232B44; --shadow:0 24px 60px rgba(0,0,0,.55);
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0A0E1A; --card:#101627; --card2:#151C30; --ink:#E8ECF5; --sub:#98A2BB;
+    --accent:#38BDF8; --accent-soft:#12213A; --accent-border:#24304F;
+    --amber:#F5B84B; --amber-bg:#1D1A10; --amber-border:#3D3420;
+    --up:#34D399; --up-bg:#0E271F; --down:#FF5C5C; --down-bg:#2A1414;
+    --line:#1E2740; --frame:#232B44; --shadow:0 24px 60px rgba(0,0,0,.55);
+    color-scheme:dark;
+  }
+  :root[data-theme="light"]{ color-scheme:light; }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.6;-webkit-font-smoothing:antialiased;font-size:15px}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 22px 96px;display:grid;
+    grid-template-columns:1fr;gap:0}
+  code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  /* header */
+  header{padding:52px 0 30px;border-bottom:1px solid var(--line);margin-bottom:8px}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);font-weight:600;margin:0 0 14px}
+  h1{font-size:38px;line-height:1.12;margin:0 0 16px;letter-spacing:-.01em;text-wrap:balance;font-weight:700}
+  h1 .dim{color:var(--sub);font-weight:600}
+  .lede{font-size:16.5px;color:var(--sub);max-width:64ch;margin:0 0 24px;text-wrap:pretty}
+  .lede b{color:var(--ink);font-weight:600}
+  .stat-row{display:flex;flex-wrap:wrap;gap:10px}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:12px 16px;box-shadow:var(--shadow);min-width:132px}
+  .stat .n{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--ink);
+    font-variant-numeric:tabular-nums;line-height:1.1}
+  .stat .n.ok{color:var(--up)} .stat .n.warn{color:var(--amber)}
+  .stat .l{font-size:12px;color:var(--sub);margin-top:3px}
+
+  /* legend */
+  .legend{display:flex;flex-wrap:wrap;gap:16px;padding:18px 0 6px;font-size:13px;color:var(--sub)}
+  .legend .k{display:inline-flex;align-items:center;gap:7px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .dot.block{background:var(--down)} .dot.user{background:var(--amber)} .dot.ready{background:var(--up)}
+
+  /* layout with rail */
+  .cols{display:grid;grid-template-columns:1fr;gap:0}
+  @media(min-width:1000px){
+    .cols{grid-template-columns:210px 1fr;gap:40px;align-items:start}
+    nav.rail{position:sticky;top:22px;display:block}
+  }
+  nav.rail{display:none}
+  nav.rail ol{list-style:none;margin:22px 0 0;padding:0;counter-reset:s}
+  nav.rail a{display:flex;gap:10px;align-items:baseline;text-decoration:none;color:var(--sub);
+    font-size:13.5px;padding:7px 0;border-left:2px solid transparent;padding-left:12px;
+    transition:color .15s,border-color .15s}
+  nav.rail a:hover{color:var(--accent);border-left-color:var(--accent-border)}
+  nav.rail a .sn{font-family:var(--mono);font-size:11px;color:var(--accent);font-weight:600;
+    min-width:16px}
+
+  /* stage */
+  .stage{padding:34px 0 8px;border-top:1px solid var(--line);scroll-margin-top:22px}
+  .stage:first-of-type{border-top:none}
+  .stage-head{display:flex;align-items:baseline;gap:14px;margin:0 0 4px}
+  .stage-head .num{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--accent);
+    background:var(--accent-soft);border:1px solid var(--accent-border);border-radius:8px;
+    padding:3px 9px;flex:none}
+  .stage-head h2{font-size:22px;margin:0;letter-spacing:-.01em;font-weight:700}
+  .stage-note{color:var(--sub);font-size:14px;margin:8px 0 18px;max-width:70ch}
+
+  /* item */
+  .item{background:var(--card);border:1px solid var(--line);border-radius:13px;
+    padding:15px 17px;margin-bottom:11px;box-shadow:var(--shadow);
+    border-left:3px solid var(--frame)}
+  .item.block{border-left-color:var(--down)}
+  .item.user{border-left-color:var(--amber)}
+  .item.ready{border-left-color:var(--up)}
+  .item-top{display:flex;align-items:flex-start;gap:11px}
+  .chip{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.05em;
+    text-transform:uppercase;border-radius:6px;padding:3px 8px;flex:none;margin-top:1px;white-space:nowrap}
+  .chip.block{background:var(--down-bg);color:var(--down)}
+  .chip.user{background:var(--amber-bg);color:var(--amber)}
+  .chip.ready{background:var(--up-bg);color:var(--up)}
+  .item-body{flex:1;min-width:0}
+  .item-title{font-weight:600;font-size:15px;margin:0 0 3px;line-height:1.4}
+  .item-desc{color:var(--sub);font-size:13.5px;margin:0}
+  .item-desc b{color:var(--ink);font-weight:600}
+  .cmd{font-family:var(--mono);font-size:12.5px;background:var(--card2);border:1px solid var(--line);
+    border-radius:8px;padding:8px 11px;margin-top:9px;overflow-x:auto;white-space:pre;color:var(--ink)}
+  .prov{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--sub);
+    background:var(--card2);border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin-top:9px}
+  .item code{background:var(--card2);border:1px solid var(--line);border-radius:5px;padding:.5px 5px;font-size:12.5px}
+
+  /* callout */
+  .note{background:var(--amber-bg);border:1px solid var(--amber-border);border-radius:12px;
+    padding:15px 18px;margin:20px 0;font-size:14px;color:var(--ink)}
+  .note b{color:var(--amber)}
+  .note.blue{background:var(--accent-soft);border-color:var(--accent-border)}
+  .note.blue b{color:var(--accent)}
+
+  footer{margin-top:44px;padding-top:22px;border-top:1px solid var(--line);
+    color:var(--sub);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  .theme-btn{position:fixed;top:16px;right:16px;z-index:20;background:var(--card);
+    border:1px solid var(--line);border-radius:10px;color:var(--sub);font-family:var(--sans);
+    font-size:12.5px;padding:8px 12px;cursor:pointer;box-shadow:var(--shadow);display:flex;gap:7px;align-items:center}
+  .theme-btn:hover{color:var(--accent);border-color:var(--accent-border)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<button class="theme-btn" type="button" aria-label="切换深浅主题">◐ 切换主题</button>
+
+<div class="wrap">
+<header>
+  <p class="kicker">AlphaLoop v2 · Phase 10 · Ignition Runbook</p>
+  <h1>点火清单 <span class="dim">从 MacBook 到 Mac mini</span></h1>
+  <p class="lede">P1–P9 的代码全部合并进 <code>main</code> 并推送，全程 <b>2037 个测试稳定绿</b>，每个阶段的迁移都只在真实库的<b>副本</b>上验证过——线上运行时至今<b>按设计未部署</b>。这份清单是把系统从开发机搬到 Mac mini 并真正跑起来的点火序列：能脚本化的标「就绪」，需要你或外部服务介入的标「需人工」，缺了就整个系统起不来的标「阻断」。所有可注入的真实后端（检索 / LLM / memoryd / 飞书投递）此前一律是「P10 抛错占位」，本阶段逐一接上。</p>
+  <div class="stat-row">
+    <div class="stat"><div class="n ok">P1–P9</div><div class="l">代码阶段全部交付</div></div>
+    <div class="stat"><div class="n">2037</div><div class="l">测试 ×3 连续全绿</div></div>
+    <div class="stat"><div class="n">v11 → v14</div><div class="l">真实库首次打开即迁移</div></div>
+    <div class="stat"><div class="n warn">12</div><div class="l">点火阶段（本清单）</div></div>
+  </div>
+</header>
+
+<div class="legend">
+  <span class="k"><span class="dot block"></span>阻断 — 不做整个系统起不来</span>
+  <span class="k"><span class="dot user"></span>需人工 — 需你或外部服务，脚本代替不了</span>
+  <span class="k"><span class="dot ready"></span>就绪 — 代码已就位，跑命令即可</span>
+</div>
+
+<div class="cols">
+<nav class="rail" aria-label="点火阶段">
+  <ol>
+    <li><a href="#s1"><span class="sn">01</span>环境盘点</a></li>
+    <li><a href="#s2"><span class="sn">02</span>凭据重建</a></li>
+    <li><a href="#s3"><span class="sn">03</span>数据库迁移</a></li>
+    <li><a href="#s4"><span class="sn">04</span>成员播种</a></li>
+    <li><a href="#s5"><span class="sn">05</span>外部依赖</a></li>
+    <li><a href="#s6"><span class="sn">06</span>可注入后端接线</a></li>
+    <li><a href="#s7"><span class="sn">07</span>飞书接线</a></li>
+    <li><a href="#s8"><span class="sn">08</span>Cloudflare Access</a></li>
+    <li><a href="#s9"><span class="sn">09</span>服务安装</a></li>
+    <li><a href="#s10"><span class="sn">10</span>冒烟测试</a></li>
+    <li><a href="#s11"><span class="sn">11</span>双账号验收</a></li>
+    <li><a href="#s12"><span class="sn">12</span>观察期决策</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section class="stage" id="s1">
+  <div class="stage-head"><span class="num">01</span><h2>环境盘点</h2></div>
+  <p class="stage-note">迁移后运行时全停，先确认 mini 上到底有什么、缺什么。别假设任何东西还在。</p>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">确认 mini 基础环境</p>
+      <p class="item-desc">Node <b>≥24</b>（仓库 <code>node:sqlite</code> 依赖 24+）、pnpm 9.15.0、git、可访问 <code>git@github.com:EthanQC/AlphaLoop</code>。缺 Node 先装。</p>
+      <div class="cmd">node -v   # 需 v24+
+pnpm -v   # 9.15.0
+git clone git@github.com:EthanQC/AlphaLoop.git && cd AlphaLoop && pnpm i && pnpm build</div>
+    </div></div>
+  </div>
+
+  <div class="item ready">
+    <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
+      <p class="item-title">跑一次 doctor 看现状</p>
+      <p class="item-desc">此刻大概率满屏红（网关/runner 未监听、launchd 未装、RSSHub 不可达）——这是<b>预期基线</b>，逐阶段消红。doctor 本身崩溃已在 P2.5 修好，不会因单项失败而不打印。</p>
+      <div class="cmd">pnpm openclaw:runtime:doctor</div>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s2">
+  <div class="stage-head"><span class="num">02</span><h2>凭据重建</h2></div>
+  <p class="stage-note">迁移丢了 <code>.env.local</code>。按 <code>docs/superpowers/specs/secrets-inventory.md</code> 逐项重填——凭据不入仓，只能你手动放。</p>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">重建 <code>.env.local</code></p>
+      <p class="item-desc">拷 <code>.env.local.example</code> 起步。必填：<code>LONGBRIDGE_APP_KEY/SECRET/ACCESS_TOKEN</code>、<code>LONGBRIDGE_ACCOUNT_MODE=paper</code>、<code>ALLOW_LIVE_EXECUTION=false</code>（宪法永久禁实盘）、飞书 <code>LARK_*</code>。P4/P7 新增：<code>FINNHUB_API_KEY</code>、<code>RSSHUB_BASE_URL</code>、<code>MEMORYD_DATA_ROOT</code>。P6 新增：<code>BROKER_EXECUTOR_SHARED_SECRET</code>（执行器缺它<b>拒绝启动</b>，这是先记录后执行链的第一道门）。</p>
+      <span class="prov">前置于 P1 / P4 / P6 / P7</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">每成员独立券商凭据目录</p>
+      <p class="item-desc">P6 的多账户隔离要求 <code>~/.alphaloop/credentials/&lt;member-id&gt;/longbridge.env</code>，权限 0600，只有 broker-executor 可读，子进程 env 注入、永不进全局 <code>process.env</code>。你和 mashu 各一份（mashu 未开户则先留空 = 无盘成员降级）。</p>
+      <span class="prov">前置于 P6 多账户</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">飞书 oauth 写回自检</p>
+      <p class="item-desc">P4 审计修过 oauth 写 <code>.env.local</code> 会毁引号/注释的 bug。跑完 oauth 后 <code>git diff</code> 确认只改了目标 key、其余逐字节不变。</p>
+      <span class="prov">前置于 P4 审计修复</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s3">
+  <div class="stage-head"><span class="num">03</span><h2>数据库迁移</h2></div>
+  <p class="stage-note">真实 <code>runtime/trading.sqlite</code> 停在 <b>v11</b>，代码已到 <b>v14</b>。首次 <code>openTradingDatabase</code> 会顺序补 v12/v13/v14。先备份。</p>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">先备份，再迁移</p>
+      <p class="item-desc">v12（strategy_cards + theses 看多看空列，<b>表重建</b>）、v13（research 结果列）、v14（monthly_reviews）。每步单事务、失败回滚。开发期每次都只在副本上验过——真实库的首次迁移由你在有备份的前提下触发。</p>
+      <div class="cmd">node apps/openclaw-config/scripts/backup-trading-data.mjs
+# 备份就绪后，任一服务首次 openTradingDatabase 即触发 v11→v14
+node -e "require('./packages/shared-types/dist/index.js').openTradingDatabase('runtime/trading.sqlite')"
+node -e "const{DatabaseSync}=require('node:sqlite');console.log(new DatabaseSync('runtime/trading.sqlite',{readOnly:true}).prepare('PRAGMA user_version').get())"  # 应为 14</div>
+      <span class="prov">跨 P1–P9 累积 14 版</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">杀掉游离的 dev watcher</p>
+      <p class="item-desc">P4 出过一次事故：MacBook 上残留的 <code>pnpm ... platform-app dev</code> 包装进程会在你一改源码时自动重启并把真实库迁掉。在 mini 上别开 dev watcher 跑生产库；确认 <code>pgrep -f "tsx watch"</code> 为空。</p>
+      <span class="prov">教训来自 P4 事故</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s4">
+  <div class="stage-head"><span class="num">04</span><h2>成员播种</h2></div>
+  <p class="stage-note">身份网关需要 <code>members</code> 表里有人可解析——库里现在 0 成员。用 CLI 建你和 mashu，各发一个 skill token。</p>
+
+  <div class="item ready">
+    <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
+      <p class="item-title">建成员 + 发 token</p>
+      <p class="item-desc">token 明文<b>只显示一次</b>（审计只记 id 不记明文）。两人对等，各自 owner 隔离贯穿全栈。</p>
+      <div class="cmd">node apps/openclaw-config/scripts/members.mjs add --email &lt;你&gt; --name &lt;昵称&gt; --feishu &lt;openId&gt;
+node apps/openclaw-config/scripts/members.mjs add --email &lt;mashu&gt; --name mashu --feishu &lt;openId&gt;
+node apps/openclaw-config/scripts/members.mjs token issue --member &lt;id&gt; --label skill-client</div>
+      <span class="prov">前置于 P3 身份网关</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s5">
+  <div class="stage-head"><span class="num">05</span><h2>外部依赖</h2></div>
+  <p class="stage-note">四个外部件：长桥 CLI、RSSHub 容器、Finnhub key、memoryd 专用实例。都是本地代码替代不了的真实服务。</p>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">长桥 CLI + 模拟盘账户</p>
+      <p class="item-desc">装 <code>longbridge</code> 到 <code>~/.local/bin</code>（env <code>LONGBRIDGE_CLI_PATH</code> 可覆盖）。P5 实测过：无 CLI 时个股分析管线<b>诚实 fail-loud</b> 而非假装成功——所以这一步缺了不会静默出坏数据，但真数据得靠它。第二个（mashu）真实账户单列。</p>
+      <span class="prov">前置于 P5 / P6</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">RSSHub Docker 容器</p>
+      <p class="item-desc">P4 的中文新闻源（财联社/华尔街见闻/格隆汇）走本机 RSSHub，仅绑回环。launchd 模板已就位（<code>com.alphaloop.rsshub</code>，<code>docker start</code> 包装），但容器本体要你先建。三条中文路由历史上常失效——P4 已配第二冗余路由，但真实连通性得点火后验。</p>
+      <div class="cmd">docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub</div>
+      <span class="prov">前置于 P4 新闻引擎</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">Finnhub key + memoryd 专用实例</p>
+      <p class="item-desc">Finnhub 免费 60 次/分，填 <code>FINNHUB_API_KEY</code>（缺则该源标 skipped_no_key，不报错）。memoryd 起一个 <code>MEMORYD_DATA_ROOT</code> 专用实例、仅绑回环（HTTP 无鉴权=回环即信任边界）、每成员一个 scope。策略记忆的镜像层此前全是 fire-and-forget 降级，接上后才真正写入。</p>
+      <span class="prov">前置于 P4 / P7</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s6">
+  <div class="stage-head"><span class="num">06</span><h2>可注入后端接线</h2></div>
+  <p class="stage-note">全程贯穿的设计：任何依赖真实运行时的能力都做成可注入后端，真实现是「P10 抛错占位」，测试注入 fake。本阶段把四个占位换成真的。</p>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">四个 <code>create*Backend()</code> 占位实现</p>
+      <p class="item-desc">① <code>createResearchBackend()</code>（P8）→ OpenClaw 受限 agent 网关（仅搜索抓取、无 shell、owner-scope 预绑定）+ 搜索配额实测；② <code>createNarrativeLlmBackend()</code>（P5）→ headless LLM 运行时；③ <code>createMemorydBackend()</code>（P7）→ memoryd 回环 HTTP；④ 飞书结果卡投递（P8/P9）。每个都在源码里标了接线点，且在没接上时优雅降级——研判会显式跳过、叙事回落纯事实表、镜像标 mirrored:false，都不崩。</p>
+      <span class="prov">前置于 P5 / P7 / P8 / P9</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s7">
+  <div class="stage-head"><span class="num">07</span><h2>飞书接线</h2></div>
+  <p class="stage-note">卡片按钮审批（ocf1）走 OpenClaw 原生 <code>card.action.trigger</code>，无需新回调栈。但三个真实配置得你在飞书后台开。</p>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">开通 <code>im:message</code> 权限</p>
+      <p class="item-desc">P8/P9 实测时真实撞到 <code>99991672 Access denied</code>——应用尚未开通 <code>im:message:send</code> / <code>im:message</code> / <code>im:message:send_as_bot</code> 任一。不开，提醒卡/审批卡/研究结果卡/复盘卡全发不出去。</p>
+      <span class="prov">P8 点火时实撞</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">订阅 <code>card.action.trigger</code> + requireMention 冒烟</p>
+      <p class="item-desc">P2.5 评审确认 OpenClaw 2026.5.28 原生把按钮点击转成合成消息注入 control agent（自带 token 去重/过期/绑定点击者）。两个残余验证点：飞书后台是否已订阅该事件；<code>requireMention:true</code> 是否拦截合成消息。任一失败 → 回落文本审批（同管道，按钮 value=文本命令）。</p>
+      <span class="prov">前置于 P6 审批卡</span>
+    </div></div>
+  </div>
+
+  <div class="item ready">
+    <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
+      <p class="item-title">单一飞书连接约束</p>
+      <p class="item-desc">宪法 #7：恰好一个进程持有飞书事件连接，回执秒级、异步处理。只有 mini 持有 WS；其余服务全绑 127.0.0.1。代码已遵守，部署时别在两处同时起飞书插件。</p>
+      <span class="prov">AGENTS.md 宪法</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s8">
+  <div class="stage-head"><span class="num">08</span><h2>Cloudflare Access（身份网关）</h2></div>
+  <p class="stage-note">公网入站零；两个子域经 cloudflared 出站隧道全指向 platform-app（:4314），由它做唯一身份执法点。</p>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title"><code>verifyAccessJwt</code> 必须变成真的</p>
+      <p class="item-desc">P3 现在是文档化 no-op（返回 true），仅靠 loopback-only 兜底安全。真实部署必须校验 <code>Cf-Access-Jwt-Assertion</code> 对 AlphaLoop 真实 Cloudflare 团队域的 JWKS——否则任何本地进程都能伪造 <code>Cf-Access-Authenticated-User-Email</code> 头冒充身份。源码里 <code>TODO(P10)</code> 标了接线点。</p>
+      <span class="prov">前置于 P3 身份网关</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">cloudflared 双子域 + Access 白名单</p>
+      <p class="item-desc"><code>reports.&lt;域名&gt;</code>（Cloudflare Access 邮箱白名单）+ <code>api.&lt;域名&gt;</code>（edge Access service token + app 层 bearer，双层）。两个子域都指向 platform-app；静态服务 :4313 永不直接暴露。白名单=你+mashu 邮箱。</p>
+      <span class="prov">前置于 P3 平台</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s9">
+  <div class="stage-head"><span class="num">09</span><h2>服务安装</h2></div>
+  <p class="stage-note">launchd 装齐：platform-app、broker-executor、market-alerts、daily-backup、rsshub、monthly-review、official-paper、reports/stock-analysis。P2.5 已统一安装脚本，别只跑一条。</p>
+
+  <div class="item ready">
+    <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
+      <p class="item-title">两条安装命令都要跑</p>
+      <p class="item-desc">P2.5 查明 <code>launchd:install-user</code>（报告/选股/official-paper）和 <code>install-launchd.sh</code>（备份/提醒/网关）装的是不重叠的两套——只跑一条会装出<b>半套系统</b>。README 已并排文档化两条命令。P4/P9 的 rsshub、monthly-review 模板已接入 glob。</p>
+      <div class="cmd">pnpm launchd:install-user
+pnpm launchd:install-backup-alerts</div>
+      <span class="prov">前置于 P2.5 接线</span>
+    </div></div>
+  </div>
+
+  <div class="item ready">
+    <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
+      <p class="item-title">doctor 应转绿</p>
+      <p class="item-desc">装完 doctor 应报 launchd 任务已 load、alerts-poller 心跳新鲜、<code>ALERTER-DOWN.json</code> 不存在、rsshub 健康。心跳/失败升级是 P2.5 连修五轮的核心——「静默死掉的提醒器」是这套系统最坏的失败模式，doctor 是唯一的外部观察者。</p>
+      <span class="prov">前置于 P2.5 可观测性</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s10">
+  <div class="stage-head"><span class="num">10</span><h2>冒烟测试</h2></div>
+  <p class="stage-note">只能线上验的项——本地单测覆盖了导出函数，但真实运行时的行情供给、飞书投递、下单只有点火后才摸得到。</p>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">美股盘中跑 <code>alerts:poll --dry-run</code></p>
+      <p class="item-desc">P2 遗留的明确义务：<code>defaultQuoteProvider</code> 从未在真实行情下跑过。必须在美股交易时段实跑一次 dry-run，确认真拿到行情、真评估、真组卡——之后才能信任它无人值守运行。</p>
+      <div class="cmd">pnpm alerts:poll -- --dry-run   # 美股盘中</div>
+      <span class="prov">前置于 P2 提醒引擎</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">真实飞书投递 + 卡片按钮往返 + 真实下单</p>
+      <p class="item-desc">给自己发一张真提醒卡确认落地；点一次审批卡按钮确认 ocf1 合成消息注入管线；真跑一次先记录后执行的下单（模拟盘），确认 lifecycle 落库→下单→回执→对账全序，且重试幂等不重复下单。</p>
+      <span class="prov">前置于 P2 / P6</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s11">
+  <div class="stage-head"><span class="num">11</span><h2>双账号真实验收</h2></div>
+  <p class="stage-note">spec §7 的验收矩阵——本地已用临时库全过，线上用真实双账号复核一遍隔离与全链路。</p>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">隔离矩阵（真实 A/B）</p>
+      <p class="item-desc">B 深链直开 A 的提案/研判/复盘被拒（403）；报告列表 B 看不到 A 的研判/复盘条目；B 关闭战绩后 A 侧名片与对比视图正确隐藏；A 无法批 B 的提案；无审批记录的下单请求被服务端拒；页面零外部请求；未登录/白名单外进不来。</p>
+      <span class="prov">spec §7 验收</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">连续 5 交易日新闻达标 + 前 3 条提案验证</p>
+      <p class="item-desc">公共日报连续 5 交易日新闻达标（≥60% 非券商源、≥30% 中文源、链接抽查 ≥5 条全可达）；每日配额生效。审批链先按需跑，攒够<b>3 条真实验证过的提案</b>再开每日自动生成 cron。</p>
+      <span class="prov">P4 / P6 验收门</span>
+    </div></div>
+  </div>
+</section>
+
+<section class="stage" id="s12">
+  <div class="stage-head"><span class="num">12</span><h2>观察期决策</h2></div>
+  <p class="stage-note">点火后要你拿真实数据做的两个开关决策——都刻意默认关，攒够观察再开。</p>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">L3 事件深挖日报开启（观察 2–3 周）</p>
+      <p class="item-desc">P4：L3 深挖日报默认关、先周报 only（07-07 评审决策，推翻原方案）。观察 2–3 周成本与质量后，你决定是否给日报开 L3。</p>
+      <span class="prov">P4 观察项</span>
+    </div></div>
+  </div>
+
+  <div class="item user">
+    <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
+      <p class="item-title">每日自动提案 cron + 圈子公共月报</p>
+      <p class="item-desc">每日自动提案：3 条真实验证后再开。圈子公共月报（两人公开战绩/命中榜对比）：<b>两人都同意才开</b>，P9 刻意划到点火后。</p>
+      <span class="prov">P6 / P9 观察项</span>
+    </div></div>
+  </div>
+
+  <div class="note blue">
+    <b>非阻断遗留 minor（台账留痕，可从容处理）：</b>backup 跨天残留 <code>.tmp</code> 清扫、期权到期当日边界、带点分级股票代码转 Yahoo 横线、<code>calendar_uncovered</code> 归因、install-system-daemons.sh 的 zsh shebang 用 bash 调用、feishu oauth 无 state 参数、feishu-context id 缺失塌缩到主键 <code>""</code>。均不阻断点火，择期清理。
+  </div>
+</section>
+
+<div class="note">
+  <b>点火完成的判定：</b>doctor 全绿 · 盘中 dry-run 真拿到行情 · 真提醒卡落地 · 审批卡按钮往返成功 · 先记录后执行的下单幂等无重复 · 双账号隔离矩阵全过 · 5 交易日新闻达标。达到即 AlphaLoop v2 <b>真正上线</b>——从「代码就绪」到「线上生效」。在此之前，任何「跑起来了」的结论都只是「已部署，X 未实测」。
+</div>
+
+<footer>
+  <span>AlphaLoop v2 · P1–P9 code-complete · 2037 tests green · 运行时按设计未部署</span>
+  <span class="mono">Ignition runbook · 2026-07-16</span>
+</footer>
+
+</main>
+</div>
+</div>
+
+<script>
+  (function(){
+    var saved=null; try{saved=localStorage.getItem("alphaloop-theme");}catch(e){}
+    if(saved){document.documentElement.setAttribute("data-theme",saved);}
+    function toggle(){
+      var cur=document.documentElement.getAttribute("data-theme");
+      if(!cur){cur=window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";}
+      var next=cur==="dark"?"light":"dark";
+      document.documentElement.setAttribute("data-theme",next);
+      try{localStorage.setItem("alphaloop-theme",next);}catch(e){}
+    }
+    var b=document.querySelector(".theme-btn");
+    if(b){b.addEventListener("click",toggle);}
+  })();
+</script>
