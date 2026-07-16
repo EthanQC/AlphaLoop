@@ -33,6 +33,7 @@
     "feishu:authorize-user": "node apps/openclaw-config/scripts/authorize-feishu-user.mjs",
     "feishu:user-plugin:oauth": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs oauth",
     "feishu:user-plugin:status": "node apps/openclaw-config/scripts/setup-feishu-user-auth.mjs status",
+    "longbridge:install": "node apps/longbridge-cli/scripts/install-longbridge-cli.mjs",
     "longbridge:snapshot": "node apps/openclaw-config/scripts/longbridge-account-snapshot.mjs",
     "longbridge:quote": "node apps/openclaw-config/scripts/longbridge-quote.mjs",
     "longbridge:reconcile-official-paper": "node apps/openclaw-config/scripts/reconcile-official-paper-orders.mjs",
