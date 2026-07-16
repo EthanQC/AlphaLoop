@@ -1776,6 +1776,11 @@ export interface SetResearchTaskResultInput {
   confidence?: ResearchConfidence;
   title?: string;
   finishedAt: string;
+  // Per-run search budget consumed (spec §0.4 "单次调研预算"): the pipeline
+  // already returns `budgetSpent`; persisting it into the existing v3
+  // `budget_spent` column (default 0) closes the loop so the trace shows the
+  // real cost. Omitted → left unchanged (default 0), not zeroed.
+  budgetSpent?: number;
 }
 
 export class ResearchTaskRepository {
@@ -1934,7 +1939,8 @@ export class ResearchTaskRepository {
     const result = this.db
       .prepare(`
         UPDATE research_tasks
-        SET status = ?, result_json = ?, confidence = ?, title = ?, finished_at = ?
+        SET status = ?, result_json = ?, confidence = ?, title = ?, finished_at = ?,
+            budget_spent = COALESCE(?, budget_spent)
         WHERE id = ?
       `)
       .run(
@@ -1943,6 +1949,7 @@ export class ResearchTaskRepository {
         input.confidence ?? null,
         input.title ?? null,
         input.finishedAt,
+        input.budgetSpent ?? null,
         id
       );
 

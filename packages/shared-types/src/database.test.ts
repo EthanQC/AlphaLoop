@@ -2684,7 +2684,8 @@ describe("ResearchTaskRepository (Phase 8 Task 1, 2026-07-16 plan)", () => {
         resultJson,
         confidence: "medium",
         title: "AAPL 短期研判",
-        finishedAt
+        finishedAt,
+        budgetSpent: 7
       });
 
       const reloaded = repo.getById(result.task.id);
@@ -2693,6 +2694,18 @@ describe("ResearchTaskRepository (Phase 8 Task 1, 2026-07-16 plan)", () => {
       expect(reloaded?.confidence).toBe("medium");
       expect(reloaded?.title).toBe("AAPL 短期研判");
       expect(reloaded?.finishedAt).toBe(finishedAt);
+      expect(reloaded?.budgetSpent).toBe(7);
+    });
+
+    it("leaves budget_spent unchanged when the input omits it (COALESCE, not zeroed)", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // First write sets a budget, a later terminal write that omits it must NOT reset it to 0.
+      repo.setResult(result.task.id, { status: "running", finishedAt: nowIso(), budgetSpent: 5 });
+      repo.setResult(result.task.id, { status: "done", finishedAt: nowIso() });
+      expect(repo.getById(result.task.id)?.budgetSpent).toBe(5);
     });
 
     it("writes real SQL NULLs (not the JSON string \"null\") for omitted resultJson/confidence/title on a failed task", () => {

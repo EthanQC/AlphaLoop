@@ -472,6 +472,7 @@ export function createResearchWorker(deps: CreateResearchWorkerDeps): ResearchWo
         ...(pipelineResult.resultJson !== null ? { resultJson: pipelineResult.resultJson } : {}),
         ...(pipelineResult.confidence !== null ? { confidence: pipelineResult.confidence } : {}),
         ...(pipelineResult.title ? { title: pipelineResult.title } : {}),
+        ...(typeof pipelineResult.budgetSpent === "number" ? { budgetSpent: pipelineResult.budgetSpent } : {}),
         finishedAt: now().toISOString()
       });
     } catch (error) {
