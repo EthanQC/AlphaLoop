@@ -91,6 +91,27 @@ const PROPOSAL_TICKET_PREFIX = "ticket_prop_";
 // really did fail, so 'failed' remains the correct terminal proposal state).
 const LIVE_OR_FILLED_LIFECYCLE_STAGES = new Set(["submitted", "pending", "filled"]);
 
+// FIX 2: WaitToCancel/PendingCancel map to stage 'pending' in
+// broker-status-map.mjs (a cancel REQUEST in flight - the order is still
+// open, so 'pending' IS the right lifecycle stage) - which puts them inside
+// LIVE_OR_FILLED_LIFECYCLE_STAGES above. But "the owner is actively trying to
+// cancel this order" is NOT evidence the trade went through, so the un-stick
+// must never fire off one of these raw statuses: if the cancel completes, the
+// proposal really did fail; if it doesn't (the order fills first), a later
+// reconcile pass observes 'Filled' and un-sticks then, with the truthful
+// stage. broker-status-map.mjs (read-only single source of truth) does not
+// distinguish cancel-in-flight from other 'pending' statuses in its OUTPUT
+// ({stage:'pending', localStatus:'pending'} for both), so this set mirrors
+// its two cancel-in-flight table keys verbatim, normalized with the exact
+// same convention as the map's own normalizeStatus (lowercase, strip
+// everything but [a-z0-9]).
+const CANCEL_IN_FLIGHT_NORMALIZED_STATUSES = new Set(["waittocancel", "pendingcancel"]);
+
+function isCancelInFlightBrokerStatus(brokerStatusRaw) {
+  const normalized = String(brokerStatusRaw ?? "").toLowerCase().replace(/[^a-z0-9]/gu, "");
+  return CANCEL_IN_FLIGHT_NORMALIZED_STATUSES.has(normalized);
+}
+
 function proposalIdFromTicketId(ticketId) {
   if (typeof ticketId !== "string" || !ticketId.startsWith(PROPOSAL_TICKET_PREFIX)) {
     return null;
@@ -169,6 +190,29 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
         brokerStatus: brokerStatusRaw,
         lifecycleStage: stage,
         localStatus
+      });
+
+      // FIX 1a: the un-stick must ALSO run on the matched branch, not just on
+      // adoption. Reachable scenario: an order adopted while the broker
+      // reported an UNMAPPED status landed at stage 'unknown_broker_status'
+      // (correctly excluded from the un-stick set), and only a LATER pass -
+      // which matches by external_order_id, i.e. THIS branch - observes it
+      // 'Filled'. Without the call here the proposal stays 'failed' forever
+      // for really-bought shares. reconcileStuckFailedProposal is idempotent
+      // (proposal status !== 'failed' is a no-op), so routine matched
+      // refreshes of healthy orders cost one proposal lookup and change
+      // nothing.
+      reconcileStuckFailedProposal(db, proposals, reports, audit, {
+        ticketId: existingByExternalId.ticket_id,
+        stage,
+        symbol,
+        side,
+        quantity,
+        limitPrice,
+        externalOrderId,
+        brokerStatusRaw,
+        localStatus,
+        observedAt
       });
       continue;
     }
@@ -336,13 +380,25 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 //   (b) that proposal is currently 'failed' (idempotent: a second reconcile
 //       pass over the same already-adopted order finds status 'executed'
 //       already and is a no-op here - no second report), AND
-//   (c) the adopted broker stage is live/filled (LIVE_OR_FILLED_LIFECYCLE_
+//   (c) the observed broker stage is live/filled (LIVE_OR_FILLED_LIFECYCLE_
 //       STAGES), never a cancelled/rejected/expired/unknown stage - those
-//       really did fail, so 'failed' is the correct terminal state.
+//       really did fail, so 'failed' is the correct terminal state, AND
+//   (d) FIX 2: the RAW broker status is not a cancel-in-flight one
+//       (WaitToCancel/PendingCancel) - those map to stage 'pending' (the
+//       order is still open), but a cancel being requested is not evidence
+//       the trade went through; see CANCEL_IN_FLIGHT_NORMALIZED_STATUSES.
+// Called from BOTH the adopt branch (order correlated to a
+// submit_unconfirmed / timeout-failed row this pass) and the matched branch
+// (order already known by external_order_id whose freshly observed stage is
+// what finally proves it live/filled - FIX 1a).
 function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
   const { ticketId, stage, symbol, side, quantity, limitPrice, externalOrderId, brokerStatusRaw, localStatus, observedAt } = input;
 
   if (!LIVE_OR_FILLED_LIFECYCLE_STAGES.has(stage)) {
+    return;
+  }
+
+  if (isCancelInFlightBrokerStatus(brokerStatusRaw)) {
     return;
   }
 
@@ -382,13 +438,19 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
 
   const reportId = createId("report");
   const notionalUsd = typeof limitPrice === "number" ? limitPrice * quantity : undefined;
+  // FIX 2: only a 'filled' stage may claim 成交 - a merely-live order
+  // (submitted/pending) is alive at the broker but NOT filled yet, and the
+  // report must say so instead of hard-coding a fill claim.
+  const statusLine = stage === "filled"
+    ? "状态：对账已确认成交（此前误判为提交未确认）"
+    : "状态：对账确认订单已提交并在券商侧存活（此前误判为提交未确认，尚未观察到成交）";
   reports.save({
     id: reportId,
     category: "trade",
     title: `${symbol} 执行报告`,
     body: [
       `工单：${ticketId}`,
-      "状态：对账已确认成交（此前误判为提交未确认）",
+      statusLine,
       "执行方：长桥官方模拟盘",
       `外部订单号：${externalOrderId}`,
       `券商状态：${brokerStatusRaw}`,
@@ -412,7 +474,7 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
       localStatus,
       lifecycleStage: stage,
       source: "reconcile-official-paper-orders",
-      note: "对账 adopt 分支补记：此前因 submit_unconfirmed 误判失败，现确认订单已成交/存活。"
+      note: "对账补记（adopt 或 matched 分支）：此前因 submit_unconfirmed 误判失败，现确认订单已成交/存活。"
     },
     createdAt: observedAt
   });
@@ -504,21 +566,39 @@ function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity,
 }
 
 // Orphan correlation: candidates are lifecycle rows with no external_order_id
-// yet, matching symbol+side+quantity, in EITHER of the two stages a
-// not-yet-externally-confirmed row can be in - 'submit_unconfirmed'
-// (adoptable: the CLI call already errored/timed out, so this row is
-// genuinely waiting for reconcile to resolve it one way or the other) or
-// 'submitting' (NOT adoptable - broker-executor's own request for it is
-// still in flight; see the "defer" branch's own comment above for why
-// adopting here would race broker-executor's callback). Closest submitted_at
-// within the window wins; 'submit_unconfirmed' candidates are preferred over
-// 'submitting' ones since adoption is the more actionable outcome.
+// yet, matching symbol+side+quantity, in one of the three stages a
+// not-yet-externally-confirmed row can be in:
+//   - 'submit_unconfirmed' (adoptable: the CLI call already errored/timed
+//     out, so this row is genuinely waiting for reconcile to resolve it one
+//     way or the other);
+//   - 'failed' + local_status 'rejected' (adoptable - FIX 1b): EXACTLY the
+//     pair the submit_unconfirmed timeout adjudication above writes, and per
+//     domain.ts's OfficialPaperOrderLifecycleStage doc the 'failed' stage is
+//     only ever written by that adjudication (broker refusals are 'rejected',
+//     a different stage). A broker order first observed in the day list
+//     AFTER the 30-minute timeout already flipped its row to 'failed' must
+//     still correlate here - otherwise it becomes a permanent ticketless
+//     orphan sitting next to a row that is its own ticket. The local_status
+//     check is defense in depth so any future 'failed' writer with different
+//     semantics does not silently become adoptable;
+//   - 'submitting' (NOT adoptable - broker-executor's own request for it is
+//     still in flight; see the "defer" branch's own comment above for why
+//     adopting here would race broker-executor's callback).
+// Closest submitted_at within the window wins (the timeout adjudication
+// never touches submitted_at, so the same time-window rule applies unchanged
+// to timeout-failed rows); 'submit_unconfirmed' candidates are preferred
+// over timeout-'failed' ones (still-open adjudication beats correcting a
+// closed one), and both are preferred over 'submitting' since adoption is
+// the more actionable outcome.
 function findOrphanCorrelationCandidate(db, { symbol, side, quantity, orderSubmittedAtMs, windowMs }) {
   const rows = db.prepare(`
     SELECT * FROM official_paper_order_lifecycle
     WHERE symbol = ? AND side = ? AND quantity = ?
       AND external_order_id IS NULL
-      AND lifecycle_stage IN ('submit_unconfirmed', 'submitting')
+      AND (
+        lifecycle_stage IN ('submit_unconfirmed', 'submitting')
+        OR (lifecycle_stage = 'failed' AND local_status = 'rejected')
+      )
   `).all(symbol, side, quantity);
 
   const withinWindow = rows
@@ -526,7 +606,8 @@ function findOrphanCorrelationCandidate(db, { symbol, side, quantity, orderSubmi
     .filter(({ deltaMs }) => Number.isFinite(deltaMs) && deltaMs <= windowMs)
     .sort((a, b) => a.deltaMs - b.deltaMs);
 
-  const adoptable = withinWindow.find(({ row }) => row.lifecycle_stage === "submit_unconfirmed");
+  const adoptable = withinWindow.find(({ row }) => row.lifecycle_stage === "submit_unconfirmed")
+    ?? withinWindow.find(({ row }) => row.lifecycle_stage === "failed");
   if (adoptable) {
     return { kind: "adopt", row: adoptable.row };
   }

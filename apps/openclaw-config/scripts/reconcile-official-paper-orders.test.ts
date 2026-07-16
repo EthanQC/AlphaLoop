@@ -510,6 +510,216 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
   });
 });
 
+// FIX 1a (matched-branch un-stick): an order adopted while the broker reports
+// an UNMAPPED status lands at stage 'unknown_broker_status' - excluded from
+// the live/filled un-stick set, so the adopt-branch un-stick correctly does
+// nothing. But when a LATER pass sees the same order 'Filled', that pass goes
+// through the matched-by-external_order_id branch - which must ALSO invoke
+// the un-stick, or the proposal stays 'failed' forever for really-bought
+// shares.
+describe("FIX 1a: matched-branch un-stick after adoption at an unmapped broker status", () => {
+  it("adopt at unknown status leaves proposal failed; next pass observing Filled un-sticks it to executed", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "NVDA.US", side: "buy", quantity: 7, limitPrice: 120 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+
+    insertLifecycleRow(db, {
+      id: "row_unmapped_then_filled", ticketId, externalOrderId: null,
+      symbol: "NVDA.US", side: "buy", quantity: 7, limitPrice: 120,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    // Pass 1: broker reports a status this codebase's map does not know.
+    const first = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_UNMAPPED", symbol: "NVDA.US", side: "Buy", quantity: 7, price: 120, status: "SomeBrandNewBrokerStatus", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+    expect(first.adopted).toHaveLength(1);
+    expect(getRow(db, "row_unmapped_then_filled").lifecycle_stage).toBe("unknown_broker_status");
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+
+    // Pass 2: same order now reported Filled -> MATCHED branch must un-stick.
+    const second = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_UNMAPPED", symbol: "NVDA.US", side: "Buy", quantity: 7, price: 120, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })
+    ], { nowIso: "2026-07-15T14:20:00.000Z" });
+    expect(second.matched).toHaveLength(1);
+
+    const updatedProposal = new ProposalRepository(db).getById(proposal.id);
+    expect(updatedProposal?.status).toBe("executed");
+    expect(updatedProposal?.ticketId).toBe(ticketId);
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(1);
+    expect(allRows(db)).toHaveLength(1);
+  });
+
+  it("matched-branch un-stick stays idempotent: a third pass over the same Filled order writes no second report", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "AMD.US", side: "buy", quantity: 4, limitPrice: 90 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+    insertLifecycleRow(db, {
+      id: "row_matched_idem", ticketId, externalOrderId: null,
+      symbol: "AMD.US", side: "buy", quantity: 4, limitPrice: 90,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_IDEM", symbol: "AMD.US", side: "Buy", quantity: 4, price: 90, status: "SomeBrandNewBrokerStatus", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+    const filledOrder = [brokerOrder({ order_id: "EXT_IDEM", symbol: "AMD.US", side: "Buy", quantity: 4, price: 90, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })];
+    await runReconcile(db, filledOrder, { nowIso: "2026-07-15T14:20:00.000Z" });
+    await runReconcile(db, filledOrder, { nowIso: "2026-07-15T14:30:00.000Z" });
+
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("executed");
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(1);
+  });
+});
+
+// FIX 1b (post-timeout adoption): the 30-minute submit_unconfirmed timeout
+// flips the lifecycle row to stage 'failed' + proposal markFailed. If the
+// broker's day-order list only shows the order on a LATER pass, the orphan
+// correlation must still find that timeout-failed row (same symbol/side/
+// quantity/time-window rules) instead of inserting a permanent ticketless
+// orphan next to it.
+describe("FIX 1b: broker order first observed after the submit_unconfirmed timeout is adopted, not orphaned", () => {
+  it("timeout flips row+proposal to failed; a later pass observing the Filled order adopts it and un-sticks the proposal", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "TSLA.US", side: "sell", quantity: 3, limitPrice: 250 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    insertLifecycleRow(db, {
+      id: "row_late_broker", ticketId, externalOrderId: null,
+      symbol: "TSLA.US", side: "sell", quantity: 3, limitPrice: 250,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    // Pass 1 (14:10, no broker orders visible yet): timeout adjudication.
+    const first = await runReconcile(db, [], { nowIso: "2026-07-15T14:10:00.000Z" });
+    expect(first.timedOut).toHaveLength(1);
+    expect(getRow(db, "row_late_broker").lifecycle_stage).toBe("failed");
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+
+    // Pass 2 (14:20): the broker's day list finally shows the order, created
+    // back at 13:02 - within the correlation window of the row's submitted_at.
+    const second = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_LATE", symbol: "TSLA.US", side: "Sell", quantity: 3, price: 250, status: "Filled", created_at: "2026-07-15T13:02:00.000Z" })
+    ], { nowIso: "2026-07-15T14:20:00.000Z" });
+
+    expect(second.adopted).toHaveLength(1);
+    expect(second.orphaned).toHaveLength(0);
+    expect(allRows(db)).toHaveLength(1);
+
+    const row = getRow(db, "row_late_broker");
+    expect(row.external_order_id).toBe("EXT_LATE");
+    expect(row.ticket_id).toBe(ticketId);
+    expect(row.lifecycle_stage).toBe("filled");
+
+    const updatedProposal = new ProposalRepository(db).getById(proposal.id);
+    expect(updatedProposal?.status).toBe("executed");
+    expect(updatedProposal?.ticketId).toBe(ticketId);
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(1);
+  });
+
+  it("does not adopt a timeout-failed row outside the correlation window, and never touches a failed row that already has an external_order_id", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_failed_far", ticketId: "ticket_prop_far", externalOrderId: null,
+      symbol: "IBM.US", side: "buy", quantity: 2,
+      lifecycleStage: "failed", brokerStatus: "unconfirmed", localStatus: "rejected",
+      submittedAt: "2026-07-15T09:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_FAR", symbol: "IBM.US", side: "Buy", quantity: 2, status: "Filled", created_at: "2026-07-15T14:00:00.000Z" })
+    ], { nowIso: "2026-07-15T14:10:00.000Z" });
+
+    // 5 hours apart: NOT adopted - the broker order becomes a normal orphan.
+    expect(getRow(db, "row_failed_far").external_order_id).toBeNull();
+    expect(getRow(db, "row_failed_far").lifecycle_stage).toBe("failed");
+    expect(getRowByExternalOrderId(db, "EXT_FAR")?.ticket_id).toBeNull();
+    expect(allRows(db)).toHaveLength(2);
+  });
+});
+
+// FIX 2: WaitToCancel/PendingCancel map to stage 'pending' (a cancel REQUEST
+// in flight - the order is still open, so 'pending' is the right lifecycle
+// stage), but "a cancel is being requested" is NOT evidence the trade went
+// through - the un-stick must not fire for those raw statuses. And when the
+// un-stick DOES fire for a merely-live (submitted/pending) order, its report
+// must not hard-code a 成交 (filled) claim.
+describe("FIX 2: cancel-in-flight never un-sticks, and un-stick report wording reflects the actual stage", () => {
+  it("adopting a WaitToCancel order does NOT un-stick the failed proposal (and writes no trade report)", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "GOOG.US", side: "buy", quantity: 5, limitPrice: 150 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+    insertLifecycleRow(db, {
+      id: "row_cancel_inflight", ticketId, externalOrderId: null,
+      symbol: "GOOG.US", side: "buy", quantity: 5, limitPrice: 150,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_W2C", symbol: "GOOG.US", side: "Buy", quantity: 5, price: 150, status: "WaitToCancel", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+
+    expect(result.adopted).toHaveLength(1);
+    expect(getRow(db, "row_cancel_inflight").lifecycle_stage).toBe("pending");
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+  });
+
+  it("a 'submitted'-stage un-stick report does not claim 成交; a 'filled'-stage one does", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 180 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+    insertLifecycleRow(db, {
+      id: "row_submitted_unstick", ticketId, externalOrderId: null,
+      symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 180,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_LIVE", symbol: "AMZN.US", side: "Buy", quantity: 6, price: 180, status: "New", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("executed");
+    const liveReports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(liveReports).toHaveLength(1);
+    expect(liveReports[0]?.body).not.toContain("已确认成交");
+    expect(liveReports[0]?.body).toContain("已提交");
+
+    // Contrast: a genuinely filled un-stick still reports 成交.
+    const db2 = makeDb();
+    seedMember(db2, "member_1");
+    const proposal2 = seedProposal(db2, { symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 180 });
+    const ticketId2 = `ticket_prop_${proposal2.id}`;
+    new ProposalRepository(db2).markFailed(proposal2.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+    insertLifecycleRow(db2, {
+      id: "row_filled_unstick", ticketId: ticketId2, externalOrderId: null,
+      symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 180,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+    await runReconcile(db2, [
+      brokerOrder({ order_id: "EXT_FILL2", symbol: "AMZN.US", side: "Buy", quantity: 6, price: 180, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+    const filledReports = new ExecutionReportRepository(db2).listRecent(10, ["trade"]);
+    expect(filledReports).toHaveLength(1);
+    expect(filledReports[0]?.body).toContain("已确认成交");
+  });
+});
+
 describe("finding #2 regression: an existing non-null ticket_id is never overwritten", () => {
   it("a second same-symbol/side/quantity broker order never steals the first order's ticket_id", async () => {
     const db = makeDb();
