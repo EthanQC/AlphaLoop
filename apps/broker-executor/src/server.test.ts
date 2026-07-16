@@ -428,6 +428,39 @@ describe("createBrokerExecutorServer", () => {
       expect(callCount()).toBe(callsAfterFirst);
     });
 
+    // FIX 5: the throw/timeout path (submit_unconfirmed, 507) previously put
+    // the raw (error as Error).message straight into the HTTP response AND
+    // into proposals.markFailed's persisted `outcome` column - unlike the
+    // success path (sanitizeExecutionResult) and the missing-order-id path,
+    // this one skipped redactSensitiveText entirely, so a secret-shaped
+    // token captured in execFileSync stderr would leak out both live and at
+    // rest.
+    it("redacts a secret-shaped token out of the HTTP response AND the persisted proposal/lifecycle rows when the CLI call throws", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      const secretToken = "sk-testtoken1234567890abcdef";
+      const { fn } = makeThrowingExec(`spawn failed, leaked token=${secretToken} in stderr`);
+      await startServer({ execFn: fn });
+
+      const approved = createApprovedProposal(db, { quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: approved.id })
+      });
+
+      expect(response.status).toBe(507);
+      const body = await response.json();
+      expect(body.error).not.toContain(secretToken);
+
+      const lifecycleRow = db
+        .prepare(`SELECT notes FROM official_paper_order_lifecycle WHERE ticket_id = ?`)
+        .get(deriveTicketId(approved.id)) as Record<string, unknown>;
+      expect(String(lifecycleRow.notes)).not.toContain(secretToken);
+
+      const proposalsRepo = new ProposalRepository(db);
+      expect(proposalsRepo.getById(approved.id)?.outcome ?? "").not.toContain(secretToken);
+    });
+
     it("submit_unconfirmed (507) on a timeout-shaped throw (killed/SIGTERM), same as a generic throw", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       const timeoutError = Object.assign(new Error("Command timed out"), { killed: true, signal: "SIGTERM" });

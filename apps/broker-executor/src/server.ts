@@ -374,7 +374,13 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         try {
           execResult = executeLongbridgePaperOrder(ticket, deps.execFn);
         } catch (execError) {
-          const message = (execError as Error).message;
+          // FIX 5: (execError as Error).message may carry execFileSync stderr
+          // verbatim (a spawn failure/timeout can echo back CLI output),
+          // which can contain secret-shaped tokens - route it through the
+          // same redactSensitiveText the success path already uses before it
+          // reaches the HTTP response, the lifecycle notes, or the proposal's
+          // persisted outcome.
+          const message = redactSensitiveText((execError as Error).message);
           const observedAt = new Date().toISOString();
           officialPaperOrders.markSubmitUnconfirmed(ticketId, [
             `长桥 CLI 调用失败或超时：${message}`,
@@ -455,7 +461,12 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
 
       notFound(res);
     } catch (error) {
-      sendJson(res, 500, { error: (error as Error).message });
+      // FIX 5: same redaction requirement as the throw/timeout path above -
+      // an uncaught error surfacing here could, in principle, be wrapping
+      // captured CLI stderr too (e.g. a rethrow further up the call chain),
+      // so this outer boundary is not exempt from the same rule the success
+      // path already follows.
+      sendJson(res, 500, { error: redactSensitiveText((error as Error).message) });
     }
   });
 }
