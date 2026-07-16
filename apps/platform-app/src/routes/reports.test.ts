@@ -6,7 +6,14 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, ResearchTaskRepository, migrate, type Member } from "@packages/shared-types";
+import {
+  ApiTokenRepository,
+  MemberRepository,
+  MonthlyReviewRepository,
+  ResearchTaskRepository,
+  migrate,
+  type Member
+} from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
 
@@ -100,14 +107,17 @@ describe("reports routes", () => {
       expect(body).toContain("日报");
     });
 
-    it("renders a real, clickable 研判 chip (P8 shipped) and keeps 复盘 disabled/P9", async () => {
+    it("renders real, clickable 研判 AND 复盘 chips (P8 + P9 both shipped) - no disabled chips remain", async () => {
       const response = await authed("/reports");
       const body = await response.text();
       expect(body).toContain("研判");
       expect(body).not.toContain("研判</span><small class=\"mono\""); // no longer the disabled-chip markup
       expect(body).toMatch(/<a href="\/reports\?type=%E7%A0%94%E5%88%A4"[^>]*>研判<\/a>/u);
       expect(body).toContain("复盘");
-      expect(body).toContain("P9 上线");
+      expect(body).not.toContain("复盘</span><small class=\"mono\""); // no longer the disabled-chip markup
+      expect(body).toMatch(/<a href="\/reports\?type=%E5%A4%8D%E7%9B%98"[^>]*>复盘<\/a>/u);
+      expect(body).not.toContain("P9 上线");
+      expect(body).not.toContain("aria-disabled"); // no disabled chip markup anywhere
     });
 
     it("filters by ?type=", async () => {
@@ -203,6 +213,90 @@ describe("reports routes", () => {
       const response = await authed("/reports?type=研判");
       const body = await response.text();
       expect(body).toContain("暂无研判");
+    });
+  });
+
+  // Phase 9 Task 4 (2026-07-16 plan): the 复盘 chip's real, DB-backed,
+  // ALWAYS-owner-scoped list (monthly_reviews has no public visibility at
+  // all, unlike research_tasks).
+  describe("GET /reports?type=复盘 (real review archive, owner-filtered, no public path)", () => {
+    function seedReview(
+      ownerId: string,
+      period: string,
+      opts: { confirm?: boolean } = {}
+    ): string {
+      const repo = new MonthlyReviewRepository(db);
+      const review = repo.upsertDraft({
+        ownerId,
+        period,
+        resultJson: {
+          ownerId,
+          period,
+          generatedAt: "2026-07-14T00:00:00.000Z",
+          predictionReview: {
+            selfThesisHitRate: { sample: "insufficient", n: 0 },
+            systemConfidenceCalibration: [],
+            systemConfidenceCalibrationNote: "系统个股分析置信度校准——全平台口径，非本人专属"
+          },
+          decisionReview: {
+            period,
+            periodStart: "2026-07-01T00:00:00.000Z",
+            periodEnd: "2026-08-01T00:00:00.000Z",
+            benchmarkSymbol: "QQQ",
+            executed: { sample: "none", n: 0, priced: 0, entries: [] },
+            rejected: { sample: "none", n: 0, disclaimer: "未执行，仅口径参考", entries: [] }
+          },
+          disciplineReview: {
+            complianceRate: { sample: "none" },
+            complianceValue: { compliant: { sample: "none", n: 0 }, violating: { sample: "none", n: 0 }, deltaPct: null }
+          },
+          alertQuality: { sample: "none", triggeredCount: 0, misreportCount: 0, misreportRate: null },
+          errorCategories: [],
+          oneLineLesson: "本月各项指标样本不足或表现正常，暂无可归纳的一句话教训。",
+          nextSteps: ["暂无下一步动作建议——数据不足或本月各项指标均在正常范围内。"],
+          improvementSuggestions: {
+            disclaimer: "以上为规则推导的改进建议，仅供参考；任何策略/纪律变更须本人在飞书或 CLI 中手动确认后生效。",
+            items: []
+          }
+        }
+      });
+      if (opts.confirm) {
+        repo.confirm(review.id, ownerId);
+      }
+      return review.id;
+    }
+
+    it("lists the viewer's own reviews as cards (period, 草稿/已确认 status, /review/<id> link)", async () => {
+      const draftId = seedReview(member.id, "2026-06");
+      const confirmedId = seedReview(member.id, "2026-05", { confirm: true });
+
+      const response = await authed("/reports?type=复盘");
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain("2026-06");
+      expect(body).toContain("草稿");
+      expect(body).toContain(`href="/review/${draftId}"`);
+      expect(body).toContain("2026-05");
+      expect(body).toContain("已确认");
+      expect(body).toContain(`href="/review/${confirmedId}"`);
+    });
+
+    it("owner isolation: member B's report list never shows member A's reviews", async () => {
+      const memberA = { ...member, id: "member_a", email: "a@example.com" };
+      new MemberRepository(db).upsert(memberA);
+      seedReview("member_a", "2026-06");
+
+      const response = await authed("/reports?type=复盘");
+      const body = await response.text();
+      expect(body).not.toContain("2026-06");
+      expect(body).toContain("暂无复盘");
+    });
+
+    it("shows 暂无复盘 (with the auto-generation hint) when the viewer has no reviews at all", async () => {
+      const response = await authed("/reports?type=复盘");
+      const body = await response.text();
+      expect(body).toContain("暂无复盘");
+      expect(body).toContain("每月第一个周末自动生成草稿");
     });
   });
 

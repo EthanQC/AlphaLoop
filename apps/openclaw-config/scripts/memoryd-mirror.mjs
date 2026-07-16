@@ -36,21 +36,24 @@
 
 // memoryd's mem_save tool accepts exactly six `type` values: session /
 // decision / preference / fact / playbook / warning (memoryd fact sheet).
-// This codebase's four mirrored record kinds map onto four of those six per
+// This codebase's five mirrored record kinds map onto three of those six per
 // the plan's explicit mapping ("策略卡→playbook / 纪律→warning /
-// 论点·判断→decision"):
+// 论点·判断→decision"), extended by Phase 9 Task 3's review flywheel plan
+// ("确认时写复盘结论...type=decision"):
 //   - strategy_card (a saved playbook: scene/entry/risk/exit)   -> playbook
 //   - discipline_rule (a self-imposed trading constraint)        -> warning
 //   - thesis (an initial bull/bear call on a symbol)              -> decision
 //   - thesis_judgment (a later append-only note on that thesis)  -> decision
-// Exported so callers (the future strategy.mjs CLI / bearer-gated API, Tasks
-// 3-4) and this module's own tests share ONE literal mapping rather than
-// each re-typing the four record-type strings independently.
+//   - monthly_review (a confirmed per-owner monthly review)       -> decision
+// Exported so callers (strategy.mjs's CLI, Phase 9's reviews.mjs CLI, a
+// future bearer-gated API) and this module's own tests share ONE literal
+// mapping rather than each re-typing the record-type strings independently.
 export const MEMORYD_TYPE_BY_RECORD = {
   strategy_card: "playbook",
   discipline_rule: "warning",
   thesis: "decision",
-  thesis_judgment: "decision"
+  thesis_judgment: "decision",
+  monthly_review: "decision"
 };
 
 // Any record type NOT in the map above (a future record kind not yet wired

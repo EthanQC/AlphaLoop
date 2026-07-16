@@ -14,6 +14,7 @@ import { handlePaperRoute } from "./routes/paper.js";
 import { handleProposalRoute } from "./routes/proposal.js";
 import { handleReportsRoute } from "./routes/reports.js";
 import { handleResearchRoute } from "./routes/research.js";
+import { handleReviewRoute, type FeishuReviewNotifier } from "./routes/review.js";
 import { handleStockRoute } from "./routes/stock.js";
 import { handleStrategyRoute } from "./routes/strategy.js";
 
@@ -43,6 +44,12 @@ export interface PlatformServerDeps {
    * collaborators) and pass it here, ticking it by hand rather than relying
    * on this route's fire-and-forget kick for timing. */
   researchWorker?: ResearchWorkerLike;
+  /** Injectable Feishu single-chat confirm notifier (Task 4, routes/
+   * review.ts), fired fire-and-forget after `POST /api/reviews/:id/confirm`.
+   * Defaults to createFeishuReviewNotifier()'s P10-gated placeholder (always
+   * degrades to `{delivered:false}` today) when the real entrypoint
+   * (index.ts) doesn't supply one. */
+  feishuNotifier?: FeishuReviewNotifier;
 }
 
 /**
@@ -110,6 +117,28 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         ...(deps.now ? { now: deps.now } : {}),
         ...(deps.researchWorker ? { researchWorker: deps.researchWorker } : {})
       })
+    ) {
+      return;
+    }
+
+    // Monthly review reading page (`GET /review/<id>`) + its confirm
+    // endpoint (`POST /api/reviews/:id/confirm`, Task 4) - one module owns
+    // both (routes/review.ts's own module header), identity-gated via
+    // `resolveIdentity` (bearer OR Access) like the research surfaces above,
+    // never bearer-only.
+    if (
+      handleReviewRoute(
+        req,
+        res,
+        url,
+        {
+          db: deps.db,
+          ...(deps.now ? { now: deps.now } : {}),
+          ...(deps.memorydBackend ? { memorydBackend: deps.memorydBackend } : {}),
+          ...(deps.feishuNotifier ? { feishuNotifier: deps.feishuNotifier } : {})
+        },
+        nonce
+      )
     ) {
       return;
     }

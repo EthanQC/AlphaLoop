@@ -10,7 +10,8 @@ describe("managed OpenClaw cron jobs", () => {
       "openclaw-trading-daily-report",
       "openclaw-trading-weekly-report",
       "openclaw-trading-stock-analysis",
-      "openclaw-trading-proposal-sweep"
+      "openclaw-trading-proposal-sweep",
+      "openclaw-trading-monthly-review"
     ]);
     expect(jobs).toEqual([
       expect.objectContaining({
@@ -32,6 +33,11 @@ describe("managed OpenClaw cron jobs", () => {
         cron: "0 * * * *",
         timezone: "Asia/Shanghai",
         systemEvent: expect.stringContaining("pnpm proposals:sweep")
+      }),
+      expect.objectContaining({
+        cron: "0 10 1-7 * 6,0",
+        timezone: "Asia/Shanghai",
+        systemEvent: expect.stringContaining("pnpm reviews:generate")
       })
     ]);
     for (const job of jobs) {
@@ -45,11 +51,13 @@ describe("managed OpenClaw cron jobs", () => {
     }
     // The three original report/analysis jobs each run a report-quality
     // validation pipeline (their "quality" label is literal); the Task 3
-    // proposal-expiry sweep is a plain atomic-consume sweep, not a quality
-    // pipeline, so it is intentionally excluded from this specific check.
+    // proposal-expiry sweep and the Phase 9 monthly-review generation are
+    // plain atomic sweeps, not quality pipelines, so both are intentionally
+    // excluded from this specific check.
     for (const job of jobs.slice(0, 3)) {
       expect(job.systemEvent).toContain("quality");
     }
     expect(jobs[3]?.systemEvent).toContain("proposal-expiry sweep");
+    expect(jobs[4]?.systemEvent).toContain("monthly per-owner review draft generation");
   });
 });

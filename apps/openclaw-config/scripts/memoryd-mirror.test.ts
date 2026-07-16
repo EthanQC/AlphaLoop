@@ -33,12 +33,13 @@ describe("scopeForOwner", () => {
 // ===========================================================================
 
 describe("MEMORYD_TYPE_BY_RECORD", () => {
-  it("maps strategy_card -> playbook, discipline_rule -> warning, thesis/thesis_judgment -> decision", () => {
+  it("maps strategy_card -> playbook, discipline_rule -> warning, thesis/thesis_judgment/monthly_review -> decision", () => {
     expect(memorydMirror.MEMORYD_TYPE_BY_RECORD).toEqual({
       strategy_card: "playbook",
       discipline_rule: "warning",
       thesis: "decision",
-      thesis_judgment: "decision"
+      thesis_judgment: "decision",
+      monthly_review: "decision"
     });
   });
 });

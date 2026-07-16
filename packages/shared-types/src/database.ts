@@ -9,6 +9,9 @@ import type {
   ExecutionReport,
   JsonValue,
   Member,
+  MonthlyReview,
+  MonthlyReviewResult,
+  MonthlyReviewStatus,
   OfficialPaperOrderLifecycle,
   OfficialPaperOrderLifecycleStage,
   OrderSide,
@@ -48,7 +51,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -841,6 +844,42 @@ const MIGRATIONS: MigrationStep[] = [
       ALTER TABLE research_tasks ADD COLUMN result_json TEXT;
       ALTER TABLE research_tasks ADD COLUMN confidence TEXT CHECK(confidence IS NULL OR confidence IN ('low','medium','high'));
       ALTER TABLE research_tasks ADD COLUMN title TEXT;
+    `);
+  },
+  (db) => {
+    // Phase 9 Task 1 (2026-07-16 plan, review flywheel): monthly_reviews is
+    // the per-owner monthly-review record - draft->confirmed is a manual
+    // confirmation gate (plan Global Constraint: "改进建议 only，变更须本人确认",
+    // enforced by MonthlyReviewRepository.confirm below, not by this DDL). A
+    // brand-new table, no rebuild of anything pre-existing - a plain step
+    // suffices (no needsForeignKeysOff), same category as v8's news_events/
+    // daily_facts and v9's stock_facts above. DDL is spec-frozen VERBATIM
+    // from the plan's Global Constraints ("此外 DDL 冻结") - do not hand-edit
+    // without updating the plan doc first.
+    //
+    // UNIQUE(owner_id, period) is the one-review-per-owner-per-month
+    // invariant the plan's "每人一份 per-owner" line requires -
+    // MonthlyReviewRepository.upsertDraft below relies on it as its
+    // ON CONFLICT target. The extra (owner_id, period) index is redundant
+    // with that UNIQUE constraint for lookups (SQLite auto-indexes a UNIQUE
+    // constraint) but is declared explicitly anyway per this task's own
+    // brief ("+ index (owner_id, period)"), mirroring how v3's
+    // proposals_owner_status_idx/theses_owner_symbol_idx already declare
+    // explicit indexes alongside this codebase's other owner-scoped tables
+    // even where a UNIQUE constraint alone would technically suffice.
+    db.exec(`
+      CREATE TABLE monthly_reviews (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES members(id),
+        period TEXT NOT NULL,
+        result_json TEXT,
+        status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','confirmed')),
+        confirmed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(owner_id, period)
+      );
+      CREATE INDEX IF NOT EXISTS monthly_reviews_owner_period_idx ON monthly_reviews(owner_id, period);
     `);
   }
 ];
@@ -2012,6 +2051,150 @@ export class ResearchTaskRepository {
     this.db.prepare(`UPDATE research_tasks SET visibility = 'public' WHERE id = ?`).run(id);
     return { ...existing, visibility: "public" };
   }
+}
+
+// Input to MonthlyReviewRepository.upsertDraft() - Task 3's `reviews
+// generate` CLI (and any re-run of the monthly cron for the same period)
+// is the production caller. `resultJson` is optional - a draft row may exist
+// before the review engine has produced a result (undefined writes a real
+// SQL NULL, never the JSON string "null" - same toJson-avoidance convention
+// ResearchTaskRepository.setResult's resultJson uses above).
+export interface UpsertMonthlyReviewDraftInput {
+  ownerId: string;
+  period: string;
+  resultJson?: MonthlyReviewResult;
+}
+
+export class MonthlyReviewRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  // Upsert keyed on UNIQUE(owner_id, period) - a same-owner/same-period
+  // re-generate (e.g. a re-run of the monthly cron, or the CLI's `generate`
+  // called twice for the same period before confirmation) overwrites the
+  // prior DRAFT's result_json/updated_at in place, rather than erroring or
+  // accumulating a second row (which the UNIQUE constraint would refuse
+  // anyway).
+  //
+  // Deliberate choice, documented per this task's brief ("已 confirmed →
+  // 拒或另存，选一并文档化"): once a review has been CONFIRMED, a later
+  // upsertDraft for the SAME (ownerId, period) is REJECTED (throws), never
+  // silently overwritten. Rationale: confirm() is this phase's one
+  // human-approval gate (plan Global Constraint: "改进建议 only，变更须本人确认，
+  // draft→confirmed 人工确认门") - a confirmed review is the archived record
+  // of what the owner actually signed off on. Letting a later re-generate
+  // silently replace a confirmed review's result_json would let the SYSTEM
+  // overwrite a human decision after the fact, exactly the failure mode the
+  // draft/confirmed split exists to prevent. The alternative floated by the
+  // brief ("or save separately", i.e. version the row / open a second draft
+  // for the same period) was rejected because this task's OWN frozen DDL
+  // declares UNIQUE(owner_id, period) - "two rows for the same period" is
+  // structurally impossible without a schema change, which this phase's
+  // "此外 DDL 冻结" constraint forbids. Throwing loudly (a confirmed review
+  // must be regenerated under a NEW period, or left alone) is the only
+  // option compatible with the frozen schema; callers that want a genuinely
+  // fresh look at an already-confirmed month need a human decision, not a
+  // silent overwrite.
+  upsertDraft(input: UpsertMonthlyReviewDraftInput): MonthlyReview {
+    const existing = this.getByOwnerPeriod(input.ownerId, input.period);
+    if (existing && existing.status === "confirmed") {
+      throw new Error(
+        `Monthly review for owner ${input.ownerId}, period ${input.period} is already confirmed; refusing to overwrite with a new draft.`
+      );
+    }
+
+    const now = nowIso();
+    const resultJson = input.resultJson !== undefined ? toJson(input.resultJson) : null;
+
+    this.db
+      .prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, result_json, status, confirmed_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'draft', NULL, ?, ?)
+        ON CONFLICT(owner_id, period) DO UPDATE SET
+          result_json = excluded.result_json,
+          updated_at = excluded.updated_at
+      `)
+      .run(createId("monthly_review"), input.ownerId, input.period, resultJson, now, now);
+
+    // Re-fetch rather than hand-construct the return value: on the
+    // ON-CONFLICT path, SQLite keeps the EXISTING row's id/created_at (the
+    // freshly-generated id/now bound above are simply never written for a
+    // conflicting row, since the DO UPDATE SET clause above does not list
+    // them) - a re-fetch is the only way to report back the id/createdAt
+    // that actually persisted, mirroring ProposalRepository.consumeApproval's
+    // own re-fetch-after-write precedent above.
+    const reloaded = this.getByOwnerPeriod(input.ownerId, input.period);
+    if (!reloaded) {
+      throw new Error(
+        `Monthly review upsert for owner ${input.ownerId}, period ${input.period} failed unexpectedly (row missing immediately after write).`
+      );
+    }
+    return reloaded;
+  }
+
+  // draft -> confirmed, one-way (see MonthlyReviewStatus's own doc comment
+  // in domain.ts - there is no confirmed -> draft path anywhere in this
+  // phase). Non-owner callers are refused (owner-gate, same pattern as
+  // ResearchTaskRepository.promoteVisibility above); an ALREADY-confirmed
+  // review is an idempotent no-op (a duplicate confirm click - CLI or
+  // Feishu - must not throw or re-stamp confirmed_at a second time).
+  confirm(id: string, ownerId: string): MonthlyReview {
+    const existing = this.getById(id);
+    if (!existing) {
+      throw new Error(`Monthly review ${id} not found.`);
+    }
+    if (existing.ownerId !== ownerId) {
+      throw new Error(`Monthly review ${id} is not owned by ${ownerId}; refusing to confirm.`);
+    }
+    if (existing.status === "confirmed") {
+      return existing;
+    }
+
+    const confirmedAt = nowIso();
+    this.db
+      .prepare(`UPDATE monthly_reviews SET status = 'confirmed', confirmed_at = ?, updated_at = ? WHERE id = ?`)
+      .run(confirmedAt, confirmedAt, id);
+
+    return { ...existing, status: "confirmed", confirmedAt, updatedAt: confirmedAt };
+  }
+
+  getById(id: string): MonthlyReview | null {
+    const row = this.db
+      .prepare(`SELECT * FROM monthly_reviews WHERE id = ? LIMIT 1`)
+      .get(id) as Record<string, unknown> | undefined;
+
+    return row ? mapMonthlyReview(row) : null;
+  }
+
+  getByOwnerPeriod(ownerId: string, period: string): MonthlyReview | null {
+    const row = this.db
+      .prepare(`SELECT * FROM monthly_reviews WHERE owner_id = ? AND period = ? LIMIT 1`)
+      .get(ownerId, period) as Record<string, unknown> | undefined;
+
+    return row ? mapMonthlyReview(row) : null;
+  }
+
+  listForOwner(ownerId: string): MonthlyReview[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM monthly_reviews WHERE owner_id = ? ORDER BY period DESC`)
+      .all(ownerId) as Array<Record<string, unknown>>;
+
+    return rows.map(mapMonthlyReview);
+  }
+}
+
+function mapMonthlyReview(row: Record<string, unknown>): MonthlyReview {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    period: String(row.period),
+    ...(row.result_json !== null && row.result_json !== undefined
+      ? { resultJson: fromJson<MonthlyReviewResult>(String(row.result_json)) as MonthlyReviewResult }
+      : {}),
+    status: String(row.status) as MonthlyReviewStatus,
+    ...(row.confirmed_at !== null && row.confirmed_at !== undefined ? { confirmedAt: String(row.confirmed_at) } : {}),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
 }
 
 function mapResearchTask(row: Record<string, unknown>): ResearchTask {

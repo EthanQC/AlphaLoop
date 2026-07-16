@@ -10,6 +10,7 @@ import {
   ApiTokenRepository,
   CircuitBreakerRepository,
   MemberRepository,
+  MonthlyReviewRepository,
   createId,
   migrate,
   type Member
@@ -162,7 +163,9 @@ describe("home route (GET /)", () => {
       "今日日报卡",
       "暂无日报",
       "纪律速览",
-      "策略记忆 P7 上线"
+      "策略记忆 P7 上线",
+      "复盘速览",
+      "暂无复盘，每月第一个周末自动生成草稿"
     ];
 
     let cursor = -1;
@@ -381,6 +384,90 @@ describe("home route (GET /)", () => {
       const response = await authed("/", tokenB);
       const body = await response.text();
       expect(body).not.toContain("熔断暂停中");
+    });
+  });
+
+  // Phase 9 Task 4 (2026-07-16 plan): ⑦ 复盘速览 - most recent review,
+  // period + status + link, or the auto-generation empty state.
+  describe("⑦ 复盘速览", () => {
+    function seedMinimalReview(ownerId: string, period: string, opts: { confirm?: boolean } = {}): string {
+      const repo = new MonthlyReviewRepository(db);
+      const review = repo.upsertDraft({
+        ownerId,
+        period,
+        resultJson: {
+          ownerId,
+          period,
+          generatedAt: "2026-07-14T00:00:00.000Z",
+          predictionReview: {
+            selfThesisHitRate: { sample: "insufficient", n: 0 },
+            systemConfidenceCalibration: [],
+            systemConfidenceCalibrationNote: "系统个股分析置信度校准——全平台口径，非本人专属"
+          },
+          decisionReview: {
+            period,
+            periodStart: "2026-07-01T00:00:00.000Z",
+            periodEnd: "2026-08-01T00:00:00.000Z",
+            benchmarkSymbol: "QQQ",
+            executed: { sample: "none", n: 0, priced: 0, entries: [] },
+            rejected: { sample: "none", n: 0, disclaimer: "未执行，仅口径参考", entries: [] }
+          },
+          disciplineReview: {
+            complianceRate: { sample: "none" },
+            complianceValue: { compliant: { sample: "none", n: 0 }, violating: { sample: "none", n: 0 }, deltaPct: null }
+          },
+          alertQuality: { sample: "none", triggeredCount: 0, misreportCount: 0, misreportRate: null },
+          errorCategories: [],
+          oneLineLesson: "本月各项指标样本不足或表现正常，暂无可归纳的一句话教训。",
+          nextSteps: ["暂无下一步动作建议——数据不足或本月各项指标均在正常范围内。"],
+          improvementSuggestions: {
+            disclaimer: "以上为规则推导的改进建议，仅供参考；任何策略/纪律变更须本人在飞书或 CLI 中手动确认后生效。",
+            items: []
+          }
+        }
+      });
+      if (opts.confirm) {
+        repo.confirm(review.id, ownerId);
+      }
+      return review.id;
+    }
+
+    it("shows the most recent (highest period) review with its 草稿 status and a working link", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedMinimalReview(member.id, "2026-05");
+      const latestId = seedMinimalReview(member.id, "2026-06");
+
+      const response = await authed("/", token);
+      const body = await response.text();
+
+      expect(body).toContain("2026-06");
+      expect(body).toContain(`href="/review/${latestId}"`);
+    });
+
+    it("shows 已确认 status for a confirmed review", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedMinimalReview(member.id, "2026-06", { confirm: true });
+
+      const response = await authed("/", token);
+      const body = await response.text();
+
+      const reviewBlockIndex = body.indexOf("复盘速览");
+      expect(reviewBlockIndex).toBeGreaterThan(-1);
+      expect(body.slice(reviewBlockIndex, reviewBlockIndex + 400)).toContain("已确认");
+    });
+
+    it("owner isolation: member B's home page never shows member A's review", async () => {
+      const { member: memberA } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      seedMinimalReview(memberA.id, "2026-06");
+
+      const memberB = makeMember({ id: "member_b", email: "b@example.com" });
+      new MemberRepository(db).upsert(memberB);
+      const tokenB = new ApiTokenRepository(db).issue(memberB.id, "test").token;
+
+      const response = await authed("/", tokenB);
+      const body = await response.text();
+      expect(body).not.toContain("2026-06");
+      expect(body).toContain("暂无复盘，每月第一个周末自动生成草稿");
     });
   });
 });
