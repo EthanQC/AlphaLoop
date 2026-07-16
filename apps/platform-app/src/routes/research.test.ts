@@ -154,8 +154,11 @@ describe("research route (GET /research/<id>)", () => {
       expect(nonceMatch).not.toBeNull();
       const nonce = nonceMatch?.[1] ?? "";
       // Two nonce'd scripts on this page (theme init + polling), BOTH must
-      // carry the SAME per-response nonce.
-      const scriptTagCount = (body.match(new RegExp(`<script nonce="${nonce}">`, "gu")) ?? []).length;
+      // carry the SAME per-response nonce. Count via string split, NOT a
+      // RegExp built from the nonce - a base64 nonce can contain '+' '/' '='
+      // which are regex metacharacters, making a naive RegExp match
+      // intermittently wrong depending on the random nonce value.
+      const scriptTagCount = body.split(`<script nonce="${nonce}">`).length - 1;
       expect(scriptTagCount).toBe(2);
       expect(body).toContain(`setTimeout(function(){location.reload();},3000);`);
     });
