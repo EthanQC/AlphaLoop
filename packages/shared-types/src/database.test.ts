@@ -10,6 +10,7 @@ import {
   CircuitBreakerRepository,
   OfficialPaperOrderLifecycleRepository,
   ResearchTaskRepository,
+  MonthlyReviewRepository,
   usEasternTradingDayUtcRange
 } from "./database.js";
 import type { NewProposal } from "./database.js";
@@ -898,9 +899,10 @@ function stripResearchTasksV13ColumnsIfPresent(db: DatabaseSync): void {
 // pre-v8 production db would be in.
 function buildSeededV7Database(): DatabaseSync {
   const db = memoryDb();
-  migrate(db); // builds the full v0..v13 schema using the real migration code
+  migrate(db); // builds the full v0..v14 schema using the real migration code
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS monthly_reviews;
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
@@ -1177,6 +1179,7 @@ function buildSeededV8Database(): DatabaseSync {
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS monthly_reviews;
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
@@ -1314,7 +1317,11 @@ function buildSeededV9Database(): DatabaseSync {
   const db = buildSeededV8Database();
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
-  db.exec(`DROP TABLE IF EXISTS strategy_cards; DROP TABLE IF EXISTS circuit_breaker_state;`);
+  db.exec(`
+    DROP TABLE IF EXISTS monthly_reviews;
+    DROP TABLE IF EXISTS strategy_cards;
+    DROP TABLE IF EXISTS circuit_breaker_state;
+  `);
   db.exec("PRAGMA user_version = 9");
 
   const now = nowIso();
@@ -1989,7 +1996,7 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
     const db = buildSeededV9Database();
     migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
     stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-    db.exec(`DROP TABLE IF EXISTS strategy_cards;`); // peel off v12's own new table - see buildSeededV7/V8/V9Database's identical technique
+    db.exec(`DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables - see buildSeededV7/V8/V9Database's identical technique
     db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
     seedMember(db, "mem_v10");
     db.prepare(`
@@ -2040,9 +2047,9 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
 //     them already present would make that assertion vacuous.
 function buildSeededV11Database(): DatabaseSync {
   const db = buildSeededV9Database();
-  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
+  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-  db.exec(`DROP TABLE IF EXISTS strategy_cards;`);
+  db.exec(`DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables
 
   db.exec("PRAGMA foreign_keys = OFF;");
   db.exec(`
@@ -2094,8 +2101,9 @@ function buildSeededV11Database(): DatabaseSync {
 // below.
 function buildSeededV12Database(): DatabaseSync {
   const db = buildSeededV9Database();
-  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
+  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db);
+  db.exec(`DROP TABLE IF EXISTS monthly_reviews;`); // peel off v14's own new table - see buildSeededV7/V8/V9Database's identical technique
 
   // buildSeededV9Database() drops circuit_breaker_state before resetting its
   // own user_version - the migrate(db) call above recreates it (v10's step)
@@ -2109,6 +2117,42 @@ function buildSeededV12Database(): DatabaseSync {
   `).run(nowIso(), nowIso());
 
   db.exec("PRAGMA user_version = 12");
+  return db;
+}
+
+// Builds a REAL v13 database: starts from buildSeededV9Database() (v9
+// shape), runs the real migrate() (which - now that v14 exists (Phase 9
+// Task 1) - advances all the way through v10, v11, v12, v13 AND v14 in one
+// call), then peels v14's OWN new table (monthly_reviews) back off - the
+// same "reversed-fixture" technique buildSeededV11Database/
+// buildSeededV12Database above already use, needed here for the identical
+// reason: v14 didn't exist when those earlier fixtures were written, so this
+// fixture's own migrate(db) call advances straight past v13 to v14 unless
+// peeled back. Unlike v13's own COLUMN-level change (which needs the
+// dedicated stripResearchTasksV13ColumnsIfPresent rebuild-and-copy helper),
+// v14 is a brand-new TABLE - `DROP TABLE IF EXISTS` alone reverses it
+// completely, no column-level peel needed. research_tasks is left WITH its
+// v13 result_json/confidence/title columns (this fixture represents v13,
+// where those columns already exist) - only stock_facts/circuit_breaker_state
+// reseeding (below) is needed, same as buildSeededV12Database.
+function buildSeededV13Database(): DatabaseSync {
+  const db = buildSeededV9Database();
+  migrate(db); // fixture-build only: advances the underlying schema through v10..v14
+  db.exec(`DROP TABLE IF EXISTS monthly_reviews;`);
+
+  // buildSeededV9Database() drops circuit_breaker_state before resetting its
+  // own user_version - the migrate(db) call above recreates it (v10's step)
+  // but empty, so it must be reseeded here (same technique
+  // buildSeededV11Database/buildSeededV12Database use above) for
+  // V10_TABLE_NAMES's "every table has data" precondition to hold in the
+  // v14 test below (this fixture reuses that same table-name list).
+  seedMember(db, "mem_v13");
+  db.prepare(`
+    INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+    VALUES ('mem_v13', ?, 'weekly loss > 3%', -0.05, ?)
+  `).run(nowIso(), nowIso());
+
+  db.exec("PRAGMA user_version = 13");
   return db;
 }
 
@@ -2313,8 +2357,13 @@ describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1
 });
 
 describe("v13 research_tasks result columns migration (Phase 8 Task 1, 2026-07-16 plan)", () => {
-  it("SCHEMA_VERSION is 13", () => {
-    expect(SCHEMA_VERSION).toBe(13);
+  // SCHEMA_VERSION has since moved on to v14 (Phase 9 Task 1, monthly
+  // reviews) - see the "v14 ..." describe block below for the current-
+  // version assertion; loosened to "at least" the same way the v10/v11/v12
+  // blocks above already were when a later phase moved SCHEMA_VERSION past
+  // the version each of those blocks was originally written to pin.
+  it("SCHEMA_VERSION is at least 13", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(13);
   });
 
   it("a fresh db lands at v13 with result_json/confidence/title present on research_tasks, all nullable", () => {
@@ -3030,5 +3079,282 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     });
 
     expect(repo.countSubmittedTodayForOwner("mem_owner", "2026-07-15T00:00:00.000Z")).toBe(2);
+  });
+});
+
+describe("v14 monthly_reviews migration (Phase 9 Task 1, 2026-07-16 plan)", () => {
+  it("SCHEMA_VERSION is 14", () => {
+    expect(SCHEMA_VERSION).toBe(14);
+  });
+
+  it("a fresh db lands at v14 with monthly_reviews present (columns/CHECK/UNIQUE/index per the plan's frozen DDL)", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("monthly_reviews");
+
+    const columns = db.prepare("PRAGMA table_info(monthly_reviews)").all() as Array<
+      { name: string; notnull: number }
+    >;
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+    expect(byName.id).toBeDefined();
+    expect(byName.owner_id).toBeDefined();
+    expect(byName.owner_id.notnull).toBe(1);
+    expect(byName.period).toBeDefined();
+    expect(byName.period.notnull).toBe(1);
+    expect(byName.result_json).toBeDefined();
+    expect(byName.result_json.notnull).toBe(0);
+    expect(byName.status).toBeDefined();
+    expect(byName.status.notnull).toBe(1);
+    expect(byName.confirmed_at).toBeDefined();
+    expect(byName.confirmed_at.notnull).toBe(0);
+    expect(byName.created_at).toBeDefined();
+    expect(byName.created_at.notnull).toBe(1);
+    expect(byName.updated_at).toBeDefined();
+    expect(byName.updated_at.notnull).toBe(1);
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("monthly_reviews_owner_period_idx");
+  });
+
+  it("is idempotent", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("status CHECK rejects any value outside ('draft','confirmed')", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v14_check");
+    const now = nowIso();
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_bad_status', 'mem_v14_check', '2026-07', 'bogus', ?, ?)
+      `).run(now, now)
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_ok_draft', 'mem_v14_check', '2026-01', 'draft', ?, ?)
+      `).run(now, now)
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_ok_confirmed', 'mem_v14_check', '2026-02', 'confirmed', ?, ?)
+      `).run(now, now)
+    ).not.toThrow();
+  });
+
+  it("enforces UNIQUE(owner_id, period)", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v14_unique");
+    seedMember(db, "mem_v14_unique_2");
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+      VALUES ('mr_1', 'mem_v14_unique', '2026-07', 'draft', ?, ?)
+    `).run(now, now);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_2', 'mem_v14_unique', '2026-07', 'draft', ?, ?)
+      `).run(now, now)
+    ).toThrow(/UNIQUE constraint failed/);
+
+    // A DIFFERENT period for the same owner, or the same period for a
+    // DIFFERENT owner, is fine - the constraint is on the (owner_id, period)
+    // PAIR, not either column alone.
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_3', 'mem_v14_unique', '2026-08', 'draft', ?, ?)
+      `).run(now, now)
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(`
+        INSERT INTO monthly_reviews (id, owner_id, period, status, created_at, updated_at)
+        VALUES ('mr_4', 'mem_v14_unique_2', '2026-07', 'draft', ?, ?)
+      `).run(now, now)
+    ).not.toThrow();
+  });
+
+  it("upgrades a genuine pre-v14 (v13-shaped, monthly_reviews absent) database to v14 with zero row loss across every pre-existing table, and the pre-existing member row (the FK target monthly_reviews will reference) is preserved verbatim", () => {
+    const db = buildSeededV13Database();
+    expect(getSchemaVersion(db)).toBe(13);
+
+    const tablesBefore = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tablesBefore.map((t) => t.name)).not.toContain("monthly_reviews");
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V10_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      if (table !== "strategy_cards") {
+        expect(countsBefore[table]).toBeGreaterThan(0);
+      }
+    }
+    const memberBefore = db.prepare("SELECT * FROM members WHERE id = 'mem_v13'").get() as Record<string, unknown>;
+    expect(memberBefore).toBeDefined();
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+    const memberAfter = db.prepare("SELECT * FROM members WHERE id = 'mem_v13'").get() as Record<string, unknown>;
+    expect(memberAfter).toEqual(memberBefore);
+
+    const tablesAfter = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tablesAfter.map((t) => t.name)).toContain("monthly_reviews");
+    expect(countRows(db, "monthly_reviews")).toBe(0);
+
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+});
+
+describe("MonthlyReviewRepository (Phase 9 Task 1, 2026-07-16 plan)", () => {
+  function setup() {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    seedMember(db, "mem_other");
+    return { db, repo: new MonthlyReviewRepository(db) };
+  }
+
+  describe("upsertDraft", () => {
+    it("creates a new draft row and round-trips via getById/getByOwnerPeriod", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "test" } });
+
+      expect(review.status).toBe("draft");
+      expect(review.ownerId).toBe("mem_owner");
+      expect(review.period).toBe("2026-07");
+      expect(review.resultJson).toEqual({ headline: "test" });
+      expect(review.confirmedAt).toBeUndefined();
+      expect(review.id).toMatch(/^monthly_review_/);
+
+      expect(repo.getById(review.id)).toEqual(review);
+      expect(repo.getByOwnerPeriod("mem_owner", "2026-07")).toEqual(review);
+    });
+
+    it("re-calling for the SAME (ownerId, period) overwrites result_json/updated_at in place, keeping the same id/created_at", () => {
+      const { repo } = setup();
+      const first = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "v1" } });
+      const second = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "v2" } });
+
+      expect(second.id).toBe(first.id);
+      expect(second.createdAt).toBe(first.createdAt);
+      expect(second.resultJson).toEqual({ headline: "v2" });
+      expect(repo.listForOwner("mem_owner")).toHaveLength(1);
+    });
+
+    it("throws when the existing row for (ownerId, period) is already confirmed, and does not overwrite it", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "v1" } });
+      repo.confirm(review.id, "mem_owner");
+
+      expect(() =>
+        repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "v2 - should be refused" } })
+      ).toThrow(/already confirmed/);
+
+      const reloaded = repo.getById(review.id);
+      expect(reloaded?.status).toBe("confirmed");
+      expect(reloaded?.resultJson).toEqual({ headline: "v1" });
+    });
+
+    it("allows omitting resultJson (writes a real SQL NULL, not the JSON string 'null')", () => {
+      const { db, repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+      expect(review.resultJson).toBeUndefined();
+
+      const row = db.prepare("SELECT result_json FROM monthly_reviews WHERE id = ?").get(review.id) as { result_json: unknown };
+      expect(row.result_json).toBeNull();
+    });
+
+    it("rejects an owner_id that does not reference an existing member (FK)", () => {
+      const { repo } = setup();
+      expect(() => repo.upsertDraft({ ownerId: "ghost_member", period: "2026-07" })).toThrow(
+        /FOREIGN KEY constraint failed/
+      );
+    });
+  });
+
+  describe("confirm", () => {
+    it("transitions draft -> confirmed, setting confirmed_at/updated_at", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+
+      const confirmed = repo.confirm(review.id, "mem_owner");
+
+      expect(confirmed.status).toBe("confirmed");
+      expect(confirmed.confirmedAt).toBeDefined();
+      expect(repo.getById(review.id)?.status).toBe("confirmed");
+    });
+
+    it("throws for a non-owner caller, and does not confirm the review", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+
+      expect(() => repo.confirm(review.id, "mem_other")).toThrow(/not owned by mem_other/);
+      expect(repo.getById(review.id)?.status).toBe("draft");
+    });
+
+    it("throws for an unknown review id", () => {
+      const { repo } = setup();
+      expect(() => repo.confirm("monthly_review_nope", "mem_owner")).toThrow(/not found/);
+    });
+
+    it("is idempotent: re-confirming an already-confirmed review is a no-op, not an error, and confirmed_at does not change", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+      const firstConfirm = repo.confirm(review.id, "mem_owner");
+
+      const secondConfirm = repo.confirm(review.id, "mem_owner");
+
+      expect(secondConfirm).toEqual(firstConfirm);
+    });
+  });
+
+  describe("listForOwner", () => {
+    it("returns only this owner's reviews, ordered by period descending", () => {
+      const { repo } = setup();
+      repo.upsertDraft({ ownerId: "mem_owner", period: "2026-05" });
+      repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+      repo.upsertDraft({ ownerId: "mem_owner", period: "2026-06" });
+      repo.upsertDraft({ ownerId: "mem_other", period: "2026-07" });
+
+      const reviews = repo.listForOwner("mem_owner");
+      expect(reviews.map((r) => r.period)).toEqual(["2026-07", "2026-06", "2026-05"]);
+    });
+
+    it("returns an empty array for an owner with no reviews", () => {
+      const { repo } = setup();
+      expect(repo.listForOwner("mem_owner")).toEqual([]);
+    });
+  });
+
+  describe("getById / getByOwnerPeriod", () => {
+    it("return null for unknown lookups", () => {
+      const { repo } = setup();
+      expect(repo.getById("monthly_review_nope")).toBeNull();
+      expect(repo.getByOwnerPeriod("mem_owner", "2026-07")).toBeNull();
+    });
   });
 });

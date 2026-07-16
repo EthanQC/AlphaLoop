@@ -312,6 +312,39 @@ export interface ResearchTask {
   finishedAt?: string;
 }
 
+// Phase 9 Task 1 (2026-07-16 plan, review flywheel): mirrors the
+// `monthly_reviews` table (v14 DDL, packages/shared-types/src/database.ts)
+// field-for-field. `draft` is the only status a fresh generate() run ever
+// produces (Task 3's CLI); `confirmed` is a one-way, owner-gated transition
+// (MonthlyReviewRepository.confirm) - there is no 'confirmed' -> 'draft'
+// path anywhere in this phase (plan: "改进建议 only，变更须本人确认" - once
+// confirmed, the review is the record of what the owner signed off on).
+export type MonthlyReviewStatus = "draft" | "confirmed";
+
+// The parsed shape of `monthly_reviews.result_json` - Task 2's deterministic
+// review engine (buildMonthlyReview) is the only producer of this shape;
+// this type only describes it once it exists, same convention as
+// ResearchResult above. Left as JsonValue here (not a task-1 concern to
+// pin down the six-section structure Task 2's plan text describes -
+// predictions/decisions/discipline/alerts/lessons/suggestions) - Task 2
+// replaces this with a real interface once it owns that shape.
+export type MonthlyReviewResult = JsonValue;
+
+export interface MonthlyReview {
+  id: string;
+  ownerId: string;
+  // 'YYYY-MM' calendar month this review covers (plan: "每月第一个周末生成、
+  // 每人一份 per-owner" - one review per (ownerId, period), UNIQUE-enforced).
+  period: string;
+  // undefined (not null) until the review engine writes a result - mirrors
+  // ResearchTask.resultJson's own undefined-until-written convention.
+  resultJson?: MonthlyReviewResult;
+  status: MonthlyReviewStatus;
+  confirmedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
