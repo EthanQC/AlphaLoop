@@ -90,6 +90,30 @@ describe("runResearchPipeline - operational intent", () => {
       expect(result.reason).toBe("operational_intent");
     }
   );
+
+  // Imperative operational commands that split verb from object (controller
+  // delivery-gate finding: the literal keyword list missed these).
+  it.each(["帮我把仓位规则改成15%", "请把这条纪律设为停用", "帮我把仓位调到10%"])(
+    "treats the imperative command %s as operational intent",
+    async (question) => {
+      const backend = vi.fn(async () => ({ results: [] }));
+      const result = await researchEngine.runResearchPipeline(baseArgs({ question, backend }));
+      expect(result.status).toBe("failed");
+      expect(result.reason).toBe("operational_intent");
+      expect(backend).not.toHaveBeenCalled();
+    }
+  );
+
+  // But a genuine INTERROGATIVE research question that merely mentions an
+  // operational object must NOT be redirected - it stays in the pipeline.
+  it.each(["仓位规则一般怎么定比较好", "我的纪律是否需要调整", "这条规则值得改吗"])(
+    "does NOT treat the research question %s as operational intent",
+    async (question) => {
+      const backend = vi.fn(async () => ({ results: [] }));
+      const result = await researchEngine.runResearchPipeline(baseArgs({ question, backend }));
+      expect(result.reason).not.toBe("operational_intent");
+    }
+  );
 });
 
 // ===========================================================================

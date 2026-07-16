@@ -101,9 +101,29 @@ const STEP_NAMES = {
 // far worse than an over-eager redirect.
 const OPERATIONAL_INTENT_KEYWORDS = ["改规则", "批提案", "记记忆", "删除", "买入", "卖出"];
 
+// The exact spec examples above (改规则/批提案/记记忆) only catch their own
+// contiguous phrasing. A real operational request is usually IMPERATIVE and
+// splits the verb from its object - "帮我把仓位规则改成15%" contains neither
+// "改规则" nor any keyword. Catch the imperative-command shape too: a command
+// marker (帮我/请把/把…设为…) + an operational object (规则/纪律/仓位/提案/记忆),
+// but ONLY when the sentence is NOT interrogative - a genuine research
+// question like "仓位规则一般怎么定" (has 怎么/如何/吗/？) stays in the
+// pipeline. Errs the safe way per the false-negative reasoning above: an
+// interrogative that squeaks through merely gets a (harmless) verdict.
+const OPERATIONAL_OBJECT = /(规则|纪律|仓位|提案|记忆|自选|标的池)/u;
+const IMPERATIVE_MARKER = /(帮我|请把|请帮|把.{0,8}(改成|设为|设成|调成|调到|设置为|改为)|(改成|设为|设成|调成|调到|设置为|改为).{0,6}[0-9])/u;
+const INTERROGATIVE_MARKER = /(怎么|如何|是否|能不能|该不该|值得|吗|呢|\?|？)/u;
+
 function detectOperationalIntent(question) {
   const text = String(question ?? "");
-  return OPERATIONAL_INTENT_KEYWORDS.find((keyword) => text.includes(keyword)) ?? null;
+  const keyword = OPERATIONAL_INTENT_KEYWORDS.find((k) => text.includes(k));
+  if (keyword) {
+    return keyword;
+  }
+  if (OPERATIONAL_OBJECT.test(text) && IMPERATIVE_MARKER.test(text) && !INTERROGATIVE_MARKER.test(text)) {
+    return "imperative_operation";
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
