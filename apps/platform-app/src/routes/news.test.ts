@@ -176,6 +176,30 @@ describe("news route (GET /news)", () => {
     expect(body).not.toContain("近 7 天暂无聚类事件");
   });
 
+  it("renders a javascript: source URL as plain text, never as a clickable href (2026-07 audit: defense-in-depth against a non-http(s) URL from an external RSS/LLM source)", async () => {
+    const eventId = insertEvent(db, {
+      clusterKey: "malicious-source",
+      titleZh: "可疑来源事件",
+      lastPublishedAt: "2026-07-14T10:00:00.000Z"
+    });
+    insertSource(db, {
+      eventId,
+      origin: "rsshub-cls",
+      publisher: "可疑来源",
+      url: "javascript:alert(1)",
+      titleRaw: "可疑来源事件",
+      publishedAt: "2026-07-14T10:00:00.000Z",
+      lang: "zh"
+    });
+
+    const response = await fetch(`${baseUrl}/news`, { headers: { authorization: `Bearer ${token}` } });
+    const body = await response.text();
+
+    expect(body).not.toContain("javascript:alert(1)");
+    expect(body).toContain("原文链接未提供");
+    expect(body).not.toMatch(/<a[^>]*href="javascript:/u);
+  });
+
   it("filters by ?symbol= and marks that chip active", async () => {
     db.prepare(`INSERT INTO stock_analysis_targets (symbol, owner_id, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)`)
       .run("AAPL.US", "member_1", "2026-07-14T00:00:00.000Z", "2026-07-14T00:00:00.000Z");

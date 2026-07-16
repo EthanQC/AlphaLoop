@@ -692,6 +692,36 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
     // whether their own echoed narrative validated or locally fell back.
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
+
+  // 2026-07 audit review: the audit item claimed stock-analysis.mjs writes
+  // narrative text into the report .md without running it through
+  // defuseMarkdownInText first. Verified NOT a defect: narrative-engine.mjs's
+  // validateBackendOutput (called from generateOneSection, which
+  // attachNarrativeSections above always goes through) already calls
+  // defuseMarkdownInText on the backend's raw output BEFORE accepting it as
+  // `narrative: true` text (see narrative-engine.mjs:201) - a defused-but-
+  // otherwise-valid text is what actually reaches record.narrative.sections.
+  // This regression test locks that existing protection in place rather
+  // than reapplying a redundant second defuse pass in this file.
+  it("a backend section containing markdown-link injection syntax is already defused by the time it reaches record.narrative (existing protection in narrative-engine.mjs, not stock-analysis.mjs)", async () => {
+    const { db } = makeDb();
+    const label = GENERATED_AT.slice(0, 10);
+    const record = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, label, [record]);
+
+    const maliciousText = "看似正常的分析文本 [点击查看](https://evil.example.com/phish) 请勿轻信。";
+    const narrativeBackend = async ({ sectionKey, deterministicText }: { sectionKey: string; deterministicText: string }) =>
+      sectionKey === "catalysts" ? { text: maliciousText } : { text: deterministicText };
+
+    await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
+
+    const catalystsResult = record.narrative.sections.find((entry: { key: string }) => entry.key === "catalysts");
+    expect(catalystsResult.text).not.toContain("[点击查看](https://evil.example.com/phish)");
+    expect(catalystsResult.text).toContain("［点击查看］(https://evil.example.com/phish)");
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    expect(markdown).not.toContain("[点击查看](https://evil.example.com/phish)");
+  });
 });
 
 // ---------------------------------------------------------------------------

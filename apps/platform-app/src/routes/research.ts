@@ -78,6 +78,12 @@ import { renderForbiddenPage } from "../render/forbidden.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
+// Same pattern as reports/markdown.ts's HTTP_LINK_RE (defense in depth): an
+// evidence item's URL comes from an LLM agent-search / external source and
+// could be a javascript:/data: URL - only ever rendering an http(s) URL as
+// a clickable <a> href closes that gap instead of relying on CSP alone.
+const HTTP_LINK_RE = /^https?:\/\//iu;
+
 export interface ResearchRouteDeps {
   db: DatabaseSync;
   /** Injectable clock for deterministic tests; defaults to wall clock. */
@@ -371,7 +377,7 @@ function renderSuggestedActionCard(suggestedAction: string | undefined): Html {
 
 // ⑥ 证据链
 function renderEvidenceRow(item: ResearchEvidenceItem): Html {
-  const titleHtml = item.url
+  const titleHtml = item.url && HTTP_LINK_RE.test(item.url)
     ? html`<a href="${item.url}" rel="noreferrer" target="_blank" style="color:var(--accent)">${item.title}</a>`
     : html`<span>${item.title}</span>`;
   return html`<div class="alert">

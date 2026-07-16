@@ -265,6 +265,22 @@ describe("research route (GET /research/<id>)", () => {
       expect(body).toContain("暂无证据");
       expect(body).toContain("无跳过项");
     });
+
+    it("renders a javascript: evidence URL as plain text, never as a clickable href (2026-07 audit: defense-in-depth against a non-http(s) URL from an external/LLM source)", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      const maliciousResult: ResearchResult = {
+        ...FULL_RESULT_JSON,
+        evidence: [{ ref: "E1", title: "可疑证据", url: "javascript:alert(1)", publisher: "未知来源" }]
+      };
+      finishTask(id, "done", { resultJson: maliciousResult, confidence: "medium" });
+
+      const response = await authed(`/research/${id}`, token);
+      const body = await response.text();
+      expect(body).not.toContain("javascript:alert(1)");
+      expect(body).toContain("可疑证据");
+      expect(body).not.toMatch(/<a[^>]*href="javascript:/u);
+    });
   });
 
   describe("失败 (failed)", () => {

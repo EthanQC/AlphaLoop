@@ -28,6 +28,13 @@ import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { html, joinHtml, type Html } from "../render/html.js";
 import { formatBeijingGeneratedAt, renderPage, type Freshness } from "../render/layout.js";
 
+// Same pattern as reports/markdown.ts's HTTP_LINK_RE (defense in depth): an
+// external source URL (RSS feed / LLM agent-search) rendered directly into
+// an href could be a javascript:/data: URL - CSP mitigates execution, but
+// only ever rendering an http(s) URL as a clickable link closes the gap
+// entirely instead of relying on CSP alone.
+const HTTP_LINK_RE = /^https?:\/\//iu;
+
 export interface NewsRouteDeps {
   db: DatabaseSync;
   /** Injectable clock for deterministic tests; defaults to wall clock. */
@@ -185,7 +192,7 @@ function formatRelativeTime(iso: string, now: Date): string {
 }
 
 function renderSourceLine(source: NewsEventSourceRow, now: Date): Html {
-  const link = source.url
+  const link = source.url && HTTP_LINK_RE.test(source.url)
     ? html`<a href="${source.url}" rel="noreferrer" target="_blank" style="color:var(--accent)">原文</a>`
     : html`<span style="color:var(--sub)">原文链接未提供</span>`;
 
