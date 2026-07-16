@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/shared-types" },
     { "path": "./apps/broker-executor" },
+    { "path": "./apps/longbridge-cli" },
     { "path": "./apps/platform-app" }
   ]
 }
