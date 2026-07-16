@@ -14,7 +14,11 @@ import type {
   OrderSide,
   Proposal,
   ProposalConfidence,
-  ProposalStatus
+  ProposalStatus,
+  ResearchConfidence,
+  ResearchResult,
+  ResearchTask,
+  ResearchTaskStatus
 } from "./domain.js";
 import { createId, nowIso } from "./domain.js";
 
@@ -44,7 +48,7 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   return db;
 }
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -780,6 +784,64 @@ const MIGRATIONS: MigrationStep[] = [
         );
       }
     }
+  },
+  (db) => {
+    // Phase 8 Task 1 (2026-07-16 plan, in-site research): three columns onto
+    // `research_tasks` (created back in v3 - MIGRATIONS[2] - and untouched by
+    // every step since) for the research pipeline's (Task 2) final write:
+    //   - result_json: the full ResearchResult (conclusion/keyPoints/
+    //     dataTable/comparison/evidence/skipped - see domain.ts's
+    //     ResearchResult) as JSON text, NULL until the task finishes.
+    //   - confidence: the SAME low/medium/high vocabulary as
+    //     ProposalConfidence/analysis_predictions.confidence, CHECK-enforced
+    //     (NULL allowed - a queued/running task has no confidence yet).
+    //   - title: a short human label for report/archive list rows and the
+    //     verdict page header, separate from the raw `question` text.
+    //
+    // A plain ADD COLUMN suffices (v6's alert_rules.removed_at precedent, NOT
+    // v7/v12's DROP+CREATE+RENAME rebuild recipe): none of the three columns
+    // change an EXISTING column's type/CHECK/FK, and no other table holds an
+    // FK reference to research_tasks - so this needs no
+    // `needsForeignKeysOff` either. SQLite's ALTER TABLE ADD COLUMN DOES
+    // support a CHECK clause as long as it doesn't reference another column
+    // (confirmed directly against this project's node:sqlite build before
+    // writing this - `ALTER TABLE t ADD COLUMN c TEXT CHECK(c IS NULL OR c IN
+    // (...))` both accepts NULL/valid values and rejects an invalid one).
+    //
+    // Defensive existence check (same precedent as the v11/v12 steps above,
+    // "a couple of this file's OWN pre-existing migration tests build
+    // deliberately partial legacy-shape fixtures"): a handful of THIS file's
+    // hand-built legacy fixtures set `PRAGMA user_version` to a value >= 3
+    // (research_tasks' own creation version) without ever physically creating
+    // research_tasks, because no migration step between v3 and this one ever
+    // needed to touch it. Every REAL database has it (MIGRATIONS[2] creates
+    // it) - but rather than assume that, a missing table is handled by
+    // creating it directly in its final (v13) shape, equivalent to "there is
+    // nothing to rebuild", not an error.
+    const tableExists = db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'research_tasks'`)
+      .get();
+
+    if (!tableExists) {
+      db.exec(`
+        CREATE TABLE research_tasks (
+          id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+          question TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','degraded','failed')),
+          steps TEXT NOT NULL DEFAULT '[]', budget_spent INTEGER NOT NULL DEFAULT 0,
+          result_path TEXT, visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','public')),
+          created_at TEXT NOT NULL, finished_at TEXT,
+          result_json TEXT, confidence TEXT CHECK(confidence IS NULL OR confidence IN ('low','medium','high')), title TEXT
+        );
+        CREATE INDEX IF NOT EXISTS research_tasks_owner_day_idx ON research_tasks(owner_id, created_at);
+      `);
+      return;
+    }
+
+    db.exec(`
+      ALTER TABLE research_tasks ADD COLUMN result_json TEXT;
+      ALTER TABLE research_tasks ADD COLUMN confidence TEXT CHECK(confidence IS NULL OR confidence IN ('low','medium','high'));
+      ALTER TABLE research_tasks ADD COLUMN title TEXT;
+    `);
   }
 ];
 
@@ -1615,6 +1677,356 @@ export class CircuitBreakerRepository {
 
     return row !== undefined;
   }
+}
+
+// ---------------------------------------------------------------------------
+// US/Eastern trading-day UTC boundary (Phase 8 Task 1, 2026-07-16 plan)
+//
+// Mirrors apps/openclaw-config/scripts/trading-schedule.mjs's PRIVATE
+// (unexported) `nyMidnightUtcIso`/`shiftDateLabel` helpers verbatim, rather
+// than importing them: that script lives under apps/openclaw-config, and
+// packages/shared-types is a dependency OF apps (not the reverse) - importing
+// across that boundary would invert the dependency graph. trading-
+// schedule.test.ts already pins the DST-crossing behavior this depends on
+// (an EDT Monday: 00:00 America/New_York == 04:00Z, and an EST Monday: ==
+// 05:00Z) - any future drift between the two copies should be caught by
+// keeping the two files' comments cross-referenced, as this one does.
+//
+// The boundary math: a `tradingDay` is a 'YYYY-MM-DD' US/Eastern CALENDAR
+// date (e.g. from trading-schedule.mjs's `currentUsEasternTradingDay`).
+// `usEasternTradingDayUtcRange` turns that label into the half-open UTC
+// instant range [dayStart, nextDayStart) - dayStart is 00:00:00
+// America/New_York on that date, nextDayStart is 00:00:00 America/New_York
+// on the FOLLOWING calendar date. A row's `created_at` (an ISO-8601 UTC
+// string, e.g. from `nowIso()`) "belongs to" that trading day iff
+// `dayStart <= created_at < nextDayStart` - since both bounds and every
+// `created_at` share the exact same fixed-width
+// `YYYY-MM-DDTHH:mm:ss.sssZ` format, plain lexicographic string comparison
+// (used directly in the SQL below) already matches chronological order with
+// no need to parse either side back into a Date.
+const NEW_YORK_TIMEZONE = "America/New_York";
+
+function nyUtcOffsetMinutes(anchorDate: Date): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: NEW_YORK_TIMEZONE,
+    timeZoneName: "shortOffset"
+  }).formatToParts(anchorDate);
+  const offsetLabel = parts.find((part) => part.type === "timeZoneName")?.value ?? "GMT+0";
+  const match = /GMT([+-])(\d+)(?::(\d+))?/.exec(offsetLabel);
+  if (!match) {
+    return 0;
+  }
+  const sign = match[1] === "-" ? -1 : 1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3] ?? 0);
+  return sign * (hours * 60 + minutes);
+}
+
+// UTC instant for 00:00:00 America/New_York on `dateLabel` ('YYYY-MM-DD').
+function nyMidnightUtcIso(dateLabel: string): string {
+  const offsetMinutes = nyUtcOffsetMinutes(new Date(`${dateLabel}T12:00:00Z`));
+  const utcMillisIfOffsetWereZero = Date.parse(`${dateLabel}T00:00:00Z`);
+  return new Date(utcMillisIfOffsetWereZero - offsetMinutes * 60000).toISOString();
+}
+
+// Next calendar date label, anchored at noon UTC before shifting - the same
+// anchoring trick trading-schedule.mjs's `shiftDateLabel` uses, so this stays
+// correct across any DST boundary (America/New_York is at most -5h from UTC,
+// so a noon-UTC anchor never lands on the "wrong" calendar day in that zone).
+function nextDateLabel(dateLabel: string): string {
+  const anchor = new Date(`${dateLabel}T12:00:00Z`);
+  anchor.setUTCDate(anchor.getUTCDate() + 1);
+  const y = anchor.getUTCFullYear();
+  const m = String(anchor.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(anchor.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+export function usEasternTradingDayUtcRange(tradingDay: string): { dayStart: string; nextDayStart: string } {
+  return {
+    dayStart: nyMidnightUtcIso(tradingDay),
+    nextDayStart: nyMidnightUtcIso(nextDateLabel(tradingDay))
+  };
+}
+
+// Input to ResearchTaskRepository.createIfWithinQuota(). `dailyLimit`
+// defaults to 10 (plan Global Constraint: "配额每人每日 ≤10 次") - callers (the
+// submit API, Task 3) are expected to omit it in production and only override
+// it in tests that need to exercise the boundary without inserting 10 rows.
+export interface CreateResearchTaskInput {
+  ownerId: string;
+  question: string;
+  tradingDay: string;
+  dailyLimit?: number;
+}
+
+export type CreateResearchTaskResult =
+  | { ok: true; task: ResearchTask }
+  | { ok: false; reason: "quota_exceeded"; used: number; limit: number };
+
+// Input to ResearchTaskRepository.setResult() - the pipeline's (Task 2)
+// terminal write. `status` is caller-supplied rather than hardcoded because
+// the pipeline can finish in any of three terminal states (done/degraded/
+// failed, per the plan's "runResearchPipeline...返回 {status:
+// 'done'|'degraded'|'failed', ...}") - this method does not itself decide
+// which.
+export interface SetResearchTaskResultInput {
+  status: ResearchTaskStatus;
+  resultJson?: ResearchResult;
+  confidence?: ResearchConfidence;
+  title?: string;
+  finishedAt: string;
+}
+
+export class ResearchTaskRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  // Count of `ownerId`'s research_tasks rows whose created_at falls inside
+  // `tradingDay`'s US/Eastern day boundary (see usEasternTradingDayUtcRange
+  // above) - the read half of the daily-quota gate. Exposed standalone (not
+  // just inlined into createIfWithinQuota) since Task 3's submit API needs
+  // the SAME count to compose its 429 message ("今日研究配额已用完（used/limit）").
+  countTodayForOwner(ownerId: string, tradingDay: string): number {
+    const { dayStart, nextDayStart } = usEasternTradingDayUtcRange(tradingDay);
+    const row = this.db
+      .prepare(`
+        SELECT COUNT(*) AS c FROM research_tasks
+        WHERE owner_id = ? AND created_at >= ? AND created_at < ?
+      `)
+      .get(ownerId, dayStart, nextDayStart) as { c: number } | undefined;
+
+    return Number(row?.c ?? 0);
+  }
+
+  // Atomic quota gate (plan: "单事务 BEGIN IMMEDIATE...原子防并发超配额"). BEGIN
+  // IMMEDIATE (not a bare/deferred BEGIN) acquires SQLite's RESERVED lock
+  // up front, so of any number of callers racing to submit a research task
+  // for the same owner/tradingDay, exactly one at a time can be mid-
+  // transaction between its count-read and its insert - any other racing
+  // caller blocks on ITS OWN "BEGIN IMMEDIATE" until the first commits (or
+  // rolls back), then re-reads the now-incremented count itself. A bare
+  // (deferred) BEGIN would let two concurrent callers both read count=9
+  // (limit 10) before either writes, and both insert - overshooting the
+  // quota by exactly the race this transaction exists to close. Mirrors
+  // deleteRule's/persistCycle's own BEGIN IMMEDIATE TRANSACTION / COMMIT /
+  // ROLLBACK shape (market-alerts-store.mjs) - the closest existing
+  // precedent for a hand-rolled multi-statement transaction in this
+  // codebase.
+  createIfWithinQuota(input: CreateResearchTaskInput): CreateResearchTaskResult {
+    const dailyLimit = input.dailyLimit ?? 10;
+
+    this.db.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      const used = this.countTodayForOwner(input.ownerId, input.tradingDay);
+      if (used >= dailyLimit) {
+        // Not an error path - a normal "no" answer - so this ROLLBACK is a
+        // plain call, not wrapped the way the catch below wraps its own
+        // (best-effort, error-recovery) rollback.
+        this.db.exec("ROLLBACK");
+        return { ok: false, reason: "quota_exceeded", used, limit: dailyLimit };
+      }
+
+      const id = createId("research");
+      const createdAt = nowIso();
+
+      this.db
+        .prepare(`
+          INSERT INTO research_tasks
+          (id, owner_id, question, status, steps, budget_spent, result_path, visibility, created_at, finished_at)
+          VALUES (?, ?, ?, 'queued', '[]', 0, NULL, 'private', ?, NULL)
+        `)
+        .run(id, input.ownerId, input.question, createdAt);
+
+      this.db.exec("COMMIT");
+
+      return {
+        ok: true,
+        task: {
+          id,
+          ownerId: input.ownerId,
+          question: input.question,
+          status: "queued",
+          steps: [],
+          budgetSpent: 0,
+          visibility: "private",
+          createdAt
+        }
+      };
+    } catch (error) {
+      // The ROLLBACK itself can fail (e.g. the connection is already out of a transaction) - that
+      // secondary failure must never replace `error`, the real cause the caller needs to see.
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore: best-effort only, `error` below is what matters.
+      }
+      throw error;
+    }
+  }
+
+  // Atomically claims ONE queued row (oldest first) and flips it to
+  // 'running', returning the claimed task - or null if no queued row exists
+  // (or another caller already claimed the only one). The nested subquery
+  // inside the UPDATE's WHERE clause runs as part of evaluating that SINGLE
+  // statement, so - like createIfWithinQuota's transaction above - two
+  // callers racing to claim the same one queued row cannot both succeed:
+  // SQLite serializes statement execution on one connection, and across
+  // connections the write lock this UPDATE takes for its duration makes the
+  // "pick the oldest queued id" subquery and the "flip it, but only if it's
+  // STILL queued" guard atomic together. `RETURNING *` (SQLite's UPDATE...
+  // RETURNING, verified against this project's node:sqlite build) hands back
+  // the exact row this statement changed, without a separate SELECT that
+  // would have to somehow distinguish "the row I just claimed" from any
+  // OTHER row already sitting at status='running' from a previous claim.
+  //
+  // `nowIsoValue` (named to avoid shadowing this module's own imported
+  // `nowIso()` clock helper) is accepted per the plan's literal
+  // `claimNextQueued(db, nowIso)` signature but currently unused - v13's
+  // frozen DDL adds no claimed_at/started_at column for this method to write
+  // it into. Kept in the signature so a later task can add one without an
+  // interface break.
+  claimNextQueued(nowIsoValue: string): ResearchTask | null {
+    void nowIsoValue;
+    const row = this.db
+      .prepare(`
+        UPDATE research_tasks
+        SET status = 'running'
+        WHERE id = (
+          SELECT id FROM research_tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1
+        )
+        AND status = 'queued'
+        RETURNING *
+      `)
+      .get() as Record<string, unknown> | undefined;
+
+    return row ? mapResearchTask(row) : null;
+  }
+
+  // Pushes `step` onto the `steps` JSON array (NOT NULL DEFAULT '[]') -
+  // read-modify-write, same JS-level JSON handling this file already uses
+  // everywhere else (toJson/fromJson) rather than reaching for SQLite's
+  // JSON1 functions, which nothing else in this codebase relies on. Callable
+  // only from the single in-process worker (Task 3) that owns a given task's
+  // step stream, so no concurrent-append race exists to guard against here.
+  appendStep(id: string, step: JsonValue): void {
+    const row = this.db
+      .prepare(`SELECT steps FROM research_tasks WHERE id = ?`)
+      .get(id) as { steps: string } | undefined;
+
+    if (!row) {
+      throw new Error(`Research task ${id} not found.`);
+    }
+
+    const steps = fromJson<JsonValue[]>(row.steps) ?? [];
+    steps.push(step);
+
+    this.db.prepare(`UPDATE research_tasks SET steps = ? WHERE id = ?`).run(toJson(steps), id);
+  }
+
+  // Terminal write: status + result_json/confidence/title + finished_at.
+  // `resultJson`/`confidence`/`title` are individually optional (a 'failed'
+  // task, e.g. the pipeline's operational-intent rejection, may have none of
+  // them) - each writes a real SQL NULL when omitted, never the JSON string
+  // "null" (toJson's usual behavior), so PRAGMA table_info / a plain SELECT
+  // sees an actual NULL for "no result yet", matching v13's nullable ADD
+  // COLUMN shape.
+  setResult(id: string, input: SetResearchTaskResultInput): void {
+    const result = this.db
+      .prepare(`
+        UPDATE research_tasks
+        SET status = ?, result_json = ?, confidence = ?, title = ?, finished_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        input.status,
+        input.resultJson !== undefined ? toJson(input.resultJson) : null,
+        input.confidence ?? null,
+        input.title ?? null,
+        input.finishedAt,
+        id
+      );
+
+    if (Number(result.changes) === 0) {
+      throw new Error(`Research task ${id} not found.`);
+    }
+  }
+
+  getById(id: string): ResearchTask | null {
+    const row = this.db
+      .prepare(`SELECT * FROM research_tasks WHERE id = ? LIMIT 1`)
+      .get(id) as Record<string, unknown> | undefined;
+
+    return row ? mapResearchTask(row) : null;
+  }
+
+  listForOwner(ownerId: string, options?: { status?: ResearchTaskStatus }): ResearchTask[] {
+    const rows = options?.status
+      ? (this.db
+          .prepare(`SELECT * FROM research_tasks WHERE owner_id = ? AND status = ? ORDER BY created_at DESC`)
+          .all(ownerId, options.status) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(`SELECT * FROM research_tasks WHERE owner_id = ? ORDER BY created_at DESC`)
+          .all(ownerId) as Array<Record<string, unknown>>);
+
+    return rows.map(mapResearchTask);
+  }
+
+  // Boot-time recovery read (plan: "worker 是...启动时重拾未完成行") - Task 3's
+  // worker calls this once at startup to find orphaned 'running' rows (a
+  // process restart interrupted them mid-pipeline) alongside any still-
+  // 'queued' rows, so it can reset the orphans back to 'queued' and resume
+  // the queue instead of losing them silently.
+  listRunningOrQueued(): ResearchTask[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM research_tasks WHERE status IN ('queued', 'running') ORDER BY created_at ASC`)
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map(mapResearchTask);
+  }
+
+  // private -> public only, owner-gated, idempotent once already public.
+  // Mirrors theses'/strategy_cards' own private-authoring/public-promotion
+  // split (three-tier visibility, Phase 7) - unlike those, research_tasks
+  // only has the two-tier private/public split the plan calls for here (no
+  // 'system' middle tier), so this method's entire job is the one
+  // private->public transition.
+  promoteVisibility(id: string, ownerId: string): ResearchTask {
+    const existing = this.getById(id);
+    if (!existing) {
+      throw new Error(`Research task ${id} not found.`);
+    }
+    if (existing.ownerId !== ownerId) {
+      throw new Error(`Research task ${id} is not owned by ${ownerId}; refusing to promote visibility.`);
+    }
+    if (existing.visibility === "public") {
+      return existing;
+    }
+
+    this.db.prepare(`UPDATE research_tasks SET visibility = 'public' WHERE id = ?`).run(id);
+    return { ...existing, visibility: "public" };
+  }
+}
+
+function mapResearchTask(row: Record<string, unknown>): ResearchTask {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    question: String(row.question),
+    status: String(row.status) as ResearchTaskStatus,
+    steps: fromJson<JsonValue[]>(String(row.steps)) ?? [],
+    budgetSpent: Number(row.budget_spent),
+    ...(row.result_path !== null && row.result_path !== undefined ? { resultPath: String(row.result_path) } : {}),
+    ...(row.result_json !== null && row.result_json !== undefined
+      ? { resultJson: fromJson<ResearchResult>(String(row.result_json)) as ResearchResult }
+      : {}),
+    ...(row.confidence !== null && row.confidence !== undefined
+      ? { confidence: String(row.confidence) as ResearchConfidence }
+      : {}),
+    ...(row.title !== null && row.title !== undefined ? { title: String(row.title) } : {}),
+    visibility: String(row.visibility) as ResearchTask["visibility"],
+    createdAt: String(row.created_at),
+    ...(row.finished_at !== null && row.finished_at !== undefined ? { finishedAt: String(row.finished_at) } : {})
+  };
 }
 
 function hashToken(token: string): string {
