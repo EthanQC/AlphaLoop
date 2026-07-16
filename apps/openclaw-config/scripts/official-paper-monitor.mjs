@@ -469,9 +469,20 @@ function formatShanghaiTime(value) {
 // poll.mjs's existing testable-CLI pattern (task H4).
 // ---------------------------------------------------------------------------
 
+const KNOWN_COMMANDS = new Set(["poll", "pnl", "snapshot"]);
+
 async function main() {
   const [command = "poll", ...args] = process.argv.slice(2);
   const force = args.includes("--force");
+
+  // Validate the command BEFORE opening the (real, shared) trading db - an
+  // unknown command has no business touching the db at all, and this also
+  // means the {ok:false} envelope below (audit fix) never has a chance to
+  // depend on db state for the most common operator mistake (a typo'd
+  // subcommand).
+  if (!KNOWN_COMMANDS.has(command)) {
+    throw new Error("Usage: official-paper-monitor.mjs <poll|pnl|snapshot> [--force]");
+  }
 
   const db = openTradingDatabase(defaultDbPath);
   try {
@@ -479,11 +490,9 @@ async function main() {
       await pollOfficialPaper(db, force);
     } else if (command === "pnl") {
       await sendPnlReport(db, force);
-    } else if (command === "snapshot") {
+    } else {
       const snapshot = await runManualSnapshot(db);
       console.log(JSON.stringify(snapshot, null, 2));
-    } else {
-      throw new Error("Usage: official-paper-monitor.mjs <poll|pnl|snapshot> [--force]");
     }
   } finally {
     db.close();
@@ -495,5 +504,16 @@ const isMainModule = process.argv[1]
   : false;
 
 if (isMainModule) {
-  await main();
+  try {
+    await main();
+  } catch (error) {
+    // Single-line JSON error envelope + non-zero exit, matching stock-
+    // analysis.mjs/market-alerts.mjs's contract (2026-07 audit fix: this
+    // entry point had no try/catch at all, so an unknown command or a
+    // locked/corrupt db surfaced as a multi-line raw Node stack trace
+    // instead - a control agent or operator reading this CLI's output must
+    // never have to parse one to learn what went wrong).
+    console.error(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    process.exitCode = 1;
+  }
 }

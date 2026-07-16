@@ -8,10 +8,12 @@
 //      that looks identical to a real quote everywhere downstream.
 //   3. audit item (b): the manual `snapshot` path now asserts the paper-
 //      account environment, same as poll/pnl, instead of skipping it.
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
@@ -344,5 +346,42 @@ describe("pollOfficialPaperPerMember", () => {
     await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
 
     expect(seenTokens.sort()).toEqual(["token-member_1", "token-member_2"]);
+  });
+});
+
+// 2026-07 audit fix: main() had no try/catch and openTradingDatabase sat
+// outside any try, so an unknown command produced a multi-line raw Node
+// stack trace instead of the {ok:false,error} single-line JSON envelope
+// every other CLI in this package uses (stock-analysis.mjs, market-alerts.
+// mjs). Spawned as a real subprocess (not an in-process import) because the
+// top-level `if (isMainModule)` block only runs under that condition, and an
+// unknown command is validated BEFORE any db is opened - see main()'s
+// KNOWN_COMMANDS check - so this never touches the real trading.sqlite.
+const scriptPath = fileURLToPath(new URL("./official-paper-monitor.mjs", import.meta.url));
+
+function runScript(args: string[]): { status: number; stdout: string; stderr: string } {
+  try {
+    const stdout = execFileSync("node", [scriptPath, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    return { status: 0, stderr: "", stdout };
+  } catch (error) {
+    const err = error as { status?: number; stderr?: string; stdout?: string };
+    return { status: err.status ?? 1, stderr: err.stderr ?? "", stdout: err.stdout ?? "" };
+  }
+}
+
+describe("official-paper-monitor.mjs CLI entry: unknown command -> JSON envelope, not a raw stack trace", () => {
+  it("exits non-zero with a single-line {ok:false,error} JSON on stderr for an unknown subcommand", () => {
+    const result = runScript(["bogus-command"]);
+
+    expect(result.status).not.toBe(0);
+    const stderrLines = result.stderr.trim().split("\n");
+    expect(stderrLines).toHaveLength(1);
+    const parsed = JSON.parse(stderrLines[0]!);
+    expect(parsed.ok).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+    expect(parsed.error).toMatch(/poll\|pnl\|snapshot/);
   });
 });
