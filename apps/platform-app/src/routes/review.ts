@@ -57,6 +57,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { MonthlyReviewRepository, methodNotAllowed, sendJson, type Member } from "@packages/shared-types";
 
+import { guardAsyncWrite } from "./async-guard.js";
 import { createMemorydBackend, mirrorRecord, type MemorydBackend } from "../data/memoryd-mirror.js";
 import {
   loadReviewById,
@@ -683,7 +684,7 @@ export function handleReviewRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleConfirm(req, res, deps, segments[2] as string);
+    guardAsyncWrite(handleConfirm(req, res, deps, segments[2] as string), req, res, "review");
     return true;
   }
 

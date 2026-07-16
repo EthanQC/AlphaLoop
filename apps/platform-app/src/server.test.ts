@@ -115,8 +115,8 @@ describe("createPlatformServer", () => {
     db.close();
 
     // The handler's synchronous throw becomes a rejected promise from the
-    // fire-and-forget `void handleCreateThesis(...)` dispatch. api-strategy.ts's
-    // `guardAsyncWrite` now attaches a local `.catch()` that closes the socket
+    // fire-and-forget `handleCreateThesis(...)` dispatch. The shared
+    // `guardAsyncWrite` (routes/async-guard.ts) attaches a `.catch()` that closes the socket
     // with a controlled 500 (residual-gap fix - previously this request hung
     // until the client timed out; the process-level guard only kept the process
     // alive, it never answered this connection). A short abort timeout bounds
@@ -131,10 +131,50 @@ describe("createPlatformServer", () => {
     });
     clearTimeout(timeout);
     expect(probe.status).toBe(500);
-    expect(await probe.json()).toEqual({ error: "内部错误，请稍后重试。" });
+    // `{ ok: false, error }` - the same shape every OTHER error response in
+    // the JSON write routes already uses (401/400/403/404/429 all carry
+    // `ok: false`); the guard's 500 must not be the one ok-less outlier a
+    // client's `if (!payload.ok)` check would misread.
+    expect(await probe.json()).toEqual({ ok: false, error: "内部错误，请稍后重试。" });
 
     // Process-level guard must have swallowed the unhandled rejection: confirm the server
     // process is still alive and serving unrelated requests on a fresh connection.
+    const health = await fetch(`${baseUrl}/health`);
+    expect(health.status).toBe(200);
+  });
+
+  it("answers POST /api/reviews/:id/confirm with a controlled 500 instead of hanging the socket when the async handler's DB call throws (review.ts was the last fire-and-forget dispatch without guardAsyncWrite)", async () => {
+    const member: Member = {
+      id: "member_a",
+      email: "member-a@example.com",
+      displayName: "Member A",
+      riskTags: [],
+      stockTags: [],
+      showPerformance: true,
+      status: "active",
+      createdAt: "2026-07-01T00:00:00.000Z"
+    };
+    new MemberRepository(db).upsert(member);
+    const { token } = new ApiTokenRepository(db).issue(member.id, "test-token");
+
+    // Close the underlying db so `resolveIdentity`'s synchronous token lookup
+    // throws inside the async `handleConfirm` body - the same rejected-promise
+    // shape as the /api/theses probe above, on review.ts's dispatch instead.
+    db.close();
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const probe = await fetch(`${baseUrl}/api/reviews/review_x/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    expect(probe.status).toBe(500);
+    expect(await probe.json()).toEqual({ ok: false, error: "内部错误，请稍后重试。" });
+
+    // Same shared-fate check as the other probes: the process survived and a
+    // fresh connection still gets served.
     const health = await fetch(`${baseUrl}/health`);
     expect(health.status).toBe(200);
   });
