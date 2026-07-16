@@ -293,6 +293,23 @@ async function handlePromote(
  * if the path doesn't belong here so the caller (server.ts) can keep trying
  * other routes/handlers.
  */
+/** Attaches a rejection handler to a fire-and-forget async write handler
+ * (2026-07 audit fix) - see api-strategy.ts's `guardAsyncWrite` for the full
+ * rationale: the process-level guard in server.ts keeps the process alive on a
+ * handler DB throw, but without this the client socket hangs until timeout. */
+function guardAsyncWrite(promise: Promise<void>, req: IncomingMessage, res: ServerResponse): void {
+  promise.catch((error: unknown) => {
+    console.error(
+      `api-research: async handler failed for ${req.method} ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`
+    );
+    if (!res.headersSent) {
+      sendJson(res, 500, { ok: false, error: "内部错误，请稍后重试。" });
+    } else {
+      res.end();
+    }
+  });
+}
+
 export function handleApiResearchRoute(
   req: IncomingMessage,
   res: ServerResponse,
@@ -309,7 +326,7 @@ export function handleApiResearchRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleSubmit(req, res, deps);
+    guardAsyncWrite(handleSubmit(req, res, deps), req, res);
     return true;
   }
 
@@ -318,7 +335,7 @@ export function handleApiResearchRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handlePromote(req, res, deps, segments[2] as string);
+    guardAsyncWrite(handlePromote(req, res, deps, segments[2] as string), req, res);
     return true;
   }
 

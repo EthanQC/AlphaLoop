@@ -492,6 +492,29 @@ async function handleCreateCard(req: IncomingMessage, res: ServerResponse, deps:
  * these responses are JSON-only with no inline `<script>`, so there is
  * nothing for a CSP nonce to attach to.
  */
+/**
+ * Attaches a rejection handler to a fire-and-forget async write handler
+ * (2026-07 audit fix). The route dispatches these as `void handleX(...)`; if
+ * the handler's own DB call throws (e.g. node:sqlite SQLITE_BUSY - this
+ * process shares trading.sqlite with a research worker and CLIs) the rejection
+ * would otherwise be unhandled. The process-level guard in server.ts keeps the
+ * process alive, but without this the client socket hangs until timeout. This
+ * closes the socket with a controlled 500 when the handler hasn't already
+ * replied.
+ */
+function guardAsyncWrite(promise: Promise<void>, req: IncomingMessage, res: ServerResponse): void {
+  promise.catch((error: unknown) => {
+    console.error(
+      `api-strategy: async handler failed for ${req.method} ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`
+    );
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "内部错误，请稍后重试。" });
+    } else {
+      res.end();
+    }
+  });
+}
+
 export function handleApiStrategyRoute(
   req: IncomingMessage,
   res: ServerResponse,
@@ -508,7 +531,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleCreateThesis(req, res, deps);
+    guardAsyncWrite(handleCreateThesis(req, res, deps), req, res);
     return true;
   }
 
@@ -517,7 +540,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleAppendJudgment(req, res, deps, segments[2] as string);
+    guardAsyncWrite(handleAppendJudgment(req, res, deps, segments[2] as string), req, res);
     return true;
   }
 
@@ -526,7 +549,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handlePromoteThesis(req, res, deps, segments[2] as string);
+    guardAsyncWrite(handlePromoteThesis(req, res, deps, segments[2] as string), req, res);
     return true;
   }
 
@@ -535,7 +558,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleCreateRule(req, res, deps);
+    guardAsyncWrite(handleCreateRule(req, res, deps), req, res);
     return true;
   }
 
@@ -544,7 +567,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleDisableRule(req, res, deps, segments[2] as string);
+    guardAsyncWrite(handleDisableRule(req, res, deps, segments[2] as string), req, res);
     return true;
   }
 
@@ -553,7 +576,7 @@ export function handleApiStrategyRoute(
       methodNotAllowed(res);
       return true;
     }
-    void handleCreateCard(req, res, deps);
+    guardAsyncWrite(handleCreateCard(req, res, deps), req, res);
     return true;
   }
 

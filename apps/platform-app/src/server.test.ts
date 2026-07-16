@@ -114,22 +114,24 @@ describe("createPlatformServer", () => {
     // fire-and-forget `void handleCreateThesis(...)` dispatch with no local catch.
     db.close();
 
-    // The handler throws before ever calling res.end()/sendJson, so this specific request's
-    // socket is left hanging (a residual gap noted in the audit - fully closing it requires
-    // a local .catch() inside api-strategy.ts's own dispatch, out of this fix's file scope).
-    // The load-bearing assertion here is that the PROCESS itself survives the unhandled
-    // rejection instead of crashing and taking every other in-flight connection down with
-    // it - so this probe request is fired with a short abort timeout and its outcome
-    // (response or abort) is intentionally not asserted on.
+    // The handler's synchronous throw becomes a rejected promise from the
+    // fire-and-forget `void handleCreateThesis(...)` dispatch. api-strategy.ts's
+    // `guardAsyncWrite` now attaches a local `.catch()` that closes the socket
+    // with a controlled 500 (residual-gap fix - previously this request hung
+    // until the client timed out; the process-level guard only kept the process
+    // alive, it never answered this connection). A short abort timeout bounds
+    // the test in case the fix regresses back to a hang.
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 200);
-    await fetch(`${baseUrl}/api/theses`, {
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const probe = await fetch(`${baseUrl}/api/theses`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({ symbol: "AAPL.US", direction: "bull" }),
       signal: controller.signal
-    }).catch(() => undefined);
+    });
     clearTimeout(timeout);
+    expect(probe.status).toBe(500);
+    expect(await probe.json()).toEqual({ error: "内部错误，请稍后重试。" });
 
     // Process-level guard must have swallowed the unhandled rejection: confirm the server
     // process is still alive and serving unrelated requests on a fresh connection.
