@@ -5,6 +5,7 @@ import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 
 import { applySecurityHeaders, createNonce } from "./security.js";
 import type { MemorydBackend } from "./data/memoryd-mirror.js";
+import { handleApiResearchRoute, type ResearchWorkerLike } from "./routes/api-research.js";
 import { handleApiStrategyRoute } from "./routes/api-strategy.js";
 import { handleHomeRoute } from "./routes/home.js";
 import { handleMemberCardRoute } from "./routes/member-card.js";
@@ -30,6 +31,18 @@ export interface PlatformServerDeps {
    * degrade - see data/memoryd-mirror.ts) when the real entrypoint
    * (index.ts) doesn't supply one. */
   memorydBackend?: MemorydBackend;
+  /** In-process research worker (Task 3, research/worker.ts) that
+   * `POST /api/research` kicks, fire-and-forget, after a successful
+   * submission. The real process (index.ts) constructs one wired to real
+   * collaborators (a P10-gated research backend, a stock_facts quote reader,
+   * a data/strategy.ts-backed memory reader) and calls its own `.start()`
+   * separately - this dep only needs `.tick()` (see
+   * routes/api-research.ts's `ResearchWorkerLike`). Tests either omit this
+   * entirely (a submission stays `queued`, unprocessed - fine for tests that
+   * don't exercise the worker) or construct a worker directly (with fake
+   * collaborators) and pass it here, ticking it by hand rather than relying
+   * on this route's fire-and-forget kick for timing. */
+  researchWorker?: ResearchWorkerLike;
 }
 
 /**
@@ -61,6 +74,21 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
       handleApiStrategyRoute(req, res, url, {
         db: deps.db,
         ...(deps.memorydBackend ? { memorydBackend: deps.memorydBackend } : {})
+      })
+    ) {
+      return;
+    }
+
+    // Submission/promotion JSON API for the in-site question box (Task 3) -
+    // dispatches before every GET/HTML route below, same as
+    // handleApiStrategyRoute above, but identity-gated via `resolveIdentity`
+    // (bearer OR Access email), not bearer-only - see routes/api-research.ts's
+    // own module header for why this differs from api-strategy.ts's rule.
+    if (
+      handleApiResearchRoute(req, res, url, {
+        db: deps.db,
+        ...(deps.now ? { now: deps.now } : {}),
+        ...(deps.researchWorker ? { researchWorker: deps.researchWorker } : {})
       })
     ) {
       return;
