@@ -7,8 +7,27 @@ const script = readFileSync(join(process.cwd(), "apps/openclaw-config/scripts/op
 
 const state = await import("./openclaw-cron-runner-state.mjs");
 const reset = await import("./cron-runner-reset.mjs");
+const cronJobsModule = await import("./openclaw-cron-jobs.mjs");
 
 describe("OpenClaw cron runner", () => {
+  it("registers a runner-side handler for every job openclaw-cron-jobs.mjs schedules (2026-07 audit: proposal-sweep and monthly-review were registered but never wired to a command, so they never executed)", () => {
+    const registeredJobNames = cronJobsModule.buildManagedOpenClawCronJobs("/repo").map((job) => job.name);
+    expect(registeredJobNames).toEqual(
+      expect.arrayContaining([
+        "openclaw-trading-daily-report",
+        "openclaw-trading-weekly-report",
+        "openclaw-trading-stock-analysis",
+        "openclaw-trading-proposal-sweep",
+        "openclaw-trading-monthly-review"
+      ])
+    );
+    for (const jobName of registeredJobNames) {
+      expect(script).toContain(`"${jobName}":`);
+    }
+    expect(script).toContain("proposals:sweep");
+    expect(script).toContain("reviews:generate");
+  });
+
   it("uses the launchd-provided pnpm binary when spawning project jobs", () => {
     expect(script).toContain("process.env.PNPM_BIN");
     expect(script).toContain("[pnpmBin, \"stock-analysis:scheduled\"]");

@@ -27,12 +27,16 @@ export const CRON_JOB_DAILY = "daily";
 export const CRON_JOB_WEEKLY = "weekly";
 export const CRON_JOB_STOCK_ANALYSIS = "stock-analysis";
 export const CRON_JOB_MARKET_ALERTS = "market-alerts";
+export const CRON_JOB_PROPOSAL_SWEEP = "proposal-sweep";
+export const CRON_JOB_MONTHLY_REVIEW = "monthly-review";
 
 export const KNOWN_CRON_JOB_NAMES = Object.freeze([
   CRON_JOB_DAILY,
   CRON_JOB_WEEKLY,
   CRON_JOB_STOCK_ANALYSIS,
-  CRON_JOB_MARKET_ALERTS
+  CRON_JOB_MARKET_ALERTS,
+  CRON_JOB_PROPOSAL_SWEEP,
+  CRON_JOB_MONTHLY_REVIEW
 ]);
 
 export function normalizeRunnerState(value = {}) {

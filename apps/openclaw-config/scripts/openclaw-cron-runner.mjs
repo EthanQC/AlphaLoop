@@ -10,6 +10,8 @@ import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-ty
 import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
 import {
   CRON_JOB_DAILY,
+  CRON_JOB_MONTHLY_REVIEW,
+  CRON_JOB_PROPOSAL_SWEEP,
   CRON_JOB_STOCK_ANALYSIS,
   CRON_JOB_WEEKLY,
   HALT_THRESHOLD,
@@ -57,13 +59,20 @@ loadLocalEnv(repoRoot);
 const allowedJobs = {
   "/run/daily": { name: CRON_JOB_DAILY, command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
   "/run/weekly": { name: CRON_JOB_WEEKLY, command: [pnpmBin, "report:weekly:run"], timeoutMs: 15 * 60 * 1000 },
-  "/run/stock-analysis": { name: CRON_JOB_STOCK_ANALYSIS, command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 }
+  "/run/stock-analysis": { name: CRON_JOB_STOCK_ANALYSIS, command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 },
+  // 2026-07 audit fix: these two were registered in openclaw-cron-jobs.mjs (proposal-expiry sweep,
+  // monthly per-owner review generation) but had no entry in cronJobNames below, so the runner's
+  // poll filter silently dropped every run-log hit for them - they never executed.
+  "/run/proposal-sweep": { name: CRON_JOB_PROPOSAL_SWEEP, command: [pnpmBin, "proposals:sweep"], timeoutMs: 2 * 60 * 1000 },
+  "/run/monthly-review": { name: CRON_JOB_MONTHLY_REVIEW, command: [pnpmBin, "reviews:generate"], timeoutMs: 5 * 60 * 1000 }
 };
 
 const cronJobNames = {
   "openclaw-trading-daily-report": allowedJobs["/run/daily"],
   "openclaw-trading-weekly-report": allowedJobs["/run/weekly"],
-  "openclaw-trading-stock-analysis": allowedJobs["/run/stock-analysis"]
+  "openclaw-trading-stock-analysis": allowedJobs["/run/stock-analysis"],
+  "openclaw-trading-proposal-sweep": allowedJobs["/run/proposal-sweep"],
+  "openclaw-trading-monthly-review": allowedJobs["/run/monthly-review"]
 };
 // Set true by loadRunnerState() below when processed-runs.json existed but could not be trusted
 // (corrupt/truncated) - in that case the fresh-boot reseed path below must ALSO run, exactly as
