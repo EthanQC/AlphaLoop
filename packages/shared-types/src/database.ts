@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -37,6 +37,17 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   mkdirSync(dirname(filePath), { recursive: true });
 
   const db = new DatabaseSync(filePath);
+  // FIX 4 (mini-deployment finding): the sqlite file inherits the process
+  // umask (typically 644, world-readable) while .env.local is 600 - this db
+  // holds member emails/feishu ids and the full order history, so tighten it
+  // to owner-only right after open. Wrapped: a chmod failure on an exotic
+  // filesystem (or a special path like ':memory:') must not break opening
+  // the database - the file simply keeps its default mode there.
+  try {
+    chmodSync(filePath, 0o600);
+  } catch {
+    // Non-fatal by design; see comment above.
+  }
   db.exec("PRAGMA busy_timeout = 5000;");
   try {
     db.exec("PRAGMA journal_mode = WAL;");
@@ -49,6 +60,27 @@ export function openTradingDatabase(filePath: string): DatabaseSync {
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
   return db;
+}
+
+// FIX 2 (2026-07 adversarial audit, symbol-format mismatch): TS mirror of
+// apps/openclaw-config/scripts/report-data.mjs's normalizeSymbol (the
+// codebase-wide symbol convention - see that file). Snapshots store
+// Longbridge-suffixed symbols ('AAPL.US') while CLI input may be bare
+// ('AAPL'); comparing symbols without applying this on BOTH sides makes a
+// legitimate held position invisible ('AAPL' !== 'AAPL.US'). Keep the two
+// implementations in sync if the convention ever changes.
+export function normalizeSymbol(value: unknown): string {
+  const symbol = String(value ?? "").trim().toUpperCase();
+  if (!symbol) {
+    return "";
+  }
+  if (/^[A-Z0-9.-]+\.[A-Z]{2,4}$/u.test(symbol) || symbol.startsWith(".")) {
+    return symbol;
+  }
+  if (/^[A-Z]{1,6}$/u.test(symbol)) {
+    return `${symbol}.US`;
+  }
+  return symbol;
 }
 
 export const SCHEMA_VERSION = 14;
@@ -1216,6 +1248,47 @@ export class OfficialPaperOrderLifecycleRepository {
     return Number(row?.notional ?? 0);
   }
 
+  // FIX 1 (2026-07 adversarial audit, order-splitting naked short): risk.ts's
+  // paper-sell exemption is gated on the held quantity read from the latest
+  // official_paper_snapshots row - which does NOT yet reflect the owner's own
+  // RESTING sell orders. Without this deduction, hold 100 -> sell A 100
+  // (exempt, resting) -> sell B 100 still reads held=100 -> also exempt ->
+  // account net short 100 with zero risk flags. The caller (broker-executor's
+  // ticket handler) subtracts this sum from the snapshot's held quantity
+  // (floored at 0) before handing heldQuantityForSymbol to evaluateRisk.
+  //
+  // Same non-terminal stage set as sumOpenNotionalForOwner above, INCLUDING
+  // 'unknown_broker_status' - an unrecognized live status may still be a
+  // resting sell, so it is counted conservatively (over-block beats a naked
+  // short). Symbol matching applies normalizeSymbol to BOTH sides (defense
+  // in depth for FIX 2's bare-vs-Longbridge-suffixed symbol mismatch:
+  // 'TSLA' and 'TSLA.US' are the same instrument), which is why the
+  // per-symbol filter runs in TS rather than in the SQL WHERE clause.
+  sumOpenSellQuantityForOwnerSymbol(ownerId: string, symbol: string): number {
+    const targetSymbol = normalizeSymbol(symbol);
+    const rows = this.db
+      .prepare(`
+        SELECT symbol, quantity
+        FROM official_paper_order_lifecycle
+        WHERE owner_id = ?
+          AND side = 'sell'
+          AND lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed', 'unknown_broker_status')
+      `)
+      .all(ownerId) as Array<{ symbol: unknown; quantity: unknown }>;
+
+    let sum = 0;
+    for (const row of rows) {
+      if (normalizeSymbol(String(row.symbol ?? "")) !== targetSymbol) {
+        continue;
+      }
+      const quantity = Number(row.quantity);
+      if (Number.isFinite(quantity) && quantity > 0) {
+        sum += quantity;
+      }
+    }
+    return sum;
+  }
+
   // Server-side dailyNewRiskPercent/openIdeas inputs (plan: "metadata 风险参数
   // 不再信 body verbatim...服务端算（当日 lifecycle 计数）") - counts today's
   // lifecycle rows for this owner (any stage: a rejected/failed attempt still
@@ -1603,8 +1676,14 @@ export class ProposalRepository {
       );
     }
 
+    // outcome = NULL: on the reconcile un-stick path this proposal was
+    // previously markFailed (outcome = '执行未确认（submit_unconfirmed）：...')
+    // and is now proven executed - leaving that stale failure text would
+    // permanently render "executed + failure reason" on the platform proposal
+    // page. Harmless on the normal success path, where outcome is already
+    // NULL; the un-stick execution report documents the correction itself.
     this.db
-      .prepare(`UPDATE proposals SET status = 'executed', ticket_id = ? WHERE id = ?`)
+      .prepare(`UPDATE proposals SET status = 'executed', ticket_id = ?, outcome = NULL WHERE id = ?`)
       .run(ticketId, id);
   }
 

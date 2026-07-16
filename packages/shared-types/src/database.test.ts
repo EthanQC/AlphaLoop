@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   migrate,
@@ -11,6 +14,7 @@ import {
   OfficialPaperOrderLifecycleRepository,
   ResearchTaskRepository,
   MonthlyReviewRepository,
+  openTradingDatabase,
   usEasternTradingDayUtcRange
 } from "./database.js";
 import type { NewProposal } from "./database.js";
@@ -22,6 +26,23 @@ function memoryDb(): DatabaseSync {
   db.exec("PRAGMA foreign_keys = ON;");
   return db;
 }
+
+// FIX 4 (2026-07 mini-deployment finding): runtime/trading.sqlite was created
+// world-readable (644) while .env.local is 600 - the trading db holds member
+// emails/feishu ids and full order history, so it must be owner-only too.
+describe("openTradingDatabase file permissions", () => {
+  it("sets the database file to mode 600 (owner read/write only) after open", () => {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-db-perms-"));
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    try {
+      expect((statSync(dbPath).mode & 0o777).toString(8)).toBe("600");
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("versioned migrations", () => {
   it("migrates a fresh db to the latest schema version", () => {
@@ -1684,6 +1705,31 @@ describe("ProposalRepository", () => {
 
       expect(() => repo.markExecuted("proposal_nope", "ticket_1")).toThrow(/not found/);
     });
+
+    // FIX 3 (2026-07 adversarial audit): the reconcile un-stick path calls
+    // markFailed (outcome = '执行未确认（submit_unconfirmed）：...') and LATER
+    // markExecuted once the order is proven live at the broker. markExecuted
+    // used to leave `outcome` untouched, so the proposal permanently showed
+    // status 'executed' + a failure text (the platform proposal page renders
+    // outcome). markExecuted must clear the stale failure outcome.
+    it("clears a stale markFailed outcome when the proposal is later marked executed (reconcile un-stick path)", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+      const proposal = repo.create(baseNewProposal());
+
+      repo.markFailed(proposal.id, "执行未确认（submit_unconfirmed）：CLI timed out");
+      repo.markExecuted(proposal.id, "ticket_1");
+
+      const reloaded = repo.getById(proposal.id);
+      expect(reloaded?.status).toBe("executed");
+      expect(reloaded?.ticketId).toBe("ticket_1");
+      expect(reloaded?.outcome).toBeUndefined();
+      // Raw column check: outcome IS NULL, not '' or leftover failure text.
+      const raw = db.prepare(`SELECT outcome FROM proposals WHERE id = ?`).get(proposal.id) as { outcome: unknown };
+      expect(raw.outcome).toBeNull();
+    });
   });
 
   describe("markFailed", () => {
@@ -3079,6 +3125,61 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     });
 
     expect(repo.sumOpenNotionalForOwner("mem_owner")).toBe(450);
+  });
+
+  // FIX 1 (2026-07 adversarial audit, order-splitting naked short): the
+  // paper-sell risk exemption reads held quantity from the latest account
+  // snapshot, which does NOT yet reflect the owner's own resting sell
+  // orders - so sequential sells of the full held quantity each read
+  // "held=100, exempt" and net the account short. This method sums the
+  // owner's OWN open sell quantity for one symbol (same non-terminal stage
+  // set as sumOpenNotionalForOwner, INCLUDING 'unknown_broker_status') so
+  // the caller can deduct it from the snapshot's held quantity.
+  it("sumOpenSellQuantityForOwnerSymbol sums the owner's open sells for that symbol across non-terminal stages (incl. unknown_broker_status), with suffix normalization, ignoring buys/other owners/other symbols/terminal stages", () => {
+    const { db, repo } = setup();
+    seedMember(db, "mem_other");
+    const base = {
+      ownerId: "mem_owner", assetClass: "stock" as const, quantity: 0,
+      limitPrice: 100, submittedAt: nowIso()
+    };
+
+    // Counted: stage 'submitting'.
+    repo.insertSubmitting({ ...base, ticketId: "t_sell_1", symbol: "TSLA.US", side: "sell", quantity: 100 });
+    // Counted: broker-acknowledged resting sell (stage 'submitted').
+    repo.insertSubmitting({ ...base, ticketId: "t_sell_2", symbol: "TSLA.US", side: "sell", quantity: 40 });
+    repo.finalizeExecution("t_sell_2", {
+      externalOrderId: "ext_sell_2", brokerStatus: "New", localStatus: "submitted",
+      lifecycleStage: "submitted", notes: [], observedAt: nowIso()
+    });
+    // Counted: bare-symbol row ('TSLA' == 'TSLA.US' under normalizeSymbol).
+    repo.insertSubmitting({ ...base, ticketId: "t_sell_bare", symbol: "TSLA", side: "sell", quantity: 10 });
+    // Counted: stage 'unknown_broker_status' (unknown status may be a live resting sell).
+    repo.insertSubmitting({ ...base, ticketId: "t_sell_unknown", symbol: "TSLA.US", side: "sell", quantity: 7 });
+    repo.finalizeExecution("t_sell_unknown", {
+      externalOrderId: "ext_sell_unknown", brokerStatus: "SomeNewLongbridgeStatus", localStatus: "unknown",
+      lifecycleStage: "unknown_broker_status", notes: [], observedAt: nowIso()
+    });
+
+    // NOT counted: a buy for the same symbol.
+    repo.insertSubmitting({ ...base, ticketId: "t_buy", symbol: "TSLA.US", side: "buy", quantity: 500 });
+    // NOT counted: another symbol.
+    repo.insertSubmitting({ ...base, ticketId: "t_other_symbol", symbol: "AAPL.US", side: "sell", quantity: 30 });
+    // NOT counted: another owner's sell of the same symbol.
+    repo.insertSubmitting({ ...base, ticketId: "t_other_owner_sell", ownerId: "mem_other", symbol: "TSLA.US", side: "sell", quantity: 60 });
+    // NOT counted: a terminal (filled) sell - it is already reflected in the
+    // next account snapshot's positions.
+    repo.insertSubmitting({ ...base, ticketId: "t_sell_filled", symbol: "TSLA.US", side: "sell", quantity: 20 });
+    repo.finalizeExecution("t_sell_filled", {
+      externalOrderId: "ext_sell_filled", brokerStatus: "Filled", localStatus: "accepted",
+      lifecycleStage: "filled", notes: [], observedAt: nowIso()
+    });
+
+    // 100 + 40 + 10 (bare) + 7 (unknown_broker_status) = 157
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "TSLA.US")).toBe(157);
+    // Suffix normalization applies to the QUERY symbol too.
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "TSLA")).toBe(157);
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_other", "TSLA.US")).toBe(60);
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "NVDA.US")).toBe(0);
   });
 
   it("save() upsert protects an already-assigned ticket_id (audit #2 direction): a later same-order write cannot overwrite it, only fill a null one", () => {
