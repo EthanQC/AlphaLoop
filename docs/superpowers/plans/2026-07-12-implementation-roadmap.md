@@ -13,7 +13,7 @@
 | **P4 新闻引擎 ✅(2026-07-15 交付)** | 四项注入修复（摄入层消毒）+ schema v8 三表 + 确定性事件聚类 + L1 多源（RSSHub 冗余/Finnhub 限速脱敏）+ L2/L3 预算编排（真后端=P10）+ daily facts + 质量门四扩展 + 日报聚类段与平台新闻页双面 | ✅ 坏样本全拦截（9 样本逐失败码）+ 聚类 47 测 + seam 贯通 + Playwright 双主题筛选实测；1128 测试 ×3 | `2026-07-15-phase4-news-engine.md` |
 | **P5 个股分析深化 ✅(2026-07-15 交付)** | schema v9 per-stock facts + 结论框三档（同源解析器双侧）+ 预测入库（analysis_predictions 首个写入方）+ 叙事编排（数字预比对/重试≤2/降级纯事实表，真后端=P10）+ 质量门三扩展 + 平台结论框摘要卡 + 三项 minor 清理 | ✅ 坏样本 15/15 逐失败码 + 叙事降级 13/13 + 双侧解析 52/52 + Playwright 双主题卡片零外部请求；1267 测试 ×3 | `2026-07-15-phase5-analysis.md` |
 | **P6 提案-审批 ✅(2026-07-15 交付)** | v10/v11 熔断表+提案仓储原子消费 + 纪律引擎（hard 阻断/proposal_check 标注/self 提示）+ per-owner 熔断（周亏>3%停一周跨重启）+ 提案生命周期（owner-only 三动作/审批卡 ocf1/24h 过期扫）+ executor 硬化（共享密钥/已批准门/幂等 replay/先记录后执行/预算含挂单）+ 对账重建（状态映射单源，根治审计 #1/#2/#5/#6）+ 多账户凭据隔离 | ✅ 全链路回放 seam + 负向矩阵（owner-only/重复消费/预算含挂单/幂等）+ Playwright 熔断横幅；资金路径真库零污染；1547 测试 ×3 | `2026-07-15-phase6-proposals.md` |
-| P7 策略记忆+名片 | memoryd 平台实例集成（per-owner scope）+三档可见性+名片视图+skill 客户端 | 三档端到端本地测试 | 待写 |
+| **P7 策略记忆+名片 ✅(2026-07-16 交付)** | schema v12（strategy_cards + theses 看多看空列）+ 记忆 store（append-only 判断历史/停用不删/升档 owner 校验）+ memoryd fire-and-forget 镜像（真实例 P10）+ 三档可见性服务端强制 + 论点卡（双栏+判断历史+事后走势代码回算）+ 纪律近30天遵守真统计 + 名片公开清单 + bearer 写 API + skill 客户端包 | ✅ 三档端到端隔离实测（系统档跨成员不可见/公开进圈子名片/纪律 hard 被 P6 读到）+ 写入 parity + Playwright 双主题；真库未触碰；1773 测试 ×3 | `2026-07-15-phase7-strategy-memory.md` |
 | P8 站内研究 | research_tasks worker+受限 agent+研判页+配额 | 全链路含数据缺失场景 | 待写 |
 | P9 复盘飞轮 | 每人月度复盘+独立回算校验 | 回算一致性单测 | 待写 |
 | P10 点火与部署 | mini 环境盘点→凭据重建→全套安装→冒烟测试→重启/恢复演练→双账号真实验收 | spec §7 全部实测项 | 待写（需用户配合 mini 访问） |
