@@ -201,6 +201,15 @@ git clone git@github.com:EthanQC/AlphaLoop.git && cd AlphaLoop && pnpm i && pnpm
     </div></div>
   </div>
 
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">渲染 <code>~/.openclaw/openclaw.json</code></p>
+      <p class="item-desc"><code>render-openclaw-config.mjs</code> 把 <code>.env.local</code> 里的飞书 <code>FEISHU_APP_ID/SECRET</code>、白名单、<code>requireMention</code>、网关 <code>OPENCLAW_GATEWAY_TOKEN</code> 落盘到 <code>~/.openclaw/openclaw.json</code>——<b>没有任何安装脚本会自动跑它</b>，必须手动执行一次（改任何密钥后都要重渲染并重启相关服务）。所需密钥全部来自你、永不入仓；<code>OPENCLAW_GATEWAY_TOKEN</code> 未固定时每次重渲染都会生成新 token，已配对客户端全失效。</p>
+      <div class="cmd">node apps/openclaw-config/scripts/render-openclaw-config.mjs</div>
+      <span class="prov">前置于 P3 网关 / 飞书接线</span>
+    </div></div>
+  </div>
+
   <div class="item user">
     <div class="item-top"><span class="chip user">需人工</span><div class="item-body">
       <p class="item-title">每成员独立券商凭据目录</p>
@@ -291,13 +300,13 @@ node apps/openclaw-config/scripts/members.mjs token issue --member &lt;id&gt; --
 
 <section class="stage" id="s6">
   <div class="stage-head"><span class="num">06</span><h2>可注入后端接线</h2></div>
-  <p class="stage-note">全程贯穿的设计：任何依赖真实运行时的能力都做成可注入后端，真实现是「P10 抛错占位」，测试注入 fake。本阶段把四个占位换成真的。</p>
+  <p class="stage-note">全程贯穿的设计：任何依赖真实运行时的能力都做成可注入后端，真实现是「P10 抛错占位」，测试注入 fake。本阶段把五个占位换成真的。</p>
 
   <div class="item block">
     <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
-      <p class="item-title">四个 <code>create*Backend()</code> 占位实现</p>
-      <p class="item-desc">① <code>createResearchBackend()</code>（P8）→ OpenClaw 受限 agent 网关（仅搜索抓取、无 shell、owner-scope 预绑定）+ 搜索配额实测；② <code>createNarrativeLlmBackend()</code>（P5）→ headless LLM 运行时；③ <code>createMemorydBackend()</code>（P7）→ memoryd 回环 HTTP；④ 飞书结果卡投递（P8/P9）。每个都在源码里标了接线点，且在没接上时优雅降级——研判会显式跳过、叙事回落纯事实表、镜像标 mirrored:false，都不崩。</p>
-      <span class="prov">前置于 P5 / P7 / P8 / P9</span>
+      <p class="item-title">五个 <code>create*Backend()</code> 占位实现</p>
+      <p class="item-desc">① <code>createResearchBackend()</code>（P8）→ OpenClaw 受限 agent 网关（仅搜索抓取、无 shell、owner-scope 预绑定）+ 搜索配额实测；② <code>createOpenclawSearchBackend()</code>（P4，news-agent-search.mjs）→ 新闻的受限 agent 搜索后端，与研判后端相互独立、同样是 P10 抛错占位；③ <code>createNarrativeLlmBackend()</code>（P5）→ headless LLM 运行时；④ <code>createMemorydBackend()</code>（P7）→ memoryd 回环 HTTP；⑤ 飞书结果卡投递 <code>createFeishuReviewNotifier()</code>（P8/P9）。每个都在源码里标了接线点，且在没接上时优雅降级——研判会显式跳过、叙事回落纯事实表、镜像标 mirrored:false，都不崩。</p>
+      <span class="prov">前置于 P4 / P5 / P7 / P8 / P9</span>
     </div></div>
   </div>
 </section>
@@ -354,15 +363,33 @@ node apps/openclaw-config/scripts/members.mjs token issue --member &lt;id&gt; --
 
 <section class="stage" id="s9">
   <div class="stage-head"><span class="num">09</span><h2>服务安装</h2></div>
-  <p class="stage-note">launchd 装齐：platform-app、broker-executor、market-alerts、daily-backup、rsshub、monthly-review、official-paper、reports/stock-analysis。P2.5 已统一安装脚本，别只跑一条。</p>
+  <p class="stage-note">launchd 装齐：platform-app、market-alerts、daily-backup、rsshub、official-paper、reports/stock-analysis（用户级）；gateway 与 broker-executor 是<b>系统级</b>守护进程，另由 <code>launchd:install-system</code> 单装。另有独立的 cron-runner 常驻进程带 5 个 OpenClaw cron 任务（含 monthly-review），再单独装。P2.5 已统一用户级 launchd 安装脚本，别只跑一条。</p>
 
   <div class="item ready">
     <div class="item-top"><span class="chip ready">就绪</span><div class="item-body">
       <p class="item-title">两条安装命令都要跑</p>
-      <p class="item-desc">P2.5 查明 <code>launchd:install-user</code>（报告/选股/official-paper）和 <code>install-launchd.sh</code>（备份/提醒/网关）装的是不重叠的两套——只跑一条会装出<b>半套系统</b>。README 已并排文档化两条命令。P4/P9 的 rsshub、monthly-review 模板已接入 glob。</p>
+      <p class="item-desc">P2.5 查明 <code>launchd:install-user</code>（报告/选股/official-paper）和 <code>install-launchd.sh</code>（备份/提醒/网关）装的是不重叠的两套——只跑一条会装出<b>半套系统</b>。README 已并排文档化两条命令。P4 的 rsshub launchd 模板已接入 glob。</p>
       <div class="cmd">pnpm launchd:install-user
 pnpm launchd:install-backup-alerts</div>
       <span class="prov">前置于 P2.5 接线</span>
+    </div></div>
+  </div>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">装 cron-runner 常驻进程 + 5 个 cron 任务</p>
+      <p class="item-desc"><code>openclaw:cron:install</code> 是 <code>com.openclaw.trading.cron-runner</code> 这个 launchd 常驻进程的<b>唯一</b>安装器：装好后一次性注册全部 5 个 OpenClaw cron 任务——daily-report、weekly-report、stock-analysis、proposal-sweep、<b>monthly-review</b>。monthly-review 是跑在 cron-runner 下的 cron 任务（<code>pnpm reviews:generate</code>），<b>不是</b> launchd 模板。doctor 的 <code>runner-listeners</code> 硬要求这个进程在 <code>18792</code> 端口上单实例监听，缺了就报红、系统起不来。</p>
+      <div class="cmd">pnpm openclaw:cron:install</div>
+      <span class="prov">前置于 P4 / P9 cron-runner</span>
+    </div></div>
+  </div>
+
+  <div class="item block">
+    <div class="item-top"><span class="chip block">阻断</span><div class="item-body">
+      <p class="item-title">装系统级守护进程（gateway + broker-executor）</p>
+      <p class="item-desc"><code>launchd:install-system</code>（=install-system-daemons.sh）把 <code>ai.openclaw.system.gateway</code> 和 <code>com.openclaw.system.trading.broker-executor</code> 装成 root 拥有的<b>系统级</b> launchd 守护进程——不是用户级、也不归 cron-runner 管。需 <code>sudo</code>。broker-executor 缺 <code>BROKER_EXECUTOR_SHARED_SECRET</code> 会拒绝启动；缺了它下单链路整条不通。</p>
+      <div class="cmd">sudo pnpm launchd:install-system</div>
+      <span class="prov">前置于 P6 执行器 / P3 网关</span>
     </div></div>
   </div>
 
