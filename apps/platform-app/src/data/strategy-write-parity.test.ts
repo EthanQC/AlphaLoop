@@ -90,3 +90,24 @@ describe("strategy write parity: CLI store (.mjs) vs bearer-API port (.ts)", () 
     expect(rowB).toEqual(rowA);
   });
 });
+
+// Parity guard: memoryd record-type classification exists in TWO
+// implementations that MUST stay key-for-key identical -
+//   - apps/openclaw-config/scripts/memoryd-mirror.mjs  (the CLI face)
+//   - apps/platform-app/src/data/memoryd-mirror.ts      (the bearer-API port)
+// (2026-07 audit: the .mjs classifies monthly_review as "decision"; the .ts
+// port was missing that key entirely and silently fell through to the
+// DEFAULT "fact" type - the SAME record type written by reviews.mjs (CLI)
+// vs routes/review.ts (bearer API) landed in memoryd under two different
+// types.) Same cross-boundary-import precedent as the writer parity tests
+// above: a .test.ts can import the sibling app's .mjs even though
+// platform-app's own source cannot.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const memorydMirrorMjs: any = await import("../../../openclaw-config/scripts/memoryd-mirror.mjs");
+import { MEMORYD_TYPE_BY_RECORD as MEMORYD_TYPE_BY_RECORD_TS } from "./memoryd-mirror.js";
+
+describe("memoryd type map parity: CLI mirror (.mjs) vs bearer-API port (.ts)", () => {
+  it("classifies every record type identically, key-for-key", () => {
+    expect(MEMORYD_TYPE_BY_RECORD_TS).toEqual(memorydMirrorMjs.MEMORYD_TYPE_BY_RECORD);
+  });
+});

@@ -25,7 +25,8 @@ export const MEMORYD_TYPE_BY_RECORD: Record<string, string> = {
   strategy_card: "playbook",
   discipline_rule: "warning",
   thesis: "decision",
-  thesis_judgment: "decision"
+  thesis_judgment: "decision",
+  monthly_review: "decision"
 };
 
 // Any record type NOT in the map above degrades to memoryd's generic 'fact'
