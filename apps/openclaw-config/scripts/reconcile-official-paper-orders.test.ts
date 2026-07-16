@@ -26,7 +26,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MemberRepository, openTradingDatabase, ProposalRepository } from "../../../packages/shared-types/dist/index.js";
+import { ExecutionReportRepository, MemberRepository, openTradingDatabase, ProposalRepository } from "../../../packages/shared-types/dist/index.js";
 
 const reconcileModule = await import("./reconcile-official-paper-orders.mjs");
 const { reconcileOfficialPaperOrders, DEFAULT_ORPHAN_CORRELATION_WINDOW_MS, DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS } = reconcileModule;
@@ -413,6 +413,100 @@ describe("idempotent reconcile (finding #6: no execution_reports, ever)", () => 
 
     // eslint-disable-next-line no-console -- test-visible before/after paste for the live-check requirement
     console.log("IDEMPOTENT RERUN before:", before, "\nIDEMPOTENT RERUN after:", after);
+  });
+});
+
+// FIX 1: an order that ACTUALLY reached the broker and filled must not leave
+// its proposal stuck at 'failed' forever. Scenario: broker-executor's own CLI
+// call threw/timed out (or returned no order_id) -> markFailed(proposal) +
+// lifecycle 'submit_unconfirmed', but the order really did reach Longbridge.
+// The next reconcile pass finds it in the broker's day-order list and adopts
+// it (correlated by symbol+side+quantity+time) - the adopt branch must ALSO
+// transition the linked proposal off 'failed' to 'executed' (only for a
+// filled/live adopted stage, never for cancelled/rejected) and write a
+// 'trade' execution_reports row mirroring broker-executor's own success path.
+describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'failed'", () => {
+  it("transitions the linked proposal 'failed' -> 'executed', links ticket_id, and writes one trade execution report", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "NVDA.US", side: "buy", quantity: 7, limitPrice: 120 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+
+    insertLifecycleRow(db, {
+      id: "row_stuck_failed", ticketId, externalOrderId: null,
+      symbol: "NVDA.US", side: "buy", quantity: 7, limitPrice: 120,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_FILLED", symbol: "NVDA.US", side: "Buy", quantity: 7, price: 120, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+
+    expect(result.adopted).toHaveLength(1);
+
+    const lifecycleRow = getRow(db, "row_stuck_failed");
+    expect(lifecycleRow.lifecycle_stage).toBe("filled");
+    expect(lifecycleRow.external_order_id).toBe("EXT_FILLED");
+
+    const updatedProposal = new ProposalRepository(db).getById(proposal.id);
+    expect(updatedProposal?.status).toBe("executed");
+    expect(updatedProposal?.ticketId).toBe(ticketId);
+
+    const reports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.metadata?.ticketId).toBe(ticketId);
+    expect(reports[0]?.metadata?.proposalId).toBe(proposal.id);
+  });
+
+  it("does NOT transition the proposal when the adopted stage is cancelled/rejected", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "AMD.US", side: "buy", quantity: 2, limitPrice: 90 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+
+    insertLifecycleRow(db, {
+      id: "row_stuck_rejected", ticketId, externalOrderId: null,
+      symbol: "AMD.US", side: "buy", quantity: 2, limitPrice: 90,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_REJECTED", symbol: "AMD.US", side: "Buy", quantity: 2, price: 90, status: "Rejected", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+
+    const updatedProposal = new ProposalRepository(db).getById(proposal.id);
+    expect(updatedProposal?.status).toBe("failed");
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+  });
+
+  it("is idempotent: a second reconcile pass over the same now-matched order does not write a second execution report", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { symbol: "MSFT.US", side: "buy", quantity: 3, limitPrice: 200 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+
+    insertLifecycleRow(db, {
+      id: "row_stuck_msft", ticketId, externalOrderId: null,
+      symbol: "MSFT.US", side: "buy", quantity: 3, limitPrice: 200,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    const orders = [
+      brokerOrder({ order_id: "EXT_MSFT", symbol: "MSFT.US", side: "Buy", quantity: 3, price: 200, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })
+    ];
+
+    await runReconcile(db, orders);
+    await runReconcile(db, orders, { nowIso: "2026-07-15T14:20:00.000Z" });
+
+    const updatedProposal = new ProposalRepository(db).getById(proposal.id);
+    expect(updatedProposal?.status).toBe("executed");
+    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(1);
   });
 });
 

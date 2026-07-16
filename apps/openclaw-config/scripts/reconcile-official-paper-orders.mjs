@@ -50,6 +50,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   AuditLogRepository,
+  createId,
+  ExecutionReportRepository,
   openTradingDatabase,
   ProposalRepository
 } from "../../../packages/shared-types/dist/index.js";
@@ -81,6 +83,14 @@ export const DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS = 30 * 60 * 1000;
 // linked", per the Task 5 deliverable, not an error.
 const PROPOSAL_TICKET_PREFIX = "ticket_prop_";
 
+// FIX 1: lifecycle stages that mean "the order genuinely reached the broker
+// and is either still live or fully filled" - NOT a completed
+// cancel/rejection. Only these stages ever un-stick an adopted order's
+// linked proposal off 'failed'; cancelled/rejected/expired/unknown leave the
+// proposal exactly as markFailed already left it (a cancelled/rejected order
+// really did fail, so 'failed' remains the correct terminal proposal state).
+const LIVE_OR_FILLED_LIFECYCLE_STAGES = new Set(["submitted", "pending", "filled"]);
+
 function proposalIdFromTicketId(ticketId) {
   if (typeof ticketId !== "string" || !ticketId.startsWith(PROPOSAL_TICKET_PREFIX)) {
     return null;
@@ -106,6 +116,7 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 
   const audit = new AuditLogRepository(db);
   const proposals = new ProposalRepository(db);
+  const reports = new ExecutionReportRepository(db);
 
   const ordersPayload = await fetchOrders();
   const executionsPayload = await fetchExecutions();
@@ -191,6 +202,25 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
         brokerStatus: brokerStatusRaw,
         lifecycleStage: stage,
         localStatus
+      });
+
+      // FIX 1: an adopted order that ACTUALLY reached the broker and is
+      // filled/live must not leave its linked proposal stuck at 'failed' -
+      // broker-executor's own submit_unconfirmed handler already called
+      // markFailed on the very proposal this ticket_id derives from, on the
+      // (incorrect, in this scenario) assumption the order never got
+      // through. Reconcile is the ONLY place that later learns the truth.
+      reconcileStuckFailedProposal(db, proposals, reports, audit, {
+        ticketId: candidate.ticket_id,
+        stage,
+        symbol,
+        side,
+        quantity,
+        limitPrice,
+        externalOrderId,
+        brokerStatusRaw,
+        localStatus,
+        observedAt
       });
       continue;
     }
@@ -294,6 +324,106 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
   }
 
   return { observedAt, matched, adopted, deferredInFlight, orphaned, timedOut };
+}
+
+// FIX 1: transitions a proposal OFF 'failed' -> 'executed' (linking
+// ticket_id) and writes a single 'trade' execution_reports row, mirroring
+// broker-executor server.ts's own success path (title `${symbol} 执行报告`,
+// category 'trade') - but ONLY when:
+//   (a) the adopted lifecycle row's ticket_id resolves to a real proposal
+//       (the `ticket_prop_<proposalId>` shape - see deriveTicketId's mirror
+//       proposalIdFromTicketId above), AND
+//   (b) that proposal is currently 'failed' (idempotent: a second reconcile
+//       pass over the same already-adopted order finds status 'executed'
+//       already and is a no-op here - no second report), AND
+//   (c) the adopted broker stage is live/filled (LIVE_OR_FILLED_LIFECYCLE_
+//       STAGES), never a cancelled/rejected/expired/unknown stage - those
+//       really did fail, so 'failed' is the correct terminal state.
+function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
+  const { ticketId, stage, symbol, side, quantity, limitPrice, externalOrderId, brokerStatusRaw, localStatus, observedAt } = input;
+
+  if (!LIVE_OR_FILLED_LIFECYCLE_STAGES.has(stage)) {
+    return;
+  }
+
+  const proposalId = proposalIdFromTicketId(ticketId);
+  if (!proposalId) {
+    return;
+  }
+
+  let proposal;
+  try {
+    proposal = proposals.getById(proposalId);
+  } catch (error) {
+    audit.write("reconcile", "adopted_failed_proposal_lookup_error", {
+      proposalId,
+      ticketId,
+      error: String(error?.message ?? error)
+    });
+    return;
+  }
+
+  if (!proposal || proposal.status !== "failed") {
+    // Not linked, already executed (idempotent replay), or in some other
+    // status this fix has no business touching - leave it alone.
+    return;
+  }
+
+  try {
+    proposals.markExecuted(proposalId, ticketId);
+  } catch (error) {
+    audit.write("reconcile", "adopted_failed_proposal_markexecuted_error", {
+      proposalId,
+      ticketId,
+      error: String(error?.message ?? error)
+    });
+    return;
+  }
+
+  const reportId = createId("report");
+  const notionalUsd = typeof limitPrice === "number" ? limitPrice * quantity : undefined;
+  reports.save({
+    id: reportId,
+    category: "trade",
+    title: `${symbol} 执行报告`,
+    body: [
+      `工单：${ticketId}`,
+      "状态：对账已确认成交（此前误判为提交未确认）",
+      "执行方：长桥官方模拟盘",
+      `外部订单号：${externalOrderId}`,
+      `券商状态：${brokerStatusRaw}`,
+      `生命周期阶段：${stage}`,
+      "",
+      "原因：",
+      "- reconcile 在券商当日订单列表中发现该工单已成交/存活，此前 broker-executor 因 CLI 调用失败或超时误判为提交未确认并标记提案失败。",
+      "- 已将提案状态由 failed 更正为 executed，并补记一条交易执行报告。"
+    ].join("\n"),
+    metadata: {
+      ticketId,
+      proposalId,
+      environment: "paper",
+      assetClass: "stock",
+      symbol,
+      side,
+      quantity,
+      ...(notionalUsd !== undefined ? { notionalUsd } : {}),
+      externalOrderId,
+      brokerStatus: brokerStatusRaw,
+      localStatus,
+      lifecycleStage: stage,
+      source: "reconcile-official-paper-orders",
+      note: "对账 adopt 分支补记：此前因 submit_unconfirmed 误判失败，现确认订单已成交/存活。"
+    },
+    createdAt: observedAt
+  });
+
+  audit.write("reconcile", "adopted_order_unstuck_failed_proposal", {
+    proposalId,
+    ticketId,
+    externalOrderId,
+    lifecycleStage: stage,
+    reportId
+  });
 }
 
 function getLifecycleByExternalOrderId(db, externalOrderId) {
