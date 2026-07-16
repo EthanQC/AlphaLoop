@@ -2506,6 +2506,28 @@ describe("usEasternTradingDayUtcRange (Phase 8 Task 1)", () => {
       nextDayStart: "2026-01-01T05:00:00.000Z"
     });
   });
+
+  // FIX 4 (DST off-by-one): nyMidnightUtcIso previously sampled the NY UTC
+  // offset at NOON UTC of the target date. On a DST transition day, local
+  // 00:00 can be on the OTHER side of the transition than noon:
+  //   - 2026-03-08 (spring forward, transition at 2am EST->3am EDT == 07:00Z):
+  //     local 00:00 is still EST (-5) = 05:00Z, but noon-UTC sampling is
+  //     already EDT (-4) by then, wrongly giving 04:00Z.
+  //   - 2026-11-01 (fall back, transition at 2am EDT->1am EST == 06:00Z):
+  //     local 00:00 is still EDT (-4) = 04:00Z, but noon-UTC sampling is
+  //     already EST (-5) by then, wrongly giving 05:00Z.
+  it("computes the correct dayStart on the spring-forward transition date itself (2026-03-08)", () => {
+    expect(usEasternTradingDayUtcRange("2026-03-08").dayStart).toBe("2026-03-08T05:00:00.000Z");
+  });
+
+  it("computes the correct dayStart on the fall-back transition date itself (2026-11-01)", () => {
+    expect(usEasternTradingDayUtcRange("2026-11-01").dayStart).toBe("2026-11-01T04:00:00.000Z");
+  });
+
+  it("leaves a normal, non-transition day's dayStart unchanged", () => {
+    expect(usEasternTradingDayUtcRange("2026-03-04").dayStart).toBe("2026-03-04T05:00:00.000Z");
+    expect(usEasternTradingDayUtcRange("2026-04-01").dayStart).toBe("2026-04-01T04:00:00.000Z");
+  });
 });
 
 // createIfWithinQuota's INSERT always stamps created_at with the real wall

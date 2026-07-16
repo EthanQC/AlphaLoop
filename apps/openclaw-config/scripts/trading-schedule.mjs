@@ -61,12 +61,18 @@ export function currentUsEasternTradingDay(date = new Date()) {
 // UTC (America/New_York is only -4/-5h), so this step is unaffected by DST.
 // Converting that calendar date's LOCAL MIDNIGHT to a UTC instant, though, DOES
 // depend on which side of a DST transition the date falls on (EST = UTC-5
-// vs EDT = UTC-4) - `nyUtcOffsetMinutes` reads the real offset in effect at
-// that date straight from Intl's `shortOffset` (e.g. "GMT-5"/"GMT-4") rather
-// than hardcoding a fixed offset or the NYSE holiday-calendar's own DST
-// assumptions, so this stays correct across every spring-forward/fall-back
-// boundary without a lookup table. Both are pinned in
-// trading-schedule.test.ts (an EDT Monday and an EST Monday).
+// vs EDT = UTC-4) - `nyUtcOffsetMinutes` reads the real offset from Intl's
+// `shortOffset` (e.g. "GMT-5"/"GMT-4") rather than hardcoding a fixed offset
+// or the NYSE holiday-calendar's own DST assumptions. FIX 4: it must be
+// sampled at (an approximation of) the LOCAL-MIDNIGHT instant itself, not at
+// noon UTC of the target date - noon and local midnight can be on OPPOSITE
+// sides of a DST transition (e.g. 2026-03-08's 07:00Z spring-forward), so a
+// noon sample used to give the wrong offset on transition days; see
+// `nyMidnightUtcIso`'s own doc comment for the two-step correction. Correct
+// behavior across every spring-forward/fall-back boundary, including the
+// transition dates themselves, is pinned in trading-schedule.test.ts and
+// database.test.ts's usEasternTradingDayUtcRange tests (the byte-identical
+// sibling copy).
 function shiftDateLabel(dateLabel, days) {
   const anchor = new Date(`${dateLabel}T12:00:00Z`);
   anchor.setUTCDate(anchor.getUTCDate() + days);
@@ -93,10 +99,30 @@ function nyUtcOffsetMinutes(anchorDate) {
 }
 
 // UTC instant for 00:00:00 America/New_York on `dateLabel` ('YYYY-MM-DD').
+//
+// FIX 4 (DST off-by-one): this used to sample the NY UTC offset at NOON UTC
+// of the target date - but local midnight (00:00) can be on the OTHER side
+// of a DST transition than noon is. E.g. 2026-03-08 (spring forward at 2am
+// EST -> 3am EDT, i.e. 07:00Z): local 00:00 that day is still EST (-5) =
+// 05:00Z, but noon UTC (12:00Z, already past the 07:00Z transition) samples
+// EDT (-4), wrongly producing 04:00Z. Fixed by sampling the offset at (an
+// approximation of) the LOCAL-MIDNIGHT instant itself instead: first guess
+// using the offset read at "00:00 UTC" (never more than ~14h from the true
+// answer, so it lands on the correct side of the transition in all but a
+// vanishingly narrow sliver), then re-read the offset AT that first-guess
+// instant and recompute if it disagrees - this second pass corrects the rare
+// case where the initial guess itself crossed the transition boundary. Kept
+// byte-identical to packages/shared-types/src/database.ts's own copy - see
+// that file's own nyMidnightUtcIso doc comment.
 function nyMidnightUtcIso(dateLabel) {
-  const offsetMinutes = nyUtcOffsetMinutes(new Date(`${dateLabel}T12:00:00Z`));
   const utcMillisIfOffsetWereZero = Date.parse(`${dateLabel}T00:00:00Z`);
-  return new Date(utcMillisIfOffsetWereZero - offsetMinutes * 60000).toISOString();
+  const firstGuessOffsetMinutes = nyUtcOffsetMinutes(new Date(utcMillisIfOffsetWereZero));
+  const firstGuessMs = utcMillisIfOffsetWereZero - firstGuessOffsetMinutes * 60000;
+  const refinedOffsetMinutes = nyUtcOffsetMinutes(new Date(firstGuessMs));
+  const finalMs = refinedOffsetMinutes === firstGuessOffsetMinutes
+    ? firstGuessMs
+    : utcMillisIfOffsetWereZero - refinedOffsetMinutes * 60000;
+  return new Date(finalMs).toISOString();
 }
 
 /**

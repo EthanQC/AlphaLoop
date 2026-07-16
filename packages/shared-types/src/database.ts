@@ -1771,10 +1771,28 @@ function nyUtcOffsetMinutes(anchorDate: Date): number {
 }
 
 // UTC instant for 00:00:00 America/New_York on `dateLabel` ('YYYY-MM-DD').
+//
+// FIX 4 (DST off-by-one): this used to sample the NY UTC offset at NOON UTC
+// of the target date - but local midnight (00:00) can be on the OTHER side
+// of a DST transition than noon is. E.g. 2026-03-08 (spring forward at 2am
+// EST -> 3am EDT, i.e. 07:00Z): local 00:00 that day is still EST (-5) =
+// 05:00Z, but noon UTC (12:00Z, already past the 07:00Z transition) samples
+// EDT (-4), wrongly producing 04:00Z. Fixed by sampling the offset at (an
+// approximation of) the LOCAL-MIDNIGHT instant itself instead: first guess
+// using the offset read at "00:00 UTC" (never more than ~14h from the true
+// answer, so it lands on the correct side of the transition in all but a
+// vanishingly narrow sliver), then re-read the offset AT that first-guess
+// instant and recompute if it disagrees - this second pass corrects the rare
+// case where the initial guess itself crossed the transition boundary.
 function nyMidnightUtcIso(dateLabel: string): string {
-  const offsetMinutes = nyUtcOffsetMinutes(new Date(`${dateLabel}T12:00:00Z`));
   const utcMillisIfOffsetWereZero = Date.parse(`${dateLabel}T00:00:00Z`);
-  return new Date(utcMillisIfOffsetWereZero - offsetMinutes * 60000).toISOString();
+  const firstGuessOffsetMinutes = nyUtcOffsetMinutes(new Date(utcMillisIfOffsetWereZero));
+  const firstGuessMs = utcMillisIfOffsetWereZero - firstGuessOffsetMinutes * 60000;
+  const refinedOffsetMinutes = nyUtcOffsetMinutes(new Date(firstGuessMs));
+  const finalMs = refinedOffsetMinutes === firstGuessOffsetMinutes
+    ? firstGuessMs
+    : utcMillisIfOffsetWereZero - refinedOffsetMinutes * 60000;
+  return new Date(finalMs).toISOString();
 }
 
 // Next calendar date label, anchored at noon UTC before shifting - the same

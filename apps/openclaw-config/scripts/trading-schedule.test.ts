@@ -142,4 +142,17 @@ describe("trading schedule policy", () => {
       "2026-11-02T05:00:00.000Z"
     );
   });
+
+  // FIX 4 (DST off-by-one): nyMidnightUtcIso previously sampled the NY UTC
+  // offset at NOON UTC of the target date, but local midnight (00:00) can be
+  // on the OTHER side of a DST transition than noon (2026-03-08 spring
+  // -forward, 2026-11-01 fall-back). This file's only exported wrapper around
+  // nyMidnightUtcIso is currentUsEasternTradingWeek's weekStartUtcIso, keyed
+  // off a week's MONDAY date label - and neither transition date in 2026
+  // falls on a Monday, so this file's public surface cannot directly exercise
+  // the exact broken instant. The byte-identical sibling copy in
+  // packages/shared-types/src/database.ts (usEasternTradingDayUtcRange, which
+  // takes a raw date label and so CAN target the transition date directly)
+  // carries the real TDD regression pins for this fix; both copies are fixed
+  // identically here per the plan's requirement that they stay in sync.
 });
