@@ -38,25 +38,35 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
   const feishuBotName = env.FEISHU_BOT_NAME ?? processEnv.FEISHU_BOT_NAME ?? "Trading Copilot";
   const feishuVerificationToken =
     env.FEISHU_VERIFICATION_TOKEN ?? processEnv.FEISHU_VERIFICATION_TOKEN ?? "";
+  // FIX 2b: keep the env-provided allow list SEPARATE from what already exists so
+  // AlphaLoop only ever ADDS. The GLOBAL allowFrom is the channel-level (plus our
+  // own `main` account) allowFrom UNION the env list - never a flatten of every
+  // per-group allowFrom (that silently promoted a member allowed in one group
+  // into every group and into DMs).
+  const envFeishuAllowFrom = parseCsv(env.FEISHU_ALLOW_FROM ?? processEnv.FEISHU_ALLOW_FROM ?? "");
   const feishuAllowFrom = unique([
-    ...parseCsv(env.FEISHU_ALLOW_FROM ?? processEnv.FEISHU_ALLOW_FROM ?? ""),
-    ...collectExistingFeishuUsers(existingFeishu)
+    ...envFeishuAllowFrom,
+    ...collectGlobalFeishuAllowFrom(existingFeishu)
   ]);
   const feishuDmPolicy =
     env.FEISHU_DM_POLICY ??
     processEnv.FEISHU_DM_POLICY ??
     (feishuAllowFrom.length > 0 ? "allowlist" : "pairing");
   const feishuGroupPolicy = "allowlist";
+  // Group ids explicitly supplied via env; only THESE receive a fresh AlphaLoop
+  // group entry. Existing groups are preserved verbatim (see mergeFeishuGroups).
+  const envFeishuGroupIds = parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? processEnv.FEISHU_GROUP_ALLOW_FROM ?? "");
   const feishuGroupAllowFrom = unique([
-    ...parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? processEnv.FEISHU_GROUP_ALLOW_FROM ?? ""),
+    ...envFeishuGroupIds,
     ...collectExistingFeishuGroups(existingFeishu)
   ]);
   const feishuRequireMention = parseOptionalBoolean(
     env.FEISHU_REQUIRE_MENTION ?? processEnv.FEISHU_REQUIRE_MENTION
   ) ?? true;
-  const feishuGroups = buildFeishuGroups({
-    groupIds: feishuGroupAllowFrom,
-    allowFrom: feishuAllowFrom,
+  const feishuGroups = mergeFeishuGroups({
+    existingGroups: existingFeishu.groups ?? {},
+    envGroupIds: envFeishuGroupIds,
+    envAllowFrom: envFeishuAllowFrom,
     requireMention: feishuRequireMention
   });
   const modelDefaults = selectModelDefaults({
@@ -97,10 +107,39 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
   // Preserve every existing agent except the old AlphaLoop `control` (which we
   // upsert), then append the current control definition. Re-running never
   // duplicates control and never drops the other agents.
-  const existingList = Array.isArray(existing.agents?.list) ? existing.agents.list : [];
+  // FIX 3a: a present-but-non-array agents.list is a corrupt config. Silently
+  // rebuilding to just [control] would DROP the user's real agents, so refuse
+  // loudly. Missing/null stays fine (fresh install -> only control).
+  const rawExistingList = existing.agents?.list;
+  if (rawExistingList !== undefined && rawExistingList !== null && !Array.isArray(rawExistingList)) {
+    throw new Error(
+      `existing agents.list must be an array (found ${typeof rawExistingList}); ` +
+        "fix ~/.openclaw/openclaw.json before re-running so real agents are not lost."
+    );
+  }
+  const existingList = Array.isArray(rawExistingList) ? rawExistingList : [];
   const agentsList = [
     ...existingList.filter((agent) => agent?.id !== "control"),
     ...buildAgents(repoRoot)
+  ];
+
+  // Plugin ids AlphaLoop needs. Per the installed OpenClaw docs
+  // (docs/tools/plugin.md) NONE of these require an allowlist entry to load when
+  // no `plugins.allow` exists: acpx/openai (and feishu) auto-activate because the
+  // config names their owned surfaces ("Bundled opt-in plugins can auto-activate
+  // when config names one of their owned surfaces, such as a provider/model ref,
+  // channel config, CLI backend, or agent harness runtime"); memory-core is
+  // force-enabled by `plugins.slots.memory` ("Slot selection force-enables the
+  // selected plugin for that slot by counting as explicit activation"); and
+  // local-context is explicitly enabled via `plugins.entries` + `load.paths`
+  // ("explicitly enable or allowlist them"). They only need listing when the user
+  // ALREADY runs an exclusive allowlist, in which case we merge into it below.
+  const alphaLoopPluginIds = [
+    "acpx",
+    "openai",
+    ...(feishuEnabled ? ["feishu"] : []),
+    "memory-core",
+    localContextPluginId
   ];
 
   const nextConfig = {
@@ -108,6 +147,9 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
     // and anything else) survives by default; AlphaLoop's keys below override.
     ...existing,
     meta: {
+      // FIX 3b: spread existing.meta so unknown meta subkeys survive; keep the
+      // lastTouchedVersion fallback and always stamp a fresh lastTouchedAt.
+      ...(existing.meta ?? {}),
       lastTouchedVersion: existing.meta?.lastTouchedVersion ?? "2026.4.2",
       lastTouchedAt: new Date().toISOString()
     },
@@ -152,7 +194,12 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
       ? {
           channels: {
             ...(existing.channels ?? {}),
+            // FIX 2a: spread existingFeishu FIRST so unknown keys, the user's own
+            // groups, and their own accounts (e.g. accounts.default with their own
+            // appId) all survive. We then override only AlphaLoop-owned channel
+            // fields and UPSERT our own `main` account - never rebuild the object.
             feishu: {
+              ...existingFeishu,
               enabled: true,
               connectionMode: "websocket",
               domain: feishuDomain,
@@ -162,9 +209,11 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
               groupPolicy: feishuGroupPolicy,
               ...(feishuGroupAllowFrom.length > 0 ? { groupAllowFrom: feishuGroupAllowFrom } : {}),
               ...(Object.keys(feishuGroups).length > 0 ? { groups: feishuGroups } : {}),
-              ...(typeof feishuRequireMention === "boolean" ? { requireMention: feishuRequireMention } : {}),
+              requireMention: feishuRequireMention,
               accounts: {
+                ...(existingFeishu.accounts ?? {}),
                 main: {
+                  ...(existingFeishu.accounts?.main ?? {}),
                   appId: feishuAppId,
                   appSecret: feishuAppSecret,
                   domain: feishuDomain,
@@ -174,7 +223,7 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
                   groupPolicy: feishuGroupPolicy,
                   ...(feishuGroupAllowFrom.length > 0 ? { groupAllowFrom: feishuGroupAllowFrom } : {}),
                   ...(Object.keys(feishuGroups).length > 0 ? { groups: feishuGroups } : {}),
-                  ...(typeof feishuRequireMention === "boolean" ? { requireMention: feishuRequireMention } : {}),
+                  requireMention: feishuRequireMention,
                   ...(feishuVerificationToken ? { verificationToken: feishuVerificationToken } : {})
                 }
               }
@@ -184,15 +233,26 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
       : {}),
     plugins: {
       ...(existing.plugins ?? {}),
-      allow: unique([
-        ...asStringArray(existing.plugins?.allow).filter(keepPluginId),
-        ...Object.keys(existing.plugins?.installs ?? {}).filter(keepPluginId),
-        "acpx",
-        "openai",
-        ...(feishuEnabled ? ["feishu"] : []),
-        "memory-core",
-        localContextPluginId
-      ]),
+      // FIX 1: `plugins.allow` is an EXCLUSIVE allowlist (docs/tools/plugin.md:
+      // "plugins.allow is an exclusive allowlist. Plugin-owned tools outside the
+      // allowlist stay unavailable, even when tools.allow includes '*'."). Emitting
+      // one where the user had none would silently disable their bundled default-on
+      // plugins AND their entries-enabled plugins (the real MacBook config has ONLY
+      // entries.memoryd-openclaw and no allow key). So: emit `allow` ONLY when the
+      // user already ran an exclusive allowlist, and then MERGE - preserving their
+      // explicit allow ids, their installs keys, their entries-enabled ids, plus
+      // AlphaLoop's ids. If they had no allow key we omit it entirely, leaving
+      // bundled defaults + AlphaLoop's own plugins (see alphaLoopPluginIds) intact.
+      ...(Array.isArray(existing.plugins?.allow)
+        ? {
+            allow: unique([
+              ...asStringArray(existing.plugins.allow).filter(keepPluginId),
+              ...Object.keys(existing.plugins?.installs ?? {}).filter(keepPluginId),
+              ...Object.keys(existing.plugins?.entries ?? {}).filter(keepPluginId),
+              ...alphaLoopPluginIds
+            ])
+          }
+        : {}),
       load: {
         ...(existing.plugins?.load ?? {}),
         paths: unique([
@@ -383,12 +443,14 @@ function filterPluginSlots(value) {
   return result;
 }
 
-function collectExistingFeishuUsers(feishuConfig) {
+// GLOBAL allowFrom only: the channel-level allowFrom plus AlphaLoop's own managed
+// `main` account. Deliberately EXCLUDES per-group allowFrom (flattening those into
+// a global union silently widens per-group permissions - the FIX 2b bug) and the
+// user's own `default` account (its members belong to that account, not to us).
+function collectGlobalFeishuAllowFrom(feishuConfig) {
   return unique([
     ...asStringArray(feishuConfig.allowFrom),
-    ...asStringArray(feishuConfig.accounts?.default?.allowFrom),
-    ...asStringArray(feishuConfig.accounts?.main?.allowFrom),
-    ...Object.values(feishuConfig.groups ?? {}).flatMap((group) => asStringArray(group?.allowFrom))
+    ...asStringArray(feishuConfig.accounts?.main?.allowFrom)
   ]);
 }
 
@@ -423,20 +485,30 @@ function parseOptionalBoolean(value) {
   return undefined;
 }
 
-function buildFeishuGroups({ groupIds, allowFrom, requireMention }) {
-  if (!Array.isArray(groupIds) || groupIds.length === 0) {
-    return {};
+// FIX 2b: preserve each existing group's own config VERBATIM (never rewrite a
+// group's allowFrom/requireMention), and only ADD groups explicitly supplied via
+// env - with the env allowFrom and env-default requireMention - when they are not
+// already present.
+function mergeFeishuGroups({ existingGroups, envGroupIds, envAllowFrom, requireMention }) {
+  const result = {};
+
+  for (const [groupId, groupConfig] of Object.entries(existingGroups ?? {})) {
+    result[groupId] = { ...groupConfig };
   }
 
-  return Object.fromEntries(
-    groupIds.map((groupId) => [
-      groupId,
-      {
-        ...(Array.isArray(allowFrom) && allowFrom.length > 0 ? { allowFrom } : {}),
-        ...(typeof requireMention === "boolean" ? { requireMention } : {})
+  if (Array.isArray(envGroupIds)) {
+    for (const groupId of envGroupIds) {
+      if (!groupId || Object.prototype.hasOwnProperty.call(result, groupId)) {
+        continue;
       }
-    ])
-  );
+      result[groupId] = {
+        ...(Array.isArray(envAllowFrom) && envAllowFrom.length > 0 ? { allowFrom: envAllowFrom } : {}),
+        ...(typeof requireMention === "boolean" ? { requireMention } : {})
+      };
+    }
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
