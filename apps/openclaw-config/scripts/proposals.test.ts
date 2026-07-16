@@ -118,6 +118,29 @@ describe("runCreate", () => {
     expect(createdAtMs).toBeLessThanOrEqual(after);
   });
 
+  // FIX 2 (symbol-format mismatch): official_paper_snapshots positions hold
+  // Longbridge-suffixed symbols ('AAPL.US'), but --symbol used to flow into
+  // the proposal row verbatim - a bare 'AAPL' then missed the executor's
+  // held-position lookup entirely (held=undefined -> conservative 0), so a
+  // legitimate full de-risking sell got 400-blocked. Normalize at creation
+  // (same convention as report-data.mjs's normalizeSymbol).
+  it("normalizes a bare --symbol to the Longbridge-suffixed convention at creation ('aapl' -> 'AAPL.US')", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+
+    const result = await cli.runCreate({ ...baseCreateFlags, symbol: "aapl" }, options);
+
+    expect(result.ok).toBe(true);
+    expect(result.proposal.symbol).toBe("AAPL.US");
+    // The persisted row too, not just the returned object.
+    const row = db.prepare(`SELECT symbol FROM proposals WHERE id = ?`).get(result.proposal.id) as { symbol: string };
+    expect(row.symbol).toBe("AAPL.US");
+
+    // An already-suffixed symbol is left unchanged.
+    const suffixed = await cli.runCreate({ ...baseCreateFlags, symbol: "0700.HK" }, options);
+    expect(suffixed.proposal.symbol).toBe("0700.HK");
+  });
+
   it("rejects an unknown owner", async () => {
     const { options } = makeDb();
     await expect(cli.runCreate(baseCreateFlags, options)).rejects.toThrow(/不存在/);

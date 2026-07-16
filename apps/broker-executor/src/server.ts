@@ -11,6 +11,7 @@ import {
   type RuleSet,
   assertOrderTicket,
   createId,
+  normalizeSymbol,
   notFound,
   readJsonBody,
   resolveLongbridgeAuthState,
@@ -184,8 +185,14 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
     if (!Array.isArray(positions)) {
       return undefined;
     }
+    // FIX 2: normalizeSymbol on BOTH sides, not plain uppercase equality -
+    // snapshots store Longbridge-suffixed symbols ('AAPL.US') while a
+    // proposal may carry a bare 'AAPL'; exact matching made a legitimately
+    // held position invisible (held=undefined -> conservative 0), 400-blocking
+    // a full de-risking sell.
+    const targetSymbol = normalizeSymbol(symbol);
     const match = positions.find(
-      (position) => String((position as Record<string, unknown>)?.symbol ?? "").toUpperCase() === symbol.toUpperCase()
+      (position) => normalizeSymbol(String((position as Record<string, unknown>)?.symbol ?? "")) === targetSymbol
     ) as Record<string, unknown> | undefined;
     if (!match) {
       return undefined;
@@ -365,7 +372,26 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
 
         // ---- Global Constraint ④: per-owner risk, budget includes this
         // owner's own OPEN (not yet filled/cancelled/rejected) orders ----
-        const riskFacts = readLatestOfficialPaperRiskFactsForOwner(proposal.ownerId, proposal.symbol);
+        let riskFacts = readLatestOfficialPaperRiskFactsForOwner(proposal.ownerId, proposal.symbol);
+        // FIX 1 (order-splitting naked short): the snapshot's held quantity
+        // does not see this owner's own RESTING sell orders yet - without
+        // deducting them, hold 100 -> sell A 100 (exempt, resting) -> sell B
+        // 100 still reads held=100 -> also exempt -> account net short 100
+        // with zero risk flags. Deduct the owner's open sell quantity for
+        // THIS symbol (floored at 0) before risk.ts applies the sell
+        // exemption. Only meaningful for sells with a found position; a
+        // missing position (heldQuantityForSymbol undefined) already counts
+        // the whole sell as risk-increasing.
+        if (proposal.side === "sell" && riskFacts?.heldQuantityForSymbol !== undefined) {
+          const openSellQuantity = officialPaperOrders.sumOpenSellQuantityForOwnerSymbol(
+            proposal.ownerId,
+            proposal.symbol
+          );
+          riskFacts = {
+            ...riskFacts,
+            heldQuantityForSymbol: Math.max(0, riskFacts.heldQuantityForSymbol - openSellQuantity)
+          };
+        }
         const openOrdersNotionalUsd = officialPaperOrders.sumOpenNotionalForOwner(proposal.ownerId);
         const dayStartIso = startOfUtcDay(nowDate()).toISOString();
         const openIdeas = officialPaperOrders.countSubmittedTodayForOwner(proposal.ownerId, dayStartIso);

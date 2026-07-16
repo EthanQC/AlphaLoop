@@ -590,6 +590,100 @@ describe("createBrokerExecutorServer", () => {
       expect(response.status).toBe(200);
     });
 
+    // FIX 1 (order-splitting naked short): the sell exemption must not
+    // double-spend the SAME held shares across sequential sells. Hold 150 ->
+    // sell A 150 (within held, exempt, resting at the broker) -> sell B 150
+    // minutes later: the snapshot still says held=150 (it does not see the
+    // resting sell), so without deducting the owner's own open sell orders
+    // the second full-size sell also reads as exempt and the account nets
+    // short 150 with zero risk flags.
+    it("blocks the second sell of the full held quantity while the first sell is still resting (open sells deducted from the snapshot's held quantity)", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 15_000,
+        positions: [{ symbol: "TSLA.US", quantity: 150 }]
+      });
+      // external_order_id is UNIQUE - mint a fresh id per execution.
+      let orderCounter = 0;
+      const fn: LongbridgeExecFn = () => {
+        orderCounter += 1;
+        return JSON.stringify({ order_id: `ext_split_${orderCounter}`, status: "New" });
+      };
+      await startServer({ execFn: fn });
+
+      // Sell A: 150 shares, fully within the held 150 -> risk-reducing, allowed.
+      const sellA = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 150,
+        limitPrice: 100
+      });
+      const responseA = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: sellA.id })
+      });
+      expect(responseA.status).toBe(200);
+
+      // Sell B: the SAME 150 held shares again while sell A rests ('New' ->
+      // stage 'submitted'). Effective held = 150 - 150 open sells = 0, so the
+      // full $15,000 (15% of net liq) counts as risk-increasing -> blocked.
+      const sellB = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 150,
+        limitPrice: 100
+      });
+      const responseB = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: sellB.id })
+      });
+
+      expect(responseB.status).toBe(400);
+      const bodyB = await responseB.json();
+      expect(bodyB.reasons.join(" ")).toMatch(/单个想法暴露/);
+
+      // Sell B must NOT have been recorded or executed.
+      const sellBLifecycle = db
+        .prepare(`SELECT 1 FROM official_paper_order_lifecycle WHERE ticket_id = ?`)
+        .get(deriveTicketId(sellB.id));
+      expect(sellBLifecycle).toBeUndefined();
+    });
+
+    // FIX 2 (symbol-format mismatch): snapshots hold Longbridge-suffixed
+    // symbols ('AAPL.US') while a proposal may carry a bare 'AAPL'. The held
+    // lookup must normalize both sides, or a legitimate full de-risking sell
+    // reads held=undefined -> conservative 0 -> 400-blocked.
+    it("finds the held position for a bare-symbol proposal ('AAPL' vs snapshot 'AAPL.US') and allows the de-risking sell within it", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 15_000,
+        positions: [{ symbol: "AAPL.US", quantity: 100 }]
+      });
+      const { fn } = makeCountingExec({ order_id: "ext_bare_symbol", status: "New" });
+      await startServer({ execFn: fn });
+
+      // 100 shares * $150 = $15,000 = 15% of net liq: over the 10% cap for a
+      // naked short, fine as a de-risking sell of the held 100 - IF the bare
+      // 'AAPL' is matched against the snapshot's 'AAPL.US'.
+      const proposal = createApprovedProposal(db, {
+        symbol: "AAPL",
+        side: "sell",
+        quantity: 100,
+        limitPrice: 150
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+    });
+
     it("per-owner risk isolation: a DIFFERENT owner's open order does not count against this owner's budget", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       seedSnapshot(db, { ownerId: "mem_other", netAssets: 100_000, marketValue: 0 });

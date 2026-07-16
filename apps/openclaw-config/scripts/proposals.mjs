@@ -33,6 +33,7 @@ import { evaluateDiscipline } from "./discipline-engine.mjs";
 import { loadLatestSnapshotForOwner } from "./market-alerts-store.mjs";
 import { composeDecisionUpdate, composeProposalCard, deliverProposalCard } from "./proposal-cards.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
+import { normalizeSymbol } from "./report-data.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 
@@ -244,7 +245,13 @@ async function submitToExecutor(proposal, options = {}) {
  */
 export async function runCreate(flags, options = {}) {
   const ownerId = requireFlag(flags, "owner");
-  const symbol = requireFlag(flags, "symbol");
+  // FIX 2 (symbol-format mismatch): normalize at creation to the codebase's
+  // Longbridge-suffixed convention (report-data.mjs's normalizeSymbol -
+  // bare 'aapl' -> 'AAPL.US', already-suffixed symbols pass through). The
+  // proposal row is what the executor's held-position lookup keys on; a bare
+  // symbol used to miss the snapshot's 'AAPL.US' position and 400-block a
+  // legitimate full de-risking sell.
+  const symbol = normalizeSymbol(requireFlag(flags, "symbol"));
   const side = requireFlag(flags, "side");
   if (side !== "buy" && side !== "sell") {
     throw new Error(`--side 必须是 buy 或 sell，收到：${side}。`);
