@@ -30,6 +30,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared-types
 
+  apps/longbridge-cli:
+    dependencies:
+      longport:
+        specifier: ^4.3.3
+        version: 4.3.3
+
   apps/platform-app:
     dependencies:
       '@packages/shared-types':
@@ -472,6 +478,40 @@ packages:
   lightningcss@1.32.0:
     resolution: {integrity: sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ==}
     engines: {node: '>= 12.0.0'}
+
+  longport-darwin-arm64@4.3.3:
+    resolution: {integrity: sha512-NSIY0v+GRBrtfRxwAbUiV1erIH0dSWrU8wYPa9iE4knEoha0hfJxekH71Ml4uikoYIfxLYz0UUq0xtTOydqEkg==}
+    engines: {node: '>= 10'}
+    cpu: [arm64]
+    os: [darwin]
+
+  longport-darwin-x64@4.3.3:
+    resolution: {integrity: sha512-W/3uHwEvZhUTYr/9lTAStuFiBbgP5QbWfO41adT60t9g3hvVnxSiB4wvc84K1CI74SmyI6H/F8uYRtxOuLSRZw==}
+    engines: {node: '>= 10'}
+    cpu: [x64]
+    os: [darwin]
+
+  longport-linux-arm64-gnu@4.3.3:
+    resolution: {integrity: sha512-FABlj1jjxuOcx3unQgnabTrXQOuiluqtGLjn3i14OkLmfOL1qhtmiflkeQULJQGX0+JCA2lCK6IaEsalgw8f3g==}
+    engines: {node: '>= 10'}
+    cpu: [arm64]
+    os: [linux]
+
+  longport-linux-x64-gnu@4.3.3:
+    resolution: {integrity: sha512-XhUMmj2IISMb+uFUpzzwQjTUi4LxahvW14R9VXPpapLltUg4Ras8ogr29T0lVPBJ5/MB7gqdoqF1Hq6jhK81XA==}
+    engines: {node: '>= 10'}
+    cpu: [x64]
+    os: [linux]
+
+  longport-win32-x64-msvc@4.3.3:
+    resolution: {integrity: sha512-sVad96Osldbsx6WA3NHw24R0I7Skebe/IKF4qobh7QWGrzgq6S4cNmOuHayYEFLgo/x94+GwSnyXK3EQxEQn1w==}
+    engines: {node: '>= 10'}
+    cpu: [x64]
+    os: [win32]
+
+  longport@4.3.3:
+    resolution: {integrity: sha512-oBSQklVG0/crloUu+X96HSQ+VEf6sJ+SG//u/jTqvXQNJZmCgVAQjtyw0/aGDbSMznSQwhZnPVvnz2alcbWFFA==}
+    engines: {node: '>= 10'}
 
   magic-string@0.30.21:
     resolution: {integrity: sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ==}
@@ -962,6 +1002,29 @@ snapshots:
       lightningcss-linux-x64-musl: 1.32.0
       lightningcss-win32-arm64-msvc: 1.32.0
       lightningcss-win32-x64-msvc: 1.32.0
+
+  longport-darwin-arm64@4.3.3:
+    optional: true
+
+  longport-darwin-x64@4.3.3:
+    optional: true
+
+  longport-linux-arm64-gnu@4.3.3:
+    optional: true
+
+  longport-linux-x64-gnu@4.3.3:
+    optional: true
+
+  longport-win32-x64-msvc@4.3.3:
+    optional: true
+
+  longport@4.3.3:
+    optionalDependencies:
+      longport-darwin-arm64: 4.3.3
+      longport-darwin-x64: 4.3.3
+      longport-linux-arm64-gnu: 4.3.3
+      longport-linux-x64-gnu: 4.3.3
+      longport-win32-x64-msvc: 4.3.3
 
   magic-string@0.30.21:
     dependencies:
