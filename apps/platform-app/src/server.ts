@@ -52,12 +52,43 @@ export interface PlatformServerDeps {
   feishuNotifier?: FeishuReviewNotifier;
 }
 
+// Process-level crash guard (2026-07 audit fix): the outer try/catch inside the request
+// handler below only wraps the SYNCHRONOUS dispatch() call. The bearer-gated write routes
+// (api-strategy.ts, api-research.ts) dispatch their async handlers fire-and-forget as
+// `void handleX(...)` - none of those handlers' own DB calls are wrapped in a local
+// try/catch, so a throw from node:sqlite (e.g. SQLITE_BUSY - this process runs a research
+// worker and shares trading.sqlite with CLIs) surfaces as an unhandled promise rejection,
+// which by default terminates the Node process. A member-facing server must survive one
+// bad request instead of taking down every other in-flight connection with it. This is
+// registered once at module load (not per-request) since it's a process-wide guard, not a
+// per-connection one; it deliberately does NOT call process.exit - logging and continuing
+// is the correct behavior for a long-lived server (contrast with a one-shot CLI script,
+// where crashing loudly is preferable).
+let processCrashGuardInstalled = false;
+function installProcessCrashGuard(): void {
+  if (processCrashGuardInstalled) {
+    return;
+  }
+  processCrashGuardInstalled = true;
+  process.on("unhandledRejection", (reason) => {
+    console.error(
+      `platform-app: unhandled rejection (process kept alive): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`
+    );
+  });
+  process.on("uncaughtException", (error) => {
+    console.error(
+      `platform-app: uncaught exception (process kept alive): ${error instanceof Error ? error.stack ?? error.message : String(error)}`
+    );
+  });
+}
+
 /**
  * Builds the platform-app HTTP server. This factory never calls `listen`
  * itself — callers (the real entrypoint or tests) decide the port and host,
  * so tests can bind to an ephemeral port instead of the production one.
  */
 export function createPlatformServer(deps: PlatformServerDeps): Server {
+  installProcessCrashGuard();
   return createServer((req, res) => {
     const nonce = createNonce();
     applySecurityHeaders(res, nonce);

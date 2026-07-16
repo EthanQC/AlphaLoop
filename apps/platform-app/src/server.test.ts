@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { migrate } from "@packages/shared-types";
+import { ApiTokenRepository, MemberRepository, migrate, type Member } from "@packages/shared-types";
 
 import { createPlatformServer } from "./server.js";
 
@@ -93,5 +93,47 @@ describe("createPlatformServer", () => {
     expect(payload).toEqual({ error: "内部错误，请稍后重试。" });
     // Server still alive: a follow-up request succeeds.
     expect((await fetch(`${baseUrl}/health`)).status).toBe(200);
+  });
+
+  it("survives an async /api/* write handler's DB throw instead of crashing the process (2026-07 audit: the outer try/catch in the request handler only wraps the SYNCHRONOUS dispatch call - the bearer write routes are dispatched as `void handleX(...)`, so a rejected promise from a DB throw inside one of those handlers was an unhandled rejection with no process-level guard)", async () => {
+    const member: Member = {
+      id: "member_a",
+      email: "member-a@example.com",
+      displayName: "Member A",
+      riskTags: [],
+      stockTags: [],
+      showPerformance: true,
+      status: "active",
+      createdAt: "2026-07-01T00:00:00.000Z"
+    };
+    new MemberRepository(db).upsert(member);
+    const { token } = new ApiTokenRepository(db).issue(member.id, "test-token");
+
+    // Close the underlying db so the handler's synchronous `createThesis(deps.db, ...)`
+    // call throws inside the async handler body, producing a rejected promise from a
+    // fire-and-forget `void handleCreateThesis(...)` dispatch with no local catch.
+    db.close();
+
+    // The handler throws before ever calling res.end()/sendJson, so this specific request's
+    // socket is left hanging (a residual gap noted in the audit - fully closing it requires
+    // a local .catch() inside api-strategy.ts's own dispatch, out of this fix's file scope).
+    // The load-bearing assertion here is that the PROCESS itself survives the unhandled
+    // rejection instead of crashing and taking every other in-flight connection down with
+    // it - so this probe request is fired with a short abort timeout and its outcome
+    // (response or abort) is intentionally not asserted on.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 200);
+    await fetch(`${baseUrl}/api/theses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ symbol: "AAPL.US", direction: "bull" }),
+      signal: controller.signal
+    }).catch(() => undefined);
+    clearTimeout(timeout);
+
+    // Process-level guard must have swallowed the unhandled rejection: confirm the server
+    // process is still alive and serving unrelated requests on a fresh connection.
+    const health = await fetch(`${baseUrl}/health`);
+    expect(health.status).toBe(200);
   });
 });
