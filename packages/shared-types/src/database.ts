@@ -1191,6 +1191,15 @@ export class OfficialPaperOrderLifecycleRepository {
     //   - submit_unconfirmed : broker call errored/timed out - the order MAY
     //                          exist at the broker, so it is counted
     //                          conservatively (over-block beats double-commit).
+    //   - unknown_broker_status : the broker-status mapper's fallback for an
+    //                          unrecognized live status string - it is still
+    //                          a resting order, just an unrecognized one, so
+    //                          it is counted conservatively too (an unknown
+    //                          status might be a live resting order); FIX 3
+    //                          - previously missing from this list, which
+    //                          reopened the exact audit finding #3
+    //                          double-commit window this method exists to
+    //                          close, just for a different unmapped status.
     // Terminal stages (filled/cancelled/rejected/expired/unknown) are excluded:
     // a filled order transitions into the next account snapshot's market_value,
     // so counting it here too would double-count once the hourly snapshot
@@ -1200,7 +1209,7 @@ export class OfficialPaperOrderLifecycleRepository {
         SELECT COALESCE(SUM(quantity * COALESCE(limit_price, 0)), 0) AS notional
         FROM official_paper_order_lifecycle
         WHERE owner_id = ?
-          AND lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed')
+          AND lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed', 'unknown_broker_status')
       `)
       .get(ownerId) as { notional: number } | undefined;
 

@@ -3038,6 +3038,27 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     expect(repo.sumOpenNotionalForOwner("mem_other")).toBe(10_000);
   });
 
+  // FIX 3 (audit #3 class): the broker-status mapper emits
+  // 'unknown_broker_status' for an unrecognized live status - a resting order
+  // parked in that stage MUST still count against the budget (conservative:
+  // an unknown status might be a live resting order), otherwise it is
+  // invisible to the 10% budget gate exactly like the pre-fix 'submitted' gap
+  // was.
+  it("sumOpenNotionalForOwner counts a lifecycle row in stage 'unknown_broker_status' (conservative: unknown status might be a live resting order)", () => {
+    const { db, repo } = setup();
+
+    repo.insertSubmitting({
+      ticketId: "t_unknown_status", ownerId: "mem_owner", symbol: "IBM.US", assetClass: "stock",
+      side: "buy", quantity: 3, limitPrice: 150, submittedAt: nowIso()
+    }); // 450
+    repo.finalizeExecution("t_unknown_status", {
+      externalOrderId: "ext_unknown_status", brokerStatus: "SomeNewLongbridgeStatus", localStatus: "accepted",
+      lifecycleStage: "unknown_broker_status", notes: [], observedAt: nowIso()
+    });
+
+    expect(repo.sumOpenNotionalForOwner("mem_owner")).toBe(450);
+  });
+
   it("save() upsert protects an already-assigned ticket_id (audit #2 direction): a later same-order write cannot overwrite it, only fill a null one", () => {
     const { db, repo } = setup();
     const base = {
