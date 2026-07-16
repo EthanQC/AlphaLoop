@@ -231,6 +231,87 @@ export interface Member {
   createdAt: string;
 }
 
+// Phase 8 Task 1 (2026-07-16 plan, in-site research): mirrors the
+// `research_tasks` table (v3 DDL + v13's result_json/confidence/title
+// columns, packages/shared-types/src/database.ts) field-for-field.
+// `ResearchConfidence` deliberately reuses the exact same three-value
+// vocabulary as `ProposalConfidence`/`analysis_predictions.confidence` (low/
+// medium/high) - the view layer (Task 4) renders it through the SAME
+// CONFIDENCE_LABELS 高/中/低 mapping those other confidence fields already
+// use (apps/platform-app/src/reports/conclusion-box.ts), so a fourth
+// independent vocabulary here would just be friction.
+export type ResearchConfidence = "low" | "medium" | "high";
+
+export type ResearchTaskStatus = "queued" | "running" | "done" | "degraded" | "failed";
+
+export type ResearchVisibility = "private" | "public";
+
+export interface ResearchEvidenceItem {
+  ref: string;
+  title: string;
+  url?: string;
+  publisher?: string;
+}
+
+export interface ResearchKeyPoint {
+  text: string;
+  evidenceRefs: string[];
+}
+
+export interface ResearchDataTableRow {
+  label: string;
+  value: string | number;
+  source: string;
+}
+
+export interface ResearchSkippedStep {
+  step: string;
+  reason: string;
+}
+
+// comparison.theses / comparison.disciplines: the plan's Task 1 line only
+// names these two arrays ("对照：theses:[...], disciplines:[...]") without
+// pinning a per-item shape - that belongs to Task 2 (research-engine.mjs),
+// which owns the actual agree/conflict comparison verdict logic. Left as JsonValue[]
+// here rather than guessing ahead of that task's own design.
+export interface ResearchComparison {
+  theses: JsonValue[];
+  disciplines: JsonValue[];
+}
+
+// The parsed shape of `research_tasks.result_json` (plan Task 1, verbatim
+// field list): the deterministic research pipeline's (Task 2) final,
+// conclusion-first write. Every field here is produced by that pipeline, not
+// hand-authored - this type only describes the shape once it exists.
+export interface ResearchResult {
+  conclusion: string;
+  confidence: ResearchConfidence;
+  keyPoints: ResearchKeyPoint[];
+  dataTable: ResearchDataTableRow[];
+  comparison: ResearchComparison;
+  suggestedAction?: string;
+  evidence: ResearchEvidenceItem[];
+  skipped: ResearchSkippedStep[];
+}
+
+export interface ResearchTask {
+  id: string;
+  ownerId: string;
+  question: string;
+  status: ResearchTaskStatus;
+  steps: JsonValue[];
+  budgetSpent: number;
+  resultPath?: string;
+  // Parsed research_tasks.result_json - undefined until the task reaches
+  // done/degraded (setResult writes it; queued/running rows never have it).
+  resultJson?: ResearchResult;
+  confidence?: ResearchConfidence;
+  title?: string;
+  visibility: ResearchVisibility;
+  createdAt: string;
+  finishedAt?: string;
+}
+
 export function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }

@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, createId, migrate, type Member } from "@packages/shared-types";
+import { ApiTokenRepository, MemberRepository, ResearchTaskRepository, createId, migrate, type Member } from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
 
@@ -354,6 +354,80 @@ describe("member card route (GET /member/<who>)", () => {
     const response = await authed("/member/member_subject4", token);
     const body = await response.text();
     expect(body).toContain("暂无公开研判");
+  });
+
+  // Phase 8 Task 4 (2026-07-16 plan): 公开研判区 real rendering (conclusion +
+  // confidence + /research/<id>), replacing the pre-P8 status-only placeholder.
+  describe("公开研判 (real rendering)", () => {
+    function finishTask(
+      ownerId: string,
+      question: string,
+      opts: { visibility?: "private" | "public"; status?: "done" | "degraded" | "queued"; confidence?: "low" | "medium" | "high" } = {}
+    ): string {
+      const repo = new ResearchTaskRepository(db);
+      const created = repo.createIfWithinQuota({ ownerId, question, tradingDay: "2026-07-14" });
+      if (!created.ok) throw new Error("test setup: quota unexpectedly exceeded");
+      if (opts.status && opts.status !== "queued") {
+        repo.setResult(created.task.id, {
+          status: opts.status,
+          confidence: opts.confidence ?? "high",
+          title: question,
+          finishedAt: "2026-07-14T09:00:00.000Z",
+          resultJson: {
+            conclusion: "该标的短期看多，估值合理。",
+            confidence: opts.confidence ?? "high",
+            keyPoints: [],
+            dataTable: [],
+            comparison: { theses: [], disciplines: [] },
+            evidence: [],
+            skipped: []
+          }
+        });
+      }
+      if ((opts.visibility ?? "public") === "public") {
+        repo.promoteVisibility(created.task.id, ownerId);
+      }
+      return created.task.id;
+    }
+
+    it("shows the subject's PUBLIC done research as conclusion + confidence + a /research/<id> link", async () => {
+      const subject = makeMember({ id: "member_subject_research", email: "research-subject@example.com" });
+      new MemberRepository(db).upsert(subject);
+      const id = finishTask(subject.id, "NVDA财报前要减仓吗", { status: "done", confidence: "high" });
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_research", token);
+      const body = await response.text();
+
+      expect(body).toContain("NVDA财报前要减仓吗");
+      expect(body).toContain("该标的短期看多，估值合理。");
+      expect(body).toContain("高"); // CONFIDENCE_LABELS.high
+      expect(body).toContain(`href="/research/${id}"`);
+    });
+
+    it("never shows the subject's PRIVATE research, even if done", async () => {
+      const subject = makeMember({ id: "member_subject_private_research", email: "private-research@example.com" });
+      new MemberRepository(db).upsert(subject);
+      finishTask(subject.id, "私有研判问题", { status: "done", visibility: "private" });
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_private_research", token);
+      const body = await response.text();
+      expect(body).not.toContain("私有研判问题");
+      expect(body).toContain("暂无公开研判");
+    });
+
+    it("never shows a public but still-queued task (no conclusion to show yet)", async () => {
+      const subject = makeMember({ id: "member_subject_queued_research", email: "queued-research@example.com" });
+      new MemberRepository(db).upsert(subject);
+      finishTask(subject.id, "还在排队的公开问题", { status: "queued", visibility: "public" });
+
+      const { token } = seedMemberWithToken();
+      const response = await authed("/member/member_subject_queued_research", token);
+      const body = await response.text();
+      expect(body).not.toContain("还在排队的公开问题");
+      expect(body).toContain("暂无公开研判");
+    });
   });
 
   it("never renders follow/comment/like/DM affordances", async () => {

@@ -8,7 +8,9 @@ import {
   ApiTokenRepository,
   ProposalRepository,
   CircuitBreakerRepository,
-  OfficialPaperOrderLifecycleRepository
+  OfficialPaperOrderLifecycleRepository,
+  ResearchTaskRepository,
+  usEasternTradingDayUtcRange
 } from "./database.js";
 import type { NewProposal } from "./database.js";
 import type { Member } from "./domain.js";
@@ -845,6 +847,46 @@ const V7_TABLE_NAMES = [
   "feishu_context_messages"
 ];
 
+// Strips v13's result_json/confidence/title columns back off research_tasks,
+// IF present - a defensive, idempotent (checks table_info first) operation
+// every buildSeededVxDatabase() fixture below calls, at every level, for the
+// exact same reason each of them already repeats `DROP TABLE IF EXISTS
+// strategy_cards`/`circuit_breaker_state` at every level regardless of
+// whether an earlier level already did it: each fixture's OWN internal
+// migrate(db) call advances the schema all the way to the CODE's current
+// latest version (v13, now that Phase 8 Task 1 exists) before that fixture
+// rolls its OWN user_version back down - so without this, a LATER fixture
+// built on top would have its own migrate(db) call try to re-run v13's ADD
+// COLUMN step against a table that already has the columns (from the
+// earlier fixture's migrate() call), and SQLite has no "ADD COLUMN IF NOT
+// EXISTS" to make that safe on its own - unlike a bare table, which a plain
+// `DROP TABLE IF EXISTS` handles. research_tasks itself predates every one
+// of these fixtures (created at v3), so - unlike v12's strategy_cards, which
+// only needed handling from the v11 fixture onward - this needs calling from
+// the EARLIEST (v7) fixture forward.
+function stripResearchTasksV13ColumnsIfPresent(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(research_tasks)").all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === "result_json")) {
+    return;
+  }
+
+  db.exec(`
+    CREATE TABLE research_tasks_pre_v13 (
+      id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+      question TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','degraded','failed')),
+      steps TEXT NOT NULL DEFAULT '[]', budget_spent INTEGER NOT NULL DEFAULT 0,
+      result_path TEXT, visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','public')),
+      created_at TEXT NOT NULL, finished_at TEXT);
+    INSERT INTO research_tasks_pre_v13
+      (id, owner_id, question, status, steps, budget_spent, result_path, visibility, created_at, finished_at)
+    SELECT id, owner_id, question, status, steps, budget_spent, result_path, visibility, created_at, finished_at
+    FROM research_tasks;
+    DROP TABLE research_tasks;
+    ALTER TABLE research_tasks_pre_v13 RENAME TO research_tasks;
+    CREATE INDEX IF NOT EXISTS research_tasks_owner_day_idx ON research_tasks(owner_id, created_at);
+  `);
+}
+
 // Builds a REAL v7 database (schema produced by the actual migration steps
 // 0..6, not hand-copied DDL that could silently drift out of sync with
 // database.ts) with one seeded row in every table that exists as of v7, then
@@ -856,7 +898,8 @@ const V7_TABLE_NAMES = [
 // pre-v8 production db would be in.
 function buildSeededV7Database(): DatabaseSync {
   const db = memoryDb();
-  migrate(db); // builds the full v0..v12 schema using the real migration code
+  migrate(db); // builds the full v0..v13 schema using the real migration code
+  stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
@@ -1132,6 +1175,7 @@ const V8_TABLE_NAMES = [...V7_TABLE_NAMES, "news_events", "news_event_sources", 
 function buildSeededV8Database(): DatabaseSync {
   const db = buildSeededV7Database();
   migrate(db);
+  stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
@@ -1269,6 +1313,7 @@ const V9_TABLE_NAMES = [...V8_TABLE_NAMES, "stock_facts"];
 function buildSeededV9Database(): DatabaseSync {
   const db = buildSeededV8Database();
   migrate(db);
+  stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`DROP TABLE IF EXISTS strategy_cards; DROP TABLE IF EXISTS circuit_breaker_state;`);
   db.exec("PRAGMA user_version = 9");
 
@@ -1942,7 +1987,8 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
 
   it("upgrades a v10 db with data in every pre-existing table (through v11) with zero row loss, and is idempotent", () => {
     const db = buildSeededV9Database();
-    migrate(db); // fixture-build only: advances the underlying schema through v10, v11 AND v12
+    migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
+    stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
     db.exec(`DROP TABLE IF EXISTS strategy_cards;`); // peel off v12's own new table - see buildSeededV7/V8/V9Database's identical technique
     db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
     seedMember(db, "mem_v10");
@@ -1994,7 +2040,8 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
 //     them already present would make that assertion vacuous.
 function buildSeededV11Database(): DatabaseSync {
   const db = buildSeededV9Database();
-  migrate(db); // fixture-build only: advances the underlying schema through v10, v11 AND v12
+  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
+  stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
   db.exec(`DROP TABLE IF EXISTS strategy_cards;`);
 
   db.exec("PRAGMA foreign_keys = OFF;");
@@ -2032,9 +2079,47 @@ function buildSeededV11Database(): DatabaseSync {
   return db;
 }
 
+// Builds a REAL v12 database: starts from buildSeededV9Database() (v9 shape,
+// research_tasks carrying the 'research_v7' row seeded all the way back in
+// buildSeededV7Database), runs the real migrate() (which - now that v13
+// exists - advances all the way through v10, v11, v12 AND v13 in one call),
+// then peels v13's OWN new columns back off research_tasks via the shared
+// stripResearchTasksV13ColumnsIfPresent helper above - the same "reversed-
+// fixture" technique buildSeededV11Database above already uses (by hand, for
+// theses' bull_points/bear_points), needed here for the identical reason:
+// v13 didn't exist when that earlier fixture was written, so it had no
+// reason to touch research_tasks. Everything else (strategy_cards present
+// and empty, theses with bull_points/bear_points) is left exactly as
+// migrate() produced it - only research_tasks needs peeling for the v13 test
+// below.
+function buildSeededV12Database(): DatabaseSync {
+  const db = buildSeededV9Database();
+  migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
+  stripResearchTasksV13ColumnsIfPresent(db);
+
+  // buildSeededV9Database() drops circuit_breaker_state before resetting its
+  // own user_version - the migrate(db) call above recreates it (v10's step)
+  // but empty, so it must be reseeded here (same technique
+  // buildSeededV11Database uses above) for V10_TABLE_NAMES's "every table has
+  // data" precondition to hold in the v13 test below.
+  seedMember(db, "mem_v12");
+  db.prepare(`
+    INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+    VALUES ('mem_v12', ?, 'weekly loss > 3%', -0.05, ?)
+  `).run(nowIso(), nowIso());
+
+  db.exec("PRAGMA user_version = 12");
+  return db;
+}
+
 describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1, 2026-07-15 plan)", () => {
-  it("SCHEMA_VERSION is 12", () => {
-    expect(SCHEMA_VERSION).toBe(12);
+  // SCHEMA_VERSION has since moved on to v13 (Phase 8 Task 1, research_tasks
+  // result columns) - see the "v13 ..." describe block below for the
+  // current-version assertion; loosened to "at least" the same way v10/v11's
+  // own fresh-db tests already were when a later phase moved SCHEMA_VERSION
+  // past the version each of those blocks was originally written to pin.
+  it("SCHEMA_VERSION is at least 12", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(12);
   });
 
   it("a fresh db lands at v12 with strategy_cards present (columns/CHECK/index per the plan's frozen DDL) and theses carrying bull_points/bear_points (NOT NULL DEFAULT '[]'), every v3 column/index intact", () => {
@@ -2224,6 +2309,528 @@ describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1
     expect(getSchemaVersion(db)).toBe(11);
     const row = db.prepare("SELECT owner_id FROM theses WHERE id = 'thesis_v7'").get() as { owner_id: string };
     expect(row.owner_id).toBe("ghost_member");
+  });
+});
+
+describe("v13 research_tasks result columns migration (Phase 8 Task 1, 2026-07-16 plan)", () => {
+  it("SCHEMA_VERSION is 13", () => {
+    expect(SCHEMA_VERSION).toBe(13);
+  });
+
+  it("a fresh db lands at v13 with result_json/confidence/title present on research_tasks, all nullable", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const columns = db.prepare("PRAGMA table_info(research_tasks)").all() as Array<
+      { name: string; notnull: number }
+    >;
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+    expect(byName.result_json).toBeDefined();
+    expect(byName.result_json.notnull).toBe(0);
+    expect(byName.confidence).toBeDefined();
+    expect(byName.confidence.notnull).toBe(0);
+    expect(byName.title).toBeDefined();
+    expect(byName.title.notnull).toBe(0);
+
+    // Every pre-existing column/index from v3 is still intact.
+    for (const col of [
+      "id", "owner_id", "question", "status", "steps", "budget_spent",
+      "result_path", "visibility", "created_at", "finished_at"
+    ]) {
+      expect(byName[col]).toBeDefined();
+    }
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("research_tasks_owner_day_idx");
+  });
+
+  it("is idempotent", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("enforces CHECK(confidence IS NULL OR confidence IN ('low','medium','high'))", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v13_check");
+    const now = nowIso();
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO research_tasks (id, owner_id, question, created_at, confidence)
+        VALUES ('rt_bad_confidence', 'mem_v13_check', 'q', ?, 'bogus')
+      `).run(now)
+    ).toThrow(/CHECK constraint failed/);
+
+    for (const value of ["low", "medium", "high", null]) {
+      expect(() =>
+        db.prepare(`
+          INSERT INTO research_tasks (id, owner_id, question, created_at, confidence)
+          VALUES (?, 'mem_v13_check', 'q', ?, ?)
+        `).run(`rt_ok_${String(value)}`, now, value)
+      ).not.toThrow();
+    }
+  });
+
+  it("upgrades a genuine pre-v13 (v12-shaped, research_tasks WITHOUT result_json/confidence/title) database to v13 with zero row loss - the pre-existing row is preserved with its original columns intact, the three new columns are NULL, and it is idempotent", () => {
+    const db = buildSeededV12Database();
+    expect(getSchemaVersion(db)).toBe(12);
+
+    const columnsBefore = db.prepare("PRAGMA table_info(research_tasks)").all() as Array<{ name: string }>;
+    expect(columnsBefore.map((c) => c.name)).not.toContain("result_json");
+    expect(columnsBefore.map((c) => c.name)).not.toContain("confidence");
+    expect(columnsBefore.map((c) => c.name)).not.toContain("title");
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V10_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      if (table !== "strategy_cards") {
+        expect(countsBefore[table]).toBeGreaterThan(0);
+      }
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // The pre-existing research_v7 row (seeded in buildSeededV7Database,
+    // carried genuinely column-less-on-the-new-three through
+    // buildSeededV12Database above) survived the ADD COLUMN step, with every
+    // original field intact and the three new columns NULL.
+    const row = db.prepare("SELECT * FROM research_tasks WHERE id = 'research_v7'").get() as Record<string, unknown>;
+    expect(row).toBeDefined();
+    expect(row.owner_id).toBe("mem_v7");
+    expect(row.question).toBe("why did AAPL move");
+    expect(row.status).toBe("done");
+    expect(row.steps).toBe("[]");
+    expect(row.budget_spent).toBe(1);
+    expect(row.result_path).toBeNull();
+    expect(row.visibility).toBe("private");
+    expect(row.result_json).toBeNull();
+    expect(row.confidence).toBeNull();
+    expect(row.title).toBeNull();
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("research_tasks_owner_day_idx");
+
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+});
+
+describe("usEasternTradingDayUtcRange (Phase 8 Task 1)", () => {
+  // Same EDT/EST reference instants trading-schedule.test.ts already pins for
+  // currentUsEasternTradingWeek's weekStartUtcIso (00:00 America/New_York ==
+  // 04:00Z in July/EDT, == 05:00Z in January/EST) - this function mirrors
+  // that same nyMidnightUtcIso math, so it must agree on both.
+  it("computes [dayStart, nextDayStart) for an EDT (July, UTC-4) trading day", () => {
+    expect(usEasternTradingDayUtcRange("2026-07-13")).toEqual({
+      dayStart: "2026-07-13T04:00:00.000Z",
+      nextDayStart: "2026-07-14T04:00:00.000Z"
+    });
+  });
+
+  it("computes [dayStart, nextDayStart) for an EST (January, UTC-5) trading day", () => {
+    expect(usEasternTradingDayUtcRange("2026-01-12")).toEqual({
+      dayStart: "2026-01-12T05:00:00.000Z",
+      nextDayStart: "2026-01-13T05:00:00.000Z"
+    });
+  });
+
+  it("rolls the calendar month/year over correctly at a month/year boundary", () => {
+    expect(usEasternTradingDayUtcRange("2026-01-31")).toEqual({
+      dayStart: "2026-01-31T05:00:00.000Z",
+      nextDayStart: "2026-02-01T05:00:00.000Z"
+    });
+    expect(usEasternTradingDayUtcRange("2025-12-31")).toEqual({
+      dayStart: "2025-12-31T05:00:00.000Z",
+      nextDayStart: "2026-01-01T05:00:00.000Z"
+    });
+  });
+});
+
+// createIfWithinQuota's INSERT always stamps created_at with the real wall
+// clock (nowIso(), same as every other repository's `create` in this file -
+// e.g. ProposalRepository.create) - it has no injectable clock. Tests below
+// that submit MULTIPLE tasks and assert the quota trips must therefore pass
+// a `tradingDay` whose US/Eastern window actually contains "right now" (real
+// time, whenever the suite happens to run), or every inserted row would fall
+// OUTSIDE the window being counted and the quota would never trip. This
+// mirrors trading-schedule.mjs's own currentUsEasternTradingDay (not
+// imported for the same package-layering reason database.ts's own
+// usEasternTradingDayUtcRange isn't - see that function's doc comment).
+function todayUsEasternTradingDay(): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+describe("ResearchTaskRepository (Phase 8 Task 1, 2026-07-16 plan)", () => {
+  function setup() {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_owner");
+    seedMember(db, "mem_other");
+    return { db, repo: new ResearchTaskRepository(db) };
+  }
+
+  describe("countTodayForOwner", () => {
+    it("counts only this owner's rows whose created_at falls inside the tradingDay's US/Eastern [dayStart, nextDayStart) window", () => {
+      const { db, repo } = setup();
+      const insert = (id: string, ownerId: string, createdAt: string) =>
+        db.prepare(`
+          INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+          VALUES (?, ?, 'q', 'queued', '[]', 0, 'private', ?)
+        `).run(id, ownerId, createdAt);
+
+      // tradingDay '2026-07-13' (EDT) -> [2026-07-13T04:00:00.000Z, 2026-07-14T04:00:00.000Z)
+      insert("rt_before", "mem_owner", "2026-07-13T03:59:59.999Z"); // just before -> excluded
+      insert("rt_at_start", "mem_owner", "2026-07-13T04:00:00.000Z"); // exactly at start -> included
+      insert("rt_mid", "mem_owner", "2026-07-13T18:00:00.000Z"); // included
+      insert("rt_just_before_end", "mem_owner", "2026-07-14T03:59:59.999Z"); // included
+      insert("rt_at_end", "mem_owner", "2026-07-14T04:00:00.000Z"); // exactly at next start -> excluded
+      insert("rt_other_owner", "mem_other", "2026-07-13T18:00:00.000Z"); // included window, wrong owner -> excluded
+
+      expect(repo.countTodayForOwner("mem_owner", "2026-07-13")).toBe(3);
+      expect(repo.countTodayForOwner("mem_other", "2026-07-13")).toBe(1);
+      expect(repo.countTodayForOwner("mem_owner", "2026-07-14")).toBe(1); // rt_at_end belongs to the NEXT trading day
+    });
+
+    it("returns 0 for an owner with no research_tasks rows at all", () => {
+      const { repo } = setup();
+      expect(repo.countTodayForOwner("mem_owner", "2026-07-13")).toBe(0);
+    });
+  });
+
+  describe("createIfWithinQuota", () => {
+    it("succeeds for the first 10 submissions and blocks the 11th, inserting exactly 10 rows (dailyLimit default 10)", () => {
+      const { db, repo } = setup();
+      const results = [];
+      for (let i = 0; i < 11; i += 1) {
+        results.push(repo.createIfWithinQuota({ ownerId: "mem_owner", question: `q${i}`, tradingDay: todayUsEasternTradingDay() }));
+      }
+
+      for (let i = 0; i < 10; i += 1) {
+        expect(results[i]?.ok).toBe(true);
+      }
+      const eleventh = results[10];
+      expect(eleventh?.ok).toBe(false);
+      if (eleventh && !eleventh.ok) {
+        expect(eleventh.reason).toBe("quota_exceeded");
+        expect(eleventh.used).toBe(10);
+        expect(eleventh.limit).toBe(10);
+      }
+
+      const count = db.prepare(`SELECT COUNT(*) c FROM research_tasks WHERE owner_id = 'mem_owner'`).get() as { c: number };
+      expect(count.c).toBe(10);
+    });
+
+    it("does not insert a row when quota is exceeded (rollback, not a partial write)", () => {
+      const { db, repo } = setup();
+      for (let i = 0; i < 10; i += 1) {
+        repo.createIfWithinQuota({ ownerId: "mem_owner", question: `q${i}`, tradingDay: todayUsEasternTradingDay() });
+      }
+      const before = (db.prepare(`SELECT COUNT(*) c FROM research_tasks`).get() as { c: number }).c;
+      const blocked = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q_blocked", tradingDay: todayUsEasternTradingDay() });
+      const after = (db.prepare(`SELECT COUNT(*) c FROM research_tasks`).get() as { c: number }).c;
+
+      expect(blocked.ok).toBe(false);
+      expect(after).toBe(before);
+    });
+
+    it("respects a custom dailyLimit", () => {
+      const { repo } = setup();
+      const first = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q0", tradingDay: todayUsEasternTradingDay(), dailyLimit: 1 });
+      const second = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q1", tradingDay: todayUsEasternTradingDay(), dailyLimit: 1 });
+      expect(first.ok).toBe(true);
+      expect(second.ok).toBe(false);
+    });
+
+    it("tracks quota per owner independently", () => {
+      const { repo } = setup();
+      for (let i = 0; i < 10; i += 1) {
+        repo.createIfWithinQuota({ ownerId: "mem_owner", question: `q${i}`, tradingDay: todayUsEasternTradingDay() });
+      }
+      const otherResult = repo.createIfWithinQuota({ ownerId: "mem_other", question: "q_other", tradingDay: todayUsEasternTradingDay() });
+      expect(otherResult.ok).toBe(true);
+    });
+
+    it("on success, returns a queued task with steps=[], budget_spent=0, visibility='private', and it round-trips via getById", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "why did AAPL move", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.task.status).toBe("queued");
+        expect(result.task.steps).toEqual([]);
+        expect(result.task.budgetSpent).toBe(0);
+        expect(result.task.visibility).toBe("private");
+        expect(result.task.question).toBe("why did AAPL move");
+
+        const reloaded = repo.getById(result.task.id);
+        expect(reloaded).toEqual(result.task);
+      }
+    });
+  });
+
+  describe("claimNextQueued", () => {
+    it("claims the oldest queued row and flips it to running", () => {
+      const { db, repo } = setup();
+      db.prepare(`
+        INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+        VALUES ('rt_newer', 'mem_owner', 'q2', 'queued', '[]', 0, 'private', '2026-07-13T10:00:00.000Z')
+      `).run();
+      db.prepare(`
+        INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+        VALUES ('rt_older', 'mem_owner', 'q1', 'queued', '[]', 0, 'private', '2026-07-13T09:00:00.000Z')
+      `).run();
+
+      const claimed = repo.claimNextQueued(nowIso());
+      expect(claimed?.id).toBe("rt_older");
+      expect(claimed?.status).toBe("running");
+
+      const stillQueued = repo.getById("rt_newer");
+      expect(stillQueued?.status).toBe("queued");
+    });
+
+    it("of two claims racing on ONE queued row, exactly one succeeds - the other gets null", () => {
+      const { db, repo } = setup();
+      db.prepare(`
+        INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+        VALUES ('rt_only', 'mem_owner', 'q', 'queued', '[]', 0, 'private', ?)
+      `).run(nowIso());
+
+      const first = repo.claimNextQueued(nowIso());
+      const second = repo.claimNextQueued(nowIso());
+
+      expect(first?.id).toBe("rt_only");
+      expect(first?.status).toBe("running");
+      expect(second).toBeNull();
+    });
+
+    it("returns null when there are no queued rows", () => {
+      const { repo } = setup();
+      expect(repo.claimNextQueued(nowIso())).toBeNull();
+    });
+
+    it("never claims a row that is already running/done/degraded/failed", () => {
+      const { db, repo } = setup();
+      for (const status of ["running", "done", "degraded", "failed"]) {
+        db.prepare(`
+          INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+          VALUES (?, 'mem_owner', 'q', ?, '[]', 0, 'private', ?)
+        `).run(`rt_${status}`, status, nowIso());
+      }
+      expect(repo.claimNextQueued(nowIso())).toBeNull();
+    });
+  });
+
+  describe("appendStep", () => {
+    it("pushes a step onto the steps JSON array, preserving prior steps", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      repo.appendStep(result.task.id, { step: "intent", message: "解析问题" });
+      repo.appendStep(result.task.id, { step: "quote", message: "跳过：未找到 XXX 行情" });
+
+      const reloaded = repo.getById(result.task.id);
+      expect(reloaded?.steps).toEqual([
+        { step: "intent", message: "解析问题" },
+        { step: "quote", message: "跳过：未找到 XXX 行情" }
+      ]);
+    });
+
+    it("throws for an unknown task id", () => {
+      const { repo } = setup();
+      expect(() => repo.appendStep("rt_missing", { step: "x" })).toThrow(/not found/);
+    });
+  });
+
+  describe("setResult", () => {
+    it("writes status/result_json/confidence/title/finished_at, round-tripping via getById", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      const resultJson = {
+        conclusion: "AAPL 短期承压",
+        confidence: "medium" as const,
+        keyPoints: [{ text: "营收不及预期", evidenceRefs: ["ev1"] }],
+        dataTable: [{ label: "现价", value: 210.5, source: "stock_facts" }],
+        comparison: { theses: [], disciplines: [] },
+        evidence: [{ ref: "ev1", title: "财报", publisher: "公司公告" }],
+        skipped: []
+      };
+      const finishedAt = nowIso();
+      repo.setResult(result.task.id, {
+        status: "done",
+        resultJson,
+        confidence: "medium",
+        title: "AAPL 短期研判",
+        finishedAt,
+        budgetSpent: 7
+      });
+
+      const reloaded = repo.getById(result.task.id);
+      expect(reloaded?.status).toBe("done");
+      expect(reloaded?.resultJson).toEqual(resultJson);
+      expect(reloaded?.confidence).toBe("medium");
+      expect(reloaded?.title).toBe("AAPL 短期研判");
+      expect(reloaded?.finishedAt).toBe(finishedAt);
+      expect(reloaded?.budgetSpent).toBe(7);
+    });
+
+    it("leaves budget_spent unchanged when the input omits it (COALESCE, not zeroed)", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // First write sets a budget, a later terminal write that omits it must NOT reset it to 0.
+      repo.setResult(result.task.id, { status: "running", finishedAt: nowIso(), budgetSpent: 5 });
+      repo.setResult(result.task.id, { status: "done", finishedAt: nowIso() });
+      expect(repo.getById(result.task.id)?.budgetSpent).toBe(5);
+    });
+
+    it("writes real SQL NULLs (not the JSON string \"null\") for omitted resultJson/confidence/title on a failed task", () => {
+      const { db, repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "帮我改规则", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      repo.setResult(result.task.id, { status: "failed", finishedAt: nowIso() });
+
+      const row = db.prepare(`SELECT result_json, confidence, title FROM research_tasks WHERE id = ?`).get(result.task.id) as {
+        result_json: unknown; confidence: unknown; title: unknown;
+      };
+      expect(row.result_json).toBeNull();
+      expect(row.confidence).toBeNull();
+      expect(row.title).toBeNull();
+
+      const reloaded = repo.getById(result.task.id);
+      expect(reloaded?.resultJson).toBeUndefined();
+      expect(reloaded?.confidence).toBeUndefined();
+      expect(reloaded?.title).toBeUndefined();
+    });
+
+    it("throws for an unknown task id", () => {
+      const { repo } = setup();
+      expect(() => repo.setResult("rt_missing", { status: "done", finishedAt: nowIso() })).toThrow(/not found/);
+    });
+  });
+
+  describe("getById", () => {
+    it("returns null for an unknown id", () => {
+      const { repo } = setup();
+      expect(repo.getById("rt_missing")).toBeNull();
+    });
+  });
+
+  describe("listForOwner", () => {
+    it("returns only this owner's rows, newest first, optionally filtered by status", () => {
+      const { repo } = setup();
+      const q1 = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q1", tradingDay: todayUsEasternTradingDay() });
+      const q2 = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q2", tradingDay: todayUsEasternTradingDay() });
+      repo.createIfWithinQuota({ ownerId: "mem_other", question: "q_other", tradingDay: todayUsEasternTradingDay() });
+      expect(q1.ok).toBe(true);
+      expect(q2.ok).toBe(true);
+      if (!q1.ok || !q2.ok) return;
+
+      repo.setResult(q1.task.id, { status: "done", finishedAt: nowIso() });
+
+      const all = repo.listForOwner("mem_owner");
+      expect(all.map((t) => t.id).sort()).toEqual([q1.task.id, q2.task.id].sort());
+
+      const doneOnly = repo.listForOwner("mem_owner", { status: "done" });
+      expect(doneOnly.map((t) => t.id)).toEqual([q1.task.id]);
+    });
+
+    it("returns an empty array for an owner with no tasks", () => {
+      const { repo } = setup();
+      expect(repo.listForOwner("mem_owner")).toEqual([]);
+    });
+  });
+
+  describe("listRunningOrQueued", () => {
+    it("returns queued and running rows (any owner), excludes done/degraded/failed, oldest first", () => {
+      const { db, repo } = setup();
+      const rows: Array<[string, string, string]> = [
+        ["rt_q", "queued", "2026-07-13T09:00:00.000Z"],
+        ["rt_r", "running", "2026-07-13T08:00:00.000Z"],
+        ["rt_done", "done", "2026-07-13T07:00:00.000Z"],
+        ["rt_degraded", "degraded", "2026-07-13T06:00:00.000Z"],
+        ["rt_failed", "failed", "2026-07-13T05:00:00.000Z"]
+      ];
+      for (const [id, status, createdAt] of rows) {
+        db.prepare(`
+          INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at)
+          VALUES (?, 'mem_owner', 'q', ?, '[]', 0, 'private', ?)
+        `).run(id, status, createdAt);
+      }
+
+      const result = repo.listRunningOrQueued();
+      expect(result.map((t) => t.id)).toEqual(["rt_r", "rt_q"]);
+    });
+
+    it("returns an empty array when nothing is queued/running", () => {
+      const { repo } = setup();
+      expect(repo.listRunningOrQueued()).toEqual([]);
+    });
+  });
+
+  describe("promoteVisibility", () => {
+    it("flips private -> public for the owner", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      const promoted = repo.promoteVisibility(result.task.id, "mem_owner");
+      expect(promoted.visibility).toBe("public");
+      expect(repo.getById(result.task.id)?.visibility).toBe("public");
+    });
+
+    it("is idempotent once already public", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      repo.promoteVisibility(result.task.id, "mem_owner");
+      expect(() => repo.promoteVisibility(result.task.id, "mem_owner")).not.toThrow();
+      expect(repo.getById(result.task.id)?.visibility).toBe("public");
+    });
+
+    it("rejects a non-owner's promote attempt, leaving visibility private", () => {
+      const { repo } = setup();
+      const result = repo.createIfWithinQuota({ ownerId: "mem_owner", question: "q", tradingDay: todayUsEasternTradingDay() });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(() => repo.promoteVisibility(result.task.id, "mem_other")).toThrow();
+      expect(repo.getById(result.task.id)?.visibility).toBe("private");
+    });
+
+    it("throws for an unknown task id", () => {
+      const { repo } = setup();
+      expect(() => repo.promoteVisibility("rt_missing", "mem_owner")).toThrow(/not found/);
+    });
   });
 });
 

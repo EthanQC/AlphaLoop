@@ -1,10 +1,11 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
 import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
 
 import { applySecurityHeaders, createNonce } from "./security.js";
 import type { MemorydBackend } from "./data/memoryd-mirror.js";
+import { handleApiResearchRoute, type ResearchWorkerLike } from "./routes/api-research.js";
 import { handleApiStrategyRoute } from "./routes/api-strategy.js";
 import { handleHomeRoute } from "./routes/home.js";
 import { handleMemberCardRoute } from "./routes/member-card.js";
@@ -30,6 +31,18 @@ export interface PlatformServerDeps {
    * degrade - see data/memoryd-mirror.ts) when the real entrypoint
    * (index.ts) doesn't supply one. */
   memorydBackend?: MemorydBackend;
+  /** In-process research worker (Task 3, research/worker.ts) that
+   * `POST /api/research` kicks, fire-and-forget, after a successful
+   * submission. The real process (index.ts) constructs one wired to real
+   * collaborators (a P10-gated research backend, a stock_facts quote reader,
+   * a data/strategy.ts-backed memory reader) and calls its own `.start()`
+   * separately - this dep only needs `.tick()` (see
+   * routes/api-research.ts's `ResearchWorkerLike`). Tests either omit this
+   * entirely (a submission stays `queued`, unprocessed - fine for tests that
+   * don't exercise the worker) or construct a worker directly (with fake
+   * collaborators) and pass it here, ticking it by hand rather than relying
+   * on this route's fire-and-forget kick for timing. */
+  researchWorker?: ResearchWorkerLike;
 }
 
 /**
@@ -42,6 +55,26 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
     const nonce = createNonce();
     applySecurityHeaders(res, nonce);
 
+    // Outer error boundary: any synchronous throw from a route handler (e.g. a
+    // corrupt JSON column that JSON.parse rejects, a bad URL) must become a
+    // controlled 500, never an uncaught exception that crashes this
+    // member-facing process or leaves the socket hanging. Mirrors
+    // broker-executor's own top-level try/catch. Async handlers own their own
+    // internal error handling (they read bodies and reply asynchronously);
+    // this catches the synchronous dispatch path the GET/HTML routes use.
+    try {
+      dispatch(req, res, nonce);
+    } catch (error) {
+      console.error(`platform-app: unhandled error for ${req.method} ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "内部错误，请稍后重试。" });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  function dispatch(req: IncomingMessage, res: ServerResponse, nonce: string): void {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/health") {
@@ -61,6 +94,21 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
       handleApiStrategyRoute(req, res, url, {
         db: deps.db,
         ...(deps.memorydBackend ? { memorydBackend: deps.memorydBackend } : {})
+      })
+    ) {
+      return;
+    }
+
+    // Submission/promotion JSON API for the in-site question box (Task 3) -
+    // dispatches before every GET/HTML route below, same as
+    // handleApiStrategyRoute above, but identity-gated via `resolveIdentity`
+    // (bearer OR Access email), not bearer-only - see routes/api-research.ts's
+    // own module header for why this differs from api-strategy.ts's rule.
+    if (
+      handleApiResearchRoute(req, res, url, {
+        db: deps.db,
+        ...(deps.now ? { now: deps.now } : {}),
+        ...(deps.researchWorker ? { researchWorker: deps.researchWorker } : {})
       })
     ) {
       return;
@@ -130,5 +178,5 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
     }
 
     notFound(res);
-  });
+  }
 }

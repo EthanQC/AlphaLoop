@@ -14,7 +14,24 @@
  *
  * Block order is a BINDING part of the plan (Task 5, req §1.2) and must not
  * be reshuffled:
- *   ① 开始研究       - disabled input/button placeholder ("站内研究 P8 上线").
+ *   ① 开始研究       - Phase 8 Task 4 (2026-07-16 plan): a real
+ *                      `<form method="post" action="/api/research">`
+ *                      (previously a disabled input/button placeholder,
+ *                      "站内研究 P8 上线" - P8 has now shipped the question
+ *                      box). A plain browser submission carries no JS: the
+ *                      form posts `question` as
+ *                      `application/x-www-form-urlencoded`, and
+ *                      routes/api-research.ts's `handleSubmit` recognizes
+ *                      that content type and responds with a `303` redirect
+ *                      straight to `/research/<id>` instead of its normal
+ *                      JSON body (see that file's own module header, "TWO
+ *                      SUBMISSION SHAPES"). Whether the question is even a
+ *                      *research* question at all is judged entirely
+ *                      server-side by the research pipeline (a non-research/
+ *                      operational-intent question resolves to a `failed`
+ *                      task with an honest reason, research-engine.mjs's own
+ *                      `operational_intent` branch) - this form performs no
+ *                      client-side validation beyond HTML5 `required`.
  *   ② 我的模拟盘概览 - real snapshot data (net assets + today's change) via
  *                      data/overview.ts, or an honest empty state.
  *   ③ 我的待办       - real pending proposals, or "提案审批 P6 上线" (always
@@ -203,18 +220,22 @@ function renderCircuitBreakerBanner(pausedUntil: string | null): Html {
 
 function renderStartResearchBlock(): Html {
   return html`<section class="card w2 dt-w4">
-    <h2>开始研究 <span class="pill warn">站内研究 P8 上线</span></h2>
-    <div class="ask" aria-disabled="true">
-      <input
-        type="text"
-        placeholder="问点什么…如「NVDA 财报前要减仓吗」"
-        disabled
-        style="flex:1;background:transparent;border:none;color:inherit;font-size:14.5px;outline:none"
-      >
-    </div>
-    <div style="margin-top:10px">
-      <button class="btn primary" type="button" disabled style="flex:none;padding:9px 18px">开始研究</button>
-    </div>
+    <h2>开始研究</h2>
+    <form method="post" action="/api/research">
+      <div class="ask">
+        <input
+          type="text"
+          name="question"
+          required
+          placeholder="问点什么…如「NVDA 财报前要减仓吗」"
+          style="flex:1;background:transparent;border:none;color:inherit;font-size:14.5px;outline:none"
+        >
+      </div>
+      <div style="margin-top:10px">
+        <button class="btn primary" type="submit" style="flex:none;padding:9px 18px">开始研究</button>
+      </div>
+    </form>
+    <p class="ask-hint">每日最多 10 次，操作类请求（改规则/下单等）请走飞书</p>
   </section>`;
 }
 

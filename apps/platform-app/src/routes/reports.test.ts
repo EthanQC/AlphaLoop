@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, migrate } from "@packages/shared-types";
+import { ApiTokenRepository, MemberRepository, ResearchTaskRepository, migrate, type Member } from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
 
@@ -33,11 +33,12 @@ describe("reports routes", () => {
   let server: ReturnType<typeof createPlatformServer>;
   let baseUrl: string;
   let token: string;
+  let member: Member;
 
   beforeEach(async () => {
     repoRoot = mkdtempSync(join(tmpdir(), "platform-app-reports-route-"));
     db = memoryDb();
-    const member = {
+    member = {
       id: "member_1",
       email: "member1@example.com",
       displayName: "Member One",
@@ -99,11 +100,12 @@ describe("reports routes", () => {
       expect(body).toContain("日报");
     });
 
-    it("renders the disabled 研判/复盘 chips labeled with their future phase", async () => {
+    it("renders a real, clickable 研判 chip (P8 shipped) and keeps 复盘 disabled/P9", async () => {
       const response = await authed("/reports");
       const body = await response.text();
       expect(body).toContain("研判");
-      expect(body).toContain("P8 上线");
+      expect(body).not.toContain("研判</span><small class=\"mono\""); // no longer the disabled-chip markup
+      expect(body).toMatch(/<a href="\/reports\?type=%E7%A0%94%E5%88%A4"[^>]*>研判<\/a>/u);
       expect(body).toContain("复盘");
       expect(body).toContain("P9 上线");
     });
@@ -124,6 +126,83 @@ describe("reports routes", () => {
         headers: { authorization: `Bearer ${token}` }
       });
       expect(response.status).toBe(405);
+    });
+  });
+
+  // Phase 8 Task 4 (2026-07-16 plan): the 研判 chip's real, DB-backed list.
+  describe("GET /reports?type=研判 (real research archive, owner-filtered)", () => {
+    function finishTask(
+      ownerId: string,
+      question: string,
+      opts: { status?: "done" | "degraded"; confidence?: "low" | "medium" | "high"; title?: string } = {}
+    ): string {
+      const repo = new ResearchTaskRepository(db);
+      const created = repo.createIfWithinQuota({ ownerId, question, tradingDay: "2026-07-14" });
+      if (!created.ok) throw new Error("test setup: quota unexpectedly exceeded");
+      repo.setResult(created.task.id, {
+        status: opts.status ?? "done",
+        confidence: opts.confidence ?? "medium",
+        title: opts.title ?? question,
+        finishedAt: "2026-07-14T09:00:00.000Z",
+        resultJson: {
+          conclusion: "测试结论",
+          confidence: opts.confidence ?? "medium",
+          keyPoints: [],
+          dataTable: [],
+          comparison: { theses: [], disciplines: [] },
+          evidence: [],
+          skipped: []
+        }
+      });
+      return created.task.id;
+    }
+
+    it("lists the viewer's own done/degraded research as cards (title, confidence badge, date, /research/<id> link)", async () => {
+      const id = finishTask(member.id, "NVDA财报前要减仓吗", { confidence: "high" });
+
+      const response = await authed("/reports?type=研判");
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain("NVDA财报前要减仓吗");
+      expect(body).toContain("高"); // CONFIDENCE_LABELS.high
+      expect(body).toContain(`href="/research/${id}"`);
+      expect(body).toContain("2026-07-14"); // finished date
+    });
+
+    it("includes degraded tasks alongside done ones", async () => {
+      finishTask(member.id, "降级的研判", { status: "degraded", confidence: "low" });
+      const response = await authed("/reports?type=研判");
+      const body = await response.text();
+      expect(body).toContain("降级的研判");
+    });
+
+    it("excludes queued/running/failed tasks (no conclusion to show yet)", async () => {
+      new ResearchTaskRepository(db).createIfWithinQuota({
+        ownerId: member.id,
+        question: "还在排队的问题",
+        tradingDay: "2026-07-14"
+      });
+      const response = await authed("/reports?type=研判");
+      const body = await response.text();
+      expect(body).not.toContain("还在排队的问题");
+      expect(body).toContain("暂无研判");
+    });
+
+    it("owner isolation: member B's report list never shows member A's research", async () => {
+      const memberA = { ...member, id: "member_a", email: "a@example.com" };
+      new MemberRepository(db).upsert(memberA);
+      finishTask("member_a", "A的私有研判问题");
+
+      const response = await authed("/reports?type=研判");
+      const body = await response.text();
+      expect(body).not.toContain("A的私有研判问题");
+      expect(body).toContain("暂无研判");
+    });
+
+    it("shows 暂无研判 when the viewer has no completed research at all", async () => {
+      const response = await authed("/reports?type=研判");
+      const body = await response.text();
+      expect(body).toContain("暂无研判");
     });
   });
 

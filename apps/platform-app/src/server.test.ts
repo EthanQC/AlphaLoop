@@ -17,9 +17,10 @@ function memoryDb(): DatabaseSync {
 describe("createPlatformServer", () => {
   let server: ReturnType<typeof createPlatformServer>;
   let baseUrl: string;
+  let db: DatabaseSync;
 
   beforeEach(async () => {
-    const db = memoryDb();
+    db = memoryDb();
     server = createPlatformServer({ db, repoRoot: process.cwd() });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => resolve());
@@ -74,5 +75,23 @@ describe("createPlatformServer", () => {
     expect(response.status).toBe(404);
     const payload = await response.json();
     expect(payload).toEqual({ error: "Not Found" });
+  });
+
+  it("converts a route handler's synchronous throw into a controlled 500 instead of crashing", async () => {
+    // A corrupt JSON column (only reachable via tampering/a bug - normal
+    // writes always round-trip valid JSON) makes mapResearchTask's JSON.parse
+    // throw synchronously inside the research render path. The outer error
+    // boundary must turn that into a 500, never an uncaught exception that
+    // takes down this member-facing process or hangs the socket.
+    db.prepare(`INSERT INTO members (id, email, display_name, risk_tags, stock_tags, show_performance, status, created_at) VALUES ('m1','m1@x.com','M1','[]','[]',1,'active','2026-07-01T00:00:00.000Z')`).run();
+    db.prepare(`INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, visibility, created_at) VALUES ('rt_bad','m1','q','done','{not valid json',0,'private','2026-07-01T00:00:00.000Z')`).run();
+    const response = await fetch(`${baseUrl}/research/rt_bad`, {
+      headers: { "Cf-Access-Authenticated-User-Email": "m1@x.com" }
+    });
+    expect(response.status).toBe(500);
+    const payload = await response.json();
+    expect(payload).toEqual({ error: "内部错误，请稍后重试。" });
+    // Server still alive: a follow-up request succeeds.
+    expect((await fetch(`${baseUrl}/health`)).status).toBe(200);
   });
 });
