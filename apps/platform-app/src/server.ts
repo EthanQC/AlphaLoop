@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
 import { methodNotAllowed, notFound, sendJson } from "@packages/shared-types";
@@ -55,6 +55,26 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
     const nonce = createNonce();
     applySecurityHeaders(res, nonce);
 
+    // Outer error boundary: any synchronous throw from a route handler (e.g. a
+    // corrupt JSON column that JSON.parse rejects, a bad URL) must become a
+    // controlled 500, never an uncaught exception that crashes this
+    // member-facing process or leaves the socket hanging. Mirrors
+    // broker-executor's own top-level try/catch. Async handlers own their own
+    // internal error handling (they read bodies and reply asynchronously);
+    // this catches the synchronous dispatch path the GET/HTML routes use.
+    try {
+      dispatch(req, res, nonce);
+    } catch (error) {
+      console.error(`platform-app: unhandled error for ${req.method} ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "内部错误，请稍后重试。" });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  function dispatch(req: IncomingMessage, res: ServerResponse, nonce: string): void {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/health") {
@@ -158,5 +178,5 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
     }
 
     notFound(res);
-  });
+  }
 }
