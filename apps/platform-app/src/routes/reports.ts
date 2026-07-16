@@ -19,8 +19,19 @@
  * scanner produces, so it gets its own sentinel query value
  * (`RESEARCH_TYPE_PARAM = "研判"`) and its own branch through
  * `renderReportsListBody`, rather than trying to force research tasks into
- * `ReportIndexEntry`'s on-disk shape. `复盘` stays the one remaining
- * disabled/"P9 上线" chip.
+ * `ReportIndexEntry`'s on-disk shape.
+ *
+ * Phase 9 Task 4 (2026-07-16 plan) addition: `?type=复盘` is the SAME kind of
+ * real, DB-backed, owner-scoped chip - `loadOwnerReviews` (data/
+ * monthly-review.ts) over `MonthlyReviewRepository.listForOwner`, never
+ * scanned from disk, never another member's rows. Unlike 研判 (which has a
+ * private/public split - a promoted task is visible to the whole circle),
+ * 复盘 has NO public visibility at all: every review is unconditionally
+ * private to its own owner (Global Constraint: "复盘...仅本人可见"), so this
+ * chip's list is ALWAYS the viewer's own reviews, full stop - there is no
+ * "circle" variant to ever add here. This was the plan's last disabled/"P9
+ * 上线" placeholder chip - after this task, `renderReportsListBody` renders
+ * NO disabled chips at all.
  */
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -28,6 +39,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { ResearchTaskRepository, methodNotAllowed, type Member, type ResearchTask } from "@packages/shared-types";
 
+import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-review.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderMarkdown, type MarkdownRenderResult } from "../reports/markdown.js";
@@ -61,12 +73,13 @@ const TYPE_ORDER: readonly ReportType[] = ["daily", "weekly", "stock-analysis", 
 // on-disk types is ever "研判".
 const RESEARCH_TYPE_PARAM = "研判";
 
-// Chip for a report kind that doesn't exist yet (plan Task 4/5: "复盘筛选片
-// 存在但空态标注「P9 上线」"). Not a ReportType value - there is nothing to
-// scan or filter for it, it exists purely so the filter row's shape matches
-// the plan's eventual six-chip layout. 研判 (Phase 8 Task 4) is no longer in
-// this list - it is a real, clickable chip now (`renderResearchChip` below).
-const DISABLED_TYPE_CHIPS: ReadonlyArray<{ label: string; note: string }> = [{ label: "复盘", note: "P9 上线" }];
+// Sentinel `?type=` value for the (now also real, DB-backed) 复盘 chip - see
+// module header. Not a `ReportType` either, for the same reason
+// RESEARCH_TYPE_PARAM isn't: monthly_reviews was never something
+// reports/scanner.ts's on-disk scanner produces. This was the plan's last
+// remaining disabled/"P9 上线" placeholder chip - there are no disabled chips
+// left after this task.
+const REVIEW_TYPE_PARAM = "复盘";
 
 const DATE_PARAM_RE = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -178,13 +191,18 @@ function renderReportsListPage(
   const now = currentNow(deps);
   const typeParam = url.searchParams.get("type");
   const isResearchView = typeParam === RESEARCH_TYPE_PARAM;
+  const isReviewView = typeParam === REVIEW_TYPE_PARAM;
 
-  // 研判 is a DB-backed, owner-scoped list (never scanned from disk) - see
-  // module header. Every other `?type=` value (or none) keeps the original
-  // on-disk `scanReports` behavior unchanged.
-  const entries = isResearchView ? [] : scanReports(deps.repoRoot);
-  const filtered = !isResearchView && typeParam ? entries.filter((entry) => entry.type === typeParam) : entries;
+  // 研判/复盘 are both DB-backed, owner-scoped lists (never scanned from
+  // disk) - see module header. Every other `?type=` value (or none) keeps
+  // the original on-disk `scanReports` behavior unchanged.
+  const entries = isResearchView || isReviewView ? [] : scanReports(deps.repoRoot);
+  const filtered =
+    !isResearchView && !isReviewView && typeParam ? entries.filter((entry) => entry.type === typeParam) : entries;
   const researchTasks = isResearchView ? loadOwnerResearchArchive(deps.db, member.id) : [];
+  // 复盘 has no public/done-vs-degraded filter of its own - EVERY review this
+  // owner has (draft or confirmed) belongs on their own list, full stop.
+  const reviews = isReviewView ? loadOwnerReviews(deps.db, member.id) : [];
 
   const page = renderPage({
     title: "报告库",
@@ -192,7 +210,7 @@ function renderReportsListPage(
     member: { displayName: member.displayName },
     freshness: "最新",
     degraded: [],
-    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks),
+    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks, reviews),
     nonce,
     now
   });
@@ -233,8 +251,18 @@ function renderResearchChip(activeType: string | null): Html {
   return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;${extraStyle}">研判</a>`;
 }
 
-function renderDisabledChip(label: string, note: string): Html {
-  return html`<span aria-disabled="true" style="display:inline-flex;align-items:center;gap:6px;border:1px dashed var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;color:var(--sub);opacity:.6;cursor:not-allowed">${label}<small class="mono" style="font-size:10.5px">${note}</small></span>`;
+// Real, clickable chip for the (now shipped) 复盘 archive - same visual
+// treatment as renderTypeChip/renderResearchChip's active/inactive states,
+// just keyed off the REVIEW_TYPE_PARAM sentinel instead of a ReportType.
+// This was the plan's last remaining disabled/"P9 上线" chip - there is no
+// `renderDisabledChip` left in this module at all after this task.
+function renderReviewChip(activeType: string | null): Html {
+  const active = activeType === REVIEW_TYPE_PARAM;
+  const extraStyle = active
+    ? "background:var(--accent-soft);color:var(--accent);border-color:var(--accent-border);font-weight:600"
+    : "background:var(--card);color:var(--ink);border-color:var(--line)";
+  const href = active ? "/reports" : `/reports?type=${encodeURIComponent(REVIEW_TYPE_PARAM)}`;
+  return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;${extraStyle}">复盘</a>`;
 }
 
 function renderReportCard(entry: ReportIndexEntry): Html {
@@ -269,25 +297,48 @@ function renderResearchArchiveCard(task: ResearchTask): Html {
     </a>`;
 }
 
+// Review archive card (plan Task 4: "列表卡 = period + 状态（草稿/已确认）+
+// /review/<id> 链接").
+const REVIEW_STATUS_LABELS: Record<string, string> = { draft: "草稿", confirmed: "已确认" };
+
+function renderReviewArchiveCard(review: TypedMonthlyReview): Html {
+  const statusLabel = REVIEW_STATUS_LABELS[review.status] ?? review.status;
+  const statusClass = review.status === "confirmed" ? "ok" : "warn";
+  return html`<a class="card" href="/review/${review.id}" style="display:block">
+      <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--sub)">
+        <span class="pill" style="background:var(--accent-soft);color:var(--accent)">复盘</span>
+        <span class="mono">${review.period}</span>
+        <span class="pill ${statusClass}">${statusLabel}</span>
+      </div>
+      <div style="margin-top:8px;font-size:14.5px;font-weight:650;color:var(--ink)">${review.period} 月度复盘</div>
+    </a>`;
+}
+
 function renderReportsListBody(
   entries: ReportIndexEntry[],
   activeType: string | null,
-  researchTasks: ResearchTask[]
+  researchTasks: ResearchTask[],
+  reviews: TypedMonthlyReview[]
 ): Html {
   const chips = joinHtml([
     ...TYPE_ORDER.map((type) => renderTypeChip(type, TYPE_LABELS[type], activeType)),
     renderResearchChip(activeType),
-    ...DISABLED_TYPE_CHIPS.map((chip) => renderDisabledChip(chip.label, chip.note))
+    renderReviewChip(activeType)
   ]);
 
   const isResearchView = activeType === RESEARCH_TYPE_PARAM;
+  const isReviewView = activeType === REVIEW_TYPE_PARAM;
   const cards = isResearchView
     ? researchTasks.length > 0
       ? joinHtml(researchTasks.map(renderResearchArchiveCard))
       : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无研判。</p>`
-    : entries.length > 0
-      ? joinHtml(entries.map(renderReportCard))
-      : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无报告。</p>`;
+    : isReviewView
+      ? reviews.length > 0
+        ? joinHtml(reviews.map(renderReviewArchiveCard))
+        : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无复盘，每月第一个周末自动生成草稿。</p>`
+      : entries.length > 0
+        ? joinHtml(entries.map(renderReportCard))
+        : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无报告。</p>`;
 
   return html`<div class="bento">
       <section class="card w2 dt-w4">

@@ -41,12 +41,27 @@
  *                      "暂无日报".
  *   ⑥ 纪律速览       - real discipline_rules, or "策略记忆 P7 上线" (always
  *                      the latter today - P7 hasn't shipped writes yet).
+ *
+ * Phase 9 Task 4 (2026-07-16 plan) ADDITION - ⑦ 复盘速览: appended AFTER the
+ * six blocks above, in its own new bento row, rather than reshuffled into
+ * them - the plan's binding order above is Phase 6 Task 5's original text
+ * and stays untouched; a brand-new block added by a later phase is
+ * documented as an addition at the end, the same way Phase 8 Task 4's ①
+ * upgrade is called out inline above rather than silently rewriting the
+ * numbered list. Shows the viewer's own MOST RECENT monthly review (highest
+ * `period`, via data/monthly-review.ts's `loadOwnerReviews` - already
+ * period-DESC ordered by `MonthlyReviewRepository.listForOwner`) - period +
+ * 状态（草稿/已确认）+ a `/review/<id>` link, or "暂无复盘，每月第一个周末自动
+ * 生成草稿" when the owner has none yet. Monthly reviews have NO public
+ * visibility (Global Constraint: 复盘 is always owner-only), so this block
+ * only ever reads the VIEWER'S OWN reviews - never another member's.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
 import { CircuitBreakerRepository, methodNotAllowed, type Member } from "@packages/shared-types";
 
+import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-review.js";
 import {
   loadDisciplineRules,
   loadLatestSnapshotForOwner,
@@ -368,6 +383,31 @@ function renderDisciplineBlock(rules: DisciplineRuleRow[]): Html {
 }
 
 // ---------------------------------------------------------------------------
+// ⑦ 复盘速览 (Phase 9 Task 4 addition - see module header)
+// ---------------------------------------------------------------------------
+
+const HOME_REVIEW_STATUS_LABELS: Record<string, string> = { draft: "草稿", confirmed: "已确认" };
+
+function renderMonthlyReviewBlock(latestReview: TypedMonthlyReview | null): Html {
+  if (!latestReview) {
+    return html`<section class="card w2 dt-w4">
+      <h2>复盘速览</h2>
+      <p style="font-size:13px;color:var(--sub)">暂无复盘，每月第一个周末自动生成草稿</p>
+    </section>`;
+  }
+  const statusLabel = HOME_REVIEW_STATUS_LABELS[latestReview.status] ?? latestReview.status;
+  const statusClass = latestReview.status === "confirmed" ? "ok" : "warn";
+  return html`<section class="card w2 dt-w4">
+    <h2>复盘速览</h2>
+    <div class="alert">
+      <span class="mono">${latestReview.period}</span>
+      <span class="pill ${statusClass}">${statusLabel}</span>
+      <a href="/review/${latestReview.id}" style="color:var(--accent)">查看复盘</a>
+    </div>
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
 
@@ -379,7 +419,8 @@ function renderHomeBody(
   alertEvents: ReadonlyArray<AlertEventRow>,
   latestDaily: ReportIndexEntry | undefined,
   disciplineRules: DisciplineRuleRow[],
-  circuitPausedUntil: string | null
+  circuitPausedUntil: string | null,
+  latestReview: TypedMonthlyReview | null
 ): Html {
   return html`${renderCircuitBreakerBanner(circuitPausedUntil)}
     <div class="bento">
@@ -395,6 +436,9 @@ function renderHomeBody(
     </div>
     <div class="bento" style="margin-top:10px">
       ${renderDisciplineBlock(disciplineRules)}
+    </div>
+    <div class="bento" style="margin-top:10px">
+      ${renderMonthlyReviewBlock(latestReview)}
     </div>`;
 }
 
@@ -412,6 +456,9 @@ export function renderHomePage(
   const alertEvents = loadRecentAlertEvents(deps.db, member.id, ALERT_EVENT_LIMIT);
   const disciplineRules = loadDisciplineRules(deps.db, member.id);
   const latestDaily = scanReports(deps.repoRoot).find((entry) => entry.type === "daily");
+  // ⑦ 复盘速览 (Phase 9 Task 4 addition) - loadOwnerReviews is already
+  // period-DESC ordered, so the first row (if any) is the most recent.
+  const latestReview = loadOwnerReviews(deps.db, member.id)[0] ?? null;
 
   const freshness = computeHomeFreshness(snapshot, now);
   const degraded = snapshot?.degraded ? [degradedReasonText(snapshot)] : [];
@@ -439,7 +486,8 @@ export function renderHomePage(
       alertEvents,
       latestDaily,
       disciplineRules,
-      circuitPausedUntil
+      circuitPausedUntil,
+      latestReview
     ),
     nonce,
     now
