@@ -53,6 +53,34 @@ export function resolveIdentity(req: IdentityRequest, db: DatabaseSync): Member 
   return member;
 }
 
+/**
+ * Phase 7 Task 4: BEARER-TOKEN-ONLY identity resolution for the platform's
+ * JSON write API (routes/api-strategy.ts). resolveIdentity above is the
+ * HTML-page identity chain and deliberately accepts EITHER a bearer token OR
+ * the `Cf-Access-Authenticated-User-Email` header (bearer first). The write
+ * API is the skill/machine-facing surface (plan Task 4: writes are "the
+ * skill/机器面"), so it must NEVER honor the Access header - a request that
+ * carries ONLY that header (no `Authorization: Bearer`) is unauthenticated
+ * for write purposes and gets 401, even though the exact same header would
+ * authenticate the SAME request for reading an HTML page. This reuses
+ * `resolveViaBearerToken` (the identical `ApiTokenRepository.verify` path
+ * resolveIdentity's own bearer branch uses) so the two identity chains can
+ * never silently drift apart on what counts as a valid token, and applies
+ * the same `__legacy_system__` guard resolveIdentity applies.
+ */
+export function resolveBearerIdentity(req: IdentityRequest, db: DatabaseSync): Member | null {
+  const member = resolveViaBearerToken(req, db);
+  if (!member) {
+    return null;
+  }
+
+  if (member.id === LEGACY_SYSTEM_MEMBER_ID) {
+    return null;
+  }
+
+  return member;
+}
+
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }

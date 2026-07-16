@@ -40,20 +40,48 @@ function seedThesis(
     direction?: "bull" | "bear" | "neutral";
     visibility?: "system" | "public";
     createdAt?: string;
+    bullPoints?: string[];
+    bearPoints?: string[];
+    targetLow?: number;
+    targetHigh?: number;
+    invalidationPrice?: number;
   }
-): void {
+): string {
+  const id = createId("thesis");
   db.prepare(`
-    INSERT INTO theses (id, owner_id, symbol, direction, visibility, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO theses
+      (id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+       visibility, created_at, updated_at, bull_points, bear_points)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    createId("thesis"),
+    id,
     opts.ownerId,
     opts.symbol,
     opts.direction ?? "bull",
+    opts.targetLow ?? null,
+    opts.targetHigh ?? null,
+    opts.invalidationPrice ?? null,
     opts.visibility ?? "system",
     opts.createdAt ?? "2026-07-01T00:00:00.000Z",
-    opts.createdAt ?? "2026-07-01T00:00:00.000Z"
+    opts.createdAt ?? "2026-07-01T00:00:00.000Z",
+    JSON.stringify(opts.bullPoints ?? []),
+    JSON.stringify(opts.bearPoints ?? [])
   );
+  return id;
+}
+
+function seedThesisHistory(db: DatabaseSync, thesisId: string, note: string, source: string, createdAt: string): void {
+  db.prepare(`
+    INSERT INTO thesis_history (id, thesis_id, note, source, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(createId("thesis_history"), thesisId, note, source, createdAt);
+}
+
+function seedStockFact(db: DatabaseSync, opts: { symbol: string; tradingDay: string; valueNum: number }): void {
+  db.prepare(`
+    INSERT INTO stock_facts (id, trading_day, symbol, fact_key, value_num, value_text, unit, source, data_time, created_at)
+    VALUES (?, ?, ?, 'quote.last', ?, NULL, 'USD', 'test', ?, ?)
+  `).run(createId("stock_fact"), opts.tradingDay, opts.symbol, opts.valueNum, opts.tradingDay, opts.tradingDay);
 }
 
 function seedAlertRuleAndEvent(
@@ -322,11 +350,11 @@ describe("stock route (GET /stock/<code>)", () => {
     expect(body).not.toContain('href="/stock-analysis/2026-06-19"');
   });
 
-  it("我的论点卡 shows the viewer's own thesis and renders P7 placeholder note when nobody has published one", async () => {
+  it("我的论点卡 shows the viewer's own thesis and renders 暂无论点 when nobody has published one", async () => {
     const { token } = seedMemberWithToken();
     const response = await authed("/stock/NVDA.US", token);
     const body = await response.text();
-    expect(body).toContain("策略记忆 P7 上线");
+    expect(body).toContain("暂无论点");
   });
 
   it("theses visibility: B's private (system) thesis is invisible to A; B's public thesis on the same symbol is visible to A", async () => {
@@ -337,7 +365,7 @@ describe("stock route (GET /stock/<code>)", () => {
 
     const privateResponse = await authed("/stock/NVDA.US", tokenA);
     const privateBody = await privateResponse.text();
-    expect(privateBody).toContain("策略记忆 P7 上线"); // B's private thesis must not leak to A
+    expect(privateBody).toContain("暂无论点"); // B's private thesis must not leak to A
     expect(privateBody).not.toContain("看空");
 
     seedThesis(db, { ownerId: "member_b", symbol: "NVDA.US", visibility: "public", direction: "bull" });
@@ -355,6 +383,29 @@ describe("stock route (GET /stock/<code>)", () => {
     const body = await response.text();
 
     expect(body).toContain("看空");
+  });
+
+  it("我的论点卡 renders bull_points/bear_points evidence and a judgment-history outcome annotation", async () => {
+    const { member, token } = seedMemberWithToken();
+    const thesisId = seedThesis(db, {
+      ownerId: member.id,
+      symbol: "NVDA.US",
+      direction: "bull",
+      targetHigh: 200,
+      invalidationPrice: 100,
+      bullPoints: ["算力需求旺盛"],
+      bearPoints: ["估值偏高"]
+    });
+    seedThesisHistory(db, thesisId, "第一次判断", "self", "2026-07-05T00:00:00.000Z");
+    seedStockFact(db, { symbol: "NVDA.US", tradingDay: "2026-07-13", valueNum: 180 });
+
+    const response = await authed("/stock/NVDA.US", token);
+    const body = await response.text();
+
+    expect(body).toContain("算力需求旺盛");
+    expect(body).toContain("估值偏高");
+    expect(body).toContain("第一次判断");
+    expect(body).toContain("样本不足"); // n=1 < 10
   });
 
   it("我的该标的提醒历史 is owner-scoped: B's alert history for the symbol never appears when A views it", async () => {

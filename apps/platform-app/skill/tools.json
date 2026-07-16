@@ -1,0 +1,167 @@
+{
+  "$schema": "AlphaLoop skill tool->endpoint map (Phase 7 Task 4)",
+  "version": "2026-07-15",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization: Bearer <api.token>",
+    "note": "Bearer-token-only. A request carrying only Cf-Access-Authenticated-User-Email (no bearer) is 401 for every endpoint below - see apps/platform-app/src/routes/api-strategy.ts. The owner of every write is always the token's resolved member.id; a body `ownerId` field is ignored, never honored."
+  },
+  "tools": [
+    {
+      "name": "thesis.create",
+      "method": "POST",
+      "path": "/api/theses",
+      "auth": "bearer",
+      "body": {
+        "symbol": "string, required",
+        "direction": "\"bull\" | \"bear\" | \"neutral\", required",
+        "targetLow": "number, optional",
+        "targetHigh": "number, optional",
+        "invalidationPrice": "number, optional",
+        "bullPoints": "string[], optional, default []",
+        "bearPoints": "string[], optional, default []",
+        "visibility": "\"system\" | \"public\", optional, default \"system\""
+      },
+      "response": { "201": "{ ok: true, thesis, mirror }" },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing/invalid symbol, direction, visibility, targetLow/targetHigh/invalidationPrice, bullPoints/bearPoints",
+        "401": "{ ok: false, error } - missing/invalid bearer token"
+      }
+    },
+    {
+      "name": "thesis.judgment.append",
+      "method": "POST",
+      "path": "/api/theses/:id/judgments",
+      "auth": "bearer",
+      "body": {
+        "note": "string, required",
+        "source": "string, optional, default \"self\""
+      },
+      "response": { "201": "{ ok: true, judgment, mirror }" },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing note",
+        "401": "missing/invalid bearer token",
+        "403": "thesis exists but is owned by another member",
+        "404": "no thesis with that id"
+      },
+      "notes": "Append-only - there is no update/delete endpoint for a judgment. A correction is always a NEW judgment row."
+    },
+    {
+      "name": "thesis.promote",
+      "method": "POST",
+      "path": "/api/theses/:id/promote",
+      "auth": "bearer",
+      "body": {},
+      "response": { "200": "{ ok: true, thesis }" },
+      "errors": {
+        "401": "missing/invalid bearer token",
+        "403": "thesis exists but is owned by another member",
+        "404": "no thesis with that id"
+      },
+      "notes": "One-way ratchet: system -> public only. Idempotent if already public. No downgrade endpoint exists."
+    },
+    {
+      "name": "rule.create",
+      "method": "POST",
+      "path": "/api/rules",
+      "auth": "bearer",
+      "body": {
+        "ruleText": "string, required",
+        "enforcement": "\"hard\" | \"proposal_check\" | \"self\", required",
+        "linkedStrategy": "string, optional"
+      },
+      "response": { "201": "{ ok: true, rule, mirror }" },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing ruleText, invalid enforcement",
+        "401": "missing/invalid bearer token"
+      }
+    },
+    {
+      "name": "rule.disable",
+      "method": "POST",
+      "path": "/api/rules/:id/disable",
+      "auth": "bearer",
+      "body": {},
+      "response": { "200": "{ ok: true, rule }" },
+      "errors": {
+        "401": "missing/invalid bearer token",
+        "403": "rule exists but is owned by another member",
+        "404": "no rule with that id"
+      },
+      "notes": "Never deletes - sets enabled=0 + disabled_at. Idempotent on an already-disabled rule."
+    },
+    {
+      "name": "card.create",
+      "method": "POST",
+      "path": "/api/cards",
+      "auth": "bearer",
+      "body": {
+        "name": "string, required",
+        "scene": "string, optional",
+        "entryCondition": "string, optional",
+        "riskControl": "string, optional",
+        "exitRule": "string, optional",
+        "visibility": "\"system\" | \"public\", optional, default \"system\""
+      },
+      "response": { "201": "{ ok: true, card, mirror }" },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing name, invalid visibility",
+        "401": "missing/invalid bearer token"
+      }
+    }
+  ],
+  "read_only_pages": [
+    {
+      "name": "strategy.page",
+      "method": "GET",
+      "path": "/strategy",
+      "format": "html",
+      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "note": "My discipline rules + my theses/strategy cards (every visibility) + the circle's public-only section."
+    },
+    {
+      "name": "member.card",
+      "method": "GET",
+      "path": "/member/:id",
+      "format": "html",
+      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "note": "A member's public card: public strategy cards + public theses only."
+    },
+    {
+      "name": "stock.page",
+      "method": "GET",
+      "path": "/stock/:symbol",
+      "format": "html",
+      "auth": "bearer OR Cf-Access-Authenticated-User-Email"
+    },
+    {
+      "name": "proposal.detail",
+      "method": "GET",
+      "path": "/proposal/:id",
+      "format": "html",
+      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "note": "Owner-only, 403 for a non-owner's real id, 404 for an unknown id."
+    }
+  ],
+  "existing_but_not_yet_http": [
+    {
+      "name": "alert.crud",
+      "status": "P2 shipped",
+      "surface": "local CLI only (apps/openclaw-config/scripts/market-alerts.mjs: add/remove/pause/resume/feedback/list)",
+      "note": "No bearer-gated HTTP endpoint exists yet - a skill cannot call this remotely today."
+    },
+    {
+      "name": "proposal.request",
+      "status": "P6 shipped",
+      "surface": "local CLI only for creation (proposals.mjs run create); GET /proposal/:id (above) is the only HTTP surface, and it is read-only",
+      "note": "No bearer-gated HTTP write endpoint exists yet for submitting a new proposal from a skill."
+    }
+  ],
+  "forthcoming": [
+    {
+      "name": "research.submit",
+      "status": "P8 not yet built",
+      "note": "research_tasks has no writer of any kind yet (CLI or HTTP); GET /research/:id today only ever renders the honest '研究执行 P8 上线' placeholder."
+    }
+  ]
+}

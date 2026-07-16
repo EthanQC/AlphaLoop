@@ -47,6 +47,15 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { methodNotAllowed, type Member } from "@packages/shared-types";
 
+import {
+  computeThesisOutcome,
+  groupThesesByOwner,
+  loadLatestPriceForSymbol,
+  loadThesesForSymbol,
+  loadThesisHistory,
+  type ThesisEvidenceRow,
+  type ThesisHistoryRow
+} from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
@@ -260,66 +269,10 @@ function loadSymbolReportMatches(repoRoot: string, symbol: string): SymbolReport
 // non-public value, database.ts) is treated as "not visible to other
 // members", matching the same rule Task 7's strategy/member-card pages use
 // ("本人全见；他人仅 public"). Enforced in the WHERE clause itself, not
-// filtered in JS after an unfiltered fetch.
-// ---------------------------------------------------------------------------
-
-export interface ThesisRow {
-  id: string;
-  ownerId: string;
-  ownerDisplayName: string;
-  direction: "bull" | "bear" | "neutral";
-  targetLow: number | null;
-  targetHigh: number | null;
-  invalidationPrice: number | null;
-  visibility: "system" | "public";
-  status: "active" | "withdrawn" | "superseded";
-  createdAt: string;
-}
-
-function loadThesesForSymbol(db: DatabaseSync, viewerId: string, symbol: string): ThesisRow[] {
-  const rows = db
-    .prepare(`
-      SELECT t.id AS id, t.owner_id AS owner_id, m.display_name AS owner_display_name,
-             t.direction AS direction, t.target_low AS target_low, t.target_high AS target_high,
-             t.invalidation_price AS invalidation_price, t.visibility AS visibility,
-             t.status AS status, t.created_at AS created_at
-      FROM theses t
-      JOIN members m ON m.id = t.owner_id
-      WHERE t.symbol = ? AND (t.owner_id = ? OR t.visibility = 'public')
-      ORDER BY (t.owner_id = ?) DESC, t.created_at DESC
-    `)
-    .all(symbol, viewerId, viewerId) as Array<Record<string, unknown>>;
-
-  return rows.map((row) => ({
-    id: String(row.id),
-    ownerId: String(row.owner_id),
-    ownerDisplayName: String(row.owner_display_name),
-    direction: row.direction as ThesisRow["direction"],
-    targetLow: row.target_low === null || row.target_low === undefined ? null : Number(row.target_low),
-    targetHigh: row.target_high === null || row.target_high === undefined ? null : Number(row.target_high),
-    invalidationPrice:
-      row.invalidation_price === null || row.invalidation_price === undefined ? null : Number(row.invalidation_price),
-    visibility: row.visibility as ThesisRow["visibility"],
-    status: row.status as ThesisRow["status"],
-    createdAt: String(row.created_at)
-  }));
-}
-
-function groupThesesByOwner(theses: ThesisRow[]): Array<{ ownerId: string; ownerDisplayName: string; theses: ThesisRow[] }> {
-  const order: string[] = [];
-  const byOwner = new Map<string, { ownerId: string; ownerDisplayName: string; theses: ThesisRow[] }>();
-  for (const thesis of theses) {
-    let group = byOwner.get(thesis.ownerId);
-    if (!group) {
-      group = { ownerId: thesis.ownerId, ownerDisplayName: thesis.ownerDisplayName, theses: [] };
-      byOwner.set(thesis.ownerId, group);
-      order.push(thesis.ownerId);
-    }
-    group.theses.push(thesis);
-  }
-  return order.map((ownerId) => byOwner.get(ownerId) as { ownerId: string; ownerDisplayName: string; theses: ThesisRow[] });
-}
-
+// filtered in JS after an unfiltered fetch. Reader/grouping logic lives in
+// data/strategy.ts (Phase 7 Task 5) - shared with routes/strategy.ts and
+// routes/member-card.ts now that bull_points/bear_points JSON parsing would
+// otherwise be tripled across three separate route files.
 // ---------------------------------------------------------------------------
 // 我的该标的提醒历史: owner-scoped (viewer only) alert_events for this symbol.
 // ---------------------------------------------------------------------------
@@ -410,9 +363,38 @@ function renderPublicSummaryCard(latest: SymbolReportMatch | undefined): Html {
 }
 
 const DIRECTION_LABELS: Record<string, string> = { bull: "看多", bear: "看空", neutral: "中性" };
+const VISIBILITY_LABELS: Record<string, string> = { system: "系统可用", public: "公开" };
 
-function renderThesisRow(thesis: ThesisRow): Html {
+function renderEvidencePoints(points: string[]): Html {
+  if (points.length === 0) {
+    return html`<p style="font-size:12px;color:var(--sub);margin:2px 0 0">暂无依据</p>`;
+  }
+  return joinHtml(points.map((point) => html`<li style="font-size:12.5px">${point}</li>`));
+}
+
+function renderJudgmentTimeline(history: ThesisHistoryRow[]): Html {
+  if (history.length === 0) {
+    return html`<p style="font-size:12px;color:var(--sub);margin-top:6px">暂无判断历史</p>`;
+  }
+  const rows = joinHtml(
+    history.map(
+      (entry) =>
+        html`<div class="alert"><time class="mono">${entry.createdAt}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
+    )
+  );
+  return html`<div style="margin-top:6px">${rows}</div>`;
+}
+
+function renderOutcomeLine(hitRate: ReturnType<typeof computeThesisOutcome>["hitRate"]): Html {
+  if (hitRate.sample === "insufficient") {
+    return html`<p style="font-size:12px;color:var(--sub);margin-top:4px">样本不足（已判断 ${hitRate.n} 次）</p>`;
+  }
+  return html`<p style="font-size:12px;color:var(--sub);margin-top:4px">命中率 ${(hitRate.hitFraction * 100).toFixed(0)}%（${hitRate.hits} 命中 / ${hitRate.total} 共判断，样本 ${hitRate.n} 次）</p>`;
+}
+
+function renderThesisRow(thesis: ThesisEvidenceRow, history: ThesisHistoryRow[], latestPrice: number | null): Html {
   const label = DIRECTION_LABELS[thesis.direction] ?? thesis.direction;
+  const visibilityLabel = VISIBILITY_LABELS[thesis.visibility] ?? thesis.visibility;
   const range =
     thesis.targetLow !== null && thesis.targetHigh !== null
       ? html`目标区间 <span class="mono">${thesis.targetLow} - ${thesis.targetHigh}</span>`
@@ -421,14 +403,34 @@ function renderThesisRow(thesis: ThesisRow): Html {
     thesis.invalidationPrice !== null
       ? html` · 失效价 <span class="mono">${thesis.invalidationPrice}</span>`
       : trustedHtml("");
-  return html`<div class="disc">${label} · ${range}${invalidation}</div>`;
+
+  const outcome = computeThesisOutcome({
+    thesis: { direction: thesis.direction, targetLow: thesis.targetLow, targetHigh: thesis.targetHigh, invalidationPrice: thesis.invalidationPrice },
+    judgments: history.map((entry) => ({ id: entry.id })),
+    latestPrice
+  });
+
+  return html`<div class="disc" style="margin-bottom:10px;padding-bottom:8px;border-bottom:1px dashed var(--line)">
+    ${label} · ${range}${invalidation}
+    <span class="pill" style="margin-left:6px;background:var(--accent-soft);color:var(--accent)">${visibilityLabel}</span>
+    <div style="display:flex;gap:16px;margin-top:8px">
+      <div style="flex:1"><div style="font-size:12px;color:var(--sub)">看多依据</div><ul style="margin:4px 0 0;padding-left:16px">${renderEvidencePoints(thesis.bullPoints)}</ul></div>
+      <div style="flex:1"><div style="font-size:12px;color:var(--sub)">看空依据</div><ul style="margin:4px 0 0;padding-left:16px">${renderEvidencePoints(thesis.bearPoints)}</ul></div>
+    </div>
+    ${renderJudgmentTimeline(history)}
+    ${history.length > 0 ? renderOutcomeLine(outcome.hitRate) : trustedHtml("")}
+  </div>`;
 }
 
-function renderThesisCard(theses: ThesisRow[]): Html {
+function renderThesisCard(
+  theses: ThesisEvidenceRow[],
+  historyByThesisId: Map<string, ThesisHistoryRow[]>,
+  latestPrice: number | null
+): Html {
   if (theses.length === 0) {
     return html`<section class="card w2 dt-w4">
       <h2>我的论点卡</h2>
-      <p style="font-size:13px;color:var(--sub)">策略记忆 P7 上线</p>
+      <p style="font-size:13px;color:var(--sub)">暂无论点</p>
     </section>`;
   }
 
@@ -437,7 +439,7 @@ function renderThesisCard(theses: ThesisRow[]): Html {
     groups.map(
       (group) =>
         html`<div style="margin-bottom:8px"><b style="font-size:12.5px">${group.ownerDisplayName}</b>${joinHtml(
-          group.theses.map(renderThesisRow)
+          group.theses.map((thesis) => renderThesisRow(thesis, historyByThesisId.get(thesis.id) ?? [], latestPrice))
         )}</div>`
     )
   );
@@ -494,11 +496,16 @@ function renderStockPage(
   const matches = loadSymbolReportMatches(deps.repoRoot, symbol);
   const latest = matches[0];
   const theses = loadThesesForSymbol(deps.db, member.id, symbol);
+  const historyByThesisId = new Map<string, ThesisHistoryRow[]>();
+  for (const thesis of theses) {
+    historyByThesisId.set(thesis.id, loadThesisHistory(deps.db, thesis.id));
+  }
+  const latestPrice = loadLatestPriceForSymbol(deps.db, symbol);
   const alertEvents = loadAlertHistoryForSymbol(deps.db, member.id, symbol);
 
   const bodyHtml = html`<div class="bento">${renderHeaderCard(symbol, latest)}</div>
     <div class="bento" style="margin-top:10px">${renderPublicSummaryCard(latest)}</div>
-    <div class="bento" style="margin-top:10px">${renderThesisCard(theses)}</div>
+    <div class="bento" style="margin-top:10px">${renderThesisCard(theses, historyByThesisId, latestPrice)}</div>
     <div class="bento" style="margin-top:10px">${renderAlertHistoryCard(alertEvents)}</div>
     <div class="bento" style="margin-top:10px">${renderHistoryListCard(matches)}</div>`;
 

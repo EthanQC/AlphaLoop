@@ -856,8 +856,9 @@ const V7_TABLE_NAMES = [
 // pre-v8 production db would be in.
 function buildSeededV7Database(): DatabaseSync {
   const db = memoryDb();
-  migrate(db); // builds the full v0..v10 schema using the real migration code
+  migrate(db); // builds the full v0..v12 schema using the real migration code
   db.exec(`
+    DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
     DROP TABLE IF EXISTS stock_facts;
@@ -1132,6 +1133,7 @@ function buildSeededV8Database(): DatabaseSync {
   const db = buildSeededV7Database();
   migrate(db);
   db.exec(`
+    DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
     DROP INDEX IF EXISTS stock_facts_symbol_day_idx;
     DROP TABLE IF EXISTS stock_facts;
@@ -1267,7 +1269,7 @@ const V9_TABLE_NAMES = [...V8_TABLE_NAMES, "stock_facts"];
 function buildSeededV9Database(): DatabaseSync {
   const db = buildSeededV8Database();
   migrate(db);
-  db.exec(`DROP TABLE IF EXISTS circuit_breaker_state;`);
+  db.exec(`DROP TABLE IF EXISTS strategy_cards; DROP TABLE IF EXISTS circuit_breaker_state;`);
   db.exec("PRAGMA user_version = 9");
 
   const now = nowIso();
@@ -1868,16 +1870,17 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
   // one DDL change Task 4 needed beyond what the plan's "此外 DDL 冻结"
   // constraint anticipated when it was written (see database.ts's own
   // migration-step comment for the full rationale).
+  //
+  // SCHEMA_VERSION has since moved on to v12 (Phase 7 Task 1, strategy
+  // memory) - see the "v12 ..." describe block below for the current-version
+  // assertion; the two checks below are loosened to "at least" the same way
+  // v10's own fresh-db test already was.
 
-  it("SCHEMA_VERSION is 11", () => {
-    expect(SCHEMA_VERSION).toBe(11);
-  });
-
-  it("a fresh db lands at v11 with external_order_id nullable (NOT NULL dropped, UNIQUE kept) and the new owner index present", () => {
+  it("a fresh db lands at least at v11, with external_order_id nullable (NOT NULL dropped, UNIQUE kept) and the new owner index present", () => {
     const db = memoryDb();
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(11);
+    expect(getSchemaVersion(db)).toBeGreaterThanOrEqual(11);
 
     const columns = db.prepare("PRAGMA table_info(official_paper_order_lifecycle)").all() as Array<
       { name: string; notnull: number }
@@ -1939,7 +1942,8 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
 
   it("upgrades a v10 db with data in every pre-existing table (through v11) with zero row loss, and is idempotent", () => {
     const db = buildSeededV9Database();
-    migrate(db); // fixture-build only: advances the underlying schema through v10 and v11
+    migrate(db); // fixture-build only: advances the underlying schema through v10, v11 AND v12
+    db.exec(`DROP TABLE IF EXISTS strategy_cards;`); // peel off v12's own new table - see buildSeededV7/V8/V9Database's identical technique
     db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
     seedMember(db, "mem_v10");
     db.prepare(`
@@ -1966,6 +1970,260 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
     for (const table of V10_TABLE_NAMES) {
       expect(countRows(db, table)).toBe(countsBefore[table]);
     }
+  });
+});
+
+// Builds a REAL v11 database: starts from buildSeededV9Database() (v9 shape,
+// strategy_cards/circuit_breaker_state absent, user_version=9), runs the real
+// migrate() (which now advances through v10, v11 AND v12 in one call), then
+// peels v12's OWN two changes back off by hand:
+//   - drops strategy_cards outright (mirrors buildSeededV7/V8/V9Database's own
+//     "peel off every additive table introduced after the version this
+//     fixture represents" technique - required here too, or a later
+//     migrate() call in a test would hit v12's `CREATE TABLE strategy_cards`
+//     a second time and throw "table already exists").
+//   - reverses theses' v12 rebuild BY HAND back to its genuine v3 shape (no
+//     bull_points/bear_points columns at all), unlike every other "peel off"
+//     helper in this file, which accepts the newest step's COLUMN-level
+//     changes staying baked in (e.g. official_paper_order_lifecycle's
+//     already-nullable external_order_id in the v11 fixture above) because
+//     nothing here yet tests a REAL pre-column-existed migration of THAT
+//     column. v12 is different: the whole point of this fixture is to prove
+//     the v12 table-rebuild recipe backfills bull_points/bear_points to '[]'
+//     for rows that genuinely predate those columns - a shortcut that left
+//     them already present would make that assertion vacuous.
+function buildSeededV11Database(): DatabaseSync {
+  const db = buildSeededV9Database();
+  migrate(db); // fixture-build only: advances the underlying schema through v10, v11 AND v12
+  db.exec(`DROP TABLE IF EXISTS strategy_cards;`);
+
+  db.exec("PRAGMA foreign_keys = OFF;");
+  db.exec(`
+    CREATE TABLE theses_v11 (
+      id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES members(id),
+      symbol TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('bull','bear','neutral')),
+      target_low REAL, target_high REAL, invalidation_price REAL,
+      visibility TEXT NOT NULL DEFAULT 'system' CHECK(visibility IN ('system','public')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn','superseded')),
+      memory_slug TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    INSERT INTO theses_v11
+      (id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+       visibility, status, memory_slug, created_at, updated_at)
+    SELECT id, owner_id, symbol, direction, target_low, target_high, invalidation_price,
+           visibility, status, memory_slug, created_at, updated_at
+    FROM theses;
+    DROP TABLE theses;
+    ALTER TABLE theses_v11 RENAME TO theses;
+    CREATE INDEX theses_owner_symbol_idx ON theses(owner_id, symbol, status);
+  `);
+  db.exec("PRAGMA foreign_keys = ON;");
+
+  // buildSeededV9Database() (two levels down) drops circuit_breaker_state
+  // before resetting its own user_version - the migrate(db) call above
+  // recreates it (v10's step) but empty, so it must be reseeded here or
+  // V10_TABLE_NAMES's "every table has data" precondition fails.
+  seedMember(db, "mem_v11");
+  db.prepare(`
+    INSERT INTO circuit_breaker_state (owner_id, paused_until, reason, weekly_loss_pct, tripped_at)
+    VALUES ('mem_v11', ?, 'weekly loss > 3%', -0.05, ?)
+  `).run(nowIso(), nowIso());
+
+  db.exec("PRAGMA user_version = 11");
+  return db;
+}
+
+describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1, 2026-07-15 plan)", () => {
+  it("SCHEMA_VERSION is 12", () => {
+    expect(SCHEMA_VERSION).toBe(12);
+  });
+
+  it("a fresh db lands at v12 with strategy_cards present (columns/CHECK/index per the plan's frozen DDL) and theses carrying bull_points/bear_points (NOT NULL DEFAULT '[]'), every v3 column/index intact", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("strategy_cards");
+
+    const cardColumns = db.prepare("PRAGMA table_info(strategy_cards)").all() as Array<
+      { name: string; notnull: number; dflt_value: string | null }
+    >;
+    const cardByName = Object.fromEntries(cardColumns.map((c) => [c.name, c]));
+    expect(Object.keys(cardByName).sort()).toEqual(
+      [
+        "id", "owner_id", "name", "scene", "entry_condition", "risk_control", "exit_rule",
+        "status", "visibility", "memory_slug", "created_at", "updated_at"
+      ].sort()
+    );
+    expect(cardByName.owner_id.notnull).toBe(1);
+    expect(cardByName.name.notnull).toBe(1);
+    expect(cardByName.status.notnull).toBe(1);
+    expect(cardByName.visibility.notnull).toBe(1);
+    expect(cardByName.created_at.notnull).toBe(1);
+    expect(cardByName.updated_at.notnull).toBe(1);
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    const indexNames = indexes.map((i) => i.name);
+    expect(indexNames).toContain("strategy_cards_owner_status_idx");
+    expect(indexNames).toContain("theses_owner_symbol_idx");
+
+    const thesesColumns = db.prepare("PRAGMA table_info(theses)").all() as Array<
+      { name: string; notnull: number; dflt_value: string | null }
+    >;
+    const thesesByName = Object.fromEntries(thesesColumns.map((c) => [c.name, c]));
+    expect(thesesByName.bull_points.notnull).toBe(1);
+    expect(thesesByName.bull_points.dflt_value).toBe("'[]'");
+    expect(thesesByName.bear_points.notnull).toBe(1);
+    expect(thesesByName.bear_points.dflt_value).toBe("'[]'");
+    for (const col of [
+      "id", "owner_id", "symbol", "direction", "target_low", "target_high", "invalidation_price",
+      "visibility", "status", "memory_slug", "created_at", "updated_at"
+    ]) {
+      expect(thesesByName[col]).toBeDefined();
+    }
+  });
+
+  it("new theses row defaults bull_points/bear_points to '[]' when not supplied", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const now = nowIso();
+
+    db.prepare(`
+      INSERT INTO theses (id, owner_id, symbol, direction, visibility, status, created_at, updated_at)
+      VALUES ('thesis_defaults', ?, 'AAPL.US', 'bull', 'system', 'active', ?, ?)
+    `).run(member.id, now, now);
+
+    const row = db.prepare("SELECT bull_points, bear_points FROM theses WHERE id = 'thesis_defaults'").get() as {
+      bull_points: string; bear_points: string;
+    };
+    expect(row.bull_points).toBe("[]");
+    expect(row.bear_points).toBe("[]");
+  });
+
+  it("enforces strategy_cards CHECK(status) and CHECK(visibility)", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const now = nowIso();
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+        VALUES ('card_bad_status', ?, 'test card', 'not_a_status', 'system', ?, ?)
+      `).run(member.id, now, now)
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+        VALUES ('card_bad_visibility', ?, 'test card', 'active', 'private', ?, ?)
+      `).run(member.id, now, now)
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO strategy_cards (id, owner_id, name, status, visibility, created_at, updated_at)
+        VALUES ('card_ok', ?, 'test card', 'active', 'system', ?, ?)
+      `).run(member.id, now, now)
+    ).not.toThrow();
+  });
+
+  it("theses CHECK(direction)/CHECK(visibility)/CHECK(status) still enforced after the v12 rebuild", () => {
+    const db = memoryDb();
+    migrate(db);
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const now = nowIso();
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO theses (id, owner_id, symbol, direction, visibility, status, created_at, updated_at)
+        VALUES ('thesis_bad_direction', ?, 'AAPL.US', 'sideways', 'system', 'active', ?, ?)
+      `).run(member.id, now, now)
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO theses (id, owner_id, symbol, direction, visibility, status, created_at, updated_at)
+        VALUES ('thesis_bad_visibility', ?, 'AAPL.US', 'bull', 'private', 'active', ?, ?)
+      `).run(member.id, now, now)
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      db.prepare(`
+        INSERT INTO theses (id, owner_id, symbol, direction, visibility, status, created_at, updated_at)
+        VALUES ('thesis_bad_status', ?, 'AAPL.US', 'bull', 'system', 'not_a_status', ?, ?)
+      `).run(member.id, now, now)
+    ).toThrow(/CHECK constraint failed/);
+  });
+
+  it("upgrades a genuine pre-v12 (v11-shaped, theses WITHOUT bull_points/bear_points) database to v12 with zero row loss - theses/discipline_rules/proposals/etc all preserved, old theses rows backfill bull_points/bear_points to '[]', theses_owner_symbol_idx survives, and it is idempotent", () => {
+    const db = buildSeededV11Database();
+    expect(getSchemaVersion(db)).toBe(11);
+
+    const thesesColumnsBefore = db.prepare("PRAGMA table_info(theses)").all() as Array<{ name: string }>;
+    expect(thesesColumnsBefore.map((c) => c.name)).not.toContain("bull_points");
+    expect(thesesColumnsBefore.map((c) => c.name)).not.toContain("bear_points");
+
+    const countsBefore: Record<string, number> = {};
+    for (const table of V10_TABLE_NAMES) {
+      countsBefore[table] = countRows(db, table);
+      expect(countsBefore[table]).toBeGreaterThan(0);
+    }
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+
+    // The pre-existing thesis row (seeded back in buildSeededV7Database as
+    // 'thesis_v7', carried genuinely column-less through buildSeededV11Database
+    // above) survived the rebuild, with both new columns defaulted.
+    const thesis = db.prepare("SELECT * FROM theses WHERE id = 'thesis_v7'").get() as Record<string, unknown>;
+    expect(thesis).toBeDefined();
+    expect(thesis.symbol).toBe("AAPL.US");
+    expect(thesis.direction).toBe("bull");
+    expect(thesis.bull_points).toBe("[]");
+    expect(thesis.bear_points).toBe("[]");
+
+    // strategy_cards exists and starts empty.
+    expect(countRows(db, "strategy_cards")).toBe(0);
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("theses_owner_symbol_idx");
+
+    // Idempotent: calling migrate() again on an already-latest db changes nothing.
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    for (const table of V10_TABLE_NAMES) {
+      expect(countRows(db, table)).toBe(countsBefore[table]);
+    }
+  });
+
+  it("aborts (with rollback) when a theses row references a nonexistent member - defends the pre-existing owner_id FK across the rebuild", () => {
+    const db = buildSeededV11Database();
+    expect(getSchemaVersion(db)).toBe(11);
+
+    // Ghost owner_id, only reachable via manual DB surgery (theses.owner_id has
+    // been a real FK to members(id) since v3, so the app's own write path can
+    // never produce this) - same class of defensive corruption v7's own gate
+    // guards against for alert_events.owner_id.
+    db.exec("PRAGMA foreign_keys = OFF;");
+    db.prepare(`UPDATE theses SET owner_id = 'ghost_member' WHERE id = 'thesis_v7'`).run();
+    db.exec("PRAGMA foreign_keys = ON;");
+
+    expect(() => migrate(db)).toThrow(/nonexistent members.*thesis_v7 -> ghost_member/);
+
+    // Rolled back: still v11, data untouched.
+    expect(getSchemaVersion(db)).toBe(11);
+    const row = db.prepare("SELECT owner_id FROM theses WHERE id = 'thesis_v7'").get() as { owner_id: string };
+    expect(row.owner_id).toBe("ghost_member");
   });
 });
 

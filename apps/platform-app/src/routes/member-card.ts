@@ -40,6 +40,16 @@ import type { DatabaseSync } from "node:sqlite";
 import { MemberRepository, methodNotAllowed, type Member } from "@packages/shared-types";
 
 import { computePaperKpis, loadSnapshotSeriesForOwner, type PaperKpis } from "../data/snapshots.js";
+import {
+  computeThesisOutcome,
+  loadLatestPriceForSymbol,
+  loadSubjectStrategyCards,
+  loadSubjectTheses,
+  loadThesisHistory,
+  type StrategyCardRow,
+  type ThesisEvidenceRow,
+  type ThesisHistoryRow
+} from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
@@ -207,54 +217,71 @@ function renderPerformanceSection(view: PerformanceView): Html {
 }
 
 // ---------------------------------------------------------------------------
-// 公开策略/论点
+// 公开策略清单 (strategy_cards)
 // ---------------------------------------------------------------------------
 
-interface ThesisRow {
-  id: string;
-  symbol: string;
-  direction: "bull" | "bear" | "neutral";
-  targetLow: number | null;
-  targetHigh: number | null;
-  invalidationPrice: number | null;
-  visibility: "system" | "public";
-  createdAt: string;
+const CARD_STATUS_LABELS: Record<string, string> = { active: "活跃", paused: "暂停", retired: "退役" };
+
+function renderStrategyCardRow(card: StrategyCardRow, showVisibilityPill: boolean): Html {
+  const statusLabel = CARD_STATUS_LABELS[card.status] ?? card.status;
+  const visibilityPill = showVisibilityPill
+    ? html`<span class="pill" style="margin-left:6px;background:var(--accent-soft);color:var(--accent)">${VISIBILITY_LABELS[card.visibility] ?? card.visibility}</span>`
+    : trustedHtml("");
+  return html`<div class="disc">
+    <b>${card.name}</b>
+    <span class="pill" style="margin-left:6px;background:var(--accent-soft);color:var(--accent)">${statusLabel}</span>
+    ${visibilityPill}
+  </div>`;
 }
 
-function mapThesisRow(row: Record<string, unknown>): ThesisRow {
-  return {
-    id: String(row.id),
-    symbol: String(row.symbol),
-    direction: row.direction as ThesisRow["direction"],
-    targetLow: row.target_low === null || row.target_low === undefined ? null : Number(row.target_low),
-    targetHigh: row.target_high === null || row.target_high === undefined ? null : Number(row.target_high),
-    invalidationPrice:
-      row.invalidation_price === null || row.invalidation_price === undefined ? null : Number(row.invalidation_price),
-    visibility: row.visibility as ThesisRow["visibility"],
-    createdAt: String(row.created_at)
-  };
+function renderStrategyCardsSection(cards: StrategyCardRow[], showVisibilityPills: boolean): Html {
+  const body =
+    cards.length > 0
+      ? joinHtml(cards.map((card) => renderStrategyCardRow(card, showVisibilityPills)))
+      : html`<p style="font-size:13px;color:var(--sub)">暂无公开策略卡</p>`;
+  return html`<section class="card w2 dt-w4">
+    <h2>公开策略清单</h2>
+    ${body}
+  </section>`;
 }
 
-/**
- * `subject`'s theses. `includePrivate` (true only when the viewer IS the
- * subject) decides whether the `visibility = 'public'` filter is applied -
- * enforced in the WHERE clause itself, never in JS after an unfiltered
- * fetch.
- */
-function loadSubjectTheses(db: DatabaseSync, subjectId: string, includePrivate: boolean): ThesisRow[] {
-  const visibilityClause = includePrivate ? "" : "AND visibility = 'public'";
-  const rows = db
-    .prepare(`
-      SELECT id, symbol, direction, target_low, target_high, invalidation_price, visibility, created_at
-      FROM theses
-      WHERE owner_id = ? ${visibilityClause}
-      ORDER BY created_at DESC
-    `)
-    .all(subjectId) as Array<Record<string, unknown>>;
-  return rows.map(mapThesisRow);
+// ---------------------------------------------------------------------------
+// 公开论点清单 (theses + 事后走势回算 - "公开即接受检验")
+// ---------------------------------------------------------------------------
+
+function renderEvidencePoints(points: string[]): Html {
+  if (points.length === 0) {
+    return html`<p style="font-size:12px;color:var(--sub);margin:2px 0 0">暂无依据</p>`;
+  }
+  return joinHtml(points.map((point) => html`<li style="font-size:12.5px">${point}</li>`));
 }
 
-function renderThesisRow(thesis: ThesisRow, showVisibilityPill: boolean): Html {
+function renderJudgmentTimeline(history: ThesisHistoryRow[]): Html {
+  if (history.length === 0) {
+    return html`<p style="font-size:12px;color:var(--sub);margin-top:6px">暂无判断历史</p>`;
+  }
+  const rows = joinHtml(
+    history.map(
+      (entry) =>
+        html`<div class="alert"><time class="mono">${entry.createdAt}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
+    )
+  );
+  return html`<div style="margin-top:6px">${rows}</div>`;
+}
+
+function renderOutcomeLine(hitRate: ReturnType<typeof computeThesisOutcome>["hitRate"]): Html {
+  if (hitRate.sample === "insufficient") {
+    return html`<p style="font-size:12px;color:var(--sub);margin-top:4px">样本不足（已判断 ${hitRate.n} 次）</p>`;
+  }
+  return html`<p style="font-size:12px;color:var(--sub);margin-top:4px">命中率 ${(hitRate.hitFraction * 100).toFixed(0)}%（${hitRate.hits} 命中 / ${hitRate.total} 共判断，样本 ${hitRate.n} 次）</p>`;
+}
+
+function renderThesisRow(
+  thesis: ThesisEvidenceRow,
+  showVisibilityPill: boolean,
+  history: ThesisHistoryRow[],
+  latestPrice: number | null
+): Html {
   const directionLabel = DIRECTION_LABELS[thesis.direction] ?? thesis.direction;
   const directionClass = DIRECTION_CLASS[thesis.direction] ?? "";
   const range =
@@ -269,21 +296,48 @@ function renderThesisRow(thesis: ThesisRow, showVisibilityPill: boolean): Html {
     ? html`<span class="pill" style="margin-left:6px;background:var(--accent-soft);color:var(--accent)">${VISIBILITY_LABELS[thesis.visibility] ?? thesis.visibility}</span>`
     : trustedHtml("");
 
-  return html`<div class="disc">
+  const outcome = computeThesisOutcome({
+    thesis: { direction: thesis.direction, targetLow: thesis.targetLow, targetHigh: thesis.targetHigh, invalidationPrice: thesis.invalidationPrice },
+    judgments: history.map((entry) => ({ id: entry.id })),
+    latestPrice
+  });
+
+  return html`<div class="disc" style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px dashed var(--line)">
     <b class="mono">${thesis.symbol}</b>
     <span class="${directionClass}" style="margin-left:6px;font-weight:600">${directionLabel}</span>
     ${visibilityPill}
     <div style="margin-top:4px">${range}${invalidation}</div>
+    <div style="display:flex;gap:16px;margin-top:8px">
+      <div style="flex:1"><div style="font-size:12px;color:var(--sub)">看多依据</div><ul style="margin:4px 0 0;padding-left:16px">${renderEvidencePoints(thesis.bullPoints)}</ul></div>
+      <div style="flex:1"><div style="font-size:12px;color:var(--sub)">看空依据</div><ul style="margin:4px 0 0;padding-left:16px">${renderEvidencePoints(thesis.bearPoints)}</ul></div>
+    </div>
+    ${renderJudgmentTimeline(history)}
+    ${history.length > 0 ? renderOutcomeLine(outcome.hitRate) : trustedHtml("")}
   </div>`;
 }
 
-function renderThesesSection(theses: ThesisRow[], showVisibilityPills: boolean): Html {
+function renderThesesSection(
+  theses: ThesisEvidenceRow[],
+  showVisibilityPills: boolean,
+  historyByThesisId: Map<string, ThesisHistoryRow[]>,
+  priceBySymbol: Map<string, number | null>
+): Html {
   const body =
     theses.length > 0
-      ? joinHtml(theses.map((thesis) => renderThesisRow(thesis, showVisibilityPills)))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无公开策略/论点</p>`;
+      ? joinHtml(
+          theses.map((thesis) =>
+            renderThesisRow(
+              thesis,
+              showVisibilityPills,
+              historyByThesisId.get(thesis.id) ?? [],
+              priceBySymbol.get(thesis.symbol) ?? null
+            )
+          )
+        )
+      : html`<p style="font-size:13px;color:var(--sub)">暂无公开论点</p>`;
   return html`<section class="card w2 dt-w4">
-    <h2>公开策略/论点</h2>
+    <h2>公开论点清单</h2>
+    <p style="font-size:11.5px;color:var(--sub);margin-top:-4px">公开即接受检验</p>
     ${body}
   </section>`;
 }
@@ -363,12 +417,22 @@ function renderMemberCardPage(
   const viewingSelf = viewer.id === subject.id;
 
   const performanceView = loadPerformanceView(deps.db, subject, viewingSelf || subject.showPerformance);
+  const strategyCards = loadSubjectStrategyCards(deps.db, subject.id, viewingSelf);
   const theses = loadSubjectTheses(deps.db, subject.id, viewingSelf);
+  const historyByThesisId = new Map<string, ThesisHistoryRow[]>();
+  const priceBySymbol = new Map<string, number | null>();
+  for (const thesis of theses) {
+    historyByThesisId.set(thesis.id, loadThesisHistory(deps.db, thesis.id));
+    if (!priceBySymbol.has(thesis.symbol)) {
+      priceBySymbol.set(thesis.symbol, loadLatestPriceForSymbol(deps.db, thesis.symbol));
+    }
+  }
   const researchTasks = loadSubjectPublicResearch(deps.db, subject.id);
 
   const bodyHtml = html`<div class="bento">${renderHeaderCard(subject)}</div>
     <div class="bento" style="margin-top:10px">${renderPerformanceSection(performanceView)}</div>
-    <div class="bento" style="margin-top:10px">${renderThesesSection(theses, viewingSelf)}</div>
+    <div class="bento" style="margin-top:10px">${renderStrategyCardsSection(strategyCards, viewingSelf)}</div>
+    <div class="bento" style="margin-top:10px">${renderThesesSection(theses, viewingSelf, historyByThesisId, priceBySymbol)}</div>
     <div class="bento" style="margin-top:10px">${renderResearchSection(researchTasks)}</div>`;
 
   const page = renderPage({
