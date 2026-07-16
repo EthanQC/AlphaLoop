@@ -19,6 +19,17 @@ export interface OfficialPaperRiskFacts {
   // snapshot. Optional (defaults to 0) so every existing caller/test that
   // never supplies it keeps behaving exactly as before.
   openOrdersNotionalUsd?: number;
+  // FIX 2 (audit-class finding): the owner's currently held LONG quantity of
+  // the ticket's own symbol, read from the latest official_paper_snapshots
+  // positions JSON for that owner. Used to gate the paper-sell risk
+  // exemption below - a sell used to be treated as riskIncreasingNotional 0
+  // unconditionally, so a naked short (sell-to-open, no held position) of
+  // any size read as ideaExposure 0% and sailed past the 10% cap. Optional
+  // (undefined) so every existing caller/test that never supplies it keeps
+  // behaving conservatively: undefined is treated as 0 held (validated
+  // below), i.e. the WHOLE sell counts as risk-increasing, same as an
+  // unknown/no-position sell.
+  heldQuantityForSymbol?: number;
 }
 
 export function evaluateRisk(
@@ -33,7 +44,7 @@ export function evaluateRisk(
   const highConvictionIdeas = getNumericMetadata(ticket, "currentHighConvictionIdeas", 0);
   const dailyNewRiskPercent = getNumericMetadata(ticket, "dailyNewRiskPercent", 0);
   const openclawPaperBudgetPercent = DEFAULT_OPENCLAW_PAPER_BUDGET_PERCENT;
-  const riskIncreasingNotional = ticket.environment === "paper" && ticket.side === "sell" ? 0 : ticket.notionalUsd;
+  const riskIncreasingNotional = computeRiskIncreasingNotional(ticket, trustedPaperFacts);
 
   const reasons: string[] = [];
   let status: RiskDecision["status"] = "allow";
@@ -112,6 +123,37 @@ export function evaluateRisk(
     reasons,
     requiresHumanReview: status !== "allow"
   };
+}
+
+// FIX 2: a sell up to the owner's held long is risk-reducing (exempt from
+// the exposure caps below, same as before); any quantity beyond that held
+// long (a short-open) counts as risk-increasing, proportional to the
+// ticket's own per-share notional. Buys, live-environment tickets, and any
+// non-paper-sell ticket are unaffected (unchanged pre-fix behavior: the full
+// notional is risk-increasing). heldQuantityForSymbol missing/negative/
+// non-finite is treated as 0 held - conservative, since an unknown position
+// might not exist at all.
+function computeRiskIncreasingNotional(
+  ticket: OrderTicket,
+  trustedPaperFacts: OfficialPaperRiskFacts | undefined
+): number {
+  if (ticket.environment !== "paper" || ticket.side !== "sell") {
+    return ticket.notionalUsd;
+  }
+
+  if (ticket.quantity <= 0) {
+    return 0;
+  }
+
+  const rawHeld = trustedPaperFacts?.heldQuantityForSymbol;
+  const heldQuantity = typeof rawHeld === "number" && Number.isFinite(rawHeld) && rawHeld > 0 ? rawHeld : 0;
+  const excessQuantity = Math.max(0, ticket.quantity - heldQuantity);
+  if (excessQuantity === 0) {
+    return 0;
+  }
+
+  const perShareNotional = ticket.notionalUsd / ticket.quantity;
+  return excessQuantity * perShareNotional;
 }
 
 function getNumericMetadata(ticket: OrderTicket, key: string, fallback: number): number {

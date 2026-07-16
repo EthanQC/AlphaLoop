@@ -120,10 +120,20 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
   // codebase, reimplemented here in TS against the same
   // official_paper_snapshots table (this app has no JS/TS boundary-crossing
   // import path to that .mjs module).
-  function readLatestOfficialPaperRiskFactsForOwner(ownerId: string): OfficialPaperRiskFacts | undefined {
+  // FIX 2: `symbol` is the ticket's own symbol - the caller reads the held
+  // LONG quantity for THIS symbol out of the same snapshot row's `positions`
+  // JSON, so risk.ts's paper-sell exemption can be gated on it (a sell up to
+  // the held long is risk-reducing; any excess is a short-open, which must
+  // count as risk-increasing notional). `positions` is a JSON array of
+  // `{ symbol, quantity, ... }` (the same shape market-alerts-store.mjs's
+  // isSymbolInPositions and portfolio-exposure.mjs already read out of this
+  // exact column) - parsed defensively; any missing/malformed positions data
+  // yields heldQuantityForSymbol: undefined, which risk.ts's own default
+  // (unknown position -> 0 held, conservative) then applies.
+  function readLatestOfficialPaperRiskFactsForOwner(ownerId: string, symbol: string): OfficialPaperRiskFacts | undefined {
     const ownRow = db
       .prepare(`
-        SELECT fetched_at, net_assets, market_value
+        SELECT fetched_at, net_assets, market_value, positions
         FROM official_paper_snapshots
         WHERE owner_id = ?
         ORDER BY fetched_at DESC
@@ -133,7 +143,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
 
     const row = ownRow ?? (db
       .prepare(`
-        SELECT fetched_at, net_assets, market_value
+        SELECT fetched_at, net_assets, market_value, positions
         FROM official_paper_snapshots
         WHERE owner_id IS NULL
         ORDER BY fetched_at DESC
@@ -152,7 +162,36 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
       return undefined;
     }
 
-    return { accountNetLiq, currentExposureUsd, fetchedAt };
+    const heldQuantityForSymbol = extractHeldQuantity(row.positions, symbol);
+    return {
+      accountNetLiq,
+      currentExposureUsd,
+      fetchedAt,
+      ...(heldQuantityForSymbol !== undefined ? { heldQuantityForSymbol } : {})
+    };
+  }
+
+  function extractHeldQuantity(rawPositions: unknown, symbol: string): number | undefined {
+    if (typeof rawPositions !== "string") {
+      return undefined;
+    }
+    let positions: unknown;
+    try {
+      positions = JSON.parse(rawPositions);
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(positions)) {
+      return undefined;
+    }
+    const match = positions.find(
+      (position) => String((position as Record<string, unknown>)?.symbol ?? "").toUpperCase() === symbol.toUpperCase()
+    ) as Record<string, unknown> | undefined;
+    if (!match) {
+      return undefined;
+    }
+    const quantity = Number(match.quantity);
+    return Number.isFinite(quantity) ? quantity : undefined;
   }
 
   return createServer(async (req, res) => {
@@ -326,7 +365,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
 
         // ---- Global Constraint ④: per-owner risk, budget includes this
         // owner's own OPEN (not yet filled/cancelled/rejected) orders ----
-        const riskFacts = readLatestOfficialPaperRiskFactsForOwner(proposal.ownerId);
+        const riskFacts = readLatestOfficialPaperRiskFactsForOwner(proposal.ownerId, proposal.symbol);
         const openOrdersNotionalUsd = officialPaperOrders.sumOpenNotionalForOwner(proposal.ownerId);
         const dayStartIso = startOfUtcDay(nowDate()).toISOString();
         const openIdeas = officialPaperOrders.countSubmittedTodayForOwner(proposal.ownerId, dayStartIso);

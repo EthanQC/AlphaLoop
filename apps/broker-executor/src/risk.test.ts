@@ -278,11 +278,133 @@ describe("evaluateRisk", () => {
       {
         accountNetLiq: 100_000,
         currentExposureUsd: 12_000,
-        fetchedAt: new Date().toISOString()
+        fetchedAt: new Date().toISOString(),
+        heldQuantityForSymbol: 5
       }
     );
 
     expect(result.reasons.join(" ")).not.toMatch(/OpenClaw 官方模拟盘预算/u);
+  });
+
+  // FIX 2 (audit-class finding): the paper-sell exemption used to zero out
+  // riskIncreasingNotional for EVERY paper sell regardless of whether the
+  // owner actually held the position - a sell-to-open (naked short) of any
+  // size read as ideaExposure 0 and sailed past the 10% cap. Gated on the
+  // owner's ACTUAL held long for that symbol (heldQuantityForSymbol): a sell
+  // up to the held long is risk-reducing (exempt); any excess beyond it (a
+  // short-open) counts as risk-increasing notional, subject to the same 10%
+  // idea-exposure cap as a buy.
+  describe("sell exemption gated on held position (FIX 2)", () => {
+    it("allows a sell fully within the held long, even though it exceeds the 10% idea-exposure cap in notional terms", () => {
+      const result = evaluateRisk(
+        {
+          id: "ticket_sell_within_held",
+          source: "openclaw-official-paper",
+          submittedAt: new Date().toISOString(),
+          environment: "paper",
+          assetClass: "stock",
+          symbol: "NVDA",
+          side: "sell",
+          quantity: 10,
+          conviction: "normal",
+          // 10 shares * $2,000 = $20,000 = 20% of net liq - would block if
+          // treated as risk-increasing, but the owner holds all 10 shares.
+          notionalUsd: 20_000
+        },
+        baseRules(),
+        {
+          accountNetLiq: 100_000,
+          currentExposureUsd: 20_000,
+          fetchedAt: new Date().toISOString(),
+          heldQuantityForSymbol: 10
+        }
+      );
+
+      expect(result.status).toBe("allow");
+    });
+
+    it("blocks a sell that exceeds the held long (a short-open) once the excess notional is over budget", () => {
+      const result = evaluateRisk(
+        {
+          id: "ticket_sell_exceeds_held",
+          source: "openclaw-official-paper",
+          submittedAt: new Date().toISOString(),
+          environment: "paper",
+          assetClass: "stock",
+          symbol: "NVDA",
+          side: "sell",
+          quantity: 10,
+          conviction: "normal",
+          // 10 shares * $2,000 = $20,000; owner holds only 2 -> 8 excess
+          // shares = $16,000 = 16% of net liq, over the 10% cap.
+          notionalUsd: 20_000
+        },
+        baseRules(),
+        {
+          accountNetLiq: 100_000,
+          currentExposureUsd: 0,
+          fetchedAt: new Date().toISOString(),
+          heldQuantityForSymbol: 2
+        }
+      );
+
+      expect(result.status).toBe("block");
+      expect(result.reasons.join(" ")).toMatch(/单个想法暴露/u);
+    });
+
+    it("blocks a naked-short sell over budget when the owner holds no position in the symbol at all", () => {
+      const result = evaluateRisk(
+        {
+          id: "ticket_sell_no_position",
+          source: "openclaw-official-paper",
+          submittedAt: new Date().toISOString(),
+          environment: "paper",
+          assetClass: "stock",
+          symbol: "TSLA",
+          side: "sell",
+          quantity: 10,
+          conviction: "normal",
+          notionalUsd: 20_000
+        },
+        baseRules(),
+        {
+          accountNetLiq: 100_000,
+          currentExposureUsd: 0,
+          fetchedAt: new Date().toISOString(),
+          heldQuantityForSymbol: 0
+        }
+      );
+
+      expect(result.status).toBe("block");
+      expect(result.reasons.join(" ")).toMatch(/单个想法暴露/u);
+    });
+
+    it("treats an unknown/missing heldQuantityForSymbol as zero held (conservative: whole sell counts as risk-increasing)", () => {
+      const result = evaluateRisk(
+        {
+          id: "ticket_sell_unknown_position",
+          source: "openclaw-official-paper",
+          submittedAt: new Date().toISOString(),
+          environment: "paper",
+          assetClass: "stock",
+          symbol: "AMD",
+          side: "sell",
+          quantity: 10,
+          conviction: "normal",
+          notionalUsd: 20_000
+        },
+        baseRules(),
+        {
+          accountNetLiq: 100_000,
+          currentExposureUsd: 0,
+          fetchedAt: new Date().toISOString()
+          // heldQuantityForSymbol omitted entirely - unknown position.
+        }
+      );
+
+      expect(result.status).toBe("block");
+      expect(result.reasons.join(" ")).toMatch(/单个想法暴露/u);
+    });
   });
 });
 

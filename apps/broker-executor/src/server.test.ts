@@ -36,15 +36,28 @@ function seedMember(db: DatabaseSync, id: string): void {
 
 function seedSnapshot(
   db: DatabaseSync,
-  opts: { ownerId: string | null; netAssets: number; marketValue: number; fetchedAt?: string }
+  opts: {
+    ownerId: string | null;
+    netAssets: number;
+    marketValue: number;
+    fetchedAt?: string;
+    positions?: Array<{ symbol: string; quantity: number }>;
+  }
 ): void {
   db
     .prepare(`
       INSERT INTO official_paper_snapshots
       (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
-      VALUES (?, ?, 'scheduled', ?, 0, ?, '[]', '{}', ?)
+      VALUES (?, ?, 'scheduled', ?, 0, ?, ?, '{}', ?)
     `)
-    .run(createId("snapshot"), opts.fetchedAt ?? nowIso(), opts.netAssets, opts.marketValue, opts.ownerId);
+    .run(
+      createId("snapshot"),
+      opts.fetchedAt ?? nowIso(),
+      opts.netAssets,
+      opts.marketValue,
+      JSON.stringify(opts.positions ?? []),
+      opts.ownerId
+    );
 }
 
 function createApprovedProposal(
@@ -522,6 +535,59 @@ describe("createBrokerExecutorServer", () => {
         .prepare(`SELECT 1 FROM official_paper_order_lifecycle WHERE ticket_id = ?`)
         .get(deriveTicketId(secondProposal.id));
       expect(secondLifecycle).toBeUndefined();
+    });
+
+    // FIX 2 end-to-end: a sell-to-open (owner holds no position) over the
+    // 10% budget must be BLOCKED at the HTTP layer, wiring the snapshot's
+    // positions JSON through to risk.ts's heldQuantityForSymbol gate.
+    it("blocks a naked-short sell (no held position) over the 10% budget end-to-end", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0, positions: [] });
+      const { fn } = makeCountingExec({ order_id: "ext_short", status: "New" });
+      await startServer({ execFn: fn });
+
+      // 200 shares * $100 = $20,000 = 20% of net liq, no held position at all.
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 200,
+        limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.reasons.join(" ")).toMatch(/单个想法暴露/);
+    });
+
+    // Companion: a sell fully within the held long is NOT blocked, even
+    // though the same notional would be over budget for a naked short.
+    it("allows a de-risking sell within the held long over the same notional that would block a naked short", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 20_000,
+        positions: [{ symbol: "TSLA.US", quantity: 200 }]
+      });
+      const { fn } = makeCountingExec({ order_id: "ext_derisk", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 200,
+        limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
     });
 
     it("per-owner risk isolation: a DIFFERENT owner's open order does not count against this owner's budget", async () => {
