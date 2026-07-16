@@ -22,14 +22,11 @@ import {
   type ProbeResult
 } from "./shape.js";
 
-export class CheckFailedError extends Error {
-  readonly payload: unknown;
-
-  constructor(message: string, payload: unknown) {
-    super(message);
-    this.payload = payload;
-  }
-}
+// Marker class: main() prints check failures without the generic "命令执行
+// 失败" prefix so the wrappers' stderr regexes see the probe wording as-is.
+// It deliberately carries NO structured payload — the error contract keeps
+// stdout empty on failure, so any payload here would be dead weight.
+export class CheckFailedError extends Error {}
 
 export interface RunDeps {
   adapterFor(region: Region): LongbridgeAdapter;
@@ -78,14 +75,12 @@ async function runCheck(deps: RunDeps): Promise<unknown> {
     probeRegion(deps, "global", timeoutMs),
     probeRegion(deps, "cn", timeoutMs)
   ]);
-  const payload = buildCheckPayload({ resolution: deps.regions, probes: { global, cn } });
   if (!global.ok && !cn.ok) {
     throw new CheckFailedError(
-      `Longbridge 连通性检查失败（无可用区域）。global: ${global.error ?? "unknown"}；cn: ${cn.error ?? "unknown"}`,
-      payload
+      `Longbridge 连通性检查失败（无可用区域）。global: ${global.error ?? "unknown"}；cn: ${cn.error ?? "unknown"}`
     );
   }
-  return payload;
+  return buildCheckPayload({ resolution: deps.regions, probes: { global, cn } });
 }
 
 function isoToday(): string {
@@ -151,6 +146,12 @@ export async function runCommand(command: Command, deps: RunDeps): Promise<unkno
         ...(command.remark !== undefined ? { remark: command.remark } : {}),
         ...(command.outsideRth !== undefined ? { outsideRth: command.outsideRth } : {})
       });
+      // Contract: exit 0 means one honest JSON document carrying a real
+      // broker order id. An adapter that "succeeds" without one (empty
+      // string, or undefined despite the type) must fail the command.
+      if (typeof response.orderId !== "string" || response.orderId === "") {
+        throw new Error("下单响应缺少有效的 order_id，结果未确认：请用 order / order detail 人工核对");
+      }
       return buildSubmitPayload(response, command);
     }
     default: {

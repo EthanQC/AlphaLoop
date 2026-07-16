@@ -46,20 +46,9 @@ describe("buildCheckPayload", () => {
     expect(payload.session.token).toBe("valid");
   });
 
-  it("reports token invalid when no region is reachable", () => {
-    const payload = buildCheckPayload({
-      resolution: { active: "global", cached: undefined, source: "default" },
-      probes: {
-        global: { ok: false, error: "401 unauthorized" },
-        cn: { ok: false, error: "connect timed out" }
-      }
-    }) as { session: { token: string }; connectivity: Record<string, { ok: boolean }>; region: { cached: string } };
-    expect(payload.session.token).not.toBe("valid");
-    expect(payload.connectivity.global?.ok).toBe(false);
-    expect(payload.connectivity.cn?.ok).toBe(false);
-    // cached must still be a valid region string for the snapshot consumers
-    expect(payload.region.cached).toBe("global");
-  });
+  // NOTE: no both-regions-down payload test here on purpose — runCheck
+  // throws CheckFailedError BEFORE building a payload in that case, so such
+  // output is unobservable by any caller (stdout stays empty on failure).
 });
 
 describe("buildQuoteRows", () => {

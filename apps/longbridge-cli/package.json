@@ -12,6 +12,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "longport": "^4.3.3"
+    "longport": "4.3.3"
   }
 }

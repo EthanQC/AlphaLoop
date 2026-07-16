@@ -11,8 +11,13 @@
 //     connect lazily, so probe() must issue a real RPC (quoteLevel()).
 //   - enablePrintQuotePackages MUST be false: its default (true) prints
 //     connection info that would pollute the pure-JSON stdout contract.
-//   - Runtime enum objects carry no reverse (value -> name) mapping, so the
-//     name tables below are maintained here, pinned to 4.3.3's d.ts.
+//   - Enum decoding: the d.ts declares `const enum`s (member accesses are
+//     compile-time inlined), but the napi runtime module exports real
+//     name -> value objects. The value -> name maps are derived from those
+//     at load time (see sdk-mapping.ts) so an SDK bump that inserts or
+//     reorders enum members can never silently relabel a decoded status.
+
+import { createRequire } from "node:module";
 
 import {
   CalendarCategory,
@@ -56,68 +61,16 @@ import type {
 import type { EnvLike, Region, RegionEndpoints, RegionResolution, ResolvedCredentials } from "./env.js";
 import { endpointsForRegion } from "./env.js";
 import type { AdapterFactory } from "./main.js";
+import { buildEnumNameMaps, calendarTimeLabel, truncateRemark } from "./sdk-mapping.js";
 
 // ---------------------------------------------------------------------------
-// enum value -> name tables (longport@4.3.3 index.d.ts ordering)
+// enum value -> name maps, derived from the installed SDK's runtime module
+// (never index-positional; see sdk-mapping.ts for the rationale and tests)
 // ---------------------------------------------------------------------------
 
-const TRADE_STATUS_NAMES = [
-  "normal",
-  "halted",
-  "delisted",
-  "fuse",
-  "prepare_list",
-  "code_moved",
-  "to_be_opened",
-  "split_stock_halts",
-  "expired",
-  "warrant_prepare_list",
-  "suspend"
-] as const;
-
-const ORDER_STATUS_NAMES = [
-  "Unknown",
-  "NotReported",
-  "ReplacedNotReported",
-  "ProtectedNotReported",
-  "VarietiesNotReported",
-  "Filled",
-  "WaitToNew",
-  "New",
-  "WaitToReplace",
-  "PendingReplace",
-  "Replaced",
-  "PartialFilled",
-  "WaitToCancel",
-  "PendingCancel",
-  "Rejected",
-  "Canceled",
-  "Expired",
-  "PartialWithdrawal"
-] as const;
-
-const ORDER_SIDE_NAMES = ["unknown", "buy", "sell"] as const;
-
-const ORDER_TYPE_NAMES = [
-  "Unknown",
-  "LO",
-  "ELO",
-  "MO",
-  "AO",
-  "ALO",
-  "ODD",
-  "LIT",
-  "MIT",
-  "TSLPAMT",
-  "TSLPPCT",
-  "TSMAMT",
-  "TSMPCT",
-  "SLO"
-] as const;
-
-const TIME_IN_FORCE_NAMES = ["Unknown", "Day", "GoodTilCanceled", "GoodTilDate"] as const;
-
-const MARKET_NAMES = ["", "US", "HK", "CN", "SG", "Crypto"] as const;
+const ENUM_MAPS = buildEnumNameMaps(
+  createRequire(import.meta.url)("longport") as Record<string, unknown>
+);
 
 const ORDER_TYPE_VALUES: Record<string, OrderType> = {
   LO: OrderType.LO,
@@ -160,7 +113,9 @@ const CALENDAR_CATEGORY_VALUES: Record<string, CalendarCategory> = {
 
 // LongPort OpenAPI hard limit — a longer remark is rejected by the server,
 // so truncating here keeps the order submittable (the repo-side caller
-// already truncates to 255, which can still exceed the SDK's 64).
+// already truncates to 255, which can still exceed the SDK's 64). The TAIL
+// is kept because the production remark's discriminating content (the full
+// 53-char ticket id) sits at the end; see truncateRemark in sdk-mapping.ts.
 const MAX_REMARK_LENGTH = 64;
 
 // ---------------------------------------------------------------------------
@@ -179,8 +134,8 @@ function iso(value: Date | null | undefined): string | undefined {
   return Number.isFinite(ms) ? value.toISOString() : undefined;
 }
 
-function enumName<T extends readonly string[]>(names: T, value: number, fallback: string): string {
-  return names[value] ?? fallback;
+function enumName(names: Map<number, string>, value: number, fallback: string): string {
+  return names.get(value) ?? fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +170,7 @@ function mapQuote(quote: SecurityQuote): AdapterQuote {
     volume: quote.volume,
     turnover: dec(quote.turnover),
     timestamp: iso(quote.timestamp),
-    status: enumName(TRADE_STATUS_NAMES, quote.tradeStatus as number, `unknown_${String(quote.tradeStatus)}`),
+    status: enumName(ENUM_MAPS.tradeStatus, quote.tradeStatus as number, `unknown_${String(quote.tradeStatus)}`),
     preMarket: mapSessionQuote(quote.preMarketQuote),
     postMarket: mapSessionQuote(quote.postMarketQuote)
   };
@@ -252,7 +207,7 @@ function mapPositions(response: StockPositionsResponse): AdapterPosition[] {
       available: dec(position.availableQuantity),
       currency: position.currency,
       costPrice: dec(position.costPrice),
-      market: enumName(MARKET_NAMES, position.market as number, String(position.market)),
+      market: enumName(ENUM_MAPS.market, position.market as number, String(position.market)),
       accountChannel: channel.accountChannel,
       initQuantity: dec(position.initQuantity)
     }))
@@ -265,7 +220,7 @@ function mapWatchlist(groups: WatchlistGroup[]): unknown {
     name: group.name,
     securities: group.securities.map((security) => ({
       symbol: security.symbol,
-      market: enumName(MARKET_NAMES, security.market as number, String(security.market)),
+      market: enumName(ENUM_MAPS.market, security.market as number, String(security.market)),
       name: security.name,
       watched_price: dec(security.watchedPrice) ?? null,
       watched_at: iso(security.watchedAt) ?? null,
@@ -297,7 +252,7 @@ function mapCalendarGroup(group: CalendarDateGroup): AdapterCalendarGroup {
       market: info.market,
       star: info.star,
       datetime: info.datetime,
-      timeLabel: info.dateType || info.financialMarketTime || info.date,
+      timeLabel: calendarTimeLabel(info.dateType, info.financialMarketTime),
       type: info.eventType,
       symbol: info.symbol,
       dataKv: info.dataKv.map((kv) => ({ key: kv.key, type: kv.valueType, value: kv.value }))
@@ -309,16 +264,16 @@ function mapOrder(order: Order | OrderDetail): AdapterOrder {
   return {
     orderId: order.orderId,
     symbol: order.symbol,
-    side: enumName(ORDER_SIDE_NAMES, order.side as number, "unknown"),
-    status: enumName(ORDER_STATUS_NAMES, order.status as number, `Unknown(${String(order.status)})`),
+    side: enumName(ENUM_MAPS.orderSide, order.side as number, "unknown"),
+    status: enumName(ENUM_MAPS.orderStatus, order.status as number, `Unknown(${String(order.status)})`),
     quantity: dec(order.quantity),
     executedQuantity: dec(order.executedQuantity),
     price: dec(order.price),
     executedPrice: dec(order.executedPrice),
     submittedAtIso: iso(order.submittedAt),
     updatedAtIso: iso(order.updatedAt),
-    orderType: enumName(ORDER_TYPE_NAMES, order.orderType as number, "Unknown"),
-    timeInForce: enumName(TIME_IN_FORCE_NAMES, order.timeInForce as number, "Unknown"),
+    orderType: enumName(ENUM_MAPS.orderType, order.orderType as number, "Unknown"),
+    timeInForce: enumName(ENUM_MAPS.timeInForce, order.timeInForce as number, "Unknown"),
     remark: order.remark,
     msg: order.msg,
     currency: order.currency,
@@ -445,11 +400,17 @@ class LongportAdapter implements LongbridgeAdapter {
       submittedQuantity: new Decimal(req.quantity),
       timeInForce,
       ...(req.price !== undefined ? { submittedPrice: new Decimal(req.price) } : {}),
-      ...(req.remark !== undefined ? { remark: req.remark.slice(0, MAX_REMARK_LENGTH) } : {}),
+      ...(req.remark !== undefined ? { remark: truncateRemark(req.remark, MAX_REMARK_LENGTH) } : {}),
       ...(outsideRth !== undefined ? { outsideRth } : {})
     };
 
     const response = await this.trade().submitOrder(options);
+    // Exit 0 must mean "the broker confirmed an order id". An empty/missing
+    // id from the SDK is an unconfirmed submit — surface it as a failure so
+    // callers treat it as submit_unconfirmed instead of a success.
+    if (!response.orderId) {
+      throw new Error("券商响应缺少 order_id，下单结果未确认：请用 order / order detail 人工核对该订单是否已受理");
+    }
     return { orderId: response.orderId };
   }
 

@@ -142,6 +142,28 @@ describe("runCommand data commands", () => {
     expect(payload).toMatchObject({ order_id: "1044001" });
   });
 
+  it("fails the submit when the adapter reports success without a usable order id", async () => {
+    for (const orderId of ["", undefined]) {
+      await expect(runCommand(
+        {
+          kind: "order-submit",
+          side: "buy",
+          symbol: "QQQ.US",
+          quantity: "1",
+          price: "551.64",
+          orderType: "LO",
+          timeInForce: "Day",
+          yes: true
+        },
+        deps({
+          global: fakeAdapter({
+            submitOrder: async () => ({ orderId }) as unknown as { orderId: string }
+          })
+        })
+      )).rejects.toThrow(/order_id/u);
+    }
+  });
+
   it("propagates adapter failures", async () => {
     await expect(runCommand(
       { kind: "assets" },

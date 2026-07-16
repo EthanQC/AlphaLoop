@@ -49,6 +49,20 @@ describe("main", () => {
     expect(JSON.parse(out[0] ?? "")).toEqual([{ symbol: "QQQ.US", last_done: "1.00" }]);
   });
 
+  it.each([
+    ["positions", ["positions"]],
+    ["order list", ["order"]],
+    ["order executions", ["order", "executions"]],
+    ["news", ["news", "QQQ.US"]],
+    ["watchlist", ["watchlist"]]
+  ])("prints exactly [] and exits 0 for an empty %s result", async (_label, argv) => {
+    const { deps, out, err } = harness(fakeAdapter());
+    const code = await main([...argv, "--format", "json"], deps);
+    expect(code).toBe(0);
+    expect(err).toEqual([]);
+    expect(out).toEqual(["[]"]);
+  });
+
   it("exits 2 with usage help on stderr for unknown commands, stdout stays empty", async () => {
     const { deps, out, err } = harness(fakeAdapter());
     const code = await main(["frobnicate", "--format", "json"], deps);

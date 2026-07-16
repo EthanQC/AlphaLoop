@@ -129,6 +129,59 @@ describe("parseArgv", () => {
       .toThrow(UsageError); // LO orders require --price
   });
 
+  it("rejects non-canonical quantity spellings (integer share counts only)", () => {
+    for (const quantity of ["1.5", "1e3", "+5", "5.", "0x10", "007", " 5", "1_000"]) {
+      expect(() => parseArgv([
+        "order", "buy", "QQQ.US", quantity, "--price", "1.00", "--yes", "--format", "json"
+      ])).toThrow(UsageError);
+    }
+  });
+
+  it("rejects non-canonical price spellings", () => {
+    for (const price of ["1e3", ".5", "5.", "0x10", "+5", "0", "0.00", "07.5"]) {
+      expect(() => parseArgv([
+        "order", "buy", "QQQ.US", "1", "--price", price, "--yes", "--format", "json"
+      ])).toThrow(UsageError);
+    }
+  });
+
+  it("accepts canonical integer quantity and decimal price", () => {
+    const parsed = parseArgv([
+      "order", "buy", "QQQ.US", "40", "--price", "0.50", "--yes", "--format", "json"
+    ]);
+    expect(parsed.command).toMatchObject({ kind: "order-submit", quantity: "40", price: "0.50" });
+  });
+
+  it("rejects order types whose required trigger/trailing flags do not exist yet", () => {
+    for (const orderType of ["LIT", "MIT", "TSLPAMT", "TSLPPCT", "TSMAMT", "TSMPCT"]) {
+      expect(() => parseArgv([
+        "order", "buy", "QQQ.US", "1", "--order-type", orderType, "--price", "5.00", "--yes", "--format", "json"
+      ])).toThrow(UsageError);
+    }
+    expect(() => parseArgv([
+      "order", "buy", "QQQ.US", "1", "--order-type", "MIT", "--yes", "--format", "json"
+    ])).toThrow(/尚未支持|--trigger-price/u);
+  });
+
+  it("rejects gtd until --expire-date exists", () => {
+    expect(() => parseArgv([
+      "order", "buy", "QQQ.US", "1", "--price", "5.00", "--tif", "gtd", "--yes", "--format", "json"
+    ])).toThrow(UsageError);
+    expect(() => parseArgv([
+      "order", "buy", "QQQ.US", "1", "--price", "5.00", "--tif", "GoodTilDate", "--yes", "--format", "json"
+    ])).toThrow(/expire-date/u);
+  });
+
+  it("still accepts gtc and the supported plain order types", () => {
+    for (const orderType of ["lo", "elo", "mo", "ao", "alo", "odd", "slo"]) {
+      const argv = ["order", "buy", "QQQ.US", "1", "--order-type", orderType, "--tif", "gtc", "--yes", "--format", "json"];
+      if (["lo", "elo", "alo", "odd", "slo"].includes(orderType)) {
+        argv.splice(4, 0, "--price", "5.00");
+      }
+      expect(parseArgv(argv).command).toMatchObject({ kind: "order-submit", timeInForce: "GoodTilCanceled" });
+    }
+  });
+
   it("rejects unknown order subcommands, commands and flags", () => {
     expect(() => parseArgv(["order", "cancel", "1", "--format", "json"])).toThrow(UsageError);
     expect(() => parseArgv(["frobnicate", "--format", "json"])).toThrow(UsageError);
