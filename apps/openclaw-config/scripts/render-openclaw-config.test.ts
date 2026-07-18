@@ -83,6 +83,11 @@ describe("buildNextConfig non-destructive merge", () => {
     expect(output.plugins.entries.feishu).toEqual({ enabled: true });
   });
 
+  it("enables the gateway chat-completions endpoint the three real backends depend on", () => {
+    const output = buildNextConfig({ existing: {}, env: {}, processEnv: {}, repoRoot: "/repo" });
+    expect(output.gateway.http.endpoints.chatCompletions).toEqual({ enabled: true });
+  });
+
   it("does NOT emit a feishu plugin entry when feishu creds are absent", () => {
     const output = buildNextConfig({ existing: {}, env: {}, processEnv: {}, repoRoot: "/repo" });
     expect(output.plugins.entries.feishu).toBeUndefined();

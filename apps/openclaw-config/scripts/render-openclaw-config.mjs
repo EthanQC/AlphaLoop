@@ -164,6 +164,15 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
       },
       controlUi: {
         enabled: true
+      },
+      // The OpenAI-compatible /v1/chat/completions endpoint is OFF by default
+      // (docs/gateway/openai-http-api.md "Enabling the endpoint"). The three
+      // real backends (_openclaw-gateway.mjs: narrative / news search /
+      // research) depend on it; loopback-only + token auth bounds the exposure.
+      http: {
+        endpoints: {
+          chatCompletions: { enabled: true }
+        }
       }
     },
     acp: {
