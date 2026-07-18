@@ -71,8 +71,12 @@
 // widens, or infers an owner/visibility scope from `question` or any other
 // untrusted input.
 
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+
 import { defuseMarkdownInText } from "./report-news.mjs";
 import { normalizeSymbol } from "./report-data.mjs";
+import { createGatewayClient, extractResultsArray, parseSmokeArgs, runSmoke } from "./_openclaw-gateway.mjs";
 
 // ---------------------------------------------------------------------------
 // Step names - single source of truth so onStep()'s `name` field and this
@@ -714,22 +718,61 @@ export async function runResearchPipeline({
 }
 
 // ---------------------------------------------------------------------------
-// P10 wiring point
+// P10 wiring: real research search backend (live OpenClaw gateway)
 // ---------------------------------------------------------------------------
 
-// Real backend implementation is OUT OF SCOPE for this task (明确不做:
-// "真实 OpenClaw 受限 agent 网关 + 真检索 + 搜索配额实测（P10）"). Mirrors
-// news-agent-search.mjs's createOpenclawSearchBackend exactly: callers
-// (Task 3's worker) can already wire in the SHAPE of the real backend today
-// while the function it returns simply throws until P10 stands up the real
-// restricted no-shell OpenClaw gateway and its search-quota measurement.
-// Every test in research-engine.test.ts instead injects a fake backend;
-// this placeholder is never exercised by a passing test path other than
-// asserting it throws.
-export function createResearchBackend() {
-  return async function researchBackend() {
-    throw new Error(
-      "research agent backend requires P10 ignition (restricted no-shell OpenClaw gateway + search quota measurement)"
-    );
+// Per-search-step latency budget (task brief: research steps ≤120s each).
+const RESEARCH_TIMEOUT_MS = 120000;
+
+// System instruction: ONE web-search turn per query, returning a JSON array in
+// exactly this engine's (simpler) result schema — {title, publisher, url,
+// summary_zh, publishedAt}, no impact/evidence_quote (validateResearchResultItem
+// above). Same anti-fabrication rules as the news search lane: honest empty
+// `[]`, never an invented url (a url-less item is hard-dropped downstream).
+const RESEARCH_SYSTEM = [
+  "你是站内研究助手的检索模块：针对给定查询做一次真实的网络检索，并把结果整理为 JSON 数组返回。",
+  "只返回一个 JSON 数组（不要 Markdown、不要代码块、不要任何解释文字）。数组每个元素形如：",
+  '{"title": "标题", "publisher": "来源媒体", "url": "真实文章链接", "summary_zh": "中文摘要", "publishedAt": "ISO8601 时间或 null"}',
+  "硬性规则：",
+  "1. url 必须是检索到的真实链接，严禁编造；summary_zh 必须是中文。",
+  "2. 若没有检索到任何可靠结果，返回空数组 []，不要编造条目。",
+  "3. 不要输出数组以外的任何字符。"
+].join("\n");
+
+function buildResearchPrompt({ query, kind }) {
+  return [`检索类别：${kind ?? "topic"}`, `查询：${query ?? ""}`, "请检索并按系统指定的 JSON 数组格式返回结果。"].join("\n");
+}
+
+// Real research backend, wired to the live gateway via the shared client.
+// Production wiring is apps/platform-app/src/index.ts → research/worker.ts
+// createDefaultResearchBackend, which dynamically imports this module and calls
+// `createResearchBackend()` (no args) per task — so a bare call must
+// self-resolve gateway URL/token from env/`~/.openclaw/openclaw.json`. Tests
+// inject `{ client }` so no network is touched. The gateway text is parsed to
+// a results array (extractResultsArray): a valid empty array is an honest "no
+// evidence" (never a throw), an unparseable reply throws — which
+// executeResearchQueries treats as a degrade (keeps partial results, marks the
+// run degraded). Items are schema-validated/defused by
+// validateResearchResultItem downstream; this backend never fabricates.
+export function createResearchBackend(options = {}) {
+  const client = options.client || createGatewayClient(options);
+  const timeoutMs = options.timeoutMs ?? RESEARCH_TIMEOUT_MS;
+  return async function researchBackend({ query, kind }) {
+    const text = await client.complete({ prompt: buildResearchPrompt({ query, kind }), system: RESEARCH_SYSTEM, timeoutMs });
+    return { results: extractResultsArray(text) };
   };
+}
+
+// ---------------------------------------------------------------------------
+// Smoke entrypoint: `node research-engine.mjs smoke [--query "..."] [--kind topic]`
+// One real gateway call — the controller runs this on the mini.
+// ---------------------------------------------------------------------------
+const isMainModule = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
+
+if (isMainModule && process.argv[2] === "smoke") {
+  const args = parseSmokeArgs(process.argv.slice(3));
+  const query = typeof args.query === "string" ? args.query : "AAPL.US 最新消息";
+  const kind = typeof args.kind === "string" ? args.kind : "topic";
+  const backend = createResearchBackend();
+  await runSmoke("research", () => backend({ query, kind }));
 }

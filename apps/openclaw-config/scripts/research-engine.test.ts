@@ -51,14 +51,65 @@ function baseArgs(overrides: Record<string, unknown> = {}) {
 }
 
 // ===========================================================================
-// createResearchBackend
+// createResearchBackend: real gateway wiring (injected fake client)
 // ===========================================================================
 
 describe("createResearchBackend", () => {
-  it("returns a backend-shaped function that throws the documented P10-ignition error when invoked", async () => {
-    const backend = researchEngine.createResearchBackend();
-    expect(typeof backend).toBe("function");
-    await expect(backend({ query: "test", kind: "news" })).rejects.toThrow(/P10 ignition/);
+  it("parses the gateway JSON array into the research backend result shape", async () => {
+    const item = {
+      title: "苹果发布财报",
+      publisher: "路透社",
+      url: "https://example.com/aapl",
+      summary_zh: "苹果季度营收超预期。",
+      publishedAt: "2026-07-10T10:00:00.000Z"
+    };
+    const complete = vi.fn(async () => JSON.stringify([item]));
+    const backend = researchEngine.createResearchBackend({ client: { complete } });
+
+    const out = await backend({ query: "AAPL.US 最新消息", kind: "symbol" });
+    expect(out.results).toEqual([item]);
+    expect(complete.mock.calls[0][0].timeoutMs).toBe(120000);
+    expect(complete.mock.calls[0][0].prompt).toContain("AAPL.US 最新消息");
+  });
+
+  it("honest empty: a gateway reply of [] returns an empty results array, never a throw", async () => {
+    const complete = vi.fn(async () => "[]");
+    const backend = researchEngine.createResearchBackend({ client: { complete } });
+    await expect(backend({ query: "无结果", kind: "topic" })).resolves.toEqual({ results: [] });
+  });
+
+  it("throws (degrade trigger) when the gateway reply has no JSON array — never fabricates results", async () => {
+    const complete = vi.fn(async () => "我无法访问网络检索。");
+    const backend = researchEngine.createResearchBackend({ client: { complete } });
+    await expect(backend({ query: "q", kind: "topic" })).rejects.toThrow(/openclaw gateway/);
+  });
+
+  it("integrates with runResearchPipeline end-to-end using the real factory over a fake client", async () => {
+    const complete = vi.fn(async () =>
+      JSON.stringify([{ url: "https://example.com/ok", summary_zh: "苹果相关中文新闻摘要。", title: "标题" }])
+    );
+    const backend = researchEngine.createResearchBackend({ client: { complete } });
+    const result = await researchEngine.runResearchPipeline(baseArgs({ backend }));
+    expect(result.status).toBe("done");
+    expect(result.resultJson.evidence.length).toBeGreaterThan(0);
+    expect(result.resultJson.evidence[0].url).toBe("https://example.com/ok");
+  });
+
+  it("a mid-search gateway throw degrades the pipeline while keeping partial evidence", async () => {
+    let call = 0;
+    const complete = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        return JSON.stringify([{ url: "https://example.com/ok", summary_zh: "已获取的中文证据。", title: "标题" }]);
+      }
+      throw new Error("openclaw gateway error: HTTP 503");
+    });
+    const backend = researchEngine.createResearchBackend({ client: { complete } });
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "AAPL.US 和 MSFT.US 最新消息", backend, quoteReader: quoteReaderFrom({ "AAPL.US": 210.5, "MSFT.US": 410.2 }) })
+    );
+    expect(result.status).toBe("degraded");
+    expect(result.resultJson.evidence).toHaveLength(1);
   });
 });
 

@@ -381,13 +381,57 @@ describe("runL3DeepDive", () => {
 });
 
 // ===========================================================================
-// createOpenclawSearchBackend
+// createOpenclawSearchBackend: real gateway wiring (injected fake client)
 // ===========================================================================
 
 describe("createOpenclawSearchBackend", () => {
-  it("returns a searchBackend-shaped function that throws the P10-ignition error when invoked", async () => {
-    const backend = agentSearch.createOpenclawSearchBackend();
-    expect(typeof backend).toBe("function");
-    await expect(backend({ query: "test", kind: "symbol" })).rejects.toThrow(/P10 ignition/);
+  it("parses the gateway JSON array into the searchBackend result shape", async () => {
+    const item = {
+      title: "苹果发布财报",
+      publisher: "路透社",
+      url: "https://example.com/aapl",
+      publishedAt: "2026-07-10T10:00:00.000Z",
+      summary_zh: "苹果季度营收超预期。",
+      impact: { direction: "bullish", affected: ["AAPL.US"], reason: "营收超预期" },
+      evidence_quote: "Apple beat expectations."
+    };
+    const complete = vi.fn(async () => JSON.stringify([item]));
+    const backend = agentSearch.createOpenclawSearchBackend({ client: { complete } });
+
+    const out = await backend({ query: "AAPL.US 最新消息", kind: "symbol" });
+    expect(out.results).toEqual([item]);
+    expect(complete.mock.calls[0][0].timeoutMs).toBe(120000);
+    expect(complete.mock.calls[0][0].prompt).toContain("AAPL.US 最新消息");
+  });
+
+  it("honest empty: a gateway reply of [] returns an empty results array, never a throw", async () => {
+    const complete = vi.fn(async () => "[]");
+    const backend = agentSearch.createOpenclawSearchBackend({ client: { complete } });
+    await expect(backend({ query: "无结果查询", kind: "symbol" })).resolves.toEqual({ results: [] });
+  });
+
+  it("tolerates a ```json fence and a { results: [...] } envelope", async () => {
+    const complete = vi.fn(async () => '```json\n{ "results": [ { "url": "https://x.example/1", "summary_zh": "中文摘要" } ] }\n```');
+    const backend = agentSearch.createOpenclawSearchBackend({ client: { complete } });
+    const out = await backend({ query: "q", kind: "macro" });
+    expect(out.results).toHaveLength(1);
+    expect(out.results[0].url).toBe("https://x.example/1");
+  });
+
+  it("throws (degrade trigger) when the gateway reply has no JSON array — never fabricates results", async () => {
+    const complete = vi.fn(async () => "抱歉，我现在无法完成检索。");
+    const backend = agentSearch.createOpenclawSearchBackend({ client: { complete } });
+    await expect(backend({ query: "q", kind: "symbol" })).rejects.toThrow(/openclaw gateway/);
+  });
+
+  it("integrates with runL2TopicSearch end-to-end using the real factory over a fake client", async () => {
+    const complete = vi.fn(async () =>
+      JSON.stringify([{ url: "https://example.com/ok", summary_zh: "中文摘要内容", title: "标题" }])
+    );
+    const searchBackend = agentSearch.createOpenclawSearchBackend({ client: { complete } });
+    const result = await agentSearch.runL2TopicSearch({ searchBackend, budget: 2, symbols: ["AAPL.US"], l1Titles: [] });
+    expect(result.degraded).toBe(false);
+    expect(result.results.length).toBeGreaterThan(0);
+    expect(result.results[0].url).toBe("https://example.com/ok");
   });
 });

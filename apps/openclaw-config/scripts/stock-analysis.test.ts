@@ -606,7 +606,7 @@ function narrativeFixtureRecord(symbol = "AAPL.US", generatedAt = GENERATED_AT) 
   return { symbol, analysis, news: stockNewsList() };
 }
 
-describe("attachNarrativeSections: default backend (P10-gated) keeps rendered output byte-equivalent except the header disclosure", () => {
+describe("attachNarrativeSections: a globally-degraded narrative run keeps rendered output byte-equivalent except the header disclosure", () => {
   it("globally degrades, discloses REPORT_DEGRADED_HEADER once per symbol, and leaves every section's bullets identical to the pre-P5 deterministic output", async () => {
     const { db } = makeDb();
     const label = GENERATED_AT.slice(0, 10);
@@ -624,10 +624,20 @@ describe("attachNarrativeSections: default backend (P10-gated) keeps rendered ou
     // input with a `.narrative` field) so `baseRecord`/`baselineMarkdown`
     // above stay an untouched "what pre-P5 would have rendered" reference.
     const narrativeRecord = narrativeFixtureRecord();
-    await stockAnalysis.attachNarrativeSections(db, label, [narrativeRecord]);
+    // Post-P10-ignition the DEFAULT narrative backend is the live OpenClaw
+    // gateway (createNarrativeLlmBackend → chat completions). To keep this
+    // rendering-invariant test deterministic regardless of ambient gateway
+    // config, inject a backend that throws exactly as the real gateway client
+    // does when the gateway is unreachable — a backend throw drives the SAME
+    // global-degrade path (REPORT_DEGRADED_HEADER + byte-equivalent fallback)
+    // this test actually asserts, independent of which backend produced it.
+    const unavailableBackend = async () => {
+      throw new Error("openclaw gateway unavailable: gateway not reachable");
+    };
+    await stockAnalysis.attachNarrativeSections(db, label, [narrativeRecord], { narrativeBackend: unavailableBackend });
 
     expect(narrativeRecord.narrative.degraded).toBe(true);
-    expect(narrativeRecord.narrative.degradedReason).toMatch(/P10 ignition/);
+    expect(narrativeRecord.narrative.degradedReason).toMatch(/openclaw gateway/);
     expect(narrativeRecord.narrative.degradedSections).toHaveLength(8);
 
     const withNarrativeMarkdown = stockAnalysis.renderBatchStockAnalysis({

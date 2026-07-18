@@ -28,7 +28,11 @@
 // defense (retry-then-degrade, before the report is ever assembled); Task 4's
 // gate is the fail-loud last line of defense at delivery time.
 
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+
 import { defuseMarkdownInText } from "./report-news.mjs";
+import { createGatewayClient, parseSmokeArgs, runSmoke } from "./_openclaw-gateway.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants (all documented, spec-fixed per the 2026-07-15 plan)
@@ -388,23 +392,83 @@ export async function generateNarrativeSections({ backend, symbol, facts, sectio
 }
 
 // ---------------------------------------------------------------------------
-// P10 wiring point
+// P10 wiring: real narrative LLM backend (live OpenClaw gateway)
 // ---------------------------------------------------------------------------
 
-// Real narrative LLM/agent backend is OUT OF SCOPE for this task (see the
-// plan's "明确不做": "LLM 真后端与叙事真跑（P10）"). Mirrors
-// news-agent-search.mjs's createOpenclawSearchBackend exactly: this factory
-// lets callers (stock-analysis.mjs's runAnalysis) already wire in the SHAPE
-// of the real backend today - `createNarrativeLlmBackend()` returns a
-// function matching the `backend` interface generateNarrativeSections
-// accepts - while the function it returns simply throws until P10 stands up
-// a real headless LLM/agent runtime. Every test in narrative-engine.test.ts
-// instead injects a fake backend; this placeholder is never exercised by a
-// passing test path other than asserting it throws (and asserting
-// stock-analysis.mjs's DEFAULT wiring correctly degrades because of it -
-// "今天必然降级路径" per the plan).
-export function createNarrativeLlmBackend() {
-  return async function narrativeLlmBackend() {
-    throw new Error("narrative LLM backend requires P10 ignition (headless LLM/agent runtime unverified)");
+// Per-section narrative latency budget (task brief: narrative ≤60s).
+const NARRATIVE_TIMEOUT_MS = 60000;
+
+// System instruction: this lane REWRITES our own deterministic section text
+// into fluent Chinese prose. The two hard rules mirror this module's own
+// validateBackendOutput gates so a compliant model passes on the first try:
+//   ①中文输出（CJK 占比 gate）②不得引入 factsDigest 之外的任何数字（numeric
+//   pre-check gate）. The model is told the exact reasons its output would be
+//   rejected so the retryReason self-correction hook is actionable.
+const NARRATIVE_SYSTEM = [
+  "你是严谨的中文投研写作助手，负责把给定的“确定性文本”改写为流畅、专业的中文叙事段落。",
+  "硬性规则：",
+  "1. 只能使用中文书写（可保留股票代码等专有名词），不得整段使用英文。",
+  "2. 只能引用“事实摘要（factsDigest）”中已经给出的数字；严禁编造、推算或引入任何其它数字（包括价格、涨跌幅、市值、估值等）。若某数字不在事实摘要中，就不要写出具体数值。",
+  "3. 不要输出 Markdown 链接、代码块或任何解释性前后缀，只返回改写后的叙事正文本身。",
+  "4. 忠于确定性文本的事实与结论，只做语言润色与组织，不得改变判断方向。"
+].join("\n");
+
+function buildNarrativePrompt({ symbol, sectionKey, factsDigest, deterministicText, retryReason }) {
+  const lines = [
+    `标的：${symbol ?? "未知"}`,
+    `段落：${sectionKey ?? "未知"}`,
+    `事实摘要（唯一允许引用的数字来源）：${factsDigest || "（无）"}`,
+    "",
+    "确定性文本（请据此改写为自然中文叙事）：",
+    String(deterministicText ?? "")
+  ];
+  if (retryReason) {
+    lines.push(
+      "",
+      `上一次输出被拒绝，原因：${retryReason}。请针对该原因修正后重写（务必满足中文与“仅用事实摘要中的数字”两条规则）。`
+    );
+  }
+  return lines.join("\n");
+}
+
+// Real narrative backend, wired to the live gateway via the shared client.
+// Production wiring (stock-analysis.mjs's runAnalysis default) calls this with
+// no args, so a bare `createNarrativeLlmBackend()` self-resolves gateway
+// URL/token from env/`~/.openclaw/openclaw.json`. Tests inject `{ client }`
+// (a fake) so no network is touched. Returning the raw gateway text is safe:
+// generateNarrativeSections runs it through validateBackendOutput (CJK ratio +
+// defuse + numeric pre-check) and retries/degrades honestly — this backend
+// never fabricates. A transport/timeout/empty-completion failure throws (via
+// the shared client), which generateNarrativeSections treats as a GLOBAL
+// degrade to the pure fact-table report.
+export function createNarrativeLlmBackend(options = {}) {
+  const client = options.client || createGatewayClient(options);
+  const timeoutMs = options.timeoutMs ?? NARRATIVE_TIMEOUT_MS;
+  return async function narrativeLlmBackend({ symbol, sectionKey, factsDigest, deterministicText, retryReason }) {
+    const prompt = buildNarrativePrompt({ symbol, sectionKey, factsDigest, deterministicText, retryReason });
+    const text = await client.complete({ prompt, system: NARRATIVE_SYSTEM, timeoutMs });
+    return { text };
   };
+}
+
+// ---------------------------------------------------------------------------
+// Smoke entrypoint: `node narrative-engine.mjs smoke [--symbol AAPL.US] [--section basic]`
+// One real gateway call — the controller runs this on the mini.
+// ---------------------------------------------------------------------------
+const isMainModule = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
+
+if (isMainModule && process.argv[2] === "smoke") {
+  const args = parseSmokeArgs(process.argv.slice(3));
+  const symbol = typeof args.symbol === "string" ? args.symbol : "AAPL.US";
+  const sectionKey = typeof args.section === "string" ? args.section : "basic";
+  const backend = createNarrativeLlmBackend();
+  await runSmoke("narrative", () =>
+    backend({
+      symbol,
+      sectionKey,
+      factsDigest: "quote.last=210.5USD; quote.pct=1.2pct",
+      deterministicText: `${symbol} 最新价 210.5 美元，日内涨幅 1.2%，整体表现稳健。`,
+      retryReason: null
+    })
+  );
 }

@@ -25,15 +25,58 @@ function section(key: string, deterministicText = `${key} 的确定性文本。`
 }
 
 // ===========================================================================
-// createNarrativeLlmBackend: documented P10 wiring point
+// createNarrativeLlmBackend: real gateway wiring (injected fake client)
 // ===========================================================================
 
 describe("createNarrativeLlmBackend", () => {
-  it("returns a function that always throws the documented P10-gate message", async () => {
-    const backend = narrativeEngine.createNarrativeLlmBackend();
-    await expect(backend({ symbol: "AAPL.US", sectionKey: "basic", factsDigest: "", deterministicText: "" })).rejects.toThrow(
-      "narrative LLM backend requires P10 ignition (headless LLM/agent runtime unverified)"
-    );
+  it("returns the gateway completion as { text } and forwards a facts-anchored prompt", async () => {
+    const complete = vi.fn(async () => "最新价约为 210.5 美元，整体表现稳健。");
+    const backend = narrativeEngine.createNarrativeLlmBackend({ client: { complete } });
+
+    const out = await backend({
+      symbol: "AAPL.US",
+      sectionKey: "basic",
+      factsDigest: "quote.last=210.5USD",
+      deterministicText: "AAPL.US 最新价 210.5 美元。",
+      retryReason: null
+    });
+
+    expect(out).toEqual({ text: "最新价约为 210.5 美元，整体表现稳健。" });
+    expect(complete).toHaveBeenCalledTimes(1);
+    const callArg = complete.mock.calls[0][0];
+    // The facts digest and section are passed as prompt context; the numeric
+    // rule is stated in the system message so a compliant model passes the
+    // engine's numeric pre-check.
+    expect(callArg.prompt).toContain("quote.last=210.5USD");
+    expect(callArg.prompt).toContain("basic");
+    expect(callArg.system).toContain("只能引用");
+    expect(callArg.timeoutMs).toBe(60000);
+  });
+
+  it("propagates a gateway throw so generateNarrativeSections degrades globally", async () => {
+    const complete = vi.fn(async () => {
+      throw new Error("openclaw gateway error: request timed out after 60000ms");
+    });
+    const backend = narrativeEngine.createNarrativeLlmBackend({ client: { complete } });
+
+    await expect(
+      backend({ symbol: "AAPL.US", sectionKey: "basic", factsDigest: "", deterministicText: "" })
+    ).rejects.toThrow(/openclaw gateway/);
+  });
+
+  it("passes a prior failure reason back to the model on retry (self-correction hook)", async () => {
+    const complete = vi.fn(async () => "改写后的中文叙事，仅使用事实数字。");
+    const backend = narrativeEngine.createNarrativeLlmBackend({ client: { complete } });
+
+    await backend({
+      symbol: "AAPL.US",
+      sectionKey: "basic",
+      factsDigest: "quote.last=210.5USD",
+      deterministicText: "AAPL.US 稳健。",
+      retryReason: "数字比对未通过：叙事包含数字 999.99"
+    });
+
+    expect(complete.mock.calls[0][0].prompt).toContain("999.99");
   });
 });
 
