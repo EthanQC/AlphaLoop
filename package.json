@@ -42,6 +42,7 @@
     "reviews:generate": "node apps/openclaw-config/scripts/reviews.mjs generate-all",
     "openclaw:cron:install": "node apps/openclaw-config/scripts/install-openclaw-cron.mjs",
     "openclaw:runtime:doctor": "node apps/openclaw-config/scripts/openclaw-runtime-doctor.mjs",
+    "tunnel:install": "node apps/openclaw-config/scripts/install-cloudflared-tunnel.mjs",
     "launchd:install-system": "bash apps/openclaw-config/scripts/install-system-daemons.sh",
     "launchd:install-user": "node apps/openclaw-config/scripts/install-user-schedules.mjs",
     "launchd:install-backup-alerts": "zsh apps/openclaw-config/scripts/install-launchd.sh",

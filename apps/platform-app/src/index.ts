@@ -7,6 +7,7 @@ import {
 
 import { createFeishuReviewNotifier } from "./data/feishu-review-notifier.js";
 import { listFilterSymbols } from "./data/news.js";
+import { getAccessJwtMode, primeAccessJwtCache } from "./identity.js";
 import {
   createDefaultMemoryReader,
   createDefaultQuoteReader,
@@ -64,8 +65,23 @@ const feishuNotifier = createFeishuReviewNotifier({ db });
 
 const server = createPlatformServer({ db, repoRoot, researchWorker, feishuNotifier });
 
+// P10: resolve the Cloudflare Access JWT mode once at startup so it shows in
+// the boot log, and so a half-configured CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD
+// pair warns (and fails closed) immediately rather than on the first
+// request. Env comes from the loadLocalEnv call above; identity.ts re-reads
+// process.env per request, so no further plumbing is needed here.
+//   - "loopback-trust": pre-P10 behavior, email header trusted (local only).
+//   - "enforce": Cf-Access-Jwt-Assertion fully verified against the team's
+//     JWKS before the email header is trusted.
+//   - "misconfigured": exactly one of the two env vars set - all email
+//     header logins are rejected until fixed (see identity.ts's warning).
+// In enforce mode the JWKS cache is pre-warmed (awaited, never throws) so
+// the first tunneled request does not eat the cold-start fail-closed miss.
+const accessJwtMode = getAccessJwtMode();
+await primeAccessJwtCache();
+
 // Loopback only — this service is never exposed beyond localhost directly;
 // external access is expected to go through a Cloudflare Access tunnel (P10).
 server.listen(port, "127.0.0.1", () => {
-  console.log(`platform-app listening on http://127.0.0.1:${port}`);
+  console.log(`platform-app listening on http://127.0.0.1:${port} (access-jwt: ${accessJwtMode})`);
 });

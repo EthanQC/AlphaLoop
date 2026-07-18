@@ -3,6 +3,14 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { ApiTokenRepository, MemberRepository, type Member } from "@packages/shared-types";
 
+import {
+  JwksCache,
+  defaultJwksFetcher,
+  normalizeTeamDomain,
+  verifyAccessToken,
+  type JwksFetcher
+} from "./access-jwt.js";
+
 /**
  * The minimal shape resolveIdentity needs from an incoming request. A real
  * `http.IncomingMessage` satisfies this structurally, and tests can pass a
@@ -32,9 +40,12 @@ const LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
  *      `members.status = 'active'` (owning member still active) in one
  *      query - see database.ts.
  *   2. Else `Cf-Access-Authenticated-User-Email` -> MemberRepository
- *      .getByEmail. Unlike the token path, getByEmail does NOT filter by
- *      status (it's a plain lookup used elsewhere for that reason), so this
- *      function enforces `status === 'active'` itself here.
+ *      .getByEmail. The header is only trusted after verifyAccessJwt passes
+ *      (a no-op in loopback-trust mode, full `Cf-Access-Jwt-Assertion`
+ *      verification once CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD are set - see
+ *      the Access JWT section below). Unlike the token path, getByEmail does
+ *      NOT filter by status (it's a plain lookup used elsewhere for that
+ *      reason), so this function enforces `status === 'active'` itself here.
  *   3. Else -> null (caller renders renderUnauthorizedPage).
  *
  * Bearer is checked first and wins if both are present - see the plan's
@@ -111,6 +122,15 @@ function resolveViaAccessEmailHeader(req: IdentityRequest, db: DatabaseSync): Me
     return null;
   }
 
+  // P10: the email header alone is spoofable by anything that can reach this
+  // port directly - before trusting it at all, require cryptographic proof
+  // it was set by Cloudflare Access (see verifyAccessJwt below). In
+  // loopback-trust mode (no CF_ACCESS_* env configured) this is a
+  // documented pass-through, preserving pre-P10 local behavior.
+  if (!verifyAccessJwt(req)) {
+    return null;
+  }
+
   const member = new MemberRepository(db).getByEmail(email);
   if (!member || member.status !== "active") {
     return null;
@@ -119,24 +139,198 @@ function resolveViaAccessEmailHeader(req: IdentityRequest, db: DatabaseSync): Me
   return member;
 }
 
+// ---------------------------------------------------------------------------
+// Cloudflare Access JWT verification (P10)
+// ---------------------------------------------------------------------------
+//
+// The cryptographic machinery (compact-JWT parsing, RS256/ES256 signature
+// checks, the JWKS cache with synchronous reads + background refresh) lives
+// in access-jwt.ts; this section owns the ENV-DRIVEN POLICY around it - the
+// three modes, the warn-once misconfiguration guard, and the binding of the
+// token's email claim to the plain-text email header the rest of the
+// identity chain resolves against.
+//
+// Configuration (both read from process.env on every call, so index.ts's
+// loadLocalEnv is the only plumbing needed):
+//   - CF_ACCESS_TEAM_DOMAIN: the Zero Trust team name, e.g. "myteam" (a full
+//     "myteam.cloudflareaccess.com" / "https://..." form is normalized).
+//     JWKS: https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+//   - CF_ACCESS_AUD: the Access application's audience (AUD) tag.
+//
+// Modes (getAccessJwtMode):
+//   - BOTH unset -> "loopback-trust": verifyAccessJwt returns true, exactly
+//     the pre-P10 behavior. platform-app binds 127.0.0.1 only, so the email
+//     header is reachable only by local processes; this mode is what keeps
+//     local dev working before the Cloudflare side exists.
+//   - BOTH set -> "enforce": the `Cf-Access-Jwt-Assertion` JWT is fully
+//     verified (signature against the team JWKS, iss, aud, exp/nbf/iat with
+//     clock skew - see access-jwt.ts) and its email claim must match the
+//     `Cf-Access-Authenticated-User-Email` header case-insensitively. Any
+//     failure -> false and the request is treated as unauthenticated.
+//   - Exactly ONE set (or a team domain that normalizes to nothing) ->
+//     "misconfigured": fail closed (every header-path request is rejected)
+//     and warn once via console.error. A half-typed config must never
+//     silently fall back to trusting forgeable headers.
+//
+// SYNCHRONY / COLD START: resolveIdentity is synchronous and is called
+// synchronously from every route handler, so verification never awaits. The
+// JWKS cache serves keys synchronously and refreshes in the background; an
+// unknown kid or a stale cache fails CLOSED for the current request and
+// schedules a refetch so the next request succeeds. index.ts calls
+// primeAccessJwtCache() at startup so the very first tunneled request does
+// not eat that one-time cold miss. A JWKS fetch failure keeps the previous
+// key set and logs - it never fails open and never throws into a request.
+
+export type AccessJwtMode = "loopback-trust" | "enforce" | "misconfigured";
+
+interface AccessJwtConfig {
+  mode: AccessJwtMode;
+  /** Present only in "enforce" mode. */
+  issuer?: string;
+  certsUrl?: string;
+  aud?: string;
+}
+
+const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+let accessJwksFetcher: JwksFetcher = defaultJwksFetcher;
+let accessJwksCache: JwksCache | null = null;
+let accessJwksCacheCertsUrl: string | null = null;
+let warnedAccessJwtMisconfigured = false;
+
 /**
- * P10 prerequisite (explicit TODO): Cloudflare Access puts
- * `Cf-Access-Authenticated-User-Email` on every request that reaches this
- * service through the Access tunnel, but ANYTHING reaching platform-app
- * directly (e.g. another local process) can forge that header today - there
- * is no cryptographic proof it came from Access. The real fix is verifying
- * the `Cf-Access-Jwt-Assertion` header against Access's JWKS for AlphaLoop's
- * actual Cloudflare team domain, which does not exist in this local dev
- * environment (P10: "cloudflared/Access 真环境与 JWT 校验"). Until P10 lands,
- * this is a documented no-op - platform-app stays loopback-only
- * (127.0.0.1:4314, never 0.0.0.0) specifically because this check does not
- * yet do anything.
- *
- * TODO(P10): implement real JWT verification here and call it from
- * resolveViaAccessEmailHeader before trusting the email header at all.
+ * Test seam: replace (or, with no argument, restore) the JWKS fetcher. Also
+ * drops the current cache so the next verification uses the new fetcher.
  */
-export function verifyAccessJwt(_req: IdentityRequest): boolean {
-  return true;
+export function __setAccessJwksFetcherForTests(fetcher?: JwksFetcher): void {
+  accessJwksFetcher = fetcher ?? defaultJwksFetcher;
+  accessJwksCache = null;
+  accessJwksCacheCertsUrl = null;
+}
+
+/** Test seam: clear the JWKS cache and the warn-once misconfiguration flag. */
+export function __resetAccessJwtStateForTests(): void {
+  accessJwksCache = null;
+  accessJwksCacheCertsUrl = null;
+  warnedAccessJwtMisconfigured = false;
+}
+
+/**
+ * Resolves the current Access JWT mode from process.env - see the section
+ * comment above for the three modes. index.ts calls this once at startup so
+ * the mode is visible in the boot log and a half-configured deployment warns
+ * immediately (not on first request).
+ */
+export function getAccessJwtMode(): AccessJwtMode {
+  return resolveAccessJwtConfig().mode;
+}
+
+/**
+ * Pre-warms the JWKS cache (one awaited background refresh) so the first
+ * request after process start does not hit the documented cold-start miss.
+ * No-op outside "enforce" mode. Never throws (a failed fetch just leaves the
+ * cache empty - requests fail closed until a later refresh succeeds).
+ */
+export async function primeAccessJwtCache(): Promise<void> {
+  const config = resolveAccessJwtConfig();
+  if (config.mode !== "enforce") {
+    return;
+  }
+  await getAccessJwksCache(config.certsUrl as string).scheduleRefresh();
+}
+
+function resolveAccessJwtConfig(): AccessJwtConfig {
+  const teamRaw = process.env.CF_ACCESS_TEAM_DOMAIN?.trim() ?? "";
+  const aud = process.env.CF_ACCESS_AUD?.trim() ?? "";
+
+  if (!teamRaw && !aud) {
+    return { mode: "loopback-trust" };
+  }
+
+  const team = teamRaw ? normalizeTeamDomain(teamRaw) : null;
+  if (!team || !aud) {
+    warnAccessJwtMisconfiguredOnce();
+    return { mode: "misconfigured" };
+  }
+
+  return { mode: "enforce", issuer: team.issuer, certsUrl: team.certsUrl, aud };
+}
+
+function warnAccessJwtMisconfiguredOnce(): void {
+  if (warnedAccessJwtMisconfigured) {
+    return;
+  }
+  warnedAccessJwtMisconfigured = true;
+  console.error(
+    "[identity] Cloudflare Access JWT verification is MISCONFIGURED: CF_ACCESS_TEAM_DOMAIN / " +
+      "CF_ACCESS_AUD must be BOTH set (enforce) or BOTH unset (loopback-trust); exactly one " +
+      "is set, or the team domain is unusable. Failing closed: all " +
+      "Cf-Access-Authenticated-User-Email logins will be rejected until fixed."
+  );
+}
+
+function getAccessJwksCache(certsUrl: string): JwksCache {
+  if (!accessJwksCache || accessJwksCacheCertsUrl !== certsUrl) {
+    accessJwksCache = new JwksCache({
+      certsUrl,
+      // Indirection on purpose: the seam swaps `accessJwksFetcher`, and the
+      // cache instance must always see the CURRENT fetcher.
+      fetcher: (url) => accessJwksFetcher(url),
+      ttlMs: ACCESS_JWKS_CACHE_TTL_MS,
+      now: Date.now,
+      onError: (error) => {
+        console.error(
+          `[identity] Access JWKS refresh failed (failing closed): ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    });
+    accessJwksCacheCertsUrl = certsUrl;
+  }
+  return accessJwksCache;
+}
+
+/**
+ * Verifies the `Cf-Access-Jwt-Assertion` header per the mode table in the
+ * section comment above. Returns false (request treated as unauthenticated)
+ * on ANY failure - missing/malformed token, bad signature, unknown kid (this
+ * request; a background refetch is scheduled), expired, wrong aud/iss, or an
+ * email-claim mismatch with the `Cf-Access-Authenticated-User-Email` header.
+ * Never throws.
+ */
+export function verifyAccessJwt(req: IdentityRequest): boolean {
+  const config = resolveAccessJwtConfig();
+  if (config.mode === "loopback-trust") {
+    return true;
+  }
+  if (config.mode === "misconfigured") {
+    return false;
+  }
+
+  const token = firstHeaderValue(req.headers["cf-access-jwt-assertion"])?.trim();
+  if (!token) {
+    return false;
+  }
+
+  const identity = verifyAccessToken(token, {
+    jwksCache: getAccessJwksCache(config.certsUrl as string),
+    issuer: config.issuer as string,
+    audience: config.aud as string,
+    now: Date.now
+  });
+  if (!identity) {
+    return false;
+  }
+
+  // The token's own email claim must match the plain-text header the rest of
+  // the identity chain resolves against - otherwise a valid JWT for member A
+  // could be replayed alongside a forged header naming member B.
+  const headerEmail = firstHeaderValue(req.headers["cf-access-authenticated-user-email"])?.trim();
+  if (!headerEmail) {
+    return false;
+  }
+  return identity.email.trim().toLowerCase() === headerEmail.toLowerCase();
 }
 
 function escapeHtml(value: string): string {
