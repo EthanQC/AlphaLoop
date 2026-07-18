@@ -43,9 +43,10 @@
  * api-research.ts's submit endpoint, this one reads no body fields at all -
  * the id comes from the URL, and there is nothing else to confirm.
  *
- * POST-CONFIRM SIDE EFFECTS (memoryd mirror + Feishu single-chat, both
- * fire-and-forget, both P10-gated placeholders that degrade gracefully) -
- * this is the TS port, for the platform's own HTTP surface, of
+ * POST-CONFIRM SIDE EFFECTS (memoryd mirror - still a P10-gated placeholder
+ * by default - + the REAL Feishu single-chat confirm card via
+ * data/feishu-review-notifier.ts, both fire-and-forget, both degrading
+ * gracefully) - this is the TS port, for the platform's own HTTP surface, of
  * apps/openclaw-config/scripts/reviews.mjs's `runConfirm` CLI flow: confirm's
  * SQL status change has already committed by the time either side effect is
  * attempted, so neither one's failure can ever undo or fail the confirm
@@ -58,6 +59,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { MonthlyReviewRepository, methodNotAllowed, sendJson, type Member } from "@packages/shared-types";
 
 import { guardAsyncWrite } from "./async-guard.js";
+import {
+  composeReviewConfirmCardLines,
+  createFeishuReviewNotifier,
+  type FeishuReviewNotifier,
+  type FeishuReviewNotifyResult
+} from "../data/feishu-review-notifier.js";
 import { createMemorydBackend, mirrorRecord, type MemorydBackend } from "../data/memoryd-mirror.js";
 import {
   loadReviewById,
@@ -84,33 +91,16 @@ import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
 // ---------------------------------------------------------------------------
-// Feishu single-chat confirm notifier (TS port of reviews.mjs's
-// createFeishuReviewNotifier/notifyFeishuReviewConfirmed - see module
-// header). P10-gated: the function this factory returns always throws until
-// a real delivery channel exists; every caller here treats that (and any
-// other failure) as a fire-and-forget degrade, never a failure of confirm
-// itself.
+// Feishu single-chat confirm notifier - REAL since the P10 wiring: the
+// factory/composer live in data/feishu-review-notifier.ts (re-exported here
+// so server.ts's existing `type FeishuReviewNotifier` import keeps working),
+// delivering over the exact sendInteractiveCard channel the market-alert
+// cards already use. Every caller here still treats any failure (a member
+// with no feishu_open_id, a transport error) as a fire-and-forget degrade,
+// never a failure of confirm itself.
 // ---------------------------------------------------------------------------
 
-export interface FeishuReviewNotifyResult {
-  ok: boolean;
-  messageId?: string;
-  reason?: string;
-}
-
-export type FeishuReviewNotifier = (args: {
-  ownerId: string;
-  title: string;
-  lines: string[];
-}) => Promise<FeishuReviewNotifyResult>;
-
-/** Mirrors reviews.mjs's createFeishuReviewNotifier exactly - see that
- * file's own header for the full P10 rationale. */
-export function createFeishuReviewNotifier(): FeishuReviewNotifier {
-  return async function feishuReviewNotifier(): Promise<FeishuReviewNotifyResult> {
-    throw new Error("飞书单聊复盘通知需要 P10 点火（真实单聊投递通道尚未接入）。");
-  };
-}
+export { createFeishuReviewNotifier, type FeishuReviewNotifier, type FeishuReviewNotifyResult };
 
 async function notifyFeishuReviewConfirmed(
   notifier: FeishuReviewNotifier,
@@ -121,11 +111,12 @@ async function notifyFeishuReviewConfirmed(
     const result = await notifier({
       ownerId,
       title: `${review.period} 月度复盘已确认`,
-      lines: [
-        `复盘周期：${review.period}`,
-        `确认时间：${review.confirmedAt ?? ""}`,
-        "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。"
-      ]
+      lines: composeReviewConfirmCardLines({
+        id: review.id,
+        period: review.period,
+        confirmedAt: review.confirmedAt ?? null,
+        result: review.result
+      })
     });
     if (result.ok) {
       return { delivered: true, messageId: result.messageId ?? null };
@@ -151,8 +142,10 @@ export interface ReviewRouteDeps {
   /** Injectable memoryd mirror backend; defaults to createMemorydBackend()'s
    * P10-gated placeholder (fire-and-forget degrade) when omitted. */
   memorydBackend?: MemorydBackend;
-  /** Injectable Feishu confirm notifier; defaults to
-   * createFeishuReviewNotifier()'s P10-gated placeholder when omitted. */
+  /** Injectable Feishu confirm notifier; defaults to the REAL
+   * createFeishuReviewNotifier({db}) (data/feishu-review-notifier.ts -
+   * members.feishu_open_id lookup + sendInteractiveCard) when omitted.
+   * Tests inject a fake to stay hermetic. */
   feishuNotifier?: FeishuReviewNotifier;
 }
 
@@ -636,7 +629,7 @@ async function handleConfirm(
     visibility: "private"
   });
 
-  const feishuNotifier = deps.feishuNotifier ?? createFeishuReviewNotifier();
+  const feishuNotifier = deps.feishuNotifier ?? createFeishuReviewNotifier({ db: deps.db });
   const notify = await notifyFeishuReviewConfirmed(feishuNotifier, identity.id, typed);
 
   if (isFormUrlEncoded(req)) {

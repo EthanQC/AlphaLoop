@@ -5,6 +5,7 @@ import {
   resolveRuntimePaths
 } from "@packages/shared-types";
 
+import { createFeishuReviewNotifier } from "./data/feishu-review-notifier.js";
 import { listFilterSymbols } from "./data/news.js";
 import {
   createDefaultMemoryReader,
@@ -53,7 +54,15 @@ const researchWorker = createResearchWorker({
 });
 researchWorker.start();
 
-const server = createPlatformServer({ db, repoRoot, researchWorker });
+// Real Feishu confirm notifier (data/feishu-review-notifier.ts): looks up
+// the review owner's members.feishu_open_id and sends the 月度复盘确认摘要 card
+// over the same sendInteractiveCard channel the market alerts already use.
+// Credentials (FEISHU_APP_ID/FEISHU_APP_SECRET) come from the loadLocalEnv
+// call above; a member with no open_id on file degrades to
+// {delivered:false, reason} without ever failing the confirm.
+const feishuNotifier = createFeishuReviewNotifier({ db });
+
+const server = createPlatformServer({ db, repoRoot, researchWorker, feishuNotifier });
 
 // Loopback only — this service is never exposed beyond localhost directly;
 // external access is expected to go through a Cloudflare Access tunnel (P10).

@@ -61,7 +61,12 @@ afterEach(() => {
   }
 });
 
-function seedMember(db: DatabaseSync, id: string, status: "active" | "revoked" = "active"): void {
+function seedMember(
+  db: DatabaseSync,
+  id: string,
+  status: "active" | "revoked" = "active",
+  feishuOpenId?: string
+): void {
   new MemberRepository(db).upsert({
     id,
     email: `${id}@example.com`,
@@ -70,7 +75,8 @@ function seedMember(db: DatabaseSync, id: string, status: "active" | "revoked" =
     stockTags: [],
     showPerformance: true,
     status,
-    createdAt: "2026-01-01T00:00:00.000Z"
+    createdAt: "2026-01-01T00:00:00.000Z",
+    ...(feishuOpenId ? { feishuOpenId } : {})
   });
 }
 
@@ -382,9 +388,9 @@ describe("confirm", () => {
     expect(result.notify.reason).toMatch(/feishu unreachable/);
   });
 
-  it("the PRODUCTION default (no memorydBackend/feishuNotifier injected) degrades gracefully too - both are P10-gated placeholders", async () => {
+  it("the PRODUCTION default (no memorydBackend/feishuNotifier injected) degrades gracefully too - memoryd is still a P10 placeholder; the REAL feishu notifier degrades honestly for a member with no feishu_open_id", async () => {
     const { db, options } = makeDb();
-    seedMember(db, OWNER_A);
+    seedMember(db, OWNER_A); // deliberately NO feishu_open_id
     const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
 
     const result = await cli.runConfirm({ owner: OWNER_A, review: generated.review.id }, options);
@@ -393,6 +399,32 @@ describe("confirm", () => {
     expect(result.review.status).toBe("confirmed");
     expect(result.mirror.mirrored).toBe(false);
     expect(result.notify.delivered).toBe(false);
+    // Pins that the default is the REAL db-backed notifier
+    // (feishu-review-notifier.mjs), not the old throwing placeholder: the
+    // degrade reason names the missing feishu_open_id.
+    expect(result.notify.reason).toContain("feishu_open_id");
+  });
+
+  it("the confirm card carries the 月度复盘确认摘要 body: headline-metric lines + the /review/<id> link line", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+    const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_1" }));
+
+    await cli.runConfirm(
+      { owner: OWNER_A, review: generated.review.id },
+      { ...options, memorydBackend: fakeMemorydBackend().backend, feishuNotifier }
+    );
+
+    const notifierArgs = feishuNotifier.mock.calls[0]?.[0] as unknown as { title: string; lines: string[] };
+    expect(notifierArgs.title).toBe(`${PERIOD} 月度复盘已确认`);
+    expect(notifierArgs.lines[0]).toBe(`复盘周期：${PERIOD}`);
+    // A fresh empty-data fixture: every metric degrades honestly rather than
+    // fabricating a number (composeReviewConfirmCardLines' own suite covers
+    // the populated variants line by line).
+    expect(notifierArgs.lines).toContain("本人论点命中率：样本不足");
+    expect(notifierArgs.lines).toContain(`复盘详情：/review/${generated.review.id}（平台站内路径）`);
+    expect(notifierArgs.lines.join("\n")).not.toContain("NaN");
   });
 
   it("is idempotent: confirming an already-confirmed review a second time does not throw and stays confirmed", async () => {
@@ -410,6 +442,110 @@ describe("confirm", () => {
   it("rejects an unknown review id", async () => {
     const { options } = makeDb();
     await expect(cli.runConfirm({ owner: OWNER_A, review: "monthly_review_ghost" }, options)).rejects.toThrow(/not found/);
+  });
+});
+
+// ===========================================================================
+// notify-test (operator smoke command for the confirm card channel)
+// ===========================================================================
+
+describe("notify-test", () => {
+  it("dry-run (the default) composes the owner's latest review card and reports the open_id resolution - WITHOUT sending", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+    const feishuNotifier = vi.fn(async () => ({ ok: true }));
+
+    const result = await cli.runNotifyTest({ owner: OWNER_A }, { ...options, feishuNotifier });
+
+    expect(result.ok).toBe(true);
+    expect(result.mode).toBe("dry-run");
+    expect(result.reviewId).toBe(generated.review.id);
+    expect(result.feishuOpenId).toBeNull();
+    expect(result.card.title).toBe(`${PERIOD} 月度复盘已确认`);
+    expect(result.card.lines).toContain(`复盘详情：/review/${generated.review.id}（平台站内路径）`);
+    expect(feishuNotifier).not.toHaveBeenCalled(); // dry-run NEVER sends
+    expect(auditRows(db, "notify-test")).toHaveLength(0); // and never audits
+  });
+
+  it("dry-run without any review row falls back to a clearly-labeled channel-test card", async () => {
+    const { options, db } = makeDb();
+    seedMember(db, OWNER_A, "active", "ou_open_id_a");
+
+    const result = await cli.runNotifyTest({ owner: OWNER_A, "dry-run": true }, options);
+
+    expect(result.ok).toBe(true);
+    expect(result.reviewId).toBeNull();
+    expect(result.feishuOpenId).toBe("ou_open_id_a");
+    expect(result.card.title).toBe("飞书复盘通知通道测试");
+  });
+
+  it("--send delivers through the injected notifier and writes a notify-test audit row", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+    const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_smoke_1" }));
+
+    const result = await cli.runNotifyTest({ owner: OWNER_A, send: true }, { ...options, feishuNotifier });
+
+    expect(result).toMatchObject({ ok: true, mode: "send", delivered: true, messageId: "om_smoke_1" });
+    expect(feishuNotifier).toHaveBeenCalledTimes(1);
+    const notifierArgs = feishuNotifier.mock.calls[0]?.[0] as unknown as { ownerId: string; title: string };
+    expect(notifierArgs.ownerId).toBe(OWNER_A);
+    expect(notifierArgs.title).toBe(`${PERIOD} 月度复盘已确认`);
+
+    const rows = auditRows(db, "notify-test");
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].payload)).toMatchObject({ ownerId: OWNER_A, reviewId: generated.review.id, delivered: true });
+  });
+
+  it("--send with the REAL default notifier and no feishu_open_id exits non-ok with the reason - a failed smoke send must be visible", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A); // no open_id -> real notifier degrades
+
+    const result = await cli.runNotifyTest({ owner: OWNER_A, send: true }, options);
+
+    expect(result.ok).toBe(false);
+    expect(result.delivered).toBe(false);
+    expect(result.error).toContain("feishu_open_id");
+    const rows = auditRows(db, "notify-test");
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].payload).delivered).toBe(false);
+  });
+
+  it("--review targets a specific review but stays owner-gated", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    seedMember(db, OWNER_B);
+    const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+
+    const own = await cli.runNotifyTest({ owner: OWNER_A, review: generated.review.id }, options);
+    expect(own.ok).toBe(true);
+    expect(own.reviewId).toBe(generated.review.id);
+
+    await expect(cli.runNotifyTest({ owner: OWNER_B, review: generated.review.id }, options)).rejects.toThrow(/非本人操作被拒/);
+  });
+
+  it("rejects --dry-run together with --send, an unknown owner, and an unknown review id", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    await expect(cli.runNotifyTest({ owner: OWNER_A, "dry-run": true, send: true }, options)).rejects.toThrow(/只能二选一/);
+    await expect(cli.runNotifyTest({ owner: "member_ghost" }, options)).rejects.toThrow(/成员不存在/);
+    await expect(cli.runNotifyTest({ owner: OWNER_A, review: "monthly_review_ghost" }, options)).rejects.toThrow(/复盘不存在/);
+  });
+
+  it("is reachable through buildCliResult with per-command flag validation (--period is not a notify-test flag)", async () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, OWNER_A);
+
+    const ok = await cli.buildCliResult(["notify-test", "--owner", OWNER_A, "--dry-run"], { dbPath });
+    expect(ok.ok).toBe(true);
+    expect(ok.mode).toBe("dry-run");
+
+    const rejected = await cli.buildCliResult(["notify-test", "--owner", OWNER_A, "--period", PERIOD], { dbPath });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.error).toContain("未知参数");
   });
 });
 

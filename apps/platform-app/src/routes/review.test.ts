@@ -405,7 +405,7 @@ describe("monthly review reading page + confirm endpoint", () => {
       expect(response.status).toBe(405);
     });
 
-    it("a bearer/JSON caller: confirms (draft -> confirmed) and gets the {ok, review, mirror, notify} JSON shape, both fire-and-forget side effects degrading gracefully (P10 not wired)", async () => {
+    it("a bearer/JSON caller: confirms (draft -> confirmed) and gets the {ok, review, mirror, notify} JSON shape, both fire-and-forget side effects degrading gracefully", async () => {
       const id = seedDraft(memberA.id, "2026-07");
       const response = await post(`/api/reviews/${id}/confirm`, withBearer(tokenA));
       expect(response.status).toBe(200);
@@ -420,13 +420,55 @@ describe("monthly review reading page + confirm endpoint", () => {
       expect(payload.ok).toBe(true);
       expect(payload.review.status).toBe("confirmed");
       expect(payload.review.confirmedAt).toBeTruthy();
-      // Both P10-gated placeholders throw today - confirm itself must still
-      // succeed (the SQL status change already committed).
+      // memoryd's default backend is still a P10-gated placeholder; the
+      // Feishu default is the REAL data/feishu-review-notifier.ts notifier,
+      // which degrades honestly here because memberA has no feishu_open_id
+      // seeded. Confirm itself must still succeed either way (the SQL status
+      // change already committed).
       expect(payload.mirror.mirrored).toBe(false);
       expect(payload.notify.delivered).toBe(false);
+      expect(payload.notify.reason).toContain("feishu_open_id");
 
       const persisted = new MonthlyReviewRepository(db).getById(id);
       expect(persisted?.status).toBe("confirmed");
+    });
+
+    it("delivers the 月度复盘确认摘要 card through the injected notifier (the wiring index.ts uses in production), lines carrying the headline metrics + review page path", async () => {
+      // Restart the suite's server with an injected fake notifier - the same
+      // deps seam index.ts fills with createFeishuReviewNotifier({db}).
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      const calls: Array<{ ownerId: string; title: string; lines: string[] }> = [];
+      server = createPlatformServer({
+        db,
+        repoRoot,
+        feishuNotifier: async (args) => {
+          calls.push(args);
+          return { ok: true, messageId: "om_route_1" };
+        }
+      });
+      await new Promise<void>((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+          resolve();
+        });
+      });
+
+      const id = seedDraft(memberA.id, "2026-07");
+      const response = await post(`/api/reviews/${id}/confirm`, withBearer(tokenA));
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as { notify: { delivered: boolean; messageId?: string | null } };
+      expect(payload.notify.delivered).toBe(true);
+      expect(payload.notify.messageId).toBe("om_route_1");
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.ownerId).toBe(memberA.id);
+      expect(calls[0]?.title).toBe("2026-07 月度复盘已确认");
+      // Headline metrics straight from fullResultFixture + the link line -
+      // composeReviewConfirmCardLines' own suite covers every line/degrade
+      // variant; this pins the route wires the real composer end to end.
+      expect(calls[0]?.lines).toContain("本人论点命中率：67%（8/12）");
+      expect(calls[0]?.lines).toContain("纪律遵守率：80%（8/10）");
+      expect(calls[0]?.lines).toContain(`复盘详情：/review/${id}（平台站内路径）`);
     });
 
     it("a form submission (reading page's own confirm button): 303-redirects to /review/<id>", async () => {

@@ -48,6 +48,7 @@ import {
   AuditLogRepository,
   MemberRepository,
   MonthlyReviewRepository,
+  loadLocalEnv,
   nowIso,
   openTradingDatabase,
   resolveRuntimePaths
@@ -55,6 +56,7 @@ import {
 
 import { computeComplianceStats, loadLatestPriceForSymbol } from "../../platform-app/dist/data/strategy.js";
 
+import { composeReviewConfirmCardLines, createFeishuReviewNotifier } from "./feishu-review-notifier.mjs";
 import { createMemorydBackend, mirrorRecord } from "./memoryd-mirror.mjs";
 import { buildMonthlyReview } from "./review-engine.mjs";
 import { compareReviewMetrics, recomputeReviewMetrics } from "./review-verifier.mjs";
@@ -64,10 +66,10 @@ const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 
 const PERIOD_PATTERN = /^\d{4}-\d{2}$/;
 
-// This CLI has no genuine boolean/no-value flags - every flag always expects
-// a value. Kept as an explicit (empty) set, matching members.mjs's own
-// documented convention for the same situation.
-const BOOLEAN_FLAGS = new Set();
+// notify-test's mode switches are this CLI's only genuine boolean/no-value
+// flags (every other flag always expects a value) - same explicit-set
+// convention as members.mjs.
+const BOOLEAN_FLAGS = new Set(["dry-run", "send"]);
 
 // Per-command flag allowlist (H6 pattern, members.mjs/proposals.mjs/
 // strategy.mjs): scoped PER SUBCOMMAND so a flag real for a different
@@ -78,7 +80,8 @@ const COMMAND_FLAGS = {
   "generate-all": new Set(["period"]),
   confirm: new Set(["owner", "review"]),
   list: new Set(["owner"]),
-  show: new Set(["owner", "review"])
+  show: new Set(["owner", "review"]),
+  "notify-test": new Set(["owner", "review", "dry-run", "send"])
 };
 
 /**
@@ -171,24 +174,16 @@ function previousBeijingPeriod(nowValue) {
 }
 
 // -----------------------------------------------------------------------
-// P10-gated placeholder for real Feishu single-chat delivery of a confirmed
-// review's summary card. Per this phase's plan Global Constraints /
-// "明确不做": "真飞书单聊投递...→ P10". Mirrors memoryd-mirror.mjs's
-// createMemorydBackend()/news-agent-search.mjs's createOpenclawSearchBackend/
-// narrative-engine.mjs's createNarrativeLlmBackend EXACTLY - a factory that
-// returns a function matching the notifier interface below, which simply
-// throws until a real P10 delivery channel exists. Every test in this file's
-// test suite injects a fake notifier instead; a production caller that wires
-// in this default will always observe {delivered:false} today - correct and
-// intended, since confirm's SQL status change has already committed
-// regardless of whether this notification goes out.
-//
-// @returns {(args: {ownerId: string, title: string, lines: string[]}) => Promise<{ok: boolean, messageId?: string, reason?: string}>}
-export function createFeishuReviewNotifier() {
-  return async function feishuReviewNotifier() {
-    throw new Error("飞书单聊复盘通知需要 P10 点火（真实单聊投递通道尚未接入）。");
-  };
-}
+// Feishu single-chat delivery of a confirmed review's summary card - REAL
+// since the P10 wiring: the default notifier is
+// feishu-review-notifier.mjs's createFeishuReviewNotifier({db}), which looks
+// up the owner's members.feishu_open_id and delivers over the exact
+// sendInteractiveCard channel market-alerts-cards.mjs already uses in
+// production. A member with no open_id on file degrades to an honest
+// {delivered:false, reason} - correct and intended, since confirm's SQL
+// status change has already committed regardless of whether this
+// notification goes out.
+// -----------------------------------------------------------------------
 
 // Fire-and-forget wrapper around the injected notifier - never throws/
 // rejects, mirrors memoryd-mirror.mjs's mirrorRecord discipline exactly
@@ -199,11 +194,12 @@ async function notifyFeishuReviewConfirmed(notifier, { ownerId, review }) {
     const result = await notifier({
       ownerId,
       title: `${review.period} 月度复盘已确认`,
-      lines: [
-        `复盘周期：${review.period}`,
-        `确认时间：${review.confirmedAt ?? ""}`,
-        "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。"
-      ]
+      lines: composeReviewConfirmCardLines({
+        id: review.id,
+        period: review.period,
+        confirmedAt: review.confirmedAt ?? null,
+        result: review.resultJson
+      })
     });
     if (result?.ok) {
       return { delivered: true, messageId: result.messageId ?? null };
@@ -330,7 +326,7 @@ export async function runConfirm(flags, options = {}) {
       visibility: "private"
     });
 
-    const feishuNotifier = options.feishuNotifier ?? createFeishuReviewNotifier();
+    const feishuNotifier = options.feishuNotifier ?? createFeishuReviewNotifier({ db });
     const notify = await notifyFeishuReviewConfirmed(feishuNotifier, { ownerId, review });
 
     new AuditLogRepository(db).write("monthly_review", "confirm", {
@@ -342,6 +338,103 @@ export async function runConfirm(flags, options = {}) {
     });
 
     return { ok: true, review, mirror, notify };
+  });
+}
+
+// -----------------------------------------------------------------------
+// notify-test: operator smoke command for the review confirm card channel
+// (`pnpm reviews:notify-test -- --owner <id> [--review <id>] [--dry-run|--send]`).
+// Composes the EXACT same 月度复盘确认摘要 card the confirm path sends (via the
+// owner's latest review, or --review, or a clearly-labeled placeholder card
+// when the owner has no reviews yet) so an operator can live-verify one real
+// card send end to end. --dry-run (the default) only reports the composed
+// card + whether feishu_open_id resolves - it never sends anything; --send
+// delivers for real through createFeishuReviewNotifier({db})'s default
+// transport (requires FEISHU_APP_ID/FEISHU_APP_SECRET, loaded from
+// .env.local by main()'s loadLocalEnv).
+// -----------------------------------------------------------------------
+
+export async function runNotifyTest(flags, options = {}) {
+  const ownerId = requireFlag(flags, "owner");
+  const dryRunFlag = Boolean(flags["dry-run"]);
+  const sendFlag = Boolean(flags.send);
+  if (dryRunFlag && sendFlag) {
+    throw new Error("--dry-run 与 --send 只能二选一。");
+  }
+  const mode = sendFlag ? "send" : "dry-run";
+
+  return withDb(options, async (db) => {
+    const member = new MemberRepository(db).getById(ownerId);
+    if (!member) {
+      throw new Error(`成员不存在：${ownerId}。`);
+    }
+
+    const reviewRepo = new MonthlyReviewRepository(db);
+    let review = null;
+    const requestedReviewId = String(flags.review ?? "").trim();
+    if (requestedReviewId) {
+      review = reviewRepo.getById(requestedReviewId);
+      if (!review) {
+        throw new Error(`复盘不存在：${requestedReviewId}。`);
+      }
+      // Same owner-gate as `show`: a review is private to its own owner.
+      if (review.ownerId !== ownerId) {
+        throw new Error(`非本人操作被拒：该复盘属于 ${review.ownerId}，操作者 ${ownerId} 无权使用。`);
+      }
+    } else {
+      // listForOwner orders by period DESC - [0] is the latest review.
+      review = reviewRepo.listForOwner(ownerId)[0] ?? null;
+    }
+
+    const card = review
+      ? {
+          title: `${review.period} 月度复盘已确认`,
+          lines: composeReviewConfirmCardLines({
+            id: review.id,
+            period: review.period,
+            confirmedAt: review.confirmedAt ?? null,
+            result: review.resultJson
+          })
+        }
+      : {
+          // No review row for this owner yet - still send SOMETHING honest so
+          // the channel itself can be smoke-verified, clearly labeled a test.
+          title: "飞书复盘通知通道测试",
+          lines: [
+            "这是一条复盘确认摘要卡的通道测试（该成员暂无复盘记录，使用占位内容）。",
+            `成员：${ownerId}`,
+            `发送时间：${options.now ?? nowIso()}`
+          ]
+        };
+
+    if (mode === "dry-run") {
+      return { ok: true, mode, ownerId, feishuOpenId: member.feishuOpenId ?? null, reviewId: review?.id ?? null, card };
+    }
+
+    const notifier = options.feishuNotifier ?? createFeishuReviewNotifier({ db });
+    const sent = await notifier({ ownerId, title: card.title, lines: card.lines });
+    const delivered = sent?.ok === true;
+
+    new AuditLogRepository(db).write("monthly_review", "notify-test", {
+      ownerId,
+      reviewId: review?.id ?? null,
+      delivered
+    });
+
+    if (delivered) {
+      return { ok: true, mode, ownerId, reviewId: review?.id ?? null, delivered: true, messageId: sent.messageId ?? null };
+    }
+    // A failed live send must be VISIBLE (non-zero exit via main()'s
+    // ok===false check), unlike confirm's fire-and-forget degrade - the whole
+    // point of this command is to verify delivery.
+    return {
+      ok: false,
+      mode,
+      ownerId,
+      reviewId: review?.id ?? null,
+      delivered: false,
+      error: sent?.reason ? String(sent.reason) : "飞书卡片发送失败。"
+    };
   });
 }
 
@@ -376,7 +469,8 @@ const COMMANDS = {
   "generate-all": runGenerateAll,
   confirm: runConfirm,
   list: runList,
-  show: runShow
+  show: runShow,
+  "notify-test": runNotifyTest
 };
 
 export async function runReviewsCommand(command, flags, options = {}) {
@@ -409,6 +503,12 @@ export async function buildCliResult(argv, options = {}) {
 }
 
 async function main() {
+  // Real Feishu delivery (confirm's default notifier, notify-test --send)
+  // needs FEISHU_APP_ID/FEISHU_APP_SECRET from .env.local - same startup
+  // convention as market-alerts-poll.mjs/feishu-context.mjs. Done here (CLI
+  // entry only) rather than at module top so importing this module in tests
+  // stays side-effect free.
+  loadLocalEnv(repoRoot);
   const result = await buildCliResult(process.argv.slice(2));
   console.log(JSON.stringify(result));
   if (result.ok === false) {
