@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
@@ -107,7 +108,8 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
     { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
     { name: "rsshub-health", run: () => checkRsshubHealth(snapshot) },
-    { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) }
+    { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) },
+    { name: "control-persona", run: () => checkControlPersona(snapshot) }
   ];
 
   const findings = await runChecksFailureIsolated(checks);
@@ -574,6 +576,54 @@ function checkStaleHeartbeatMarketHours(lastRun, nowMs) {
   }
 
   return findings;
+}
+
+// v2 persona deployment fix (the #1 user complaint: the deployed Feishu bot
+// answered as vanilla Codex) - "control-persona" check: the control agent's
+// workspace AGENTS.md is the persona/instructions file the embedded codex
+// harness reads, and with `skipBootstrap: true` NOTHING else ever writes it -
+// only render-openclaw-config.mjs's installControlPersona does. A missing or
+// empty file means the bot is running with no persona at all, silently
+// answering as a vanilla assistant while every other health signal stays
+// green - severity `error`, because the runtime is up but functionally wrong.
+//
+// Path resolution: `snapshot.controlWorkspaceAgentsPath` is a test-only
+// injection point (mirrors platformAppPort/rsshubBaseUrl above - real
+// callers, i.e. openclaw-runtime-doctor.mjs, never set it); the production
+// default mirrors buildAgents()'s own `workspace: "~/.openclaw/workspaces/
+// control"` in render-openclaw-config.mjs.
+function checkControlPersona(snapshot) {
+  const path = snapshot.controlWorkspaceAgentsPath
+    ?? join(homedir(), ".openclaw", "workspaces", "control", "AGENTS.md");
+
+  if (!existsSync(path)) {
+    return [error(
+      "control-persona.missing",
+      `control agent 工作区缺少人设文件（${path} 不存在）——飞书机器人会以无人设的 vanilla Codex 应答。`
+        + `请执行 node apps/openclaw-config/scripts/render-openclaw-config.mjs 部署人设（skipBootstrap=true，没有其它任何流程会写这个文件）。`
+    )];
+  }
+
+  let content;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (readError) {
+    return [error(
+      "control-persona.unreadable",
+      `control agent 人设文件存在但无法读取（${path}）：${describeError(readError)}。`
+        + `请执行 node apps/openclaw-config/scripts/render-openclaw-config.mjs 重新部署。`
+    )];
+  }
+
+  if (content.trim().length === 0) {
+    return [error(
+      "control-persona.empty",
+      `control agent 人设文件为空（${path}）——飞书机器人会以无人设的 vanilla Codex 应答。`
+        + `请执行 node apps/openclaw-config/scripts/render-openclaw-config.mjs 重新部署人设。`
+    )];
+  }
+
+  return [];
 }
 
 function readAlerterDownArtifact(runtimeRoot) {

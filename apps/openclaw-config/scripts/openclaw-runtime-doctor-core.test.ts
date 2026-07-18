@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { recordJobRun } from "./job-run-log.mjs";
@@ -48,6 +48,24 @@ const PLATFORM_APP_HEALTH_DISABLED = { platformAppPort: 1 };
 // without needing a fake listener.
 const RSSHUB_HEALTH_DISABLED = { rsshubBaseUrl: "http://127.0.0.1:1" };
 
+// v2 persona deployment fix: analyzeOpenClawRuntimeSnapshot now also checks
+// that the control agent workspace's AGENTS.md (the persona file
+// render-openclaw-config.mjs installs) exists and is non-empty - same
+// hermetic-suite concern as PLATFORM_APP_HEALTH_DISABLED /
+// RSSHUB_HEALTH_DISABLED above: whether the REAL ~/.openclaw/workspaces/
+// control/AGENTS.md exists on the machine running this suite must not change
+// any test's outcome. This fixture points every test that isn't specifically
+// about that check at a temp file that exists and is non-empty; it outlives
+// afterEach's per-test cleanup (module-scoped, removed once in afterAll).
+const controlPersonaFixtureDir = mkdtempSync(join(tmpdir(), "alphaloop-doctor-persona-"));
+const controlPersonaHealthyPath = join(controlPersonaFixtureDir, "AGENTS.md");
+writeFileSync(controlPersonaHealthyPath, "# Trading Copilot\n\n人设已部署。\n");
+const CONTROL_PERSONA_HEALTHY = { controlWorkspaceAgentsPath: controlPersonaHealthyPath };
+
+afterAll(() => {
+  rmSync(controlPersonaFixtureDir, { recursive: true, force: true });
+});
+
 const tempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
@@ -68,6 +86,7 @@ afterEach(() => {
 describe("OpenClaw runtime doctor core", () => {
   it("flags gateway restart storms and failed runner results", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [
@@ -94,6 +113,7 @@ describe("OpenClaw runtime doctor core", () => {
 
   it("accepts the desired steady state", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
@@ -108,6 +128,7 @@ describe("OpenClaw runtime doctor core", () => {
 
   it("does not keep failing a job after a newer successful runner result", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
@@ -124,6 +145,7 @@ describe("OpenClaw runtime doctor core", () => {
 
   it("ignores stale gateway restart errors outside the recent window", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
       nowMs: Date.parse("2026-06-19T12:10:00.000Z"),
@@ -143,6 +165,7 @@ describe("OpenClaw runtime doctor core", () => {
 describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app, Phase 4 Task 8 with rsshub)", () => {
   it("warns, but does not fail, when none of the required jobs are loaded", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -160,6 +183,7 @@ describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app
 
   it("reports nothing for launchd-jobs once all four are loaded", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -187,6 +211,7 @@ describe("alerts-poller-health check (task H2)", () => {
     );
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -215,6 +240,7 @@ describe("alerts-poller-health check (task H2)", () => {
     // async function's promise to settle) - a rejection here would fail this
     // test itself, which is exactly the "never throws" proof this test wants.
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -237,6 +263,7 @@ describe("alerts-poller-health check (task H2)", () => {
     openTradingDatabase(dbPath).close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -264,6 +291,7 @@ describe("alerts-poller-health check (task H2)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -291,6 +319,7 @@ describe("alerts-poller-health check (task H2)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -308,6 +337,7 @@ describe("alerts-poller-health check (task H2)", () => {
     writeFileSync(join(runtimeRoot, "market-alerts", "ALERTER-DOWN.json"), "{ this is not valid json ");
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -335,6 +365,7 @@ describe("alerts-poller-health check (task H2)", () => {
     writeFileSync(dbPath, "not a real sqlite file, just garbage bytes");
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -369,6 +400,7 @@ describe("alerts-poller-health check (task H2)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -402,6 +434,7 @@ describe("alerts-poller-health check (task H2)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -445,6 +478,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -467,6 +501,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -491,6 +526,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -515,6 +551,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     await closeServer(probe);
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...RSSHUB_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -538,6 +575,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     // thrower. If this DIDN'T resolve, `await` below would make the whole
     // test fail with an unhandled rejection.
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
       fetchImpl: () => {
@@ -586,6 +624,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -613,6 +652,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -635,6 +675,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -659,6 +700,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -680,6 +722,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
     await closeServer(probe);
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
@@ -707,6 +750,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
 
     try {
       const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
         launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
@@ -748,6 +792,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
 
   it("reports nothing when dbPath is not supplied at all", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -764,6 +809,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     openTradingDatabase(dbPath).close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -783,6 +829,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -803,6 +850,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -827,6 +875,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     db.close();
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -845,6 +894,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     writeFileSync(dbPath, "not a real sqlite file, just garbage bytes");
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -877,6 +927,7 @@ describe("failure isolation across checks (task H2 fix round)", () => {
     });
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
@@ -900,5 +951,69 @@ describe("failure isolation across checks (task H2 fix round)", () => {
       expect.objectContaining({ code: "launchd-jobs.market-alerts.not_loaded", severity: "warn" }),
       expect.objectContaining({ code: "launchd-jobs.platform-app.not_loaded", severity: "warn" })
     ]));
+  });
+});
+
+// v2 persona deployment fix (the #1 user complaint: the deployed Feishu bot
+// answered as vanilla Codex) - "control-persona" check: the control
+// workspace's AGENTS.md is the persona file the embedded codex harness
+// reads, and with skipBootstrap:true only render-openclaw-config.mjs's
+// installControlPersona ever writes it. Missing or empty means the bot runs
+// with no persona while every other signal stays green -> severity error.
+describe("control-persona check (v2 persona deployment fix)", () => {
+  function baseSnapshot() {
+    return {
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+    };
+  }
+
+  it("fails when the control workspace AGENTS.md does not exist, pointing at the render script", async () => {
+    const dir = makeTempDir("alphaloop-doctor-persona-missing-");
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...baseSnapshot(),
+      controlWorkspaceAgentsPath: join(dir, "AGENTS.md")
+    });
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "control-persona.missing", severity: "error" })
+    ]));
+    const message = report.findings.find((entry) => entry.code === "control-persona.missing")?.message;
+    expect(message).toContain("render-openclaw-config.mjs");
+  });
+
+  it("fails when the control workspace AGENTS.md exists but is empty (whitespace-only counts as empty)", async () => {
+    const dir = makeTempDir("alphaloop-doctor-persona-empty-");
+    const personaPath = join(dir, "AGENTS.md");
+    writeFileSync(personaPath, "  \n\n\t\n");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...baseSnapshot(),
+      controlWorkspaceAgentsPath: personaPath
+    });
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "control-persona.empty", severity: "error" })
+    ]));
+    const message = report.findings.find((entry) => entry.code === "control-persona.empty")?.message;
+    expect(message).toContain("render-openclaw-config.mjs");
+  });
+
+  it("reports nothing when the persona file exists and is non-empty", async () => {
+    const dir = makeTempDir("alphaloop-doctor-persona-ok-");
+    const personaPath = join(dir, "AGENTS.md");
+    writeFileSync(personaPath, "# Trading Copilot\n\n人设内容。\n");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...baseSnapshot(),
+      controlWorkspaceAgentsPath: personaPath
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("control-persona."))).toBe(false);
   });
 });
