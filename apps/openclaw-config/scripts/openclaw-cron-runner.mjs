@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,8 +35,31 @@ const host = "127.0.0.1";
 // the real repo's runtime directory.
 const runtimeDir = process.env.OPENCLAW_CRON_RUNNER_RUNTIME_DIR ?? join(repoRoot, "runtime", "openclaw-cron-runner");
 const processedRunsPath = join(runtimeDir, "processed-runs.json");
-const openclawCronDir = process.env.OPENCLAW_CRON_DIR ?? join(homedir(), ".openclaw", "cron");
-const pollMs = Number(process.env.OPENCLAW_CRON_RUNNER_POLL_MS ?? 5000);
+// 2026-07-18 CRITICAL fix (silent no-op): OpenClaw 2026.7 migrated cron storage out of the
+// ~/.openclaw/cron file store (jobs.json + runs/<id>.jsonl) into its shared sqlite state DB -
+// `openclaw cron status` on the deployed mini reports {"storage":"sqlite","sqlitePath":
+// "~/.openclaw/state/openclaw.sqlite"}, and the old files exist only as *.migrated husks. This
+// runner kept reading the dead file paths, saw zero managed jobs forever, and NONE of the 5
+// scheduled pipelines ever executed - while the gateway's own run log showed green 3-12ms
+// systemEvent stub runs. Discovery now goes through the documented, gateway-backed OpenClaw CLI
+// (`openclaw cron list --json` / `openclaw cron runs --id <jobId>` - see docs/automation/
+// cron-jobs.md: "Job definitions, runtime state, and run history persist in OpenClaw's shared
+// SQLite state database") instead of any on-disk storage layout that can migrate underneath us
+// again. See the discovery guard below for the fail-loud protection against a recurrence.
+const openclawBin = process.env.OPENCLAW_BIN ?? "openclaw";
+// Per-invocation wall-clock budget for the CLI (it talks to the gateway over a local WebSocket;
+// the CLI's own default request timeout is 30s).
+const cliTimeoutMs = Number(process.env.OPENCLAW_CRON_RUNNER_CLI_TIMEOUT_MS ?? 30_000);
+// How many run-history entries to fetch per job (matches the CLI's own default of 50).
+const runsFetchLimit = Math.max(1, Number(process.env.OPENCLAW_CRON_RUNNER_RUNS_FETCH_LIMIT ?? 50));
+// Discovery guard threshold: if the gateway reports a managed job fired (lastRunAtMs in `cron
+// list`) but the run stays invisible through `cron runs` for longer than this, health goes red
+// and an alert fires - the exact silent-no-op class the 2026.7 migration caused.
+const discoveryGapMs = Number(process.env.OPENCLAW_CRON_RUNNER_DISCOVERY_GAP_MS ?? 10 * 60_000);
+// CLI discovery costs a real subprocess + gateway round-trip per cycle (the old file stat was
+// ~free), and every managed job here is hourly or slower - 30s poll latency is irrelevant to
+// them, so the default backs off from the file-era 5s.
+const pollMs = Number(process.env.OPENCLAW_CRON_RUNNER_POLL_MS ?? 30_000);
 const pnpmBin = process.env.PNPM_BIN ?? "pnpm";
 const retryBaseMs = Number(process.env.OPENCLAW_CRON_RUNNER_RETRY_BASE_MS ?? 60_000);
 const retryMaxMs = Number(process.env.OPENCLAW_CRON_RUNNER_RETRY_MAX_MS ?? 30 * 60_000);
@@ -79,20 +101,52 @@ const cronJobNames = {
 // if this were a brand-new install, instead of the (empty, wrong) recovered processedRunKeys list
 // standing unseeded.
 let recoveredFromCorruptState = false;
+// Durable marker that the one-time "mark all CLI-visible history as already-processed" seeding
+// pass has completed on THIS discovery interface. It is deliberately separate from
+// processed-runs.json existing: on the deployed mini the state file predates the sqlite
+// migration, so without this marker the first poll on the new interface would treat every
+// historical gateway run (up to runsFetchLimit per job) as brand-new and fire a burst of stale
+// reports. Seeding happens on the first successful poll cycle (not at import) so a gateway that
+// is down at boot just delays it instead of half-completing it. Declared BEFORE the initial
+// loadRunnerState() call because corrupt-state recovery inside it clears both of these.
+const seedMarkerPath = join(runtimeDir, "cli-seed-completed.json");
+let seedCompleted = false;
 let runnerState = loadRunnerState();
 const inFlightRunKeys = new Set();
 
-if (!existsSync(processedRunsPath) || recoveredFromCorruptState) {
-  seedExistingOpenClawRuns();
-}
+seedCompleted = existsSync(seedMarkerPath) && existsSync(processedRunsPath) && !recoveredFromCorruptState;
+
+// In-memory discovery-guard bookkeeping surfaced through getRunnerHealthSnapshot() / GET
+// /health. Restart resets the gap timers - acceptable: a real gap re-accumulates within one
+// threshold window.
+const discoveryHealth = {
+  lastListAt: null,
+  lastListOk: null,
+  lastListError: null,
+  seedError: null,
+  jobInterfaceErrors: {},
+  // internal job name -> { sinceMs, openclawJobId, lastRunAtMs }
+  gapSince: {},
+  alertedGapJobs: new Set()
+};
 
 const server = createServer(async (request, response) => {
+  const url = new URL(request.url ?? "/", `http://${host}:${port}`);
+
+  // Discovery-guard surface: 200 when discovery is healthy, 503 with the error list when the
+  // runner cannot see what the gateway says it fired (or the CLI interface is failing) - so a
+  // probe/doctor check turns the silent-no-op class into a visible red.
+  if (request.method === "GET" && url.pathname === "/health") {
+    const snapshot = getRunnerHealthSnapshot();
+    sendJson(response, snapshot.ok ? 200 : 503, snapshot);
+    return;
+  }
+
   if (request.method !== "POST") {
     sendJson(response, 405, { ok: false, error: "method_not_allowed" });
     return;
   }
 
-  const url = new URL(request.url ?? "/", `http://${host}:${port}`);
   const job = allowedJobs[url.pathname];
   if (!job) {
     sendJson(response, 404, { ok: false, error: "unknown_job" });
@@ -110,8 +164,9 @@ const server = createServer(async (request, response) => {
 
 // Only actually bind the port / start polling when this file is run directly (`node
 // openclaw-cron-runner.mjs`), not when it's imported (e.g. by tests) — importing it should be
-// side-effect-free beyond the harmless state load/seed above, which tests sandbox via
-// OPENCLAW_CRON_RUNNER_RUNTIME_DIR / OPENCLAW_CRON_DIR.
+// side-effect-free beyond the harmless state load above (seeding runs inside the poll cycle, so
+// no CLI subprocess is ever spawned at import), which tests sandbox via
+// OPENCLAW_CRON_RUNNER_RUNTIME_DIR / OPENCLAW_BIN.
 const isMainModule = process.argv[1]
   ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
   : false;
@@ -124,7 +179,9 @@ if (isMainModule) {
       host,
       port,
       repoRoot,
-      openclawCronDir,
+      discoveryInterface: "openclaw-cli",
+      openclawBin,
+      seedCompleted,
       pollMs
     }));
   });
@@ -154,9 +211,113 @@ async function pollOpenClawRunLogs() {
   // startup, so a long-lived process doesn't need a restart to reclaim old files' disk space.
   pruneResultFiles(runtimeDir, resultRetentionMs);
 
-  const managedJobs = readManagedCronJobs();
+  // Discovery goes through the gateway-backed CLI. A failing `cron list` aborts the cycle
+  // LOUDLY (health + stderr) - before the 2026.7 fix the equivalent failure mode (reading files
+  // that no longer existed) just looked like "no managed jobs" forever.
+  let managedJobs;
+  try {
+    managedJobs = await readManagedCronJobs();
+    discoveryHealth.lastListAt = new Date().toISOString();
+    discoveryHealth.lastListOk = true;
+    discoveryHealth.lastListError = null;
+  } catch (error) {
+    discoveryHealth.lastListAt = new Date().toISOString();
+    discoveryHealth.lastListOk = false;
+    discoveryHealth.lastListError = String(error?.message ?? error);
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "cron-discovery-list-failed",
+      openclawBin,
+      error: discoveryHealth.lastListError
+    }));
+    return;
+  }
+
+  if (!seedCompleted) {
+    try {
+      await seedExistingOpenClawRuns(managedJobs);
+      discoveryHealth.seedError = null;
+    } catch (error) {
+      discoveryHealth.seedError = String(error?.message ?? error);
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "cron-discovery-seed-failed",
+        error: discoveryHealth.seedError
+      }));
+    }
+    // Never process run entries in the same cycle as (an attempt at) seeding: a half-observed
+    // history must not turn into a replay burst. The next cycle runs normally (or retries the
+    // seed if it failed).
+    return;
+  }
+
   for (const entry of managedJobs) {
-    const runEntries = readCronRunEntries(entry.id);
+    if (runnerState.jobFailureState[entry.job.name]?.halted) {
+      // Halted jobs are operator territory (cron-runner-reset.mjs) - skip the per-job runs fetch
+      // AND the guard: the runner not executing them is intentional, already escalated state.
+      clearDiscoveryGap(entry.job.name);
+      continue;
+    }
+
+    // Steady-state cost control: `cron list` already tells us the job's most recent run
+    // (state.lastRunAtMs). Only pay for the per-job `cron runs` round-trip when that run is not
+    // yet accounted for locally, or when a locally-failed run is awaiting its retry window. If a
+    // future CLI keys entries differently (e.g. a runId that diverges from runAtMs), this gate
+    // fails OPEN - the candidate never looks processed, so we fetch every cycle (wasteful, never
+    // wrong). Note a gateway-side errored run also keeps this gate hot until the next successful
+    // run replaces lastRunAtMs - matching the old semantics of never marking non-ok gateway runs
+    // as processed.
+    const candidateKey = entry.lastRunAtMs === null
+      ? null
+      : buildOpenClawRunKey({ jobId: entry.id, runAtMs: entry.lastRunAtMs, action: "finished" });
+    const candidateUnprocessed = candidateKey !== null && !runnerState.processedRunKeys.includes(candidateKey);
+    const hasPendingRetry = Object.keys(runnerState.failedRunAttempts).some((key) => key.startsWith(`${entry.id}:`));
+    if (!candidateUnprocessed && !hasPendingRetry) {
+      clearDiscoveryGap(entry.job.name);
+      continue;
+    }
+
+    let runEntries;
+    try {
+      runEntries = await readCronRunEntries(entry.id);
+      delete discoveryHealth.jobInterfaceErrors[entry.job.name];
+    } catch (error) {
+      discoveryHealth.jobInterfaceErrors[entry.job.name] = String(error?.message ?? error);
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "cron-discovery-runs-failed",
+        job: entry.job.name,
+        openclawJobId: entry.id,
+        error: discoveryHealth.jobInterfaceErrors[entry.job.name]
+      }));
+      // A run the gateway reports as fired that we cannot even LIST is the same blindness class
+      // as it being absent - start/keep the gap clock.
+      if (candidateUnprocessed) {
+        noteDiscoveryGap(entry, Date.now());
+      }
+      continue;
+    }
+
+    // The guard itself: the gateway claims this job ran at lastRunAtMs; is that run visible
+    // through the interface we execute from? Visibility is judged on the gateway's own record
+    // (action "finished" at that runAtMs, regardless of its ok/error status or of our local
+    // execution outcome) - the guard watches the INTERFACE, not job success.
+    if (candidateUnprocessed) {
+      const candidateVisible = runEntries.some((runEntry) =>
+        runEntry.action === "finished" &&
+        (Number(runEntry.runAtMs) === entry.lastRunAtMs || buildOpenClawRunKey(runEntry) === candidateKey));
+      if (candidateVisible) {
+        clearDiscoveryGap(entry.job.name);
+      } else {
+        noteDiscoveryGap(entry, Date.now());
+      }
+    } else {
+      clearDiscoveryGap(entry.job.name);
+    }
+
     for (const runEntry of runEntries) {
       if (runEntry.action !== "finished" || runEntry.status !== "ok") {
         continue;
@@ -224,6 +385,8 @@ async function pollOpenClawRunLogs() {
       }
     }
   }
+
+  await escalateExceededDiscoveryGaps(Date.now());
 }
 
 // Retries the escalation alert for every halted job whose escalationPending flag is still set
@@ -385,10 +548,16 @@ export function pruneResultFiles(dir, retentionMs, now = Date.now()) {
   return deleted;
 }
 
-function seedExistingOpenClawRuns() {
+// One-time (per discovery interface) bankruptcy pass: everything the gateway's run history
+// already shows is marked processed WITHOUT executing it - those runs happened while this runner
+// could not see them (or before it existed), and replaying up to runsFetchLimit stale
+// reports/sweeps per job on first boot would be worse than skipping them. Only after ALL managed
+// jobs' histories were fetched successfully does the durable marker get written - a partial
+// observation must never masquerade as a completed seed.
+async function seedExistingOpenClawRuns(managedJobs) {
   const keys = new Set(runnerState.processedRunKeys);
-  for (const entry of readManagedCronJobs()) {
-    for (const runEntry of readCronRunEntries(entry.id)) {
+  for (const entry of managedJobs) {
+    for (const runEntry of await readCronRunEntries(entry.id)) {
       keys.add(buildOpenClawRunKey(runEntry));
     }
   }
@@ -397,39 +566,213 @@ function seedExistingOpenClawRuns() {
     processedRunKeys: Array.from(keys)
   });
   saveRunnerState();
+  writeFileSync(
+    seedMarkerPath,
+    `${JSON.stringify({ seededAt: new Date().toISOString(), discoveryInterface: "openclaw-cli" }, null, 2)}\n`,
+    "utf8"
+  );
+  seedCompleted = true;
+  console.log(JSON.stringify({
+    ok: true,
+    service: "openclaw-cron-runner",
+    action: "cron-discovery-seeded",
+    jobs: managedJobs.length,
+    processedRunKeys: keys.size
+  }));
 }
 
-function readManagedCronJobs() {
-  const jobsPath = join(openclawCronDir, "jobs.json");
-  const data = readJsonFile(jobsPath, { jobs: [] });
-  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
-  return jobs
-    .filter((job) => job?.enabled !== false && cronJobNames[job?.name])
-    .map((job) => ({
-      id: String(job.id),
-      name: String(job.name),
-      job: cronJobNames[job.name]
-    }));
-}
-
-function readCronRunEntries(jobId) {
-  const runsDir = join(openclawCronDir, "runs");
-  const path = join(runsDir, `${jobId}.jsonl`);
-  if (!existsSync(path)) {
-    return [];
-  }
-  return readFileSync(path, "utf8")
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
+// Invokes the OpenClaw CLI (which talks to the running gateway) and parses its stdout as JSON.
+// Any failure - spawn error, non-zero exit, timeout, non-JSON output - throws with enough
+// context for health/stderr; callers decide whether that aborts the cycle (list) or degrades one
+// job (runs).
+function execOpenClawCronJson(args) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(openclawBin, args, {
+      cwd: repoRoot,
+      timeout: cliTimeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: 32 * 1024 * 1024
+    }, (error, stdout, stderr) => {
+      if (error) {
+        rejectPromise(new Error(
+          `${openclawBin} ${args.join(" ")} failed: ${String(error?.message ?? error)}` +
+          (stderr ? ` | stderr: ${tail(stderr)}` : "")
+        ));
+        return;
       }
-    })
-    .filter((entry) => entry && typeof entry === "object");
+      try {
+        resolvePromise(JSON.parse(String(stdout)));
+      } catch {
+        rejectPromise(new Error(
+          `${openclawBin} ${args.join(" ")} did not return JSON (CLI output drift?): ${String(stdout).slice(0, 300)}`
+        ));
+      }
+    });
+  });
+}
+
+// Managed-job discovery via `openclaw cron list --json`. Verified output shape on the deployed
+// OpenClaw 2026.7.1-2: { jobs: [{ id, name, enabled, state: { lastRunAtMs, lastRunStatus, ... },
+// ... }] }. Shape drift throws (doctor-style fail-loud -> cron-list-failed in health) instead of
+// quietly becoming "zero managed jobs" - the exact silence that hid this bug for a month.
+async function readManagedCronJobs() {
+  const data = await execOpenClawCronJson(["cron", "list", "--json"]);
+  if (!data || !Array.isArray(data.jobs)) {
+    throw new Error(
+      `${openclawBin} cron list --json: expected a top-level \`jobs\` array but got keys ` +
+      `[${Object.keys(data ?? {}).join(", ")}] - the CLI output schema changed; update readManagedCronJobs().`
+    );
+  }
+  return data.jobs
+    .filter((job) => job?.enabled !== false && typeof job?.name === "string" && cronJobNames[job.name] && job?.id != null)
+    .map((job) => {
+      const lastRunAtMs = Number(job?.state?.lastRunAtMs ?? job?.lastRunAtMs);
+      return {
+        id: String(job.id),
+        name: String(job.name),
+        job: cronJobNames[job.name],
+        lastRunAtMs: Number.isFinite(lastRunAtMs) ? lastRunAtMs : null,
+        lastRunStatus: job?.state?.lastRunStatus ?? job?.lastRunStatus ?? null
+      };
+    });
+}
+
+// Run-history discovery via `openclaw cron runs --id <jobId>`. Verified output shape on the
+// deployed OpenClaw 2026.7.1-2: { entries: [{ ts, jobId, action, status, runAtMs, ... }] } -
+// the same entry fields the pre-migration runs/<id>.jsonl lines carried, so
+// buildOpenClawRunKey() and the finished/ok filter are unchanged. Shape drift throws
+// (cron-runs-failed[<job>] in health) rather than reading as an empty history.
+async function readCronRunEntries(jobId) {
+  const data = await execOpenClawCronJson(["cron", "runs", "--id", jobId, "--limit", String(runsFetchLimit)]);
+  if (!data || !Array.isArray(data.entries)) {
+    throw new Error(
+      `${openclawBin} cron runs --id ${jobId}: expected a top-level \`entries\` array but got keys ` +
+      `[${Object.keys(data ?? {}).join(", ")}] - the CLI output schema changed; update readCronRunEntries().`
+    );
+  }
+  return data.entries.filter((entry) => entry && typeof entry === "object");
+}
+
+function noteDiscoveryGap(entry, nowMs) {
+  const existing = discoveryHealth.gapSince[entry.job.name];
+  if (existing) {
+    existing.lastRunAtMs = entry.lastRunAtMs;
+    return;
+  }
+  discoveryHealth.gapSince[entry.job.name] = {
+    sinceMs: nowMs,
+    openclawJobId: entry.id,
+    lastRunAtMs: entry.lastRunAtMs
+  };
+}
+
+function clearDiscoveryGap(jobName) {
+  delete discoveryHealth.gapSince[jobName];
+  discoveryHealth.alertedGapJobs.delete(jobName);
+}
+
+// The fail-loud guard's output surface (also served as GET /health): ok=false whenever the
+// runner is in ANY state where gateway-fired managed jobs might silently not execute - the
+// pre-fix runner sat in exactly such a state for a month reporting nothing.
+export function getRunnerHealthSnapshot(nowMs = Date.now()) {
+  const gaps = Object.entries(discoveryHealth.gapSince).map(([jobName, gap]) => ({
+    jobName,
+    openclawJobId: gap.openclawJobId,
+    lastRunAtMs: gap.lastRunAtMs,
+    missingForMs: nowMs - gap.sinceMs,
+    exceededThreshold: nowMs - gap.sinceMs >= discoveryGapMs
+  }));
+  const errors = [];
+  if (!seedCompleted) {
+    errors.push(discoveryHealth.seedError ? `discovery-seed-pending: ${discoveryHealth.seedError}` : "discovery-seed-pending");
+  }
+  if (discoveryHealth.lastListOk === false) {
+    errors.push(`cron-list-failed: ${discoveryHealth.lastListError}`);
+  }
+  for (const [jobName, message] of Object.entries(discoveryHealth.jobInterfaceErrors)) {
+    errors.push(`cron-runs-failed[${jobName}]: ${message}`);
+  }
+  for (const gap of gaps) {
+    if (gap.exceededThreshold) {
+      errors.push(
+        `cron-discovery-gap[${gap.jobName}]: gateway reports a run at ${gap.lastRunAtMs} for OpenClaw job ` +
+        `${gap.openclawJobId}, but no matching entry has been visible via \`openclaw cron runs\` for ` +
+        `${gap.missingForMs}ms - scheduled work is NOT executing.`
+      );
+    }
+  }
+  return {
+    ok: errors.length === 0,
+    service: "openclaw-cron-runner",
+    discoveryInterface: "openclaw-cli",
+    openclawBin,
+    seedCompleted,
+    lastListAt: discoveryHealth.lastListAt,
+    lastListOk: discoveryHealth.lastListOk,
+    gapThresholdMs: discoveryGapMs,
+    gaps,
+    errors
+  };
+}
+
+// Escalates every discovery gap that has outlasted discoveryGapMs: loud stderr always, plus a
+// Feishu alert (once per gap - cleared when the gap clears) unless alerts are disabled. A gap
+// here means the gateway fired a managed job and the runner cannot see the run through its
+// execution interface - left alone, that is a 100% silent no-op of a scheduled pipeline.
+async function escalateExceededDiscoveryGaps(nowMs) {
+  for (const [jobName, gap] of Object.entries(discoveryHealth.gapSince)) {
+    if (nowMs - gap.sinceMs < discoveryGapMs || discoveryHealth.alertedGapJobs.has(jobName)) {
+      continue;
+    }
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "cron-discovery-gap",
+      job: jobName,
+      openclawJobId: gap.openclawJobId,
+      lastRunAtMs: gap.lastRunAtMs,
+      missingForMs: nowMs - gap.sinceMs,
+      note: "Gateway fired this managed job but the runner cannot see the run via `openclaw cron runs` - " +
+        "the silent-no-op class this runner's discovery guard exists to catch."
+    }));
+    if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
+      discoveryHealth.alertedGapJobs.add(jobName);
+      continue;
+    }
+    try {
+      const delivery = await deliverReportToFeishu({
+        title: `OpenClaw cron-runner 发现盲区：${jobName}`,
+        markdown: [
+          "# OpenClaw cron-runner 发现盲区",
+          "",
+          `- 任务：${jobName}（OpenClaw job ${gap.openclawJobId}）`,
+          `- 现象：gateway 显示该任务已在 ${new Date(gap.lastRunAtMs ?? nowMs).toISOString()} 触发，但 runner 通过 \`openclaw cron runs\` 持续 ${Math.round((nowMs - gap.sinceMs) / 60000)} 分钟看不到对应记录。`,
+          "- 后果：该定时管线当前处于静默不执行状态（与 2026-07 sqlite 迁移导致的静默故障同类）。",
+          "- 请检查：mini 上 OpenClaw 版本/存储是否又迁移、gateway 是否健康、runner 的 OPENCLAW_BIN 是否指向正确的 CLI。"
+        ].join("\n"),
+        maxSectionChars: 3600
+      });
+      if (delivery.sent) {
+        discoveryHealth.alertedGapJobs.add(jobName);
+      } else {
+        console.error(JSON.stringify({
+          ok: false,
+          service: "openclaw-cron-runner",
+          action: "cron-discovery-gap-alert-not-sent",
+          job: jobName,
+          reason: delivery.reason ?? null
+        }));
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "cron-discovery-gap-alert-error",
+        job: jobName,
+        error: String(error?.message ?? error)
+      }));
+    }
+  }
 }
 
 function buildOpenClawRunKey(entry) {
@@ -451,6 +794,28 @@ function loadRunnerState() {
   });
   if (recovered) {
     recoveredFromCorruptState = true;
+    // Corrupt recovery invalidates the seed marker: the recovered processedRunKeys are empty, so
+    // without a fresh seeding pass the next poll would treat every CLI-visible historical run as
+    // new (the replay license the recovery exists to deny). Dropping the marker forces the
+    // bankruptcy pass to run again - crash-safe, since the marker is only rewritten after a
+    // FULLY successful seed.
+    seedCompleted = false;
+    rmSync(seedMarkerPath, { force: true });
+    // Persist the recovered conservative state immediately (best-effort): otherwise every
+    // subsequent loadRunnerState() re-reads the same corrupt bytes and repeats the whole
+    // recovery (another backup file, another escalation) once per poll cycle. A failed write
+    // here just means exactly that repeat happens - which is loud, not silent.
+    try {
+      writeRunnerStateAtomic(processedRunsPath, `${JSON.stringify(serializeRunnerState(state), null, 2)}\n`);
+    } catch (persistError) {
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "recovered-state-persist-failed",
+        path: processedRunsPath,
+        error: String(persistError?.message ?? persistError)
+      }));
+    }
   }
   return state;
 }
