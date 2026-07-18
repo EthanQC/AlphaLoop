@@ -266,6 +266,12 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
       },
       entries: {
         ...filterPluginObject(existing.plugins?.entries ?? {}),
+        // OpenClaw 2026.7+ requires EXPLICIT trust for externally-installed
+        // channel plugins: a configured channels.feishu alone logs
+        // "installed without explicit trust. Add plugins.entries.feishu.enabled=true"
+        // and the channel stays down. Emitted only when feishu creds are
+        // present (same gate as the channels.feishu block).
+        ...(feishuEnabled ? { feishu: { enabled: true } } : {}),
         acpx: {
           enabled: true,
           config: {

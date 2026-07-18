@@ -73,6 +73,16 @@ describe("buildNextConfig non-destructive merge", () => {
     expect(output.channels.feishu.accounts.main.appId).toBe("cli_app_123");
     // Existing channels must still be present alongside feishu.
     expect(output.channels.slack).toEqual({ enabled: true });
+    // OpenClaw 2026.7+ needs explicit plugin trust for the external feishu
+    // channel plugin - without entries.feishu.enabled=true the gateway logs
+    // "installed without explicit trust" and the channel stays down
+    // (observed live on the mini, 2026-07-18).
+    expect(output.plugins.entries.feishu).toEqual({ enabled: true });
+  });
+
+  it("does NOT emit a feishu plugin entry when feishu creds are absent", () => {
+    const output = buildNextConfig({ existing: {}, env: {}, processEnv: {}, repoRoot: "/repo" });
+    expect(output.plugins.entries.feishu).toBeUndefined();
   });
 });
 
