@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 
 // @ts-expect-error - .mjs CLI helper without type declarations
-import { buildNextConfig } from "./render-openclaw-config.mjs";
+import { buildNextConfig, installControlPersona } from "./render-openclaw-config.mjs";
 
 function makeExisting() {
   return {
@@ -245,5 +248,85 @@ describe("FIX 3: defensive edges", () => {
     expect(output.meta.customMetaKey).toBe("survive");
     expect(output.meta.lastTouchedVersion).toBe("9.9.9");
     expect(typeof output.meta.lastTouchedAt).toBe("string");
+  });
+});
+
+// v2 persona deployment (the #1 user complaint fix): the control agent's
+// workspace (~/.openclaw/workspaces/control) used to stay EMPTY forever -
+// skipBootstrap:true means OpenClaw never writes bootstrap files, and no
+// script ever deployed agents/control.md - so the deployed Feishu bot
+// answered as vanilla Codex with no persona at all. installControlPersona is
+// the deployment seam: agents/control.md ({{REPO_ROOT}}-templated, the
+// single source of persona) + repo-root AGENTS.md (Trading Constitution)
+// composed into <homedir>/.openclaw/workspaces/control/AGENTS.md.
+describe("installControlPersona", () => {
+  const tempDirs: string[] = [];
+
+  function makeTempHome(): string {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-render-home-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  // A deliberately fake repo root: it must differ from the real checkout path
+  // so the "no hardcoded developer-machine path" assertions below can tell a
+  // legitimately-expanded {{REPO_ROOT}} apart from a path someone hardcoded
+  // back into agents/control.md.
+  const FAKE_REPO_ROOT = "/srv/fake-alphaloop";
+
+  it("writes the persona into <homedir>/.openclaw/workspaces/control/AGENTS.md with {{REPO_ROOT}} fully expanded", () => {
+    const home = makeTempHome();
+    const { workspacePersonaPath } = installControlPersona({ repoRoot: FAKE_REPO_ROOT, homedir: home });
+
+    expect(workspacePersonaPath).toBe(join(home, ".openclaw", "workspaces", "control", "AGENTS.md"));
+    const content = readFileSync(workspacePersonaPath, "utf8");
+    expect(content.trim().length).toBeGreaterThan(0);
+
+    // Placeholder fully expanded - no template token survives...
+    expect(content).not.toContain("{{REPO_ROOT}}");
+    // ...and expanded to the repoRoot that was passed in (a real routed CLI
+    // path proves the routing table went through expansion, not deletion).
+    expect(content).toContain(`${FAKE_REPO_ROOT}/apps/openclaw-config/scripts/market-alerts.mjs`);
+    expect(content).toContain(`${FAKE_REPO_ROOT}/apps/openclaw-config/scripts/proposals.mjs`);
+  });
+
+  it("contains no hardcoded developer-machine paths (the v1-era staleness this fix retires)", () => {
+    const home = makeTempHome();
+    const { workspacePersonaPath } = installControlPersona({ repoRoot: FAKE_REPO_ROOT, homedir: home });
+    const content = readFileSync(workspacePersonaPath, "utf8");
+
+    expect(content).not.toContain("/Users/abble");
+    expect(content).not.toContain("/Users/qingchang");
+  });
+
+  it("prepends the repo-root AGENTS.md Trading Constitution content", () => {
+    const home = makeTempHome();
+    const { workspacePersonaPath } = installControlPersona({ repoRoot: FAKE_REPO_ROOT, homedir: home });
+    const content = readFileSync(workspacePersonaPath, "utf8");
+
+    // Verbatim constitution lines from the repo-root AGENTS.md.
+    expect(content).toContain("# Trading Constitution");
+    expect(content).toContain("Never auto-submit real-money orders.");
+    // The constitution comes BEFORE the persona body (prepend, not append).
+    expect(content.indexOf("# Trading Constitution")).toBeLessThan(content.indexOf("Trading Copilot"));
+  });
+
+  it("is idempotent: re-running overwrites the derived file with identical content", () => {
+    const home = makeTempHome();
+    const first = installControlPersona({ repoRoot: FAKE_REPO_ROOT, homedir: home });
+    const firstContent = readFileSync(first.workspacePersonaPath, "utf8");
+    const second = installControlPersona({ repoRoot: FAKE_REPO_ROOT, homedir: home });
+
+    expect(second.workspacePersonaPath).toBe(first.workspacePersonaPath);
+    expect(readFileSync(second.workspacePersonaPath, "utf8")).toBe(firstContent);
   });
 });
