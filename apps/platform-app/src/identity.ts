@@ -40,12 +40,15 @@ const LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
  *      `members.status = 'active'` (owning member still active) in one
  *      query - see database.ts.
  *   2. Else `Cf-Access-Authenticated-User-Email` -> MemberRepository
- *      .getByEmail. The header is only trusted after verifyAccessJwt passes
- *      (a no-op in loopback-trust mode, full `Cf-Access-Jwt-Assertion`
- *      verification once CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD are set - see
- *      the Access JWT section below). Unlike the token path, getByEmail does
- *      NOT filter by status (it's a plain lookup used elsewhere for that
- *      reason), so this function enforces `status === 'active'` itself here.
+ *      .getByEmail. This header is ONLY trusted after verifyAccessJwt passes:
+ *      in ENFORCE mode that means a cryptographically-verified
+ *      `Cf-Access-Jwt-Assertion` whose email claim matches the header; the
+ *      pre-P10 blind-trust behavior survives only behind the explicit
+ *      CF_ACCESS_DISABLED=true escape (see the Access JWT section below for the
+ *      full precedence - the default is FAIL CLOSED). Unlike the token path,
+ *      getByEmail does NOT filter by status (it's a plain lookup used
+ *      elsewhere for that reason), so this function enforces
+ *      `status === 'active'` itself here.
  *   3. Else -> null (caller renders renderUnauthorizedPage).
  *
  * Bearer is checked first and wins if both are present - see the plan's
@@ -122,11 +125,12 @@ function resolveViaAccessEmailHeader(req: IdentityRequest, db: DatabaseSync): Me
     return null;
   }
 
-  // P10: the email header alone is spoofable by anything that can reach this
-  // port directly - before trusting it at all, require cryptographic proof
-  // it was set by Cloudflare Access (see verifyAccessJwt below). In
-  // loopback-trust mode (no CF_ACCESS_* env configured) this is a
-  // documented pass-through, preserving pre-P10 local behavior.
+  // The email header alone is spoofable by anything that can reach this port
+  // directly. verifyAccessJwt is the gate: it returns true ONLY when the
+  // request either carries a cryptographically-valid Cf-Access-Jwt-Assertion
+  // that agrees with this email (ENFORCE mode) or the operator has explicitly
+  // opted into blind trust via CF_ACCESS_DISABLED=true (loopback dev/tests).
+  // With neither, it fails closed - the email header yields no identity.
   if (!verifyAccessJwt(req)) {
     return null;
   }
@@ -146,42 +150,44 @@ function resolveViaAccessEmailHeader(req: IdentityRequest, db: DatabaseSync): Me
 // The cryptographic machinery (compact-JWT parsing, RS256/ES256 signature
 // checks, the JWKS cache with synchronous reads + background refresh) lives
 // in access-jwt.ts; this section owns the ENV-DRIVEN POLICY around it - the
-// three modes, the warn-once misconfiguration guard, and the binding of the
-// token's email claim to the plain-text email header the rest of the
-// identity chain resolves against.
+// three modes, the warn-once fail-closed guard, and the binding of the
+// token's email claim to the plain-text email header the rest of the identity
+// chain resolves against.
 //
-// Configuration (both read from process.env on every call, so index.ts's
-// loadLocalEnv is the only plumbing needed):
-//   - CF_ACCESS_TEAM_DOMAIN: the Zero Trust team name, e.g. "myteam" (a full
+// Configuration (read from process.env, which index.ts populates via
+// loadLocalEnv before wiring anything - do NOT hardcode team/aud):
+//   - CF_ACCESS_TEAM_DOMAIN: the Zero Trust team, e.g. "myteam" (a full
 //     "myteam.cloudflareaccess.com" / "https://..." form is normalized).
 //     JWKS: https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
-//   - CF_ACCESS_AUD: the Access application's audience (AUD) tag.
+//   - CF_ACCESS_AUD:      the Access application's audience (AUD) tag.
+//   - CF_ACCESS_DISABLED: escape hatch (see mode 1 below).
 //
-// Modes (getAccessJwtMode):
-//   - BOTH unset -> "loopback-trust": verifyAccessJwt returns true, exactly
-//     the pre-P10 behavior. platform-app binds 127.0.0.1 only, so the email
-//     header is reachable only by local processes; this mode is what keeps
-//     local dev working before the Cloudflare side exists.
-//   - BOTH set -> "enforce": the `Cf-Access-Jwt-Assertion` JWT is fully
-//     verified (signature against the team JWKS, iss, aud, exp/nbf/iat with
-//     clock skew - see access-jwt.ts) and its email claim must match the
-//     `Cf-Access-Authenticated-User-Email` header case-insensitively. Any
-//     failure -> false and the request is treated as unauthenticated.
-//   - Exactly ONE set (or a team domain that normalizes to nothing) ->
-//     "misconfigured": fail closed (every header-path request is rejected)
-//     and warn once via console.error. A half-typed config must never
-//     silently fall back to trusting forgeable headers.
+// PRECEDENCE - loud on purpose; the entire point of P10 is that a
+// missing/misconfigured verifier must NEVER silently trust a forgeable header
+// once this service is publicly reachable through the Access tunnel:
+//   1. CF_ACCESS_DISABLED === "true" -> "disabled": verifyAccessJwt returns
+//      true, exactly the pre-P10 blind-trust behavior. This is the ONLY way to
+//      keep trusting the bare email header; it exists for loopback dev/CI
+//      (platform-app binds 127.0.0.1 only) and the existing test suite.
+//   2. Else BOTH team + aud set -> "enforce": the `Cf-Access-Jwt-Assertion`
+//      JWT is fully verified (signature against the team JWKS, iss, aud,
+//      exp/nbf/iat with clock skew - see access-jwt.ts) and its email claim
+//      must match the `Cf-Access-Authenticated-User-Email` header
+//      case-insensitively. Any failure -> false (request is unauthenticated).
+//   3. Else (EITHER unset, and not disabled) -> "fail-closed": every
+//      header-path request is rejected, and a one-time console.error warns
+//      that verification is off. Absence of config is NOT consent to trust.
 //
 // SYNCHRONY / COLD START: resolveIdentity is synchronous and is called
 // synchronously from every route handler, so verification never awaits. The
 // JWKS cache serves keys synchronously and refreshes in the background; an
 // unknown kid or a stale cache fails CLOSED for the current request and
 // schedules a refetch so the next request succeeds. index.ts calls
-// primeAccessJwtCache() at startup so the very first tunneled request does
-// not eat that one-time cold miss. A JWKS fetch failure keeps the previous
-// key set and logs - it never fails open and never throws into a request.
+// primeAccessJwtCache() at startup so the very first tunneled request does not
+// eat that one-time cold miss. A JWKS fetch failure keeps the previous key set
+// and logs - it never fails open and never throws into a request.
 
-export type AccessJwtMode = "loopback-trust" | "enforce" | "misconfigured";
+export type AccessJwtMode = "disabled" | "enforce" | "fail-closed";
 
 interface AccessJwtConfig {
   mode: AccessJwtMode;
@@ -196,7 +202,7 @@ const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
 let accessJwksFetcher: JwksFetcher = defaultJwksFetcher;
 let accessJwksCache: JwksCache | null = null;
 let accessJwksCacheCertsUrl: string | null = null;
-let warnedAccessJwtMisconfigured = false;
+let warnedAccessJwtFailClosed = false;
 
 /**
  * Test seam: replace (or, with no argument, restore) the JWKS fetcher. Also
@@ -208,17 +214,17 @@ export function __setAccessJwksFetcherForTests(fetcher?: JwksFetcher): void {
   accessJwksCacheCertsUrl = null;
 }
 
-/** Test seam: clear the JWKS cache and the warn-once misconfiguration flag. */
+/** Test seam: clear the JWKS cache and the warn-once fail-closed flag. */
 export function __resetAccessJwtStateForTests(): void {
   accessJwksCache = null;
   accessJwksCacheCertsUrl = null;
-  warnedAccessJwtMisconfigured = false;
+  warnedAccessJwtFailClosed = false;
 }
 
 /**
  * Resolves the current Access JWT mode from process.env - see the section
  * comment above for the three modes. index.ts calls this once at startup so
- * the mode is visible in the boot log and a half-configured deployment warns
+ * the mode is visible in the boot log and a fail-closed deployment warns
  * immediately (not on first request).
  */
 export function getAccessJwtMode(): AccessJwtMode {
@@ -240,32 +246,38 @@ export async function primeAccessJwtCache(): Promise<void> {
 }
 
 function resolveAccessJwtConfig(): AccessJwtConfig {
+  // (1) Explicit escape hatch wins over everything: blind-trust the header.
+  if (process.env.CF_ACCESS_DISABLED === "true") {
+    return { mode: "disabled" };
+  }
+
   const teamRaw = process.env.CF_ACCESS_TEAM_DOMAIN?.trim() ?? "";
   const aud = process.env.CF_ACCESS_AUD?.trim() ?? "";
-
-  if (!teamRaw && !aud) {
-    return { mode: "loopback-trust" };
-  }
-
   const team = teamRaw ? normalizeTeamDomain(teamRaw) : null;
-  if (!team || !aud) {
-    warnAccessJwtMisconfiguredOnce();
-    return { mode: "misconfigured" };
+
+  // (2) Both fully configured: enforce real JWT verification.
+  if (team && aud) {
+    return { mode: "enforce", issuer: team.issuer, certsUrl: team.certsUrl, aud };
   }
 
-  return { mode: "enforce", issuer: team.issuer, certsUrl: team.certsUrl, aud };
+  // (3) Anything else (nothing set, only one set, or an unusable team domain)
+  // fails closed. A missing/half-typed verifier must never fall back to
+  // trusting the forgeable email header.
+  warnAccessJwtFailClosedOnce();
+  return { mode: "fail-closed" };
 }
 
-function warnAccessJwtMisconfiguredOnce(): void {
-  if (warnedAccessJwtMisconfigured) {
+function warnAccessJwtFailClosedOnce(): void {
+  if (warnedAccessJwtFailClosed) {
     return;
   }
-  warnedAccessJwtMisconfigured = true;
+  warnedAccessJwtFailClosed = true;
   console.error(
-    "[identity] Cloudflare Access JWT verification is MISCONFIGURED: CF_ACCESS_TEAM_DOMAIN / " +
-      "CF_ACCESS_AUD must be BOTH set (enforce) or BOTH unset (loopback-trust); exactly one " +
-      "is set, or the team domain is unusable. Failing closed: all " +
-      "Cf-Access-Authenticated-User-Email logins will be rejected until fixed."
+    "[identity] Cloudflare Access JWT verification is FAILING CLOSED: set BOTH " +
+      "CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD to enforce real verification, or " +
+      "CF_ACCESS_DISABLED=true for loopback dev/tests. Until then every " +
+      "Cf-Access-Authenticated-User-Email login is rejected (the bare header is " +
+      "never trusted without proof)."
   );
 }
 
@@ -301,10 +313,10 @@ function getAccessJwksCache(certsUrl: string): JwksCache {
  */
 export function verifyAccessJwt(req: IdentityRequest): boolean {
   const config = resolveAccessJwtConfig();
-  if (config.mode === "loopback-trust") {
+  if (config.mode === "disabled") {
     return true;
   }
-  if (config.mode === "misconfigured") {
+  if (config.mode === "fail-closed") {
     return false;
   }
 
@@ -317,7 +329,8 @@ export function verifyAccessJwt(req: IdentityRequest): boolean {
     jwksCache: getAccessJwksCache(config.certsUrl as string),
     issuer: config.issuer as string,
     audience: config.aud as string,
-    now: Date.now
+    now: Date.now,
+    clockSkewSec: 60
   });
   if (!identity) {
     return false;

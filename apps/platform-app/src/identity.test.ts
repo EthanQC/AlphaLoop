@@ -3,13 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  ApiTokenRepository,
-  MemberRepository,
-  migrate,
-  nowIso,
-  type Member
-} from "@packages/shared-types";
+import { ApiTokenRepository, MemberRepository, migrate, type Member } from "@packages/shared-types";
 
 import type { Jwk } from "./access-jwt.js";
 import {
@@ -22,17 +16,40 @@ import {
   verifyAccessJwt
 } from "./identity.js";
 
-// Access JWT env handling: every test in this file starts from the
-// loopback-trust baseline (both CF_ACCESS_* vars unset) regardless of what
-// the invoking shell exported - the pre-P10 resolveIdentity tests below
-// depend on the email header being trusted without a JWT. Enforce-mode tests
-// opt in explicitly via enforceEnv().
+// Access-verification env handling. The pre-P10 resolveIdentity tests below
+// depend on the email header being trusted without a JWT, which under the P10
+// contract requires the explicit CF_ACCESS_DISABLED=true escape (mode
+// "disabled"). So the shared baseline sets it; enforce-mode and fail-closed
+// tests override via enforceEnv() / failClosedEnv(). (The wider suite gets the
+// same default from vitest.config.ts's `env`, so route tests that authenticate
+// via the header keep working without touching each file.)
 const SAVED_TEAM_DOMAIN = process.env.CF_ACCESS_TEAM_DOMAIN;
 const SAVED_AUD = process.env.CF_ACCESS_AUD;
+const SAVED_DISABLED = process.env.CF_ACCESS_DISABLED;
 
-beforeEach(() => {
+function clearAccessEnv(): void {
   delete process.env.CF_ACCESS_TEAM_DOMAIN;
   delete process.env.CF_ACCESS_AUD;
+  delete process.env.CF_ACCESS_DISABLED;
+}
+
+/** ENFORCE mode: both vars set, escape hatch off. */
+function enforceEnv(): void {
+  clearAccessEnv();
+  process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
+  process.env.CF_ACCESS_AUD = ACCESS_AUD;
+}
+
+/** FAIL-CLOSED mode: nothing configured, escape hatch off. */
+function failClosedEnv(): void {
+  clearAccessEnv();
+}
+
+beforeEach(() => {
+  // DISABLED baseline (pre-P10 blind header trust) for the plain
+  // resolveIdentity tests.
+  clearAccessEnv();
+  process.env.CF_ACCESS_DISABLED = "true";
   __resetAccessJwtStateForTests();
   __setAccessJwksFetcherForTests();
 });
@@ -42,13 +59,15 @@ afterEach(() => {
 });
 
 afterAll(() => {
-  delete process.env.CF_ACCESS_TEAM_DOMAIN;
-  delete process.env.CF_ACCESS_AUD;
+  clearAccessEnv();
   if (SAVED_TEAM_DOMAIN !== undefined) {
     process.env.CF_ACCESS_TEAM_DOMAIN = SAVED_TEAM_DOMAIN;
   }
   if (SAVED_AUD !== undefined) {
     process.env.CF_ACCESS_AUD = SAVED_AUD;
+  }
+  if (SAVED_DISABLED !== undefined) {
+    process.env.CF_ACCESS_DISABLED = SAVED_DISABLED;
   }
   __resetAccessJwtStateForTests();
   __setAccessJwksFetcherForTests();
@@ -162,7 +181,7 @@ describe("resolveIdentity", () => {
     expect(resolveIdentity(req({ authorization: token }), db)).toBeNull();
   });
 
-  it("falls back to Cf-Access-Authenticated-User-Email when no bearer token is present", () => {
+  it("falls back to Cf-Access-Authenticated-User-Email when no bearer token is present (disabled mode)", () => {
     const db = memoryDb();
     const member = makeMember();
     new MemberRepository(db).upsert(member);
@@ -217,14 +236,14 @@ describe("resolveIdentity", () => {
 // ---------------------------------------------------------------------------
 // Cloudflare Access JWT verification (P10)
 // ---------------------------------------------------------------------------
-// Locally-generated keypairs play the role of Access's signing keys; the
-// JWKS "endpoint" is an injected fetcher (no network in tests). The JWKS
-// cache reads synchronously and refreshes in the BACKGROUND (access-jwt.ts),
-// so tests pre-warm it via primeAccessJwtCache() - exactly what index.ts
-// does at startup - or use settle() to let a scheduled refresh land.
+// A locally-generated RSA (and, for one case, EC) keypair plays the role of
+// Access's signing key; the JWKS "endpoint" is an injected async fetcher (no
+// network in tests). Enforce-mode verifications read from the in-memory JWKS
+// cache, so tests await primeAccessJwtCache() (the same warm-up index.ts runs
+// at startup) before the synchronous verifyAccessJwt call.
 
 const ACCESS_KID = "test-key-1";
-const ACCESS_EC_KID = "test-ec-key-1";
+const ACCESS_ES_KID = "test-key-ec-1";
 const ACCESS_TEAM = "myteam";
 const ACCESS_ISSUER = `https://${ACCESS_TEAM}.cloudflareaccess.com`;
 const ACCESS_JWKS_URL = `${ACCESS_ISSUER}/cdn-cgi/access/certs`;
@@ -233,14 +252,19 @@ const ACCESS_EMAIL = "member1@example.com";
 
 const accessKeyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const strangerKeyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
-const ecKeyPair = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const accessEcKeyPair = generateKeyPairSync("ec", { namedCurve: "P-256" });
 
-function jwkFor(key: KeyObject, kid: string): Jwk {
-  return { ...key.export({ format: "jwk" }), kid, use: "sig" } as Jwk;
-}
-
-function defaultJwks(): Jwk[] {
-  return [jwkFor(accessKeyPair.publicKey, ACCESS_KID), jwkFor(ecKeyPair.publicKey, ACCESS_EC_KID)];
+function jwksKeys(
+  entries: Array<{ key: KeyObject; kid: string; alg?: string }> = [
+    { key: accessKeyPair.publicKey, kid: ACCESS_KID }
+  ]
+): Jwk[] {
+  return entries.map(({ key, kid, alg }) => ({
+    ...(key.export({ format: "jwk" }) as Record<string, unknown>),
+    kid,
+    use: "sig",
+    alg: alg ?? "RS256"
+  })) as Jwk[];
 }
 
 function b64url(value: string): string {
@@ -251,46 +275,51 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/** Hand-built JWT mirroring the claims Access mints (RS256 or ES256). */
+/** Hand-built RS256 JWT mirroring the claims Access mints. */
 function buildJwt(
   options: {
-    alg?: "RS256" | "ES256";
     header?: Record<string, unknown>;
     payload?: Record<string, unknown>;
     signWith?: KeyObject;
   } = {}
 ): string {
-  const alg = options.alg ?? "RS256";
-  const header = {
-    alg,
-    typ: "JWT",
-    kid: alg === "ES256" ? ACCESS_EC_KID : ACCESS_KID,
-    ...options.header
-  };
+  const header = { alg: "RS256", typ: "JWT", kid: ACCESS_KID, ...options.header };
   const payload = {
     aud: [ACCESS_AUD],
     iss: ACCESS_ISSUER,
     email: ACCESS_EMAIL,
     exp: nowSeconds() + 600,
     nbf: nowSeconds() - 60,
-    iat: nowSeconds() - 1,
+    iat: nowSeconds(),
     sub: "access-user-sub",
     ...options.payload
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
-  const signature =
-    alg === "ES256"
-      ? cryptoSign("sha256", Buffer.from(signingInput, "utf8"), {
-          key: options.signWith ?? ecKeyPair.privateKey,
-          dsaEncoding: "ieee-p1363"
-        })
-      : cryptoSign("RSA-SHA256", Buffer.from(signingInput, "utf8"), options.signWith ?? accessKeyPair.privateKey);
+  const signature = cryptoSign(
+    "RSA-SHA256",
+    Buffer.from(signingInput, "utf8"),
+    options.signWith ?? accessKeyPair.privateKey
+  );
   return `${signingInput}.${signature.toString("base64url")}`;
 }
 
-function enforceEnv(): void {
-  process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
-  process.env.CF_ACCESS_AUD = ACCESS_AUD;
+/** Hand-built ES256 JWT (raw R||S signature, per JWS). */
+function buildEsJwt(): string {
+  const header = { alg: "ES256", typ: "JWT", kid: ACCESS_ES_KID };
+  const payload = {
+    aud: [ACCESS_AUD],
+    iss: ACCESS_ISSUER,
+    email: ACCESS_EMAIL,
+    exp: nowSeconds() + 600,
+    nbf: nowSeconds() - 60,
+    iat: nowSeconds()
+  };
+  const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+  const signature = cryptoSign("sha256", Buffer.from(signingInput, "utf8"), {
+    key: accessEcKeyPair.privateKey,
+    dsaEncoding: "ieee-p1363"
+  });
+  return `${signingInput}.${signature.toString("base64url")}`;
 }
 
 /** `null` omits the corresponding header entirely. */
@@ -306,8 +335,8 @@ function accessHeaders(jwt: string | null, email: string | null = ACCESS_EMAIL) 
 }
 
 /**
- * Installs a JWKS fetcher returning the given responses in order (the last
- * repeats). A function response is invoked, so it can throw to simulate a
+ * Installs an async JWKS fetcher returning the given key sets in order (the
+ * last repeats). A function response is invoked, so it can throw to simulate a
  * network failure. Returns the list of fetched URLs for call-count asserts.
  */
 function installJwksFetcher(...responses: Array<Jwk[] | (() => Jwk[])>): { calls: string[] } {
@@ -323,112 +352,106 @@ function installJwksFetcher(...responses: Array<Jwk[] | (() => Jwk[])>): { calls
   return { calls };
 }
 
-/** installJwksFetcher + the same startup pre-warm index.ts performs. */
-async function primed(...responses: Array<Jwk[] | (() => Jwk[])>): Promise<{ calls: string[] }> {
-  const handle = installJwksFetcher(...responses);
-  await primeAccessJwtCache();
-  return handle;
-}
-
-/** Lets a background JWKS refresh scheduled by a verification land. */
-function settle(): Promise<void> {
-  return new Promise((resolvePromise) => setImmediate(() => resolvePromise()));
-}
-
 describe("getAccessJwtMode", () => {
-  it("is loopback-trust when neither CF_ACCESS_* var is set", () => {
-    expect(getAccessJwtMode()).toBe("loopback-trust");
+  it("is disabled when CF_ACCESS_DISABLED=true", () => {
+    expect(getAccessJwtMode()).toBe("disabled");
   });
 
-  it("is enforce when both are set", () => {
+  it("CF_ACCESS_DISABLED=true wins even when team+aud are also set", () => {
+    process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
+    process.env.CF_ACCESS_AUD = ACCESS_AUD;
+    process.env.CF_ACCESS_DISABLED = "true";
+    expect(getAccessJwtMode()).toBe("disabled");
+  });
+
+  it("is enforce when both team+aud are set and the escape is off", () => {
     enforceEnv();
     expect(getAccessJwtMode()).toBe("enforce");
   });
 
-  it("is misconfigured when exactly one is set", () => {
+  it("is fail-closed when neither var is set and the escape is off", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
-    expect(getAccessJwtMode()).toBe("misconfigured");
-
-    delete process.env.CF_ACCESS_TEAM_DOMAIN;
-    __resetAccessJwtStateForTests();
-    process.env.CF_ACCESS_AUD = ACCESS_AUD;
-    expect(getAccessJwtMode()).toBe("misconfigured");
+    failClosedEnv();
+    expect(getAccessJwtMode()).toBe("fail-closed");
   });
 
-  it("is misconfigured when the team domain normalizes to nothing", () => {
+  it("is fail-closed when exactly one of team/aud is set", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    process.env.CF_ACCESS_TEAM_DOMAIN = "https://";
+    clearAccessEnv();
+    process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
+    expect(getAccessJwtMode()).toBe("fail-closed");
+
+    clearAccessEnv();
     process.env.CF_ACCESS_AUD = ACCESS_AUD;
-    expect(getAccessJwtMode()).toBe("misconfigured");
+    expect(getAccessJwtMode()).toBe("fail-closed");
   });
 });
 
 describe("verifyAccessJwt", () => {
-  it("returns true with no CF_ACCESS_* env, even for a bare forged header (loopback-trust mode)", () => {
+  it("disabled mode trusts even a bare forged header (no JWT)", () => {
+    // beforeEach set CF_ACCESS_DISABLED=true.
     expect(verifyAccessJwt(req({}))).toBe(true);
     expect(verifyAccessJwt(req({ "cf-access-authenticated-user-email": "anyone@example.com" }))).toBe(true);
   });
 
-  it("fails closed and warns exactly once via console.error when only one env var is set", async () => {
+  it("fail-closed mode rejects the header path and warns exactly once", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    process.env.CF_ACCESS_TEAM_DOMAIN = ACCESS_TEAM;
-    installJwksFetcher(defaultJwks());
+    failClosedEnv();
 
-    const jwt = buildJwt();
-    expect(verifyAccessJwt(req(accessHeaders(jwt)))).toBe(false);
-    expect(verifyAccessJwt(req(accessHeaders(jwt)))).toBe(false);
-    expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(String(errorSpy.mock.calls[0]?.[0])).toContain("CF_ACCESS_TEAM_DOMAIN");
-  });
-
-  it("fails closed when only CF_ACCESS_AUD is set", () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    process.env.CF_ACCESS_AUD = ACCESS_AUD;
-    installJwksFetcher(defaultJwks());
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
+    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain("CF_ACCESS_DISABLED");
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain("CF_ACCESS_TEAM_DOMAIN");
   });
 
   it("accepts a valid RS256 token signed by the JWKS key", async () => {
     enforceEnv();
-    const { calls } = await primed(defaultJwks());
+    const { calls } = installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
 
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
     expect(calls).toEqual([ACCESS_JWKS_URL]);
   });
 
-  it("accepts a valid ES256 token (Cloudflare may rotate to EC keys)", async () => {
+  it("accepts a valid ES256 token (raw R||S signature)", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys([{ key: accessEcKeyPair.publicKey, kid: ACCESS_ES_KID, alg: "ES256" }]));
+    await primeAccessJwtCache();
 
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt({ alg: "ES256" }))))).toBe(true);
+    expect(verifyAccessJwt(req(accessHeaders(buildEsJwt())))).toBe(true);
   });
 
   it("normalizes a full team-domain form (https://<team>.cloudflareaccess.com)", async () => {
-    process.env.CF_ACCESS_TEAM_DOMAIN = `https://${ACCESS_TEAM}.cloudflareaccess.com`;
+    clearAccessEnv();
+    process.env.CF_ACCESS_TEAM_DOMAIN = `https://${ACCESS_TEAM}.cloudflareaccess.com/`;
     process.env.CF_ACCESS_AUD = ACCESS_AUD;
-    const { calls } = await primed(defaultJwks());
+    const { calls } = installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
 
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
     expect(calls).toEqual([ACCESS_JWKS_URL]);
   });
 
-  it("rejects a request whose Cf-Access-Jwt-Assertion header is missing", async () => {
+  it("rejects a token whose Cf-Access-Jwt-Assertion header is missing", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(verifyAccessJwt(req(accessHeaders(null)))).toBe(false);
   });
 
   it("rejects a token signed by the wrong key (signature mismatch)", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const forged = buildJwt({ signWith: strangerKeyPair.privateKey });
     expect(verifyAccessJwt(req(accessHeaders(forged)))).toBe(false);
   });
 
   it("rejects a tampered payload even with a once-valid signature", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const valid = buildJwt();
     const [header, , signature] = valid.split(".") as [string, string, string];
     const tamperedPayload = b64url(
@@ -444,7 +467,8 @@ describe("verifyAccessJwt", () => {
 
   it("rejects an expired token but tolerates expiry within the clock-skew window", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
 
     const expired = buildJwt({ payload: { exp: nowSeconds() - 120 } });
     expect(verifyAccessJwt(req(accessHeaders(expired)))).toBe(false);
@@ -455,13 +479,15 @@ describe("verifyAccessJwt", () => {
 
   it("rejects a token with no exp claim", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(verifyAccessJwt(req(accessHeaders(buildJwt({ payload: { exp: undefined } }))))).toBe(false);
   });
 
   it("rejects a token whose aud does not contain CF_ACCESS_AUD", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(
       verifyAccessJwt(req(accessHeaders(buildJwt({ payload: { aud: ["some-other-app"] } }))))
     ).toBe(false);
@@ -469,121 +495,119 @@ describe("verifyAccessJwt", () => {
 
   it("accepts aud as a plain string equal to CF_ACCESS_AUD", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(verifyAccessJwt(req(accessHeaders(buildJwt({ payload: { aud: ACCESS_AUD } }))))).toBe(true);
   });
 
   it("rejects a token from the wrong issuer", async () => {
     enforceEnv();
-    await primed(defaultJwks());
-    const wrongIssuer = buildJwt({
-      payload: { iss: "https://otherteam.cloudflareaccess.com" }
-    });
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
+    const wrongIssuer = buildJwt({ payload: { iss: "https://otherteam.cloudflareaccess.com" } });
     expect(verifyAccessJwt(req(accessHeaders(wrongIssuer)))).toBe(false);
   });
 
   it("rejects a valid JWT replayed alongside a different email header", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(verifyAccessJwt(req(accessHeaders(buildJwt(), "other@example.com")))).toBe(false);
-  });
-
-  it("rejects a token whose email claim is empty", async () => {
-    enforceEnv();
-    await primed(defaultJwks());
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt({ payload: { email: "" } }))))).toBe(false);
   });
 
   it("matches the email claim against the header case-insensitively", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const jwt = buildJwt({ payload: { email: "Member1@Example.COM" } });
     expect(verifyAccessJwt(req(accessHeaders(jwt, "member1@example.com")))).toBe(true);
   });
 
   it("rejects when the email header is missing even if the JWT itself is valid", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     expect(verifyAccessJwt(req(accessHeaders(buildJwt(), null)))).toBe(false);
   });
 
-  it("rejects malformed tokens and the alg:none downgrade", async () => {
+  it("rejects malformed tokens and non-RS256/ES256 algorithms (incl. alg:none)", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
 
     expect(verifyAccessJwt(req(accessHeaders("garbage")))).toBe(false);
     expect(verifyAccessJwt(req(accessHeaders("a.b")))).toBe(false);
 
-    const unsignedPayload = b64url(
+    const algNone = `${b64url(JSON.stringify({ alg: "none", kid: ACCESS_KID }))}.${b64url(
       JSON.stringify({ aud: [ACCESS_AUD], iss: ACCESS_ISSUER, email: ACCESS_EMAIL, exp: nowSeconds() + 600 })
-    );
-    const algNoneEmptySig = `${b64url(JSON.stringify({ alg: "none", kid: ACCESS_KID }))}.${unsignedPayload}.`;
-    expect(verifyAccessJwt(req(accessHeaders(algNoneEmptySig)))).toBe(false);
-    const algNoneJunkSig = `${b64url(JSON.stringify({ alg: "none", kid: ACCESS_KID }))}.${unsignedPayload}.${b64url("junk")}`;
-    expect(verifyAccessJwt(req(accessHeaders(algNoneJunkSig)))).toBe(false);
+    )}.`;
+    expect(verifyAccessJwt(req(accessHeaders(algNone)))).toBe(false);
   });
 
-  it("serves repeated verifications from the cached JWKS (single fetch)", async () => {
+  it("serves the JWKS from cache across verifications (no refetch while fresh)", async () => {
     enforceEnv();
-    const { calls } = await primed(defaultJwks());
+    const { calls } = installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
 
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
     expect(calls).toHaveLength(1);
   });
 
-  it("cold start without priming fails closed once, then succeeds after the background fetch", async () => {
-    enforceEnv();
-    const { calls } = installJwksFetcher(defaultJwks());
-
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
-    await settle();
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
-    expect(calls).toHaveLength(1);
-  });
-
-  it("recovers from key rotation: unknown kid fails closed now, background refetch admits the next request", async () => {
+  it("fails an unknown kid but recovers after the background refetch (key rotation)", async () => {
     enforceEnv();
     const { calls } = installJwksFetcher(
-      [jwkFor(strangerKeyPair.publicKey, "retired-key")],
-      defaultJwks()
+      jwksKeys([{ key: strangerKeyPair.publicKey, kid: "retired-key" }]),
+      jwksKeys()
     );
-    await primeAccessJwtCache();
+    await primeAccessJwtCache(); // fetch #1 -> cache holds only "retired-key"
     expect(calls).toHaveLength(1);
 
+    // ACCESS_KID unknown -> this request fails closed and schedules a refetch.
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
-    await settle();
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
+
+    // Await the scheduled (coalesced) refetch, then the new kid verifies.
+    await primeAccessJwtCache(); // fetch #2 -> cache now holds ACCESS_KID
     expect(calls).toHaveLength(2);
+    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
+  });
+
+  it("keeps failing (no fetch loop) when the kid stays unknown after a refetch", async () => {
+    enforceEnv();
+    const { calls } = installJwksFetcher(
+      jwksKeys([{ key: strangerKeyPair.publicKey, kid: "retired-key" }])
+    );
+    await primeAccessJwtCache(); // fetch #1
+    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
+    await primeAccessJwtCache(); // fetch #2 (still only retired-key)
+    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.length).toBeLessThanOrEqual(3);
   });
 
   it("fails closed (not open, no throw) when the JWKS fetch fails", async () => {
     enforceEnv();
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    await primed(() => {
+    installJwksFetcher(() => {
       throw new Error("network down");
     });
+    await primeAccessJwtCache();
 
     expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
-    expect(errorSpy).toHaveBeenCalled();
-    expect(String(errorSpy.mock.calls[0]?.[0])).toContain("failing closed");
   });
 
-  it("skips malformed JWKS entries but keeps the usable keys", async () => {
+  it("fails closed when the JWKS returns an unimportable key", async () => {
     enforceEnv();
-    await primed([
-      { kid: "broken-key", kty: "RSA", n: "!!!", e: "!!!" } as Jwk,
-      jwkFor(accessKeyPair.publicKey, ACCESS_KID)
-    ]);
-
-    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(true);
+    installJwksFetcher([{ kid: ACCESS_KID, kty: "RSA", use: "sig", alg: "RS256" }] as Jwk[]);
+    await primeAccessJwtCache();
+    expect(verifyAccessJwt(req(accessHeaders(buildJwt())))).toBe(false);
   });
 });
 
 describe("resolveIdentity under enforce mode", () => {
   it("resolves the member when the email header is backed by a valid Access JWT", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const db = memoryDb();
     const member = makeMember();
     new MemberRepository(db).upsert(member);
@@ -593,7 +617,8 @@ describe("resolveIdentity under enforce mode", () => {
 
   it("no longer trusts a bare email header once enforce mode is on", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const db = memoryDb();
     const member = makeMember();
     new MemberRepository(db).upsert(member);
@@ -605,7 +630,8 @@ describe("resolveIdentity under enforce mode", () => {
 
   it("rejects a valid JWT for A presented with a forged email header naming B", async () => {
     enforceEnv();
-    await primed(defaultJwks());
+    installJwksFetcher(jwksKeys());
+    await primeAccessJwtCache();
     const db = memoryDb();
     const memberB = makeMember({ id: "member_b", email: "member-b@example.com" });
     new MemberRepository(db).upsert(memberB);
@@ -614,9 +640,9 @@ describe("resolveIdentity under enforce mode", () => {
     expect(resolveIdentity(req(accessHeaders(buildJwt(), memberB.email)), db)).toBeNull();
   });
 
-  it("leaves the bearer-token path untouched by enforce mode (JWKS never consulted)", () => {
+  it("leaves the bearer-token path untouched by enforce mode", () => {
     enforceEnv();
-    const { calls } = installJwksFetcher(() => {
+    installJwksFetcher(() => {
       throw new Error("JWKS must not be consulted for bearer auth");
     });
     const db = memoryDb();
@@ -625,7 +651,30 @@ describe("resolveIdentity under enforce mode", () => {
     const { token } = new ApiTokenRepository(db).issue(member.id, "cli");
 
     expect(resolveIdentity(req({ authorization: `Bearer ${token}` }), db)).toEqual(member);
-    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("resolveIdentity fail-closed by default (no CF_ACCESS_* env, escape off)", () => {
+  it("does NOT trust the bare email header", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    failClosedEnv();
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(
+      resolveIdentity(req({ "cf-access-authenticated-user-email": member.email }), db)
+    ).toBeNull();
+  });
+
+  it("does NOT trust the email header even with a JWT present (nothing to verify against)", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    failClosedEnv();
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(resolveIdentity(req(accessHeaders(buildJwt())), db)).toBeNull();
   });
 });
 

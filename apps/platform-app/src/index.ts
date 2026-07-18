@@ -66,15 +66,17 @@ const feishuNotifier = createFeishuReviewNotifier({ db });
 const server = createPlatformServer({ db, repoRoot, researchWorker, feishuNotifier });
 
 // P10: resolve the Cloudflare Access JWT mode once at startup so it shows in
-// the boot log, and so a half-configured CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD
-// pair warns (and fails closed) immediately rather than on the first
-// request. Env comes from the loadLocalEnv call above; identity.ts re-reads
-// process.env per request, so no further plumbing is needed here.
-//   - "loopback-trust": pre-P10 behavior, email header trusted (local only).
-//   - "enforce": Cf-Access-Jwt-Assertion fully verified against the team's
-//     JWKS before the email header is trusted.
-//   - "misconfigured": exactly one of the two env vars set - all email
-//     header logins are rejected until fixed (see identity.ts's warning).
+// the boot log, and so a fail-closed deployment warns immediately rather than
+// on the first request. Env comes from the loadLocalEnv call above; identity.ts
+// re-reads process.env per request, so no further plumbing is needed here.
+//   - "disabled": pre-P10 blind trust of the email header, gated behind the
+//     explicit CF_ACCESS_DISABLED=true escape (local/loopback only).
+//   - "enforce": CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD both set -
+//     Cf-Access-Jwt-Assertion fully verified against the team's JWKS (and its
+//     email claim matched to the header) before the email header is trusted.
+//   - "fail-closed": neither disabled nor fully configured - all email-header
+//     logins are rejected until fixed (see identity.ts's warning). The
+//     forgeable header is never trusted by default.
 // In enforce mode the JWKS cache is pre-warmed (awaited, never throws) so
 // the first tunneled request does not eat the cold-start fail-closed miss.
 const accessJwtMode = getAccessJwtMode();
