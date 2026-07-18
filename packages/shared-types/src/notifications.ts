@@ -684,12 +684,92 @@ export async function updateInteractiveCard(
   }
 }
 
-// Default transport reuses the feishu-user-plugin MCP subprocess channel
-// (see callFeishuUserPluginTool below). Real MCP behaviour is a
-// deployment-time concern; this path is intentionally left uncovered by unit
-// tests here (see notifications.test.ts) since there is no established
-// subprocess-mocking pattern in this suite yet.
-const defaultCardTransport: CardTransport = {
+// Direct tenant-token HTTP transport (2026-07-18 live-send fix): the legacy
+// default routed cards through the feishu-user-plugin MCP subprocess - a
+// DIFFERENT Feishu app with its own credentials - and passed an open_id where
+// that tool expects a chat_id. Cards therefore could never deliver from the
+// production app (live probe: HTTP 400 code=230001 invalid receive_id, while
+// a direct im/v1/messages send with FEISHU_APP_ID/SECRET succeeded). This
+// transport sends with the app's OWN tenant token via the same API surface
+// the text-notification path above already uses.
+export const directHttpCardTransport: CardTransport = {
+  async sendCard(target, cardJson) {
+    const credentials = resolveFeishuAppCredentials();
+    if (!credentials) {
+      return { ok: false, error: "FEISHU_APP_ID / FEISHU_APP_SECRET are not configured for direct card send." };
+    }
+    const targetType: "open_id" | "chat_id" = target.chatId ? "chat_id" : "open_id";
+    const targetId = target.chatId ?? target.openId;
+    if (!targetId) {
+      return { ok: false, error: "Interactive card target needs a chatId or openId." };
+    }
+    try {
+      return await withNotificationRetry(async () => {
+        const response = await fetch(
+          `${resolveFeishuApiBase(credentials.domain ?? process.env.FEISHU_DOMAIN)}/open-apis/im/v1/messages?receive_id_type=${targetType}`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${await fetchFeishuTenantAccessToken(credentials)}`,
+              "content-type": "application/json; charset=utf-8"
+            },
+            body: JSON.stringify({
+              receive_id: targetId,
+              msg_type: "interactive",
+              content: JSON.stringify(cardJson)
+            })
+          }
+        );
+        const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+        if (!response.ok || !body || Number(body.code ?? 0) !== 0) {
+          const reason = body && typeof body.msg === "string" ? body.msg : `${response.status} ${response.statusText}`;
+          throw new Error(`Feishu card send rejected: ${reason}`);
+        }
+        const data = body.data as { message_id?: unknown } | undefined;
+        const messageId = typeof data?.message_id === "string" ? data.message_id : undefined;
+        return { ok: true, ...(messageId ? { messageId } : {}) };
+      }, "feishu direct card send");
+    } catch (error) {
+      return { ok: false, error: sanitizeNotificationError(error) };
+    }
+  },
+  async updateCard(messageId, cardJson) {
+    const credentials = resolveFeishuAppCredentials();
+    if (!credentials) {
+      return { ok: false, error: "FEISHU_APP_ID / FEISHU_APP_SECRET are not configured for direct card update." };
+    }
+    try {
+      return await withNotificationRetry(async () => {
+        const response = await fetch(
+          `${resolveFeishuApiBase(credentials.domain ?? process.env.FEISHU_DOMAIN)}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+          {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${await fetchFeishuTenantAccessToken(credentials)}`,
+              "content-type": "application/json; charset=utf-8"
+            },
+            body: JSON.stringify({ content: JSON.stringify(cardJson) })
+          }
+        );
+        const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+        if (!response.ok || !body || Number(body.code ?? 0) !== 0) {
+          const reason = body && typeof body.msg === "string" ? body.msg : `${response.status} ${response.statusText}`;
+          throw new Error(`Feishu card update rejected: ${reason}`);
+        }
+        return { ok: true };
+      }, "feishu direct card update");
+    } catch (error) {
+      return { ok: false, error: sanitizeNotificationError(error) };
+    }
+  }
+};
+
+// Legacy transport reuses the feishu-user-plugin MCP subprocess channel
+// (see callFeishuUserPluginTool below) - a different Feishu app entirely.
+// Kept ONLY as the no-credentials fallback so pre-P10 dev setups keep their
+// old behavior; production (FEISHU_APP_ID/SECRET configured) must never use
+// it for cards.
+const legacyMcpCardTransport: CardTransport = {
   async sendCard(target, cardJson) {
     try {
       const chatId = target.chatId ?? target.openId ?? resolveFeishuUserPluginBotChatId();
@@ -733,6 +813,21 @@ const defaultCardTransport: CardTransport = {
     } catch (error) {
       return { ok: false, error: sanitizeNotificationError(error) };
     }
+  }
+};
+
+// Default: the direct app-credential transport whenever the app credentials
+// resolve (env or openclaw.json); the legacy MCP subprocess only when they
+// don't. Chosen per call (not at module load) so env changes in tests and
+// long-lived processes are honored.
+const defaultCardTransport: CardTransport = {
+  sendCard(target, cardJson) {
+    const transport = resolveFeishuAppCredentials() ? directHttpCardTransport : legacyMcpCardTransport;
+    return transport.sendCard(target, cardJson);
+  },
+  updateCard(messageId, cardJson) {
+    const transport = resolveFeishuAppCredentials() ? directHttpCardTransport : legacyMcpCardTransport;
+    return transport.updateCard(messageId, cardJson);
   }
 };
 

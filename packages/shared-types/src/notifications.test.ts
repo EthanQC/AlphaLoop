@@ -9,6 +9,7 @@ import {
   buildReportSummaryMarkdown,
   deliverReportToFeishu,
   isFeishuProseFailure,
+  directHttpCardTransport,
   sendInteractiveCard,
   shouldSendFullReportChapters,
   updateInteractiveCard,
@@ -443,5 +444,104 @@ describe("updateInteractiveCard", () => {
     const result = await updateInteractiveCard("om_456", card, fakeTransport);
 
     expect(result).toEqual({ ok: false, error: "message not editable" });
+  });
+});
+
+describe("directHttpCardTransport (2026-07-18 live-send fix)", () => {
+  // The legacy default routed cards through the feishu-user-plugin MCP - a
+  // DIFFERENT app - and passed open_id where chat_id was expected; live probe
+  // failed HTTP 400 code=230001 while a direct im/v1/messages send succeeded.
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+  });
+
+  function stubFetch(handler: (url: string, init: RequestInit) => { status?: number; body: unknown }) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      const out = handler(String(url), init ?? {});
+      return new Response(JSON.stringify(out.body), { status: out.status ?? 200 });
+    }) as typeof fetch;
+    return calls;
+  }
+
+  it("sends interactive cards to open_id via im/v1/messages with the app tenant token", async () => {
+    process.env.FEISHU_APP_ID = "cli_test_app";
+    process.env.FEISHU_APP_SECRET = "test_secret";
+    const calls = stubFetch((url) => {
+      if (url.includes("tenant_access_token")) {
+        return { body: { code: 0, tenant_access_token: "t-token-1", expire: 7200 } };
+      }
+      return { body: { code: 0, msg: "success", data: { message_id: "om_direct_1" } } };
+    });
+
+    const result = await directHttpCardTransport.sendCard({ openId: "ou_user_1" }, { schema: "2.0" });
+
+    expect(result).toEqual({ ok: true, messageId: "om_direct_1" });
+    const sendCall = calls.find((c) => c.url.includes("/im/v1/messages?"));
+    expect(sendCall).toBeDefined();
+    expect(sendCall!.url).toContain("receive_id_type=open_id");
+    const body = JSON.parse(String(sendCall!.init.body));
+    expect(body.receive_id).toBe("ou_user_1");
+    expect(body.msg_type).toBe("interactive");
+    expect(typeof body.content).toBe("string");
+    expect((sendCall!.init.headers as Record<string, string>).authorization).toBe("Bearer t-token-1");
+  });
+
+  it("prefers chat_id over open_id when both are given", async () => {
+    process.env.FEISHU_APP_ID = "cli_test_app";
+    process.env.FEISHU_APP_SECRET = "test_secret";
+    const calls = stubFetch((url) =>
+      url.includes("tenant_access_token")
+        ? { body: { code: 0, tenant_access_token: "t", expire: 7200 } }
+        : { body: { code: 0, data: {} } }
+    );
+
+    await directHttpCardTransport.sendCard({ chatId: "oc_chat_9", openId: "ou_user_1" }, {});
+
+    const sendCall = calls.find((c) => c.url.includes("/im/v1/messages?"))!;
+    expect(sendCall.url).toContain("receive_id_type=chat_id");
+    expect(JSON.parse(String(sendCall.init.body)).receive_id).toBe("oc_chat_9");
+  });
+
+  it("surfaces the Feishu error message on a non-zero code without leaking the token", async () => {
+    process.env.FEISHU_APP_ID = "cli_test_app";
+    process.env.FEISHU_APP_SECRET = "test_secret";
+    stubFetch((url) =>
+      url.includes("tenant_access_token")
+        ? { body: { code: 0, tenant_access_token: "secret-token-x", expire: 7200 } }
+        : { status: 400, body: { code: 230001, msg: "invalid receive_id" } }
+    );
+
+    const result = await directHttpCardTransport.sendCard({ openId: "ou_bad" }, {});
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("invalid receive_id");
+    expect(result.error).not.toContain("secret-token-x");
+  });
+
+  it("fails cleanly when app credentials are absent", async () => {
+    const result = await directHttpCardTransport.sendCard({ openId: "ou_user_1" }, {});
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not configured");
+  });
+
+  it("updates a card via PATCH im/v1/messages/:id", async () => {
+    process.env.FEISHU_APP_ID = "cli_test_app";
+    process.env.FEISHU_APP_SECRET = "test_secret";
+    const calls = stubFetch((url) =>
+      url.includes("tenant_access_token")
+        ? { body: { code: 0, tenant_access_token: "t", expire: 7200 } }
+        : { body: { code: 0 } }
+    );
+
+    const result = await directHttpCardTransport.updateCard("om_77", { schema: "2.0" });
+
+    expect(result).toEqual({ ok: true });
+    const patchCall = calls.find((c) => c.url.includes("/im/v1/messages/om_77"))!;
+    expect(patchCall.init.method).toBe("PATCH");
   });
 });
