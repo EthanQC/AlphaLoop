@@ -1,9 +1,13 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-const script = readFileSync(join(process.cwd(), "apps/openclaw-config/scripts/openclaw-cron-runner.mjs"), "utf8");
+import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+
+const runnerScriptPath = join(process.cwd(), "apps/openclaw-config/scripts/openclaw-cron-runner.mjs");
+const script = readFileSync(runnerScriptPath, "utf8");
 
 const state = await import("./openclaw-cron-runner-state.mjs");
 const reset = await import("./cron-runner-reset.mjs");
@@ -234,6 +238,7 @@ describe("CLI-based discovery executes managed runs (the 2026.7 sqlite-migration
       OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
       OPENCLAW_BIN: cli.binPath,
       PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: join(runtimeDir, "trading.sqlite"),
       OPENCLAW_CRON_RUNNER_ALERTS: "0"
     });
 
@@ -263,6 +268,7 @@ describe("CLI-based discovery executes managed runs (the 2026.7 sqlite-migration
       OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
       OPENCLAW_BIN: cli.binPath,
       PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: join(runtimeDir, "trading.sqlite"),
       OPENCLAW_CRON_RUNNER_ALERTS: "0"
     });
 
@@ -298,6 +304,7 @@ describe("CLI-based discovery executes managed runs (the 2026.7 sqlite-migration
       OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
       OPENCLAW_BIN: cli.binPath,
       PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: join(runtimeDir, "trading.sqlite"),
       OPENCLAW_CRON_RUNNER_ALERTS: "0"
     });
 
@@ -364,6 +371,7 @@ describe("fail-loud discovery guard (the silent-no-op class this bug was)", () =
       OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
       OPENCLAW_BIN: cli.binPath,
       PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: join(runtimeDir, "trading.sqlite"),
       OPENCLAW_CRON_RUNNER_ALERTS: "0",
       OPENCLAW_CRON_RUNNER_DISCOVERY_GAP_MS: "0"
     });
@@ -717,6 +725,7 @@ describe("SIGKILL fallback for a hung child process (audit item c)", () => {
     const runner = await importFreshRunner({
       OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
       OPENCLAW_BIN: cli.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: join(runtimeDir, "trading.sqlite"),
       OPENCLAW_CRON_RUNNER_ALERTS: "0",
       OPENCLAW_CRON_RUNNER_SIGKILL_GRACE_MS: "500"
     });
@@ -741,4 +750,528 @@ describe("SIGKILL fallback for a hung child process (audit item c)", () => {
     // child's own 60s exit - proves the SIGKILL fallback is what ended it, not the child itself.
     expect(elapsedMs).toBeLessThan(10_000);
   }, 15_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 2026-07-26 CONFIRMED production failure on the deployed mini.
+//
+// `daily` and `weekly` were both halted (3 same-class failures) with escalationPending AND
+// noticePending still set. Report delivery had been bound to the wrong Feishu app since 2026-07-20,
+// so EVERY poll cycle re-attempted 4 alert sends (2 escalation retries + 2 notice retries), each
+// one failing and each one printing a full stderr line: 60,637 lines / 27MB in
+// runtime/launchd/com.openclaw.trading.cron-runner.err.log, growing forever, with no bound, no
+// backoff of its own and no give-up. Meanwhile `curl 127.0.0.1:18792/health` answered
+// 200 {"ok":true,"errors":[]} - two of the five managed pipelines dead for six days and every
+// operator-visible surface said "fine" - and the run_log table held 389 rows, ALL of them
+// job='market-alerts', because this runner never wrote a run_log row for a managed job at all.
+//
+// The tests below pin the three properties that failure needed: execution is recorded
+// independently of notification, alert sends are bounded by a per-channel circuit breaker, and
+// health tells the truth.
+// ---------------------------------------------------------------------------------------------
+
+interface RecordedRunLogEntry {
+  job: string;
+  startedAt: string;
+  finishedAt?: string | null;
+  ok: boolean;
+  inputs?: unknown[];
+  evidence?: unknown[];
+  failedStep?: string | null;
+}
+
+// The runner reads OPENCLAW_CRON_RUNNER_ALERTS at send time (not import time), and
+// importFreshRunner restores env overrides once the import resolves - so alert-path tests manage
+// it here instead, and always inject a fake notifier so no test can ever touch a real transport.
+function useAlertEnv(): void {
+  const previous = process.env.OPENCLAW_CRON_RUNNER_ALERTS;
+  delete process.env.OPENCLAW_CRON_RUNNER_ALERTS;
+  afterEach(() => {
+    if (previous === undefined) {
+      delete process.env.OPENCLAW_CRON_RUNNER_ALERTS;
+    } else {
+      process.env.OPENCLAW_CRON_RUNNER_ALERTS = previous;
+    }
+  });
+}
+
+describe("alert delivery resilience (2026-07-26 wedge: unbounded alert retries + silently-green health)", () => {
+  const tempDirs: string[] = [];
+  const makeTempDir = makeTempDirFactory(tempDirs);
+  useAlertEnv();
+  afterEach(() => cleanupTempDirs(tempDirs));
+
+  it("records the job's execution result to run_log the moment the command completes, even when every alert send throws", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-runlog-alertfail-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-runlog-alertfail-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath
+    });
+
+    const alertCalls: unknown[] = [];
+    runner.__setAlertDelivererForTest(async (payload: unknown) => {
+      alertCalls.push(payload);
+      throw new Error("Feishu report delivery requires the user-plugin bot channel: no bot chat id configured.");
+    });
+    const runLogEntries: RecordedRunLogEntry[] = [];
+    runner.__setRunLogRecorderForTest((entry: RecordedRunLogEntry) => {
+      runLogEntries.push(entry);
+    });
+
+    await runner.pollOpenClawRunLogs();
+
+    // The command ran and its REAL outcome is in run_log, despite the alert channel being dead.
+    expect(readInvocations(pnpm.logPath)).toEqual([["report:daily:run"]]);
+    expect(runLogEntries).toHaveLength(1);
+    expect(runLogEntries[0]).toMatchObject({ job: "daily", ok: false, failedStep: "command" });
+    expect(runLogEntries[0].startedAt).toBeTruthy();
+    expect(runLogEntries[0].finishedAt).toBeTruthy();
+    // ...and the alert really was attempted and really did fail (this is not a "no alert" path).
+    expect(alertCalls.length).toBeGreaterThan(0);
+  });
+
+  it("writes a real run_log row through job-run-log.mjs into the trading database", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-runlog-sqlite-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-runlog-sqlite-fake-");
+    const dbDir = makeTempDir("alphaloop-cron-runner-runlog-db-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir);
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_DB_PATH: dbPath,
+      OPENCLAW_CRON_RUNNER_ALERTS: "0"
+    });
+
+    await runner.pollOpenClawRunLogs();
+
+    const db = openTradingDatabase(dbPath);
+    try {
+      const rows = db.prepare("SELECT job, ok, started_at, finished_at FROM run_log ORDER BY rowid").all() as Array<{
+        job: string;
+        ok: number;
+        started_at: string;
+        finished_at: string | null;
+      }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].job).toBe("daily");
+      expect(rows[0].ok).toBe(1);
+      expect(rows[0].finished_at).toBeTruthy();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps executing jobs on later poll cycles while the alert channel is dead", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-alertfail-loop-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-alertfail-loop-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_RETRY_BASE_MS: "0"
+    });
+    runner.__setAlertDelivererForTest(async () => {
+      throw new Error("alert transport is down");
+    });
+    runner.__setRunLogRecorderForTest(() => {});
+
+    // Cycle 1: the job fails, so the notice alert fires and fails too.
+    await expect(runner.pollOpenClawRunLogs()).resolves.toBeUndefined();
+    // Cycle 2: a dead alert channel must not abort/skip the retry of the job itself.
+    const secondCycle = await runner.pollOpenClawRunLogs().then(() => "resolved");
+    expect(secondCycle).toBe("resolved");
+    expect(readInvocations(pnpm.logPath).length).toBeGreaterThanOrEqual(2);
+  }, 20_000);
+
+  it("survives a notifier that throws synchronously instead of rejecting the poll cycle", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-sync-throw-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-sync-throw-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath
+    });
+    runner.__setAlertDelivererForTest(() => {
+      // Not an async function: throws before any promise exists, the shape that turns into an
+      // uncaught exception rather than a rejected promise if a call site is not defensive.
+      throw new Error("notifier exploded synchronously");
+    });
+    runner.__setRunLogRecorderForTest(() => {});
+
+    await expect(runner.pollOpenClawRunLogs()).resolves.toBeUndefined();
+    expect(readInvocations(pnpm.logPath)).toEqual([["report:daily:run"]]);
+    const health = runner.getRunnerHealthSnapshot();
+    expect(health.consecutiveAlertFailures).toBeGreaterThan(0);
+  });
+
+  it("bounds a hanging notifier with the alert timeout instead of stalling the poll cycle forever", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-alert-hang-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-alert-hang-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_ALERT_TIMEOUT_MS: "80"
+    });
+    runner.__setAlertDelivererForTest(() => new Promise(() => {
+      // never settles - a TCP connect black-holed by a firewall
+    }));
+    runner.__setRunLogRecorderForTest(() => {});
+
+    const startedAt = Date.now();
+    await expect(runner.pollOpenClawRunLogs()).resolves.toBeUndefined();
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(readInvocations(pnpm.logPath)).toEqual([["report:daily:run"]]);
+    expect(runner.getRunnerHealthSnapshot().lastAlertError).toMatch(/timed out/iu);
+  }, 20_000);
+
+  it("opens the alert circuit breaker after N consecutive failures: stops calling the notifier and marks health degraded", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-breaker-open-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-breaker-open-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_ALERT_BREAKER_THRESHOLD: "3",
+      // No inter-attempt backoff so the breaker threshold itself is what this test measures.
+      OPENCLAW_CRON_RUNNER_ALERT_RETRY_BASE_MS: "0",
+      OPENCLAW_CRON_RUNNER_ALERT_BREAKER_COOLDOWN_MS: "600000"
+    });
+    let attempts = 0;
+    runner.__setAlertDelivererForTest(async () => {
+      attempts += 1;
+      throw new Error("alert transport is down");
+    });
+    runner.__setRunLogRecorderForTest(() => {});
+
+    // Six cycles' worth of pending notice/escalation retries: pre-fix this was 4 sends per cycle,
+    // forever. The breaker must cap the notifier at exactly `threshold` calls.
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      await runner.pollOpenClawRunLogs();
+    }
+
+    expect(attempts).toBe(3);
+    const health = runner.getRunnerHealthSnapshot();
+    expect(health.alertsDegraded).toBe(true);
+    expect(health.consecutiveAlertFailures).toBe(3);
+    expect(health.lastAlertError).toContain("alert transport is down");
+    expect(health.ok).toBe(false);
+    expect(health.errors.join("\n")).toContain("alert-channel-degraded");
+    // Suppressed attempts are counted, not silently dropped.
+    expect(health.suppressedAlertAttempts).toBeGreaterThan(0);
+  }, 20_000);
+
+  it("closes the breaker again after a later successful send and clears degraded health", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-breaker-reset-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-breaker-reset-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_ALERT_BREAKER_THRESHOLD: "2",
+      OPENCLAW_CRON_RUNNER_ALERT_RETRY_BASE_MS: "0",
+      // Cooldown 0: the half-open probe is allowed on the very next cycle, so this test measures
+      // the reset semantics rather than wall-clock patience.
+      OPENCLAW_CRON_RUNNER_ALERT_BREAKER_COOLDOWN_MS: "0"
+    });
+    let healthy = false;
+    runner.__setAlertDelivererForTest(async () => {
+      if (!healthy) {
+        throw new Error("alert transport is down");
+      }
+      return { sent: true };
+    });
+    runner.__setRunLogRecorderForTest(() => {});
+
+    await runner.pollOpenClawRunLogs();
+    await runner.pollOpenClawRunLogs();
+    expect(runner.getRunnerHealthSnapshot().alertsDegraded).toBe(true);
+
+    // The underlying transport is fixed (exactly the parallel Feishu-app fix): the next probe
+    // succeeds and the breaker resets itself - no restart, no operator action.
+    healthy = true;
+    await runner.pollOpenClawRunLogs();
+
+    const recovered = runner.getRunnerHealthSnapshot();
+    expect(recovered.alertsDegraded).toBe(false);
+    expect(recovered.consecutiveAlertFailures).toBe(0);
+    expect(recovered.lastAlertError).toBeNull();
+    expect(recovered.errors.join("\n")).not.toContain("alert-channel-degraded");
+  }, 20_000);
+
+  it("sanitizes lastAlertError so health never leaks a token or secret", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-alert-secret-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-alert-secret-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath
+    });
+    runner.__setAlertDelivererForTest(async () => {
+      throw new Error("feishu rejected the call: token=t-supersecret-value Bearer abc.def-123");
+    });
+    runner.__setRunLogRecorderForTest(() => {});
+
+    await runner.pollOpenClawRunLogs();
+
+    const health = runner.getRunnerHealthSnapshot();
+    expect(health.lastAlertError).not.toContain("t-supersecret-value");
+    expect(health.lastAlertError).not.toContain("abc.def-123");
+    expect(health.lastAlertError).toContain("[REDACTED]");
+  });
+
+  it("reports halted managed jobs in health instead of answering a silent 200/ok while two pipelines are dead", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-halted-health-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-halted-health-fake-");
+    const cli = writeFakeOpenclawCli(fakeDir, { list: { jobs: [] } });
+
+    // Exactly the deployed mini's state on 2026-07-26: daily halted after 3 same-class failures,
+    // with both alert flags still pending.
+    let haltedState = state.normalizeRunnerState({});
+    for (let i = 0; i < 3; i += 1) {
+      haltedState = state.recordRunResult(
+        haltedState,
+        `daily:run-${i}:finished`,
+        { ok: false, job: "daily", error: "scheduled-report.mjs crashed" },
+        Date.parse("2026-07-20T00:00:00.000Z") + i * 60_000
+      );
+    }
+    expect(haltedState.jobFailureState.daily.halted).toBe(true);
+    writeFileSync(
+      join(runtimeDir, "processed-runs.json"),
+      `${JSON.stringify(state.serializeRunnerState(haltedState), null, 2)}\n`,
+      "utf8"
+    );
+    writeFileSync(join(runtimeDir, "cli-seed-completed.json"), `${JSON.stringify({ seededAt: "2026-07-18T00:00:00.000Z" })}\n`, "utf8");
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath
+    });
+    // A working alert channel: the pending notice/escalation get delivered and cleared, and the
+    // halt itself is STILL a red health state - the pipeline is not running.
+    runner.__setAlertDelivererForTest(async () => ({ sent: true }));
+    runner.__setRunLogRecorderForTest(() => {});
+
+    await runner.pollOpenClawRunLogs();
+
+    const health = runner.getRunnerHealthSnapshot();
+    expect(health.ok).toBe(false);
+    expect(health.alertsDegraded).toBe(false);
+    expect(health.haltedJobs).toEqual([
+      expect.objectContaining({ jobName: "daily", consecutiveCount: 3 })
+    ]);
+    expect(health.errors.join("\n")).toContain("cron-job-halted[daily]");
+  });
+
+  it("still retries a pending halt escalation when the gateway is unreachable (a dead `cron list` must not gate alert delivery)", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-gwdown-alert-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-gwdown-alert-fake-");
+    // The gateway is down: `openclaw cron list` fails, which aborts the discovery half of the
+    // cycle. The alert-retry passes used to run BEFORE discovery; moving them after it must not
+    // make them hostage to the gateway.
+    const cli = writeFakeOpenclawCli(fakeDir, { failWith: "gateway unreachable" });
+
+    let haltedState = state.normalizeRunnerState({});
+    for (let i = 0; i < 3; i += 1) {
+      haltedState = state.recordRunResult(
+        haltedState,
+        `daily:run-${i}:finished`,
+        { ok: false, job: "daily", error: "scheduled-report.mjs crashed" },
+        Date.parse("2026-07-20T00:00:00.000Z") + i * 60_000
+      );
+    }
+    expect(haltedState.jobFailureState.daily.escalationPending).toBe(true);
+    writeFileSync(
+      join(runtimeDir, "processed-runs.json"),
+      `${JSON.stringify(state.serializeRunnerState(haltedState), null, 2)}\n`,
+      "utf8"
+    );
+    writeFileSync(join(runtimeDir, "cli-seed-completed.json"), `${JSON.stringify({ seededAt: "2026-07-18T00:00:00.000Z" })}\n`, "utf8");
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath
+    });
+    let sends = 0;
+    runner.__setAlertDelivererForTest(async () => {
+      sends += 1;
+      return { sent: true };
+    });
+
+    await runner.pollOpenClawRunLogs();
+
+    expect(sends).toBeGreaterThan(0);
+    expect(runner.__getRunnerStateForTest().jobFailureState.daily?.escalationPending).toBe(false);
+  });
+
+  it("contains a run_log write failure: the poll cycle still completes and health shows the blindness", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-runlog-fail-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-runlog-fail-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir);
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath,
+      OPENCLAW_CRON_RUNNER_ALERTS: "0"
+    });
+    runner.__setRunLogRecorderForTest(() => {
+      throw new Error("database is locked");
+    });
+
+    await expect(runner.pollOpenClawRunLogs()).resolves.toBeUndefined();
+
+    // The run itself still counted as processed - a bookkeeping failure must not re-run the job.
+    expect(runner.__getRunnerStateForTest().processedRunKeys).toContain(`${DAILY_JOB_ID}:1000:finished`);
+    const health = runner.getRunnerHealthSnapshot();
+    expect(health.runLog.failures).toBe(1);
+    expect(health.errors.join("\n")).toContain("run-log-write-failed");
+  });
+});
+
+describe("process-level guards: a notification failure can never kill the service", () => {
+  const tempDirs: string[] = [];
+  const makeTempDir = makeTempDirFactory(tempDirs);
+  const children: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const child of children.splice(0)) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    }
+    cleanupTempDirs(tempDirs);
+  });
+
+  it("installs unhandledRejection / uncaughtException / signal guards and never lets the first poll cycle reject module evaluation", () => {
+    // The pre-fix entrypoint was `await pollOpenClawRunLogs();` at module top level: a rejection
+    // there fails module evaluation and exits the process before setInterval is ever installed.
+    expect(script).toContain('process.on("unhandledRejection"');
+    expect(script).toContain('process.on("uncaughtException"');
+    expect(script).toContain('server.on("error"');
+    expect(script).toContain("installProcessGuards");
+    expect(script).toMatch(/try \{\s*\n\s*await pollOpenClawRunLogs\(\);/u);
+    // No explicit exit anywhere except the deliberate signal handler.
+    expect(script).not.toContain("process.exit(1)");
+  });
+
+  it("keeps serving (and logs) when the HTTP port is already taken, instead of exiting on the unhandled EADDRINUSE", async () => {
+    const port = 21000 + Math.floor(Math.random() * 4000);
+    const fakeDir = makeTempDir("alphaloop-cron-runner-port-fake-");
+    const cli = writeFakeOpenclawCli(fakeDir, { list: { jobs: [] } });
+
+    const startRunner = (runtimeDir: string): ChildProcess => {
+      const child = spawn(process.execPath, [runnerScriptPath], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+          OPENCLAW_BIN: cli.binPath,
+          OPENCLAW_CRON_RUNNER_PORT: String(port),
+          OPENCLAW_CRON_RUNNER_POLL_MS: "1000",
+          OPENCLAW_CRON_RUNNER_ALERTS: "0"
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      children.push(child);
+      return child;
+    };
+
+    const collect = (child: ChildProcess): { text: () => string } => {
+      let text = "";
+      child.stdout?.on("data", (chunk) => { text += String(chunk); });
+      child.stderr?.on("data", (chunk) => { text += String(chunk); });
+      return { text: () => text };
+    };
+
+    const waitFor = async (probe: () => boolean, timeoutMs: number): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (probe()) {
+          return true;
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      }
+      return false;
+    };
+
+    const first = startRunner(makeTempDir("alphaloop-cron-runner-port-a-"));
+    const firstOutput = collect(first);
+    expect(await waitFor(() => firstOutput.text().includes('"port":'), 15_000)).toBe(true);
+
+    const second = startRunner(makeTempDir("alphaloop-cron-runner-port-b-"));
+    const secondOutput = collect(second);
+    expect(await waitFor(() => secondOutput.text().includes("http-server-error"), 15_000)).toBe(true);
+    // Pre-fix, an EADDRINUSE with no `error` listener throws out of the server and kills the
+    // process (launchd then restarts it into the same collision, forever).
+    expect(second.exitCode).toBeNull();
+    expect(second.signalCode).toBeNull();
+    // ...and it keeps polling: the seeded marker proves the poll loop ran after the bind failure.
+    expect(await waitFor(() => secondOutput.text().includes("cron-discovery-seeded"), 15_000)).toBe(true);
+  }, 60_000);
 });

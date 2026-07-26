@@ -5,8 +5,14 @@ import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { deliverReportToFeishu, loadLocalEnv } from "../../../packages/shared-types/dist/index.js";
-import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown } from "./openclaw-cron-runner-alerts.mjs";
+import {
+  deliverReportToFeishu,
+  loadLocalEnv,
+  openTradingDatabase,
+  resolveRuntimePaths
+} from "../../../packages/shared-types/dist/index.js";
+import { recordJobRun } from "./job-run-log.mjs";
+import { buildCronFailureAlertMarkdown, buildCronHaltAlertMarkdown, sanitizeAlertText } from "./openclaw-cron-runner-alerts.mjs";
 import {
   CRON_JOB_DAILY,
   CRON_JOB_MONTHLY_REVIEW,
@@ -70,6 +76,35 @@ const resultRetentionMs = Number(process.env.OPENCLAW_CRON_RUNNER_RESULT_RETENTI
 // child that ignores SIGTERM used to wedge that runKey forever (the timeout timer only ever sent
 // ONE signal), since `child.on("exit")` above would then never fire.
 const sigkillGraceMs = Number(process.env.OPENCLAW_CRON_RUNNER_SIGKILL_GRACE_MS ?? 10_000);
+// ---------------------------------------------------------------------------------------------
+// 2026-07-26 CONFIRMED production failure (deployed mini) - the alert channel wedging the runner.
+//
+// Report delivery had been bound to the wrong Feishu app since 2026-07-20, so `daily` and
+// `weekly` failed 3x each, halted, and sat there with escalationPending AND noticePending set.
+// retryPendingEscalationAlerts()/retryPendingNoticeAlerts() then re-attempted all four sends on
+// EVERY poll cycle, forever: no attempt cap, no per-channel backoff, no give-up, one full stderr
+// line per failure. Six days later that was 60,637 lines / 27MB of
+// runtime/launchd/com.openclaw.trading.cron-runner.err.log - while GET /health still answered
+// 200 {"ok":true,"errors":[]}, because health only knew about CLI-discovery gaps.
+//
+// The three constants below bound that: N consecutive failures on a channel open a circuit
+// breaker (logged ONCE, surfaced in /health as alertsDegraded), after which sends on that channel
+// are suppressed except for one probe per cooldown, until a probe succeeds and resets everything.
+// Before the breaker opens, each failure also pushes its own exponential backoff, so even a
+// short-lived outage cannot produce a per-cycle retry storm.
+// ---------------------------------------------------------------------------------------------
+const alertBreakerThreshold = Math.max(1, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_BREAKER_THRESHOLD ?? 3));
+const alertRetryBaseMs = Math.max(0, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_RETRY_BASE_MS ?? 60_000));
+const alertRetryMaxMs = Math.max(alertRetryBaseMs, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_RETRY_MAX_MS ?? 15 * 60_000));
+const alertBreakerCooldownMs = Math.max(0, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_BREAKER_COOLDOWN_MS ?? 30 * 60_000));
+// Hard wall-clock bound on ONE alert send. deliverReportToFeishu talks to a remote HTTP API; a
+// black-holed connection with no timeout would stall the whole poll cycle (the alert passes are
+// awaited inline), which is the same outcome as the runner being dead - so a hang is treated as
+// just another failure and feeds the breaker.
+const alertTimeoutMs = Math.max(0, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_TIMEOUT_MS ?? 30_000));
+// Where the run_log row for each managed job execution is written. Defaults to the repo's real
+// trading database (resolveRuntimePaths); tests point it at a sandboxed sqlite file.
+const runLogDbPath = process.env.OPENCLAW_CRON_RUNNER_DB_PATH?.trim() || null;
 mkdirSync(runtimeDir, { recursive: true });
 loadLocalEnv(repoRoot);
 
@@ -130,6 +165,252 @@ const discoveryHealth = {
   alertedGapJobs: new Set()
 };
 
+// Every alert this runner can emit (job failure notice, halt escalation, state-persistence
+// failure, discovery gap) goes out over the SAME transport, so they share one breaker. Keyed by
+// channel name anyway, so adding a second transport later cannot accidentally share a breaker
+// with this one.
+const ALERT_CHANNEL_REPORT = "feishu-report";
+const alertChannelStates = new Map();
+
+// Injectable transport (tests) - production always uses the real Feishu report delivery. Kept as
+// a mutable binding rather than a parameter so every call site (including the ones deep inside
+// the persistence-failure escalation path) is covered by one seam.
+let alertDeliverer = deliverReportToFeishu;
+
+// Injectable run_log writer (tests) - production opens the trading database per write.
+let runLogRecorder = defaultRunLogRecorder;
+const runLogHealth = { writes: 0, failures: 0, lastWriteAt: null, lastError: null };
+
+// Set when the HTTP server cannot bind (EADDRINUSE after a restart race, ...). Before this the
+// `error` event had no listener at all, so it threw out of the server and killed the process -
+// which launchd (KeepAlive=true) restarted straight back into the same collision.
+let serverError = null;
+
+function getAlertChannel(channel) {
+  let existing = alertChannelStates.get(channel);
+  if (!existing) {
+    existing = {
+      channel,
+      consecutiveFailures: 0,
+      degraded: false,
+      degradedSince: null,
+      nextAttemptAtMs: null,
+      suppressedAttempts: 0,
+      lastError: null,
+      lastErrorAt: null,
+      lastSuccessAt: null
+    };
+    alertChannelStates.set(channel, existing);
+  }
+  return existing;
+}
+
+// Note the deliberate semantic change (2026-07-26): with alerts disabled, a pending notice/
+// escalation now stays PENDING instead of being quietly treated as delivered. It costs nothing
+// (takeAlertSlot refuses the slot before any work), and re-enabling alerts then reports the halt
+// that is still true, rather than a job silently sitting halted with its alert flags cleared.
+function alertsDisabled() {
+  return process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0";
+}
+
+// The gate in front of every send: alerts globally disabled, still inside this channel's backoff
+// window, or the breaker is open and its cooldown has not elapsed. A refused slot is COUNTED
+// (suppressedAttempts, surfaced in /health) rather than silently dropped.
+function takeAlertSlot(channel, nowMs = Date.now()) {
+  if (alertsDisabled()) {
+    return { ready: false, reason: "alerts-disabled" };
+  }
+  const state = getAlertChannel(channel);
+  if (state.nextAttemptAtMs !== null && nowMs < state.nextAttemptAtMs) {
+    state.suppressedAttempts += 1;
+    return { ready: false, reason: state.degraded ? "alert-channel-degraded" : "alert-retry-backoff" };
+  }
+  return { ready: true };
+}
+
+// The ONLY way this module sends an alert. Never throws and never retries internally: it either
+// delivers, or records a bounded failure the poll loop can carry on past. `buildPayload` is a
+// thunk so a suppressed send costs nothing (no markdown rendering behind an open breaker).
+async function sendAlert(channel, buildPayload, context = {}) {
+  const slot = takeAlertSlot(channel);
+  if (!slot.ready) {
+    return { sent: false, skipped: true, reason: slot.reason };
+  }
+  const state = getAlertChannel(channel);
+  try {
+    const payload = typeof buildPayload === "function" ? buildPayload() : buildPayload;
+    // alertDeliverer(...) is invoked inside the try on purpose: a transport that throws
+    // SYNCHRONOUSLY (before any promise exists) must be caught here too, not become an uncaught
+    // exception that takes the process down.
+    const delivery = await withAlertTimeout(alertDeliverer(payload), channel);
+    if (!delivery?.sent) {
+      throw new Error(String(delivery?.reason ?? "Alert was not sent."));
+    }
+    recordAlertSuccess(state);
+    return { sent: true, skipped: false, reason: null };
+  } catch (error) {
+    recordAlertFailure(state, error, context);
+    return { sent: false, skipped: false, reason: state.lastError };
+  }
+}
+
+function withAlertTimeout(value, channel) {
+  const pending = Promise.resolve(value);
+  // A rejection arriving AFTER we already timed out must not surface as an unhandled rejection.
+  pending.catch(() => {});
+  if (alertTimeoutMs <= 0) {
+    return pending;
+  }
+  return new Promise((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => {
+      rejectPromise(new Error(`Alert send on channel "${channel}" timed out after ${alertTimeoutMs}ms.`));
+    }, alertTimeoutMs);
+    timer.unref?.();
+    pending.then(
+      (delivery) => {
+        clearTimeout(timer);
+        resolvePromise(delivery);
+      },
+      (error) => {
+        clearTimeout(timer);
+        rejectPromise(error);
+      }
+    );
+  });
+}
+
+function recordAlertFailure(state, error, context) {
+  state.consecutiveFailures += 1;
+  state.lastError = sanitizeAlertText(String(error?.message ?? error), 400);
+  state.lastErrorAt = new Date().toISOString();
+  const justDegraded = !state.degraded && state.consecutiveFailures >= alertBreakerThreshold;
+  if (justDegraded) {
+    state.degraded = true;
+    state.degradedSince = state.lastErrorAt;
+  }
+  const backoffMs = state.degraded
+    ? alertBreakerCooldownMs
+    : Math.min(alertRetryMaxMs, alertRetryBaseMs * 2 ** (state.consecutiveFailures - 1));
+  state.nextAttemptAtMs = Date.now() + backoffMs;
+
+  if (!state.degraded) {
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "alert-send-failed",
+      channel: state.channel,
+      alertAction: context.action ?? null,
+      job: context.job ?? null,
+      consecutiveFailures: state.consecutiveFailures,
+      nextAttemptAt: new Date(state.nextAttemptAtMs).toISOString(),
+      error: state.lastError
+    }));
+    return;
+  }
+  if (justDegraded) {
+    // Logged exactly ONCE per outage - the 27MB stderr file this whole change exists to prevent
+    // was this same failure printed on every poll cycle for six days. Live state stays visible
+    // through GET /health (alertsDegraded / consecutiveAlertFailures / lastAlertError).
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "alert-channel-degraded",
+      channel: state.channel,
+      consecutiveFailures: state.consecutiveFailures,
+      cooldownMs: alertBreakerCooldownMs,
+      nextAttemptAt: new Date(state.nextAttemptAtMs).toISOString(),
+      error: state.lastError,
+      note: "Circuit breaker OPEN: further sends on this channel are suppressed (one probe per " +
+        "cooldown) until one succeeds. This line is logged once per outage; see GET /health for live state."
+    }));
+  }
+}
+
+function recordAlertSuccess(state) {
+  const wasDegraded = state.degraded;
+  const suppressedAttempts = state.suppressedAttempts;
+  state.consecutiveFailures = 0;
+  state.degraded = false;
+  state.degradedSince = null;
+  state.nextAttemptAtMs = null;
+  state.suppressedAttempts = 0;
+  state.lastError = null;
+  state.lastErrorAt = null;
+  state.lastSuccessAt = new Date().toISOString();
+  if (wasDegraded) {
+    console.log(JSON.stringify({
+      ok: true,
+      service: "openclaw-cron-runner",
+      action: "alert-channel-recovered",
+      channel: state.channel,
+      suppressedAttempts
+    }));
+  }
+}
+
+function defaultRunLogRecorder(entry) {
+  const dbPath = runLogDbPath ?? resolveRuntimePaths(repoRoot).dbPath;
+  const db = openTradingDatabase(dbPath);
+  try {
+    recordJobRun(db, entry);
+  } finally {
+    db.close();
+  }
+}
+
+// The execution record. Written the moment the child process exits, BEFORE any notification is
+// attempted and independent of whether one succeeds - on the deployed mini, run_log held 389 rows
+// and every single one was job='market-alerts', because this runner (the only thing that executes
+// the five managed pipelines) never wrote a run_log row at all. "Did the daily report actually
+// run?" had no answer anywhere except a pile of per-run JSON files nothing queries.
+function recordRunToRunLog(result) {
+  const entry = {
+    job: result.job,
+    startedAt: result.startedAt,
+    finishedAt: result.finishedAt,
+    ok: Boolean(result.ok),
+    inputs: [{
+      trigger: result.trigger,
+      command: result.command,
+      openclawJobId: result.openclawJobId,
+      openclawJobName: result.openclawJobName,
+      openclawRunId: result.openclawRunId,
+      openclawRunAtMs: result.openclawRunAtMs
+    }],
+    actions: [],
+    failedStep: result.ok ? null : "command",
+    retries: 0,
+    callCount: 0,
+    evidence: [{
+      event: "cron_runner_exec",
+      at: result.finishedAt,
+      code: result.code,
+      signal: result.signal,
+      resultPath: result.resultPath,
+      error: result.error ? sanitizeAlertText(result.error, 500) : null,
+      stderrTail: sanitizeAlertText(result.stderrTail ?? "", 500)
+    }]
+  };
+  try {
+    runLogRecorder(entry);
+    runLogHealth.writes += 1;
+    runLogHealth.lastWriteAt = new Date().toISOString();
+    runLogHealth.lastError = null;
+    return { ok: true, error: null };
+  } catch (error) {
+    runLogHealth.failures += 1;
+    runLogHealth.lastError = sanitizeAlertText(String(error?.message ?? error), 300);
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "run-log-write-failed",
+      job: result.job,
+      error: runLogHealth.lastError
+    }));
+    return { ok: false, error };
+  }
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", `http://${host}:${port}`);
 
@@ -171,7 +452,70 @@ const isMainModule = process.argv[1]
   ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
   : false;
 
+// Every way this process could previously die without meaning to. None of these existed before
+// 2026-07-26: an unhandled rejection is FATAL by default in Node >= 15, the HTTP server's `error`
+// event had no listener (so EADDRINUSE threw out of it), and the entrypoint's top-level
+// `await pollOpenClawRunLogs()` meant a single rejected poll cycle failed module evaluation and
+// exited the process BEFORE setInterval was ever installed - i.e. the runner could die from a
+// notification/discovery failure and, with launchd KeepAlive=true, respawn straight into it.
+// The policy here is uniform: log loudly, stay up, keep polling. A supervisor restart is never a
+// better outcome than a degraded-but-serving runner that says so on /health.
+function installProcessGuards() {
+  process.on("unhandledRejection", (reason) => {
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "unhandled-rejection",
+      error: sanitizeAlertText(String(reason?.stack ?? reason?.message ?? reason), 2000),
+      note: "Logged and swallowed on purpose: a background rejection must not kill the runner."
+    }));
+  });
+
+  process.on("uncaughtException", (error) => {
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "uncaught-exception",
+      error: sanitizeAlertText(String(error?.stack ?? error?.message ?? error), 2000),
+      note: "Logged and swallowed on purpose: the poll interval and HTTP server keep running."
+    }));
+  });
+
+  // The mini showed `last terminating signal = Terminated: 15` with no record of who sent it or
+  // when. Signals are legitimate (launchd bootout/kickstart -k, an operator, a reinstall) - but
+  // they must leave a timestamped trace instead of a silent gap in the log.
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(signal, () => {
+      console.error(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        action: "signal-received",
+        signal,
+        uptimeSeconds: Math.round(process.uptime()),
+        note: "Shutting down on an external signal (launchd bootout/kickstart, operator, reinstall)."
+      }));
+      server.close();
+      process.exit(0);
+    });
+  }
+
+  server.on("error", (error) => {
+    serverError = sanitizeAlertText(String(error?.message ?? error), 300);
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "http-server-error",
+      host,
+      port,
+      error: serverError,
+      note: "The health/HTTP surface is unavailable, but the poll loop keeps executing scheduled jobs."
+    }));
+  });
+}
+
 if (isMainModule) {
+  installProcessGuards();
+
   server.listen(port, host, () => {
     console.log(JSON.stringify({
       ok: true,
@@ -186,7 +530,18 @@ if (isMainModule) {
     }));
   });
 
-  await pollOpenClawRunLogs();
+  try {
+    await pollOpenClawRunLogs();
+  } catch (error) {
+    // A rejected FIRST cycle used to reject module evaluation itself - the process exited before
+    // the interval below was ever installed, so the runner never polled again.
+    console.error(JSON.stringify({
+      ok: false,
+      service: "openclaw-cron-runner",
+      action: "initial-poll-failed",
+      error: sanitizeAlertText(String(error?.message ?? error), 1000)
+    }));
+  }
   setInterval(() => {
     pollOpenClawRunLogs().catch((error) => {
       console.error(JSON.stringify({ ok: false, service: "openclaw-cron-runner", error: String(error?.message ?? error) }));
@@ -201,16 +556,32 @@ async function pollOpenClawRunLogs() {
   // stale in-memory state (still halted) silently overwriting it on the next saveRunnerState().
   runnerState = loadRunnerState();
 
-  // A halted job produces no new run results to piggyback an alert retry on, so a still-pending
-  // escalation (send failed, or the process died mid-send) needs its own retry point each cycle.
-  await retryPendingEscalationAlerts();
-  // Same idea for the 1st-same-class-failure "notice" alert: before this task, a failed notice
-  // send had no retry mechanism at all (only escalation did) and was lost forever.
-  await retryPendingNoticeAlerts();
   // Per-run result JSON files (task 5, item 7): swept once per poll cycle rather than only at
   // startup, so a long-lived process doesn't need a restart to reclaim old files' disk space.
   pruneResultFiles(runtimeDir, resultRetentionMs);
 
+  try {
+    await discoverAndExecuteManagedRuns();
+  } finally {
+    // ALWAYS, even when discovery aborted this cycle (gateway down): a pending halt/notice alert
+    // must not be gated on the gateway being reachable. Equally, these run LAST rather than first
+    // (their pre-2026-07-26 position), so a slow or dead alert channel can never delay - let alone
+    // gate - the scheduled work itself. Neither pass throws; both are bounded by the channel
+    // breaker, so an outage costs one attempt per backoff window instead of one per poll cycle.
+    //
+    // A halted job produces no new run results to piggyback an alert retry on, so a still-pending
+    // escalation (send failed, or the process died mid-send) needs its own retry point each cycle.
+    await retryPendingEscalationAlerts();
+    // Same idea for the 1st-same-class-failure "notice" alert: before task 2026-07-14, a failed
+    // notice send had no retry mechanism at all (only escalation did) and was lost forever.
+    await retryPendingNoticeAlerts();
+  }
+}
+
+// Discovery + execution half of a poll cycle: everything that talks to the OpenClaw gateway and
+// runs managed jobs. Split out of pollOpenClawRunLogs so its early `return`s (a failing `cron
+// list`, a seeding cycle) skip only the discovery work, never the alert-retry passes above.
+async function discoverAndExecuteManagedRuns() {
   // Discovery goes through the gateway-backed CLI. A failing `cron list` aborts the cycle
   // LOUDLY (health + stderr) - before the 2026.7 fix the equivalent failure mode (reading files
   // that no longer existed) just looked like "no managed jobs" forever.
@@ -342,43 +713,26 @@ async function pollOpenClawRunLogs() {
         // dedupe below, since a halt can happen on a retry of a runKey already alerted once.
         const alertLevel = getFailureAlertLevel(runnerState, entry.job.name);
         if (!result.ok && shouldAlertFailure(runnerState, runKey) && alertLevel === "notice") {
-          await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey], "notice")
-            .then(() => {
-              runnerState = recordFailureAlerted(runnerState, runKey);
-              runnerState = clearNoticePending(runnerState, entry.job.name);
-              saveRunnerState();
-            })
-            .catch((error) => {
-              // Leave noticePending set (recordRunResult above already set it true on this
-              // 1st-same-class-failure transition): retryPendingNoticeAlerts() below will retry it
-              // on the next poll cycle instead of this notice going silently unreported forever.
-              console.error(JSON.stringify({
-                ok: false,
-                service: "openclaw-cron-runner",
-                action: "failure-alert",
-                job: result.job,
-                error: String(error?.message ?? error)
-              }));
-            });
+          // sendCronFailureAlert never throws (see its own comment): a dead alert channel must not
+          // abort this job's bookkeeping, skip the remaining run entries, or unwind the cycle.
+          // Not delivered => noticePending stays set (recordRunResult set it on this
+          // 1st-same-class-failure transition) and retryPendingNoticeAlerts picks it up later,
+          // bounded by the channel breaker.
+          const notice = await sendCronFailureAlert(result, runnerState.failedRunAttempts[runKey], "notice");
+          if (notice.sent) {
+            runnerState = recordFailureAlerted(runnerState, runKey);
+            runnerState = clearNoticePending(runnerState, entry.job.name);
+            saveRunnerState();
+          }
         }
         if (!result.ok && alertLevel === "escalation") {
-          await sendCronFailureAlert(result, runnerState.jobFailureState[entry.job.name], "escalation")
-            .then(() => {
-              runnerState = clearEscalationPending(runnerState, entry.job.name);
-              saveRunnerState();
-            })
-            .catch((error) => {
-              // Leave escalationPending set (recordRunResult above already set it true on this
-              // halt transition): retryPendingEscalationAlerts() will retry it on the next poll
-              // cycle instead of this halt going silently unreported.
-              console.error(JSON.stringify({
-                ok: false,
-                service: "openclaw-cron-runner",
-                action: "halt-escalation-alert",
-                job: result.job,
-                error: String(error?.message ?? error)
-              }));
-            });
+          // Same contract as the notice above: escalationPending stays set until a send actually
+          // succeeds, so a halt is never silently unreported - and never infinitely retried.
+          const escalation = await sendCronFailureAlert(result, runnerState.jobFailureState[entry.job.name], "escalation");
+          if (escalation.sent) {
+            runnerState = clearEscalationPending(runnerState, entry.job.name);
+            saveRunnerState();
+          }
         }
       } finally {
         inFlightRunKeys.delete(runKey);
@@ -395,18 +749,13 @@ async function pollOpenClawRunLogs() {
 async function retryPendingEscalationAlerts() {
   for (const { jobName, jobFailure } of getPendingEscalationJobs(runnerState)) {
     const result = (jobFailure.lastResultPath ? readJsonFile(jobFailure.lastResultPath, null) : null) ?? { job: jobName };
-    try {
-      await sendCronFailureAlert(result, jobFailure, "escalation");
+    // Bounded by the channel breaker inside sendCronFailureAlert: once the channel is degraded
+    // this costs nothing (no markdown, no transport call, no log line) until the cooldown probe.
+    // Pre-fix, this loop printed one full stderr line per pending job per 30s poll, forever.
+    const escalation = await sendCronFailureAlert(result, jobFailure, "escalation");
+    if (escalation.sent) {
       runnerState = clearEscalationPending(runnerState, jobName);
       saveRunnerState();
-    } catch (error) {
-      console.error(JSON.stringify({
-        ok: false,
-        service: "openclaw-cron-runner",
-        action: "halt-escalation-alert-retry",
-        job: jobName,
-        error: String(error?.message ?? error)
-      }));
     }
   }
 }
@@ -420,18 +769,10 @@ async function retryPendingEscalationAlerts() {
 async function retryPendingNoticeAlerts() {
   for (const { jobName, jobFailure } of getPendingNoticeJobs(runnerState)) {
     const result = (jobFailure.lastResultPath ? readJsonFile(jobFailure.lastResultPath, null) : null) ?? { job: jobName };
-    try {
-      await sendCronFailureAlert(result, {}, "notice");
+    const notice = await sendCronFailureAlert(result, {}, "notice");
+    if (notice.sent) {
       runnerState = clearNoticePending(runnerState, jobName);
       saveRunnerState();
-    } catch (error) {
-      console.error(JSON.stringify({
-        ok: false,
-        service: "openclaw-cron-runner",
-        action: "notice-alert-retry",
-        job: jobName,
-        error: String(error?.message ?? error)
-      }));
     }
   }
 }
@@ -492,6 +833,10 @@ async function runAllowedJob(job, context = {}) {
     stdoutTail: tail(stdout),
     stderrTail: tail(stderr)
   };
+  // FIRST thing after the child exits, before the result file and before any notification: the
+  // execution record is the one artifact that must exist no matter what the alert channel, the
+  // disk or the gateway are doing. recordRunToRunLog never throws.
+  const runLogWrite = recordRunToRunLog(result);
   try {
     writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
   } catch (error) {
@@ -510,6 +855,12 @@ async function runAllowedJob(job, context = {}) {
       error: String(error?.message ?? error)
     }));
     await escalateStatePersistFailure("result-file-write-failed", error, { job: job.name, resultPath });
+  }
+  if (!runLogWrite.ok) {
+    // Same H1 principle as the result-file write above: a run that executed but could not be
+    // recorded is exactly the blindness class this task is about, so it escalates - through the
+    // breaker-bounded channel, so a broken alert transport cannot turn it into a retry storm.
+    await escalateStatePersistFailure("run-log-write-failed", runLogWrite.error, { job: job.name });
   }
   return result;
 }
@@ -701,6 +1052,59 @@ export function getRunnerHealthSnapshot(nowMs = Date.now()) {
       );
     }
   }
+
+  // Alert-channel truth. On 2026-07-26 this endpoint answered 200 {"ok":true} while the report
+  // channel had been failing every 30 seconds for six days - the "silently green while nothing
+  // works" mode. A degraded channel is now a RED health state carrying its own last error.
+  const alertChannels = Array.from(alertChannelStates.values()).map((channelState) => ({
+    channel: channelState.channel,
+    degraded: channelState.degraded,
+    consecutiveFailures: channelState.consecutiveFailures,
+    suppressedAttempts: channelState.suppressedAttempts,
+    lastError: channelState.lastError,
+    lastErrorAt: channelState.lastErrorAt,
+    lastSuccessAt: channelState.lastSuccessAt,
+    nextAttemptAt: channelState.nextAttemptAtMs === null ? null : new Date(channelState.nextAttemptAtMs).toISOString()
+  }));
+  const reportChannel = alertChannelStates.get(ALERT_CHANNEL_REPORT) ?? null;
+  const alertsDegraded = alertChannels.some((channelState) => channelState.degraded);
+  for (const channelState of alertChannels) {
+    if (channelState.degraded) {
+      errors.push(
+        `alert-channel-degraded[${channelState.channel}]: ${channelState.consecutiveFailures} consecutive ` +
+        `failed sends (circuit breaker open, ${channelState.suppressedAttempts} suppressed since) - ` +
+        `last error: ${channelState.lastError}`
+      );
+    }
+  }
+
+  // Halted managed jobs. A halt is deliberate (3 same-class failures, operator territory via
+  // cron-runner-reset.mjs) but it means that pipeline is NOT running - on the mini, daily and
+  // weekly had been halted for six days behind a green health endpoint.
+  const haltedJobs = Object.entries(runnerState?.jobFailureState ?? {})
+    .filter(([, jobFailure]) => jobFailure?.halted)
+    .map(([jobName, jobFailure]) => ({
+      jobName,
+      failureClass: jobFailure.failureClass ?? null,
+      consecutiveCount: jobFailure.consecutiveCount ?? 0,
+      escalationPending: Boolean(jobFailure.escalationPending),
+      noticePending: Boolean(jobFailure.noticePending)
+    }));
+  for (const halted of haltedJobs) {
+    errors.push(
+      `cron-job-halted[${halted.jobName}]: halted after ${halted.consecutiveCount} same-class failures ` +
+      `(${halted.failureClass ?? "unknown class"}) - this pipeline is NOT executing until an operator runs ` +
+      `\`node apps/openclaw-config/scripts/cron-runner-reset.mjs ${halted.jobName}\`.`
+    );
+  }
+
+  if (runLogHealth.lastError) {
+    errors.push(`run-log-write-failed: ${runLogHealth.lastError}`);
+  }
+  if (serverError) {
+    errors.push(`http-server-error: ${serverError}`);
+  }
+
   return {
     ok: errors.length === 0,
     service: "openclaw-cron-runner",
@@ -711,6 +1115,17 @@ export function getRunnerHealthSnapshot(nowMs = Date.now()) {
     lastListOk: discoveryHealth.lastListOk,
     gapThresholdMs: discoveryGapMs,
     gaps,
+    alertsDegraded,
+    consecutiveAlertFailures: alertChannels.reduce((max, channelState) => Math.max(max, channelState.consecutiveFailures), 0),
+    lastAlertError: reportChannel?.lastError ?? null,
+    lastAlertErrorAt: reportChannel?.lastErrorAt ?? null,
+    lastAlertSuccessAt: reportChannel?.lastSuccessAt ?? null,
+    suppressedAlertAttempts: alertChannels.reduce((total, channelState) => total + channelState.suppressedAttempts, 0),
+    alertBreakerThreshold,
+    alertChannels,
+    haltedJobs,
+    runLog: { ...runLogHealth },
+    serverError,
     errors
   };
 }
@@ -735,12 +1150,13 @@ async function escalateExceededDiscoveryGaps(nowMs) {
       note: "Gateway fired this managed job but the runner cannot see the run via `openclaw cron runs` - " +
         "the silent-no-op class this runner's discovery guard exists to catch."
     }));
-    if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
+    if (alertsDisabled()) {
       discoveryHealth.alertedGapJobs.add(jobName);
       continue;
     }
-    try {
-      const delivery = await deliverReportToFeishu({
+    const delivery = await sendAlert(
+      ALERT_CHANNEL_REPORT,
+      () => ({
         title: `OpenClaw cron-runner 发现盲区：${jobName}`,
         markdown: [
           "# OpenClaw cron-runner 发现盲区",
@@ -751,26 +1167,14 @@ async function escalateExceededDiscoveryGaps(nowMs) {
           "- 请检查：mini 上 OpenClaw 版本/存储是否又迁移、gateway 是否健康、runner 的 OPENCLAW_BIN 是否指向正确的 CLI。"
         ].join("\n"),
         maxSectionChars: 3600
-      });
-      if (delivery.sent) {
-        discoveryHealth.alertedGapJobs.add(jobName);
-      } else {
-        console.error(JSON.stringify({
-          ok: false,
-          service: "openclaw-cron-runner",
-          action: "cron-discovery-gap-alert-not-sent",
-          job: jobName,
-          reason: delivery.reason ?? null
-        }));
-      }
-    } catch (error) {
-      console.error(JSON.stringify({
-        ok: false,
-        service: "openclaw-cron-runner",
-        action: "cron-discovery-gap-alert-error",
-        job: jobName,
-        error: String(error?.message ?? error)
-      }));
+      }),
+      { action: "cron-discovery-gap-alert", job: jobName }
+    );
+    // Only a confirmed delivery marks the gap as alerted. An undelivered one stays owed and is
+    // re-attempted on a later cycle - bounded by the channel breaker, never per-cycle spinning,
+    // and the gap itself is visible in GET /health the whole time regardless.
+    if (delivery.sent) {
+      discoveryHealth.alertedGapJobs.add(jobName);
     }
   }
 }
@@ -957,60 +1361,46 @@ export function writeRunnerStateAtomic(path, data) {
 // attempted and any failure of THAT is itself only logged, never thrown) - a persistence problem
 // escalating must never itself crash the runner.
 async function escalateStatePersistFailure(action, error, context = {}) {
-  if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
+  if (alertsDisabled()) {
     return;
   }
-  try {
-    const contextLines = Object.entries(context).map(([key, value]) => `- ${key}：${String(value)}`);
-    const delivery = await deliverReportToFeishu({
+  await sendAlert(
+    ALERT_CHANNEL_REPORT,
+    () => ({
       title: "OpenClaw cron-runner 状态持久化失败",
       markdown: [
         "# OpenClaw cron-runner 状态持久化失败",
         "",
         `- 动作：${action}`,
-        `- 错误：${String(error?.message ?? error)}`,
-        ...contextLines,
+        `- 错误：${sanitizeAlertText(String(error?.message ?? error), 1000)}`,
+        ...Object.entries(context).map(([key, value]) => `- ${key}：${sanitizeAlertText(String(value), 500)}`),
         "",
         "- 风险：runner 的去重/停机状态可能未落盘，重启后存在重复执行或漏记的风险，请尽快检查磁盘空间/文件权限。"
       ].join("\n"),
       maxSectionChars: 3600
-    });
-    if (!delivery.sent) {
-      console.error(JSON.stringify({
-        ok: false,
-        service: "openclaw-cron-runner",
-        action: "state-persist-failure-alert-not-sent",
-        reason: delivery.reason ?? null
-      }));
-    }
-  } catch (alertError) {
-    console.error(JSON.stringify({
-      ok: false,
-      service: "openclaw-cron-runner",
-      action: "state-persist-failure-alert-error",
-      error: String(alertError?.message ?? alertError)
-    }));
-  }
+    }),
+    { action, job: context.job ?? null }
+  );
 }
 
+// Resolves to { sent, skipped, reason } and NEVER throws or retries internally - callers only
+// clear their pending flag on `sent`, so an undelivered alert stays owed without ever aborting a
+// job, skipping a run entry or spinning. Retry cadence and give-up are the channel breaker's job.
 async function sendCronFailureAlert(result, attempt, alertLevel = "notice") {
-  if (process.env.OPENCLAW_CRON_RUNNER_ALERTS === "0") {
-    return;
-  }
   const isEscalation = alertLevel === "escalation";
-  const markdown = isEscalation
-    ? buildCronHaltAlertMarkdown(result, attempt)
-    : buildCronFailureAlertMarkdown(result, attempt);
-  const delivery = await deliverReportToFeishu({
-    title: isEscalation
-      ? `OpenClaw 自动报告已停机：${result.job}`
-      : `OpenClaw 自动报告失败告警：${result.job}`,
-    markdown,
-    maxSectionChars: 3600
-  });
-  if (!delivery.sent) {
-    throw new Error(delivery.reason ?? "Failure alert was not sent.");
-  }
+  return sendAlert(
+    ALERT_CHANNEL_REPORT,
+    () => ({
+      title: isEscalation
+        ? `OpenClaw 自动报告已停机：${result.job}`
+        : `OpenClaw 自动报告失败告警：${result.job}`,
+      markdown: isEscalation
+        ? buildCronHaltAlertMarkdown(result, attempt)
+        : buildCronFailureAlertMarkdown(result, attempt),
+      maxSectionChars: 3600
+    }),
+    { action: isEscalation ? "halt-escalation-alert" : "failure-alert", job: result?.job ?? null }
+  );
 }
 
 function readJsonFile(path, fallback) {
@@ -1047,4 +1437,15 @@ function tail(value) {
 export { pollOpenClawRunLogs, runAllowedJob };
 export function __getRunnerStateForTest() {
   return runnerState;
+}
+
+// Test seams (never called in production): the alert transport and the run_log writer are the two
+// edges that touch the network / the database, so tests drive every resilience path through fakes
+// instead of a live gateway or a real sqlite file.
+export function __setAlertDelivererForTest(deliverer) {
+  alertDeliverer = deliverer ?? deliverReportToFeishu;
+}
+
+export function __setRunLogRecorderForTest(recorder) {
+  runLogRecorder = recorder ?? defaultRunLogRecorder;
 }
