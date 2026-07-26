@@ -277,8 +277,20 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
     markdownPath,
     pdfPath
   });
+  // 2026-07-26: a failed Feishu delivery must NOT discard a successfully
+  // generated analysis. This used to throw BEFORE the stock_analysis_runs
+  // insert, so an undeliverable report also lost the markdown path, the run
+  // row and the state file - the analysis had to be regenerated from scratch
+  // once delivery was fixed. deliverReportToFeishu no longer throws (it
+  // returns {sent:false, reason}), so record the run either way and surface
+  // the delivery outcome in the JSON envelope + a non-zero exit code.
   if (!delivery.sent) {
-    throw new Error(delivery.reason ?? "个股分析报告未发送。");
+    console.error(JSON.stringify({
+      ok: false,
+      step: "feishu-delivery",
+      reason: delivery.reason ?? "个股分析报告未发送。"
+    }));
+    process.exitCode = 1;
   }
 
   const runId = createId("stock_analysis_run");
@@ -288,7 +300,7 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, pdfPath, JSON.stringify(delivery));
 
   writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols });
-  console.log(JSON.stringify({ delivered: true, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
+  console.log(JSON.stringify({ delivered: delivery.sent, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
 }
 
 // Task H7 (2026-07-14 legacy audit): one bad target (delisted/suspended

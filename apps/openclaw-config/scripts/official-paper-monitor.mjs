@@ -165,11 +165,20 @@ async function sendPnlReport(db, forceRun = false) {
     markdownPath,
     pdfPath
   });
+  // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
+  // already persisted by this point, so a Feishu delivery failure must not
+  // throw the whole run away. deliverReportToFeishu returns {sent:false,
+  // reason} instead of throwing; report it honestly and exit non-zero.
   if (!delivery.sent) {
-    throw new Error(delivery.reason ?? "模拟盘收支变化报告未发送。");
+    console.error(JSON.stringify({
+      ok: false,
+      step: "feishu-delivery",
+      reason: delivery.reason ?? "模拟盘收支变化报告未发送。"
+    }));
+    process.exitCode = 1;
   }
 
-  console.log(JSON.stringify({ delivered: true, snapshotId, markdownPath, pdfPath }, null, 2));
+  console.log(JSON.stringify({ delivered: delivery.sent, snapshotId, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
 }
 
 // Audit item (b), 2026-07-14 (task H4): the manual `snapshot` subcommand used
