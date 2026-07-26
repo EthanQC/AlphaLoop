@@ -115,7 +115,13 @@ loadLocalEnv(repoRoot);
 // same strings independently, free to drift).
 const allowedJobs = {
   "/run/daily": { name: CRON_JOB_DAILY, command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
-  "/run/weekly": { name: CRON_JOB_WEEKLY, command: [pnpmBin, "report:weekly:run"], timeoutMs: 15 * 60 * 1000 },
+  // 2026-07-26: 45min, not 15. The weekly report aggregates a full week of
+  // news clustering plus per-symbol analysis; measured on the mini it takes
+  // ~20 minutes, so the old 15-minute cap SIGTERM'd every single run (three
+  // consecutive kills in run_log, each exactly 15:00 after start) and the
+  // weekly pipeline had never once produced output. Daily measured ~3.5min
+  // and stays at 15.
+  "/run/weekly": { name: CRON_JOB_WEEKLY, command: [pnpmBin, "report:weekly:run"], timeoutMs: 45 * 60 * 1000 },
   "/run/stock-analysis": { name: CRON_JOB_STOCK_ANALYSIS, command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 },
   // 2026-07 audit fix: these two were registered in openclaw-cron-jobs.mjs (proposal-expiry sweep,
   // monthly per-owner review generation) but had no entry in cronJobNames below, so the runner's
