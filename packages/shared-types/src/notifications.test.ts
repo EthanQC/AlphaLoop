@@ -301,6 +301,9 @@ rl.on("line", (line) => {
   const envKeys = [
     "LARK_APP_ID",
     "LARK_APP_SECRET",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ACCOUNT_ID",
     "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
     "FEISHU_USER_PLUGIN_COMMAND",
     "FEISHU_USER_PLUGIN_ARGS",
@@ -339,6 +342,15 @@ rl.on("line", (line) => {
 
     process.env.LARK_APP_ID = "test_app_id";
     process.env.LARK_APP_SECRET = "test_app_secret";
+    // The 2026-07-26 fix makes the app-credential path the DEFAULT, so this
+    // legacy-path test has to make app credentials genuinely unresolvable:
+    // no FEISHU_APP_ID/SECRET in the env AND an account id that cannot exist
+    // in ~/.openclaw/openclaw.json (resolveFeishuAppCredentials's second
+    // source), otherwise the machine running the suite would decide which
+    // channel is exercised here.
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
     process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_test_chat";
     process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
     process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
@@ -348,14 +360,233 @@ rl.on("line", (line) => {
     // Pre-fix: the file-send step's "Send failed: ..." response is not
     // caught (only `/^error:/iu` was checked), so trySendFeishuUserPluginBotFile
     // reports `sent: true` and deliverReportToFeishu resolves as if the PDF
-    // had genuinely been delivered - this rejection never happens.
-    await expect(
-      deliverReportToFeishu({
-        title: "测试报告",
-        markdown: "# 测试报告\n\n内容",
-        pdfPath
-      })
-    ).rejects.toThrow(/Send failed/);
+    // had genuinely been delivered.
+    //
+    // The failure is still detected after the 2026-07-26 fix, but it is now
+    // reported as a structured not-delivered RESULT rather than a throw -
+    // throwing out of deliverReportToFeishu is exactly what took the cron
+    // runner down for every scheduled report.
+    const result = await deliverReportToFeishu({
+      title: "测试报告",
+      markdown: "# 测试报告\n\n内容",
+      pdfPath
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toMatch(/Send failed/);
+    // ... and it really did go through the legacy user-plugin channel.
+    expect(result.target).toBe("feishu-user-plugin-bot-post");
+  });
+});
+
+// 2026-07-26 scheduled-report delivery fix. deliverReportToFeishu used to
+// require the feishu-user-plugin MCP bot channel (a DIFFERENT Feishu app -
+// the operator's personal one) and THREW when it was not configured, so
+// every daily/weekly/stock-analysis/monthly-review run on the mini died with
+// "Feishu report delivery requires the user-plugin bot channel: No bot chat
+// id is configured" and never produced a single run_log row. Cards were
+// migrated to the app's own tenant token earlier this month
+// (directHttpCardTransport, above); reports never were. These tests fake the
+// same HTTP boundary those card tests fake.
+describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
+  const realFetch = globalThis.fetch;
+  const envKeys = [
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ACCOUNT_ID",
+    "FEISHU_DOMAIN",
+    "FEISHU_NOTIFY_OPEN_ID",
+    "FEISHU_NOTIFY_CHAT_ID",
+    "FEISHU_WEBHOOK_URL",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "HOME"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+  const savedCwd = process.cwd();
+  let tempDir: string | undefined;
+
+  const REPORT_MARKDOWN = [
+    "# OpenClaw 日报 2026-07-26",
+    "",
+    "窗口：2026-07-25 20:00 - 2026-07-26 20:00（北京时间）",
+    "",
+    "## 1. 今日结论",
+    "",
+    "- 市场信号：QQQ 最新价 738.31，较前收上涨 0.37%。",
+    "",
+    "## 2. 明日跟踪",
+    "",
+    "- QQQ：先看 730 - 745 区间是否被放量突破。"
+  ].join("\n");
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      if (key !== "HOME") {
+        delete process.env[key];
+      }
+    }
+    process.env.FEISHU_APP_ID = "cli_trading_copilot";
+    process.env.FEISHU_APP_SECRET = "app-secret-x";
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (process.cwd() !== savedCwd) {
+      process.chdir(savedCwd);
+    }
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+    if (tempDir) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    }
+  });
+
+  function stubFetch(handler: (url: string, init: RequestInit) => { status?: number; body: unknown }) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      const out = handler(String(url), init ?? {});
+      return new Response(JSON.stringify(out.body), { status: out.status ?? 200 });
+    }) as typeof fetch;
+    return calls;
+  }
+
+  function okFeishu(token = "t-token-report") {
+    return (url: string) => url.includes("tenant_access_token")
+      ? { body: { code: 0, tenant_access_token: token, expire: 7200 } }
+      : { body: { code: 0, msg: "success", data: { message_id: "om_report" } } };
+  }
+
+  function messageCalls(calls: Array<{ url: string; init: RequestInit }>) {
+    return calls
+      .filter((call) => call.url.includes("/open-apis/im/v1/messages?"))
+      .map((call) => ({
+        url: call.url,
+        headers: call.init.headers as Record<string, string>,
+        body: JSON.parse(String(call.init.body)) as {
+          receive_id: string;
+          msg_type: string;
+          content: string;
+        }
+      }));
+  }
+
+  it("posts the summary and every chapter to the global target with the app tenant token", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+
+    const sends = messageCalls(calls);
+    // 1 summary + 3 chapters (the pre-`##` header block, 今日结论, 明日跟踪).
+    expect(sends).toHaveLength(4);
+    for (const send of sends) {
+      expect(send.url).toContain("receive_id_type=open_id");
+      expect(send.body.receive_id).toBe("ou_global_member");
+      expect(send.headers.authorization).toBe("Bearer t-token-report");
+      // "post" (rich text), not "text": the report body is markdown-ish and
+      // markdownToFeishuPostContent already renders headings/bullets for the
+      // webhook + app notification paths.
+      expect(send.body.msg_type).toBe("post");
+    }
+
+    const summary = JSON.parse(sends[0]!.body.content) as { zh_cn: { title: string; content: unknown[] } };
+    expect(summary.zh_cn.title).toBe("OpenClaw 日报 2026-07-26 摘要");
+    expect(JSON.stringify(summary.zh_cn.content)).toContain("QQQ 最新价 738.31");
+
+    expect(result.deliveries.map((entry) => entry.kind)).toEqual(["summary", "chapter", "chapter", "chapter"]);
+    expect(result.deliveries.every((entry) => entry.sent)).toBe(true);
+  });
+
+  it("prefers a per-owner openId on the payload over the global notify target", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 个股分析 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      openId: "ou_owner_specific"
+    });
+
+    expect(result.sent).toBe(true);
+    const receivers = new Set(messageCalls(calls).map((send) => send.body.receive_id));
+    expect(receivers).toEqual(new Set(["ou_owner_specific"]));
+  });
+
+  it("returns a structured not-delivered result - never throws - when no target resolves", async () => {
+    // Isolate BOTH target sources resolveFeishuAppTarget can still reach with
+    // no FEISHU_NOTIFY_* set: the repo's sqlite notification_targets row
+    // (derived from cwd) and ~/.openclaw/credentials (derived from $HOME).
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-no-target-"));
+    process.env.HOME = tempDir;
+    process.chdir(tempDir);
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.reason).toMatch(/FEISHU_NOTIFY_OPEN_ID/);
+    expect(result.deliveries).toEqual([]);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("surfaces the Feishu error message on a non-zero code without leaking the tenant token", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_bad";
+    stubFetch((url) => url.includes("tenant_access_token")
+      ? { body: { code: 0, tenant_access_token: "secret-token-x", expire: 7200 } }
+      : { status: 400, body: { code: 230001, msg: "invalid receive_id" } });
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toContain("invalid receive_id");
+    expect(result.reason).not.toContain("secret-token-x");
+    expect(JSON.stringify(result.deliveries)).not.toContain("secret-token-x");
+  });
+
+  it("keeps splitting oversized chapters with maxSectionChars", async () => {
+    process.env.FEISHU_NOTIFY_CHAT_ID = "oc_group_chat";
+    const calls = stubFetch(okFeishu());
+    const longSection = ["## 1. 今日结论", "", "段落一".repeat(40), "", "段落二".repeat(40)].join("\n");
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: `# OpenClaw 日报 2026-07-26\n\n${longSection}`,
+      maxSectionChars: 100
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-chat-id");
+    const chapters = result.deliveries.filter((entry) => entry.kind === "chapter");
+    const multiPart = chapters.filter((entry) => (entry.parts ?? 1) > 1);
+    expect(multiPart.length).toBeGreaterThan(0);
+    expect(multiPart[0]!.title).toContain("（1/");
+    for (const send of messageCalls(calls)) {
+      expect(send.url).toContain("receive_id_type=chat_id");
+      expect(send.body.receive_id).toBe("oc_group_chat");
+    }
   });
 });
 

@@ -43,8 +43,21 @@ export interface ReportDeliveryPayload {
   title: string;
   markdown: string;
   markdownPath?: string;
+  /**
+   * Legacy: the PDF attachment is retired (2026-07-12 requirements, §0.4
+   * "PDF 已退役"). Only the legacy feishu-user-plugin channel still uploads
+   * it when a caller passes one; the app-credential channel never does.
+   */
   pdfPath?: string;
   maxSectionChars?: number;
+  /**
+   * Per-owner Feishu open_id. When set it wins over the global notification
+   * target, so an owner-scoped report (个股分析/个人复盘) lands in that
+   * member's own DM instead of the shared 报告发布 channel. Callers that own
+   * no single member (daily/weekly are 公共通知) leave it unset and get the
+   * global target from resolveFeishuAppTarget.
+   */
+  openId?: string;
 }
 
 export interface ReportDeliveryEntry {
@@ -162,17 +175,60 @@ export async function sendNotification(payload: NotificationPayload): Promise<No
   return sendFallbackNotification(payload);
 }
 
+/**
+ * Deliver a report to Feishu. NEVER throws: an undeliverable report comes
+ * back as `{sent: false, reason}` so the caller can log it and keep going.
+ *
+ * 2026-07-26 fix. This used to demand the feishu-user-plugin MCP bot channel
+ * and THROW when it was not configured. That channel is a DIFFERENT Feishu
+ * app (the operator's personal one), and FEISHU_USER_PLUGIN_BOT_CHAT_ID is
+ * unset on the mini, so every scheduled report (daily/weekly/stock-analysis/
+ * monthly-review) died with "No bot chat id is configured" and never reached
+ * Feishu or the run log. Interactive cards hit the same wall earlier this
+ * month and were migrated to the app's own tenant token
+ * (directHttpCardTransport); reports never were.
+ *
+ * Precedence mirrors defaultCardTransport exactly, and is decided per call
+ * (not at module load) so env changes are honored:
+ *   1. FEISHU_APP_ID/FEISHU_APP_SECRET (or ~/.openclaw/openclaw.json) resolve
+ *      -> direct im/v1/messages send with the app's own tenant token.
+ *   2. no app credentials -> the legacy feishu-user-plugin MCP channel.
+ *   3. neither is usable -> `{sent: false, reason}`.
+ * FEISHU_REPORT_ALLOW_FALLBACK still gates the degraded webhook/app fallback
+ * (allowReportFallbackDelivery) exactly as before, but it is no longer needed
+ * for basic delivery.
+ */
 export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
+  const credentials = resolveFeishuAppCredentials();
+  if (credentials) {
+    try {
+      return await deliverReportViaAppCredentials(payload, credentials);
+    } catch (error) {
+      return {
+        sent: false,
+        target: "none",
+        reason: `Feishu report app-credential delivery failed: ${sanitizeNotificationError(error)}`,
+        deliveries: []
+      };
+    }
+  }
+
   const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
   if (!pluginBotReadiness.enabled) {
     if (allowReportFallbackDelivery()) {
-      return deliverReportViaFallback(payload, pluginBotReadiness.reason);
+      return tryDeliverReportViaFallback(payload, pluginBotReadiness.reason);
     }
 
-    throw new Error([
-      `Feishu report delivery requires the user-plugin bot channel: ${pluginBotReadiness.reason ?? "not ready"}.`,
-      "Degraded fallback delivery is disabled for reports; set FEISHU_REPORT_ALLOW_FALLBACK=1 only if an operator explicitly accepts degraded report delivery."
-    ].join(" "));
+    return {
+      sent: false,
+      target: "none",
+      reason: [
+        "Feishu report delivery has no usable channel:",
+        "FEISHU_APP_ID/FEISHU_APP_SECRET are not configured and no OpenClaw Feishu app account was found,",
+        `and the legacy user-plugin bot channel is not ready either (${pluginBotReadiness.reason ?? "not ready"}).`
+      ].join(" "),
+      deliveries: []
+    };
   }
 
   try {
@@ -180,13 +236,15 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
   } catch (error) {
     const primaryError = sanitizeNotificationError(error);
     if (allowReportFallbackDelivery()) {
-      return deliverReportViaFallback(payload, primaryError);
+      return tryDeliverReportViaFallback(payload, primaryError);
     }
 
-    throw new Error([
-      `Feishu report user-plugin delivery failed after retries: ${primaryError}`,
-      "Degraded fallback delivery is disabled for reports, so this report was not marked delivered."
-    ].join(" "));
+    return {
+      sent: false,
+      target: "feishu-user-plugin-bot-post",
+      reason: `Feishu report user-plugin delivery failed after retries: ${primaryError}`,
+      deliveries: []
+    };
   }
 }
 
@@ -254,9 +312,27 @@ async function sendFallbackNotification(payload: NotificationPayload): Promise<N
     };
   }
 
+  await postFeishuAppMessage(credentials, appTarget, payload);
+
+  return {
+    sent: true,
+    target: appTarget.targetType === "chat_id" ? "feishu-app-chat-id" : "feishu-app-open-id"
+  };
+}
+
+// The one place that speaks im/v1/messages for a plain text/post message with
+// the app's OWN tenant token. Shared by the degraded notification fallback
+// (above) and the report delivery path (below) so both keep the same request
+// shape, the same non-zero-code handling and the same error text. Throws on
+// rejection; retry/sanitization policy is the caller's choice.
+async function postFeishuAppMessage(
+  credentials: FeishuAppCredentials,
+  target: FeishuAppTarget,
+  payload: NotificationPayload
+): Promise<void> {
   const message = buildFeishuAppMessage(payload);
   const response = await fetch(
-    `${resolveFeishuApiBase(credentials.domain ?? process.env.FEISHU_DOMAIN)}/open-apis/im/v1/messages?receive_id_type=${appTarget.targetType}`,
+    `${resolveFeishuApiBase(credentials.domain ?? process.env.FEISHU_DOMAIN)}/open-apis/im/v1/messages?receive_id_type=${target.targetType}`,
     {
       method: "POST",
       headers: {
@@ -264,7 +340,7 @@ async function sendFallbackNotification(payload: NotificationPayload): Promise<N
         "content-type": "application/json; charset=utf-8"
       },
       body: JSON.stringify({
-        receive_id: appTarget.targetId,
+        receive_id: target.targetId,
         msg_type: message.msg_type,
         content: JSON.stringify(message.content)
       })
@@ -278,11 +354,6 @@ async function sendFallbackNotification(payload: NotificationPayload): Promise<N
       : `${response.status} ${response.statusText}`;
     throw new Error(`Feishu app notification rejected: ${reason}`);
   }
-
-  return {
-    sent: true,
-    target: appTarget.targetType === "chat_id" ? "feishu-app-chat-id" : "feishu-app-open-id"
-  };
 }
 
 async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryError?: string): Promise<ReportDeliveryResult> {
@@ -339,6 +410,149 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
     deliveryResult.reason = reason;
   }
   return deliveryResult;
+}
+
+// Report delivery over the app's OWN tenant token (2026-07-26 fix; see
+// deliverReportToFeishu's doc comment for the production failure this
+// replaces). Same API surface directHttpCardTransport uses for cards.
+//
+// Message shape: "post" (rich text), not "text". Report bodies are markdown -
+// headings, bullets, tables - and markdownToFeishuPostContent (already used
+// by the webhook and app notification paths) turns headings into 【…】/— …
+// and strips ** / ` so the body reads as prose in the client instead of
+// showing raw markdown syntax; "post" also carries a per-message title, which
+// is what makes a multi-message report navigable. An interactive card was
+// rejected for the body because a report chapter routinely exceeds what a
+// card renders comfortably; cards stay for alerts/approvals.
+//
+// Unlike the legacy channel this sends the summary AND every chapter. The
+// `shouldSendFullReportChapters()` policy that suppresses chapters elsewhere
+// encoded "飞书只发送摘要卡片 + PDF" - but the PDF is retired (2026-07-12
+// requirements §0.4), so on this channel the full text has no other way to
+// arrive. Per-message size stays bounded by splitReportIntoChapterMessages.
+async function deliverReportViaAppCredentials(
+  payload: ReportDeliveryPayload,
+  credentials: FeishuAppCredentials
+): Promise<ReportDeliveryResult> {
+  const target = resolveReportDeliveryTarget(payload);
+  if (!target) {
+    return {
+      sent: false,
+      target: "none",
+      reason: "No Feishu report target could be resolved. Pass `openId` on the report payload, set FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
+      deliveries: []
+    };
+  }
+
+  const entryTarget: NotificationDeliveryTarget = target.targetType === "chat_id"
+    ? "feishu-app-chat-id"
+    : "feishu-app-open-id";
+  const deliveries: ReportDeliveryEntry[] = [];
+  const summaryTitle = `${payload.title} 摘要`;
+  const summary = await trySendFeishuAppReportMessage(credentials, target, {
+    title: summaryTitle,
+    body: buildReportSummaryMarkdown(payload),
+    format: "post"
+  });
+  deliveries.push({
+    kind: "summary",
+    title: summaryTitle,
+    target: entryTarget,
+    sent: summary.sent,
+    ...(summary.reason ? { reason: summary.reason } : {})
+  });
+
+  if (summary.sent) {
+    const sections = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
+    for (const section of sections) {
+      const chapter = await trySendFeishuAppReportMessage(credentials, target, {
+        title: section.title,
+        body: section.body,
+        format: "post"
+      });
+      deliveries.push({
+        kind: "chapter",
+        title: section.title,
+        target: entryTarget,
+        sent: chapter.sent,
+        ...(chapter.reason ? { reason: chapter.reason } : {}),
+        chapter: section.chapter,
+        part: section.part,
+        parts: section.parts
+      });
+      if (!chapter.sent) {
+        break;
+      }
+    }
+  }
+
+  // `target` names the channel that was USED (attempted), matching the
+  // user-plugin branch above, so a failure still tells the caller where it
+  // tried; `sent` is the only success signal.
+  const firstFailure = deliveries.find((entry) => !entry.sent);
+  const result: ReportDeliveryResult = {
+    sent: summary.sent,
+    target: entryTarget,
+    deliveries
+  };
+  if (firstFailure) {
+    result.reason = `${firstFailure.kind === "summary" ? "摘要" : firstFailure.title} 未送达：${firstFailure.reason ?? "unknown error"}`;
+  }
+  return result;
+}
+
+async function trySendFeishuAppReportMessage(
+  credentials: FeishuAppCredentials,
+  target: FeishuAppTarget,
+  payload: NotificationPayload
+): Promise<{ sent: boolean; reason?: string }> {
+  try {
+    await withNotificationRetry(
+      () => postFeishuAppMessage(credentials, target, payload),
+      "feishu app report send"
+    );
+    return { sent: true };
+  } catch (error) {
+    return { sent: false, reason: sanitizeNotificationError(error) };
+  }
+}
+
+// Per-owner target first, then the global one. Wrapped because
+// resolveFeishuAppTarget touches sqlite and the filesystem, and report
+// delivery must degrade rather than throw.
+function resolveReportDeliveryTarget(payload: ReportDeliveryPayload): FeishuAppTarget | null {
+  const openId = payload.openId?.trim();
+  if (openId) {
+    return {
+      targetType: "open_id",
+      targetId: openId,
+      source: "report-payload:openId"
+    };
+  }
+
+  try {
+    return resolveFeishuAppTarget();
+  } catch {
+    return null;
+  }
+}
+
+// deliverReportViaFallback can throw (sendFallbackNotification rejects a
+// non-2xx webhook), and deliverReportToFeishu must not.
+async function tryDeliverReportViaFallback(
+  payload: ReportDeliveryPayload,
+  primaryError?: string
+): Promise<ReportDeliveryResult> {
+  try {
+    return await deliverReportViaFallback(payload, primaryError);
+  } catch (error) {
+    return {
+      sent: false,
+      target: "none",
+      reason: `Degraded Feishu report fallback failed: ${sanitizeNotificationError(error)}${primaryError ? ` (primary error: ${primaryError})` : ""}`,
+      deliveries: []
+    };
+  }
 }
 
 async function deliverReportViaUserPlugin(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
@@ -1088,7 +1302,9 @@ export function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): stri
     "",
     "## 摘要",
     "",
-    ...(bullets.length > 0 ? bullets : ["- 报告没有提取到可行动摘要，请打开 PDF 查看正文并人工复核。"])
+    // PDF is retired (2026-07-12 requirements §0.4), so the honest pointer is
+    // the chapter messages that follow this summary, not an attachment.
+    ...(bullets.length > 0 ? bullets : ["- 报告没有提取到可行动摘要，请阅读下方章节正文并人工复核。"])
   ].filter((line) => line !== "").join("\n");
 }
 

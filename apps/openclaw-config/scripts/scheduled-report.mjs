@@ -185,20 +185,56 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
     : await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
+  // No `openId`: 日报/周报 are 公共通知 (2026-07-12 requirements §0.2 - 群:
+  // 公共通知（报告发布）), not owner-scoped, so delivery uses the global
+  // Feishu target (FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID / the stored
+  // one). Owner-scoped reports are the ones that should pass `openId`.
   const result = await deliverReportToFeishu({
     title: `${titlePrefix} ${info.label}`,
     markdown,
     markdownPath: reportPath,
     pdfPath
   });
-  if (!result.sent) {
-    throw new Error(result.reason ?? "Report delivery was not sent.");
-  }
+  // Only stamp `deliveredAt` on entries that actually sent - a not-delivered
+  // entry carrying a delivery timestamp is exactly the kind of false record
+  // the state file exists to prevent.
   const deliveries = result.deliveries.map((entry) => ({
     ...entry,
-    deliveredAt: new Date().toISOString()
+    ...(entry.sent ? { deliveredAt: new Date().toISOString() } : {})
   }));
   const chapterMessages = deliveries.filter((entry) => entry.kind === "chapter");
+
+  // 2026-07-26: deliverReportToFeishu no longer throws for an undeliverable
+  // report (that throw is what killed every scheduled run on the mini before
+  // a single row reached the run log). Degrade instead of crashing: the
+  // report itself was generated and is on disk, so record the FAILED
+  // delivery attempt in the state file, print the reason as structured
+  // output, and leave `deliveredAt` unset so the next run retries delivery.
+  // A non-zero exit code still marks the run as failed - degrading must not
+  // turn a missed delivery into a silently "successful" run.
+  if (!result.sent) {
+    updateState(info, {
+      path: reportPath,
+      pdfPath,
+      kind: reportKind,
+      chunks: chapterMessages.length,
+      deliveries,
+      deliveryFailedAt: new Date().toISOString(),
+      deliveryFailureReason: result.reason ?? "Report delivery was not sent.",
+      regeneratedDuringDelivery,
+      preparedInSameRun: alreadyPrepared
+    });
+    console.error(JSON.stringify({
+      delivered: false,
+      kind: reportKind,
+      label: info.label,
+      reason: result.reason ?? "Report delivery was not sent.",
+      targets: deliveries.map((entry) => entry.target),
+      path: reportPath
+    }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
 
   updateState(info, {
     deliveredAt: new Date().toISOString(),
@@ -208,6 +244,10 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     chunks: chapterMessages.length,
     deliveries,
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
+    // Clear any failure recorded by an earlier attempt at this same window
+    // (updateState merges into the existing entry; undefined drops the key).
+    deliveryFailedAt: undefined,
+    deliveryFailureReason: undefined,
     regeneratedDuringDelivery,
     preparedInSameRun: alreadyPrepared
   });
