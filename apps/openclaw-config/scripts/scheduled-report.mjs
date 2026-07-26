@@ -55,38 +55,14 @@ const timezone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
 // market-alerts-poll.mjs, official-paper-monitor.mjs) - kind/action/
 // windowInfo/reportPath/reportPdfPath are declared here (prepareReport/
 // deliverReport close over them) but only ever COMPUTED inside the guard,
-// exactly as before when actually run as a CLI.
+// exactly as before when actually run as a CLI. The guard itself lives at
+// the very BOTTOM of this file - see the "CLI entry point" section there for
+// why it must not sit here.
 let kind;
 let action;
 let windowInfo;
 let reportPath;
 let reportPdfPath;
-
-const isMainModule = process.argv[1]
-  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-  : false;
-
-if (isMainModule) {
-  const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2).filter((arg) => arg !== "--");
-  kind = assertKind(kindArg);
-  action = assertAction(actionArg);
-  windowInfo = resolveReportWindow(kind, dateArg);
-  reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
-  reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
-
-  mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
-  mkdirSync(runtimeDir, { recursive: true });
-
-  if (action === "prepare") {
-    const report = await prepareReport(kind, windowInfo);
-    console.log(report.path);
-  } else if (action === "deliver") {
-    await deliverReport(kind, windowInfo, false);
-  } else {
-    await prepareReport(kind, windowInfo);
-    await deliverReport(kind, windowInfo, true);
-  }
-}
 
 async function prepareReport(reportKind, info) {
   assertOfficialPaperReportEnvironment();
@@ -1764,4 +1740,54 @@ function formatPercent(value) {
     maximumFractionDigits: 2,
     minimumFractionDigits: 2
   });
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point - MUST remain the LAST statement in this module.
+// ---------------------------------------------------------------------------
+// 2026-07-26 regression fix: this dispatch used to sit near the TOP of the
+// file (right below the `let kind/action/...` declarations, ~line 65). It
+// contains a top-level `await`, so running the file as a CLI SUSPENDED module
+// evaluation at that point and executed the entire report pipeline while
+// every top-level binding declared further down was still in its temporal
+// dead zone. `function` declarations are hoisted, so prepareReport ->
+// renderDailyReport -> renderClusteredNewsSection -> deriveChannelLabel all
+// resolved fine - but `const CHANNEL_LABELS`, declared ~980 lines BELOW the
+// old dispatch site, had not been initialized yet, so every daily/weekly run
+// that clustered at least one news event died with:
+//   ReferenceError: Cannot access 'CHANNEL_LABELS' before initialization
+// It was invisible to `import`-based tests and to a bare module load: for any
+// importer `isMainModule` is false, the block is skipped, evaluation runs to
+// completion, and CHANNEL_LABELS ends up initialized. Only the real CLI path
+// hit it, and only when the news section had events to render - which is why
+// it looked like a phantom circular import (it is not one; the module graph
+// reachable from here has no cycle back into this file).
+// Keeping the dispatch LAST means the module body is always fully evaluated
+// before any of it runs, which makes the hazard structurally impossible
+// rather than order-dependent. cli-entry-order.test.ts enforces this for
+// every CLI script in this directory.
+const isMainModule = process.argv[1]
+  ? resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
+
+if (isMainModule) {
+  const [kindArg = "daily", actionArg = "run", dateArg] = process.argv.slice(2).filter((arg) => arg !== "--");
+  kind = assertKind(kindArg);
+  action = assertAction(actionArg);
+  windowInfo = resolveReportWindow(kind, dateArg);
+  reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
+  reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
+
+  mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
+  mkdirSync(runtimeDir, { recursive: true });
+
+  if (action === "prepare") {
+    const report = await prepareReport(kind, windowInfo);
+    console.log(report.path);
+  } else if (action === "deliver") {
+    await deliverReport(kind, windowInfo, false);
+  } else {
+    await prepareReport(kind, windowInfo);
+    await deliverReport(kind, windowInfo, true);
+  }
 }

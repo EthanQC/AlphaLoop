@@ -371,3 +371,54 @@ describe("summarizePaperBudget uses positions' real market-value fields (task H7
     expect(summary).not.toContain("非真实市价");
   });
 });
+
+// 2026-07-26: `node scheduled-report.mjs daily run` crashed with
+// "ReferenceError: Cannot access 'CHANNEL_LABELS' before initialization"
+// inside deriveChannelLabel for every run that clustered at least one news
+// event - the CLI dispatch's top-level `await` used to suspend module
+// evaluation ~980 lines ABOVE that const, so the whole pipeline ran while it
+// was still in its temporal dead zone (cli-entry-order.test.ts pins the
+// ordering invariant that makes this impossible now). The fix only MOVED the
+// dispatch, so these pin that the label mapping the crash surfaced through
+// still renders exactly as before.
+describe("news channel labels (deriveChannelLabel)", () => {
+  function withNewsEvents(sources: Array<Record<string, unknown>>) {
+    return sources.map((source, index) => ({
+      clusterKey: `cluster-${index}`,
+      titleZh: `事件 ${index}`,
+      summaryZh: `事件 ${index} 摘要`,
+      impact: { direction: "neutral", affected: ["QQQ.US"], reason: "测试事件" },
+      sources: [source]
+    }));
+  }
+
+  it("maps known origins to their Chinese channel labels and leaves unknown origins verbatim", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, {
+      ...buildFixtureData(),
+      newsEvents: withNewsEvents([
+        { origin: "rsshub-cls", publisher: "", titleRaw: "美联储维持利率不变", url: "https://example.com/a", publishedAt: "2026-07-14T01:00:00.000Z", lang: "zh" },
+        { origin: "openclaw-l2-search", publisher: "", titleRaw: "检索补充", url: "https://example.com/b", publishedAt: "2026-07-14T00:50:00.000Z", lang: "zh" },
+        { origin: "an-origin-with-no-mapping", publisher: "", titleRaw: "Unmapped origin", url: "https://example.com/c", publishedAt: "2026-07-14T00:40:00.000Z", lang: "en" }
+      ])
+    });
+
+    expect(markdown).toContain("渠道：财联社电报");
+    expect(markdown).toContain("渠道：OpenClaw 检索");
+    // Unmapped origins fall through to the raw origin string - the
+    // "未知渠道" default is reserved for a null/undefined origin.
+    expect(markdown).toContain("渠道：an-origin-with-no-mapping");
+  });
+
+  it("falls back to 未知渠道 when a source carries no origin at all", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, {
+      ...buildFixtureData(),
+      newsEvents: withNewsEvents([
+        { origin: undefined, publisher: "", titleRaw: "无渠道来源", url: "https://example.com/d", publishedAt: "2026-07-14T00:30:00.000Z", lang: "zh" }
+      ])
+    });
+
+    expect(markdown).toContain("渠道：未知渠道");
+  });
+});
