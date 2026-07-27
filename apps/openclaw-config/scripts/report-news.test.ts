@@ -397,3 +397,147 @@ describe("report news aggregation", () => {
     expect(decorated.summary).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
   });
 });
+
+// 2026-07-28 data-loss regression: newsIdentity's title fallback used to
+// normalize with `\W+`, which in JavaScript is ASCII-only ([^A-Za-z0-9_]) even
+// under the /u flag. Every CJK character was therefore stripped, so EVERY
+// URL-less Chinese headline collapsed to the same empty key and articles 2..N
+// were silently dropped as "duplicates" of article 1. The RSSHub Chinese feeds
+// (财联社/华尔街见闻/格隆汇) are the primary news source for this product, so
+// this quietly discarded most of the daily report's Chinese news.
+describe("news identity dedup keeps non-ASCII scripts distinct", () => {
+  const CHINESE_HEADLINES = [
+    "英伟达发布新一代芯片",
+    "台积电产能利用率回升",
+    "谷歌云业务增长超预期"
+  ];
+
+  function chineseArticle(title: string, index: number) {
+    return {
+      id: `rsshub-${index}`,
+      symbol: "QQQ.US",
+      title,
+      // No url on purpose: the url branch of newsIdentity would mask the bug.
+      publishedAt: new Date(Date.UTC(2026, 6, 20, 1, index)).toISOString(),
+      publishedAtMs: Date.UTC(2026, 6, 20, 1, index),
+      source: "rsshub-cls",
+      sourceName: "财联社",
+      publisher: "财联社"
+    };
+  }
+
+  it("keeps three distinct URL-less Chinese headlines as three distinct articles", () => {
+    const articles = CHINESE_HEADLINES.map(chineseArticle);
+    const merged = news.mergeNewsArticles(articles);
+
+    expect(merged).toHaveLength(3);
+    expect(new Set(merged.map((article) => article.title))).toEqual(new Set(CHINESE_HEADLINES));
+  });
+
+  it("renders all three Chinese headlines instead of silently keeping one", () => {
+    const selected = news.selectDiverseNewsArticles(CHINESE_HEADLINES.map(chineseArticle), 6);
+    const rendered = selected.map((article) => news.renderDetailedNewsLine(article)).join("\n");
+
+    expect(selected).toHaveLength(3);
+    for (const title of CHINESE_HEADLINES) {
+      expect(rendered).toContain(title);
+    }
+  });
+
+  it("still merges genuinely duplicate Chinese articles across publishers, keeping source evidence", () => {
+    const merged = news.mergeNewsArticles([
+      {
+        id: "cls-1",
+        symbol: "QQQ.US",
+        title: "英伟达发布新一代芯片",
+        publishedAt: "2026-07-20T01:00:00.000Z",
+        publishedAtMs: Date.parse("2026-07-20T01:00:00.000Z"),
+        source: "rsshub-cls",
+        publisher: "财联社"
+      },
+      {
+        // Same story redistributed: identical headline, different publisher,
+        // full-width punctuation and stray whitespace added by the second
+        // feed. Must still collapse into ONE article.
+        id: "wallstreetcn-1",
+        symbol: "QQQ.US",
+        title: "英伟达发布新一代芯片 ！",
+        publishedAt: "2026-07-20T02:00:00.000Z",
+        publishedAtMs: Date.parse("2026-07-20T02:00:00.000Z"),
+        source: "rsshub-wallstreetcn",
+        publisher: "华尔街见闻"
+      },
+      {
+        // A THIRD, genuinely different URL-less Chinese story: the buggy
+        // `\W+` key merged it into the same empty bucket as the 英伟达 pair.
+        id: "cls-2",
+        symbol: "QQQ.US",
+        title: "央行公开市场净投放规模扩大",
+        publishedAt: "2026-07-20T02:30:00.000Z",
+        publishedAtMs: Date.parse("2026-07-20T02:30:00.000Z"),
+        source: "rsshub-cls",
+        publisher: "财联社"
+      },
+      {
+        id: "gelonghui-1",
+        symbol: "QQQ.US",
+        title: "台积电产能利用率回升",
+        url: "https://example.com/tsmc",
+        publishedAt: "2026-07-20T03:00:00.000Z",
+        publishedAtMs: Date.parse("2026-07-20T03:00:00.000Z"),
+        source: "rsshub-gelonghui",
+        publisher: "格隆汇"
+      },
+      {
+        // Same URL as the previous one: the url branch must keep deduping.
+        id: "gelonghui-1-repost",
+        symbol: "QQQ.US",
+        title: "台积电产能利用率回升（转载）",
+        url: "https://example.com/tsmc",
+        publishedAt: "2026-07-20T04:00:00.000Z",
+        publishedAtMs: Date.parse("2026-07-20T04:00:00.000Z"),
+        source: "yahoo-finance-search",
+        publisher: "Yahoo"
+      }
+    ]);
+
+    expect(merged).toHaveLength(3);
+    const nvidia = merged.find((article) => article.title.startsWith("英伟达"));
+    const tsmc = merged.find((article) => article.title.startsWith("台积电"));
+    expect(merged.some((article) => article.title.startsWith("央行"))).toBe(true);
+    expect(nvidia?.sourceEvidence).toEqual(["rsshub-cls", "rsshub-wallstreetcn"]);
+    expect(tsmc?.sourceEvidence).toEqual(["rsshub-gelonghui", "yahoo-finance-search"]);
+  });
+
+  it("dedupes a mixed Chinese + English batch on real title identity", () => {
+    const merged = news.mergeNewsArticles([
+      { id: "zh-1", symbol: "AAPL.US", title: "苹果发布新款 iPhone", source: "rsshub-cls" },
+      { id: "zh-2", symbol: "AAPL.US", title: "苹果服务业务收入创新高", source: "rsshub-cls" },
+      // zh-3 shares no Latin characters with zh-2, so the buggy ASCII-only key
+      // collapsed the two into one empty bucket.
+      { id: "zh-3", symbol: "AAPL.US", title: "供应链称新机备货量上调", source: "rsshub-gelonghui" },
+      { id: "en-1", symbol: "AAPL.US", title: "Apple Unveils New iPhone", source: "google-news-rss" },
+      { id: "en-1-dupe", symbol: "AAPL.US", title: "Apple  Unveils, New iPhone!", source: "bing-news-rss" },
+      { id: "zh-1-dupe", symbol: "AAPL.US", title: "苹果发布新款 iPhone。", source: "rsshub-wallstreetcn" }
+    ]);
+
+    expect(merged).toHaveLength(4);
+    expect(merged.map((article) => article.title).sort()).toEqual([
+      "Apple Unveils New iPhone",
+      "供应链称新机备货量上调",
+      "苹果发布新款 iPhone",
+      "苹果服务业务收入创新高"
+    ]);
+  });
+
+  it("does not collapse two different pure-punctuation titles into one empty key", () => {
+    const merged = news.mergeNewsArticles([
+      { id: "punct-1", symbol: "QQQ.US", title: "!!!", source: "google-news-rss" },
+      { id: "punct-2", symbol: "QQQ.US", title: "???", source: "google-news-rss" },
+      { id: "emoji-1", symbol: "QQQ.US", title: "🚀🚀", source: "bing-news-rss" }
+    ]);
+
+    expect(merged).toHaveLength(3);
+    expect(merged.map((article) => article.id).sort()).toEqual(["emoji-1", "punct-1", "punct-2"]);
+  });
+});

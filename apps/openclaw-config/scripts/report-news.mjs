@@ -397,11 +397,52 @@ function hasNonLongbridgeEvidence(article) {
   return collectSourceEvidence(article).some((source) => source !== "longbridge-news");
 }
 
+// 2026-07-28 data-loss fix: the title fallback used to normalize with
+// `.replace(/\W+/gu, " ")`. JavaScript's `\W` is ASCII-only ([^A-Za-z0-9_])
+// even with the /u flag - it is NOT Unicode-aware - so every CJK character was
+// stripped and three distinct Chinese headlines ("英伟达发布新一代芯片",
+// "台积电产能利用率回升", "谷歌云业务增长超预期") all normalized to the SAME
+// empty string. mergeNewsArticles keys its dedup map on this value, so
+// articles 2..N were silently dropped as duplicates of article 1. The Chinese
+// RSSHub feeds (财联社/华尔街见闻/格隆汇) are this product's primary news
+// source and frequently arrive without a usable URL, so the daily report was
+// keeping exactly ONE Chinese headline per bucket.
+//
+// What the key preserves now: NFKC-folded, lowercased letters and numbers of
+// ANY script (`\p{L}\p{N}` - Han ideographs, kana, Cyrillic, Arabic, Latin,
+// digits), with every run of anything else (punctuation, symbols, emoji,
+// whitespace, control chars) collapsed to a single space. NFKC first so a
+// full-width "Ａ"/"１" and a half-width "A"/"1" - routinely mixed by Chinese
+// publishers - land on the same key, which is what makes cross-publisher
+// redistribution of the SAME story still dedupe to one article.
+const NON_IDENTITY_CHARS = /[^\p{L}\p{N}]+/gu;
+
+function normalizeNewsTitleForIdentity(title) {
+  return String(title ?? "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(NON_IDENTITY_CHARS, " ")
+    .trim();
+}
+
 function newsIdentity(article) {
   if (article.url) {
     return `url:${article.url.toLowerCase()}`;
   }
-  return `title:${article.symbol}:${article.title.toLowerCase().replace(/\W+/gu, " ").trim()}`;
+  const normalizedTitle = normalizeNewsTitleForIdentity(article.title);
+  if (normalizedTitle) {
+    return `title:${article.symbol}:${normalizedTitle}`;
+  }
+  // The other failure mode: a title that is legitimately all punctuation or
+  // emoji ("!!!", "🚀🚀") still normalizes to "". Those articles carry no
+  // evidence of being the same story, so an empty key must NOT make them all
+  // duplicates of each other. Fall back to the article's own identity
+  // (source + id + raw title). This stays a PURE function of the article - no
+  // counters, no randomness - because selectDiverseNewsArticles compares two
+  // newsIdentity() calls for equality and a non-deterministic key would break
+  // its duplicate-removal step.
+  const rawTitle = String(article.title ?? "").trim().toLowerCase();
+  return `unkeyed:${article.source}:${article.id}:${rawTitle}`;
 }
 
 function summarizeNewsImpact(article) {
