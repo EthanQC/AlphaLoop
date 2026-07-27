@@ -58,6 +58,56 @@ describe("stock analysis metrics", () => {
     expect(summary).toContain("期权链");
   });
 
+  // 2026-07-27 adversarial review of ca4cc52: this line still shipped bare
+  // placeholders ("目标价缺失", "PE 暂无") and a DERIVED "趋势分 0.00" that reads
+  // like a measured value, while the rest of the commit had already switched
+  // to reason-carrying disclosures.
+  describe("summarizeUpsidePotential: no bare placeholders, no fabricated zero", () => {
+    it("states WHY each missing metric is missing, and never prints a trend score it could not compute", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: 295,
+        valuation: { sources: ["nasdaq-summary"], failures: ["finnhub-metric：Finnhub 指标接口返回 429"] },
+        historyStats: metrics.summarizeHistory({ error: "Nasdaq 历史行情触发限流，当前维度待验证" }, 295),
+        optionStats: { summary: "期权链读取失败：Nasdaq 期权链未返回合约。" }
+      });
+
+      // Brief form here (the full source-by-source reason lives on the
+      // 估值补充 bullet; this line repeats in three sections per symbol).
+      expect(summary).toContain("PE 不可得（估值来源未返回该字段，原因见估值补充）");
+      expect(summary).toContain("PB 不可得（估值来源未返回该字段，原因见估值补充）");
+      expect(summary).toContain("目标价隐含空间 不可得（");
+      expect(summary).toContain("趋势分 不可得（历史走势读取失败：");
+      expect(summary).not.toContain("暂无");
+      expect(summary).not.toContain("目标价缺失");
+      expect(summary).not.toContain("趋势分 0.00");
+    });
+
+    it("uses the ETF's structural wording here too, so both valuation lines agree", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: 281,
+        valuation: { sources: ["nasdaq-summary"], failures: [], marketCap: 97_291_489_986 },
+        historyStats: metrics.summarizeHistory([{ date: "2026-07-15", close: 280 }], 281),
+        optionStats: { summary: "期权链读取失败：无合约。" },
+        instrumentKind: "etf"
+      });
+
+      expect(summary).toContain("PE 不适用（ETF 无市盈率口径");
+      expect(summary).toContain("目标价隐含空间 不适用（ETF 无卖方一年目标价");
+      expect(summary).not.toContain("不可得");
+    });
+
+    it("still prints a real trend score of exactly 0 when history WAS available", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: 295,
+        valuation: { trailingPE: 24, priceToBook: 5, oneYearTarget: 340 },
+        historyStats: { ma20: 290, ma60: 275, trendScore: 0, available: true },
+        optionStats: { summary: "期权链只读补充。" }
+      });
+
+      expect(summary).toContain("趋势分 0.00");
+    });
+  });
+
   // Task H7 (2026-07-14 legacy audit) fixed this function to label the
   // ACTUAL window (`longWindowDays`) instead of hardcoding "180 日" - these
   // tests pin that behavior in its new home (relocated here, verbatim, by
@@ -307,9 +357,9 @@ describe("summarizeValuation: every missing metric states WHY", () => {
       { instrumentKind: "etf" }
     );
 
-    expect(result.summary).toContain("PE 不可得（ETF 无市盈率口径");
-    expect(result.summary).toContain("PB 不可得（ETF 无市净率口径");
-    expect(result.summary).toContain("一年目标价 不可得（ETF 无卖方一年目标价");
+    expect(result.summary).toContain("PE 不适用（ETF 无市盈率口径");
+    expect(result.summary).toContain("PB 不适用（ETF 无市净率口径");
+    expect(result.summary).toContain("一年目标价 不适用（ETF 无卖方一年目标价");
     expect(result.summary).toContain("市值 97.29 十亿美元");
     expect(result.summary).not.toContain("暂无");
   });
@@ -322,6 +372,22 @@ describe("summarizeValuation: every missing metric states WHY", () => {
 
     expect(result.summary).toContain("PE 不可得（来源未提供该字段：finnhub-metric");
     expect(result.summary).toContain("一年目标价 320.00");
+  });
+
+  it("marks an ETF's metrics 不适用 (structural) and a source outage 不可得 (data), so a reader can tell them apart", () => {
+    const etf = metrics.summarizeValuation(
+      { sources: ["nasdaq-summary"], failures: [], marketCap: 97_291_489_986 },
+      { instrumentKind: "etf" }
+    );
+    const outage = metrics.summarizeValuation(
+      { sources: ["nasdaq-summary"], failures: ["finnhub-metric：Finnhub 指标接口返回 429"], marketCap: 3_000_000_000_000 },
+      { instrumentKind: "stock" }
+    );
+
+    expect(etf.summary).toContain("PE 不适用（ETF 无市盈率口径");
+    expect(etf.summary).not.toContain("PE 不可得");
+    expect(outage.summary).toContain("PE 不可得（来源未提供该字段：finnhub-metric");
+    expect(outage.summary).not.toContain("不适用");
   });
 
   it("still renders real numbers untouched when every metric is present", () => {

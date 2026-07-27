@@ -872,8 +872,8 @@ describe("stock.facts_coverage: disclosures count, bare placeholders do not", ()
     });
     const markdown = renderStockReport([{ record: etf.record }]);
 
-    expect(markdown).toContain("PE 不可得（ETF 无市盈率口径");
-    expect(markdown).toContain("一年目标价 不可得（ETF 无卖方一年目标价");
+    expect(markdown).toContain("PE 不适用（ETF 无市盈率口径");
+    expect(markdown).toContain("一年目标价 不适用（ETF 无卖方一年目标价");
     expect(countFactsCoverage(symbolSection(markdown, "QQQM.US"))).toBe(8);
     expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
   });
@@ -884,13 +884,13 @@ describe("stock.facts_coverage: disclosures count, bare placeholders do not", ()
       fundamentals: { sources: ["nasdaq-summary"], failures: [], marketCap: 97_291_489_986 },
       optionChain: UNAVAILABLE_OPTION_CHAIN
     });
+    // Strip the REASON out of every disclosure the renderer emits (both
+    // verbs - 不适用 for the ETF's structural gaps, 不可得 for a source outage),
+    // leaving the bare placeholder each one replaced.
     const silent = renderStockReport([{ record: etf.record }])
-      .replace(/PE 不可得（[^）]+）/gu, "PE 暂无")
-      .replace(/PB 不可得（[^）]+）/gu, "PB 暂无")
-      .replace(/一年目标价 不可得（[^）]+）/gu, "一年目标价 暂无")
+      .replace(/(PE|PB|一年目标价|目标价隐含空间|趋势分) (?:不可得|不适用)（[^）]+）/gu, "$1 暂无")
       .replace(/一年目标价均数据不可得/gu, "一年目标价暂无")
       .replace(/目标价数据不可得/gu, "目标价暂无")
-      .replace(/目标价缺失/gu, "目标价暂无")
       .replace(/历史走势读取失败：[^\n]*/gu, "历史走势暂无。")
       .replace(/期权链读取失败：[^\n]*/gu, "期权链暂无。");
 
@@ -928,5 +928,124 @@ describe("stock.numeric_match: deterministic derivations are backed, fabrication
 
     expect(result.ok).toBe(false);
     expect(result.failures).toContain("stock.numeric_match:AAPL.US:777.77");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-27 adversarial review of ca4cc52 - stock.valuation_depth. The gate
+// must accept exactly what the renderer honestly emits (a reason-carrying
+// disclosure), keep "结构上没有这个指标" distinguishable from "数据源没给", and
+// keep failing a silent gap. Every fixture below goes through the real
+// renderer, so "what the renderer emits" is never a second, hand-typed guess.
+// ---------------------------------------------------------------------------
+
+const ALL_VALUATION_SOURCES_DOWN = {
+  error: "finnhub-metric：Finnhub 指标接口返回 429；nasdaq-summary：Nasdaq 摘要未返回该标的数据（Symbol not exists.）；stockanalysis-statistics：读取失败：503"
+};
+
+// Replaces every line the renderer emits valuation evidence on (the
+// "估值补充" bullet and summarizeUpsidePotential's "综合上行潜力" bullet, which
+// repeats PE/PB in three sections) with one controlled substitute - the only
+// way to construct "the renderer's own valuation evidence, corrupted" without
+// hand-typing a whole report that would drift from what it really emits.
+function rewriteValuationEvidence(markdown: string, replacement: string): string {
+  return markdown
+    .split("\n")
+    .flatMap((line) => {
+      if (line.startsWith("- 估值补充：")) {
+        return [replacement];
+      }
+      return line.startsWith("- 综合上行潜力：") ? ["- 综合上行潜力：中性；具体估值口径见估值补充。"] : [line];
+    })
+    .join("\n");
+}
+
+describe("stock.valuation_depth: an honest disclosure ships, a silent gap does not", () => {
+  it("accepts an ALL-EQUITY batch whose valuation sources all failed, because the renderer discloses the reason", () => {
+    // The failure this defends: PE/PB genuinely unfetchable -> the renderer
+    // says exactly why -> the gate used to refuse it anyway, blocking the
+    // whole batch forever with no way to ship an honest report.
+    const aapl = buildStockRecord("AAPL.US", { fundamentals: ALL_VALUATION_SOURCES_DOWN });
+    const markdown = renderStockReport([{ record: aapl.record }]);
+
+    expect(markdown).toContain("估值补充：估值读取失败：");
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("accepts a per-field equity outage (sources answered, none carried PE/PB) and names the failing sources", () => {
+    const aapl = buildStockRecord("AAPL.US", {
+      fundamentals: {
+        sources: ["nasdaq-summary"],
+        failures: ["finnhub-metric：Finnhub 指标接口触发限流，当前维度待验证"],
+        marketCap: 3_000_000_000_000,
+        oneYearTarget: 280
+      }
+    });
+    const markdown = renderStockReport([{ record: aapl.record }]);
+
+    expect(markdown).toContain("PE 不可得（来源未提供该字段：finnhub-metric");
+    expect(markdown).toContain("PB 不可得（来源未提供该字段：finnhub-metric");
+    // A data-source outage must NEVER borrow the ETF's structural wording.
+    expect(markdown).not.toContain("不适用");
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("keeps 'ETF 无此指标' textually distinguishable from '数据源不可用' - and accepts both", () => {
+    const etf = buildStockRecord("QQQM.US", {
+      fundamentals: { sources: ["nasdaq-summary", "finnhub-metric"], failures: [], marketCap: 97_291_489_986, previousClose: 281.68 }
+    });
+    const markdown = renderStockReport([{ record: etf.record }]);
+
+    expect(markdown).toContain("PE 不适用（ETF 无市盈率口径");
+    expect(markdown).toContain("PB 不适用（ETF 无市净率口径");
+    expect(markdown).not.toContain("PE 不可得");
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("FAILS an equity that borrows the structural '不适用' wording, even a near-miss paraphrase of the ETF reason", () => {
+    // "structurally inapplicable" acceptance is scoped to the ETF branch as
+    // tightly as the renderer scopes it (the EXACT ETF_INAPPLICABLE_REASONS
+    // sentence) - an equity always HAS a P/E, so neither a bare 不适用 nor a
+    // reason that merely opens with "ETF" may buy its way past the gate.
+    const aapl = buildStockRecord("AAPL.US", { fundamentals: ALL_VALUATION_SOURCES_DOWN });
+    const markdown = renderStockReport([{ record: aapl.record }]);
+
+    for (const forgedBullet of [
+      "- 估值补充：PE 不适用（暂不适用）；PB 不适用（暂不适用）。",
+      "- 估值补充：PE 不适用（ETF 无市盈率口径，本标的其实是个股）；PB 不适用（ETF 无市净率口径，本标的其实是个股）。"
+    ]) {
+      const result = validateStockAnalysisMarkdown(rewriteValuationEvidence(markdown, forgedBullet));
+
+      expect(result.failures).toContain("stock.valuation_depth");
+    }
+  });
+
+  it("FAILS a disclosure with no stated reason at all ('PE 不可得' bare)", () => {
+    const aapl = buildStockRecord("AAPL.US", { fundamentals: ALL_VALUATION_SOURCES_DOWN });
+    const bare = rewriteValuationEvidence(
+      renderStockReport([{ record: aapl.record }]),
+      "- 估值补充：PE 不可得；PB 不可得。"
+    );
+
+    const result = validateStockAnalysisMarkdown(bare);
+
+    expect(result.failures).toContain("stock.valuation_depth");
+  });
+
+  it("FAILS when the report's only PE/PB tokens sit inside an English news headline", () => {
+    // The detectors used to run case-insensitively over the WHOLE document,
+    // so "…Europe 5.5 percent…" alone satisfied "PE <number>" and a genuine
+    // silent valuation gap shipped masked by unrelated prose.
+    const aapl = buildStockRecord("AAPL.US");
+    const masked = renderStockReport([{ record: aapl.record }])
+      .replace(/PE [0-9.]+/gu, "PE 暂无")
+      .replace(/PB [0-9.]+/gu, "PB 暂无")
+      .concat(
+        "\n- 2026-07-15 09:00 AAPL.US：欧洲关税消息；媒体：Reuters；渠道：Reuters；分类：待验证；基本面：待验证；影响：观察；链接：https://example.com/a；原始标题：Apple faces Europe 5.5 percent tariff while a rival PB 3.2 ratio climbs。"
+      );
+
+    const result = validateStockAnalysisMarkdown(masked);
+
+    expect(result.failures).toContain("stock.valuation_depth");
   });
 });

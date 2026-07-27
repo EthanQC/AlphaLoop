@@ -250,28 +250,72 @@ export function mergeFundamentalSnapshots(snapshots) {
 // they are structurally inapplicable, and the report must say exactly that
 // (verified 2026-07-27: Finnhub free tier returns 19 metrics for QQQM with no
 // pe/pb key at all; Nasdaq's ETF summary carries no OneYrTarget).
-const ETF_INAPPLICABLE_REASONS = {
+// Exported alongside VALUATION_DISCLOSURE below: report-quality.mjs accepts
+// the structural branch ONLY for these exact sentences, so "an ETF has no
+// P/E" can never be paraphrased into an excuse for an equity whose P/E simply
+// failed to load.
+export const ETF_INAPPLICABLE_REASONS = {
   pe: "ETF 无市盈率口径，Finnhub 免费版对基金不返回该指标",
   pb: "ETF 无市净率口径，基金不披露账面价值",
   eps: "ETF 不披露每股收益",
   targetPrice: "ETF 无卖方一年目标价，Nasdaq 基金摘要不含 OneYrTarget"
 };
 
-function missingValuationReason(field, { instrumentKind, failures }) {
+// 2026-07-27 (adversarial review of ca4cc52, defect 2): the two disclosure
+// verbs are deliberately DIFFERENT words, because they mean different things
+// to a reader and to the gate:
+//   - 不适用: the instrument structurally HAS no such metric. Only ever
+//     rendered for an ETF, and only for the four fields above, so every
+//     不适用 reason literally starts with INAPPLICABLE_REASON_PREFIX.
+//   - 不可得: the metric exists for this instrument, but no source returned
+//     it (outage/rate-limit/coverage gap). The reason names the sources.
+// Before this split both cases rendered "不可得（…）", so a total PE/PB outage
+// across an all-equity batch was indistinguishable - in the report AND in the
+// gate - from "a fund has no P/E".
+//
+// Exported because report-quality.mjs builds its stock.valuation_depth and
+// facts-coverage detectors from these exact literals rather than a second,
+// hand-typed copy: a phrasing change here can no longer silently stop
+// satisfying the gate (see that file's VALUATION_FIELD_DETECTORS, and
+// stock-analysis-metrics.test.ts / report-quality.test.ts, which assert both
+// sides against the SAME rendered output).
+export const VALUATION_DISCLOSURE = {
+  inapplicable: "不适用",
+  unavailable: "不可得"
+};
+
+// Renders an EXPLICIT "<不适用|不可得>（原因）" - never a bare "暂无", which
+// report-quality.mjs's detectors deliberately refuse to count as a disclosure
+// (a placeholder with no stated reason is a silent gap).
+//
+// `error` is summarizeValuation's whole-block failure (no source responded at
+// all); `failures` are the per-source failures a partially-successful merge
+// carried out on `merged.failures`.
+//
+// `brief` is for the SECOND place a missing metric is disclosed
+// (summarizeUpsidePotential, which repeats PE/PB/目标价 in three sections):
+// spelling every source's error out there would print the same multi-source
+// failure list nine times per symbol. The brief form still states the reason -
+// the source did not return the field - and points at the 估值补充 bullet that
+// names which source failed and how. The structural (ETF) reason is short and
+// self-contained, so it is rendered in full either way.
+export function renderMissingValuationDisclosure(field, { instrumentKind = "stock", failures = [], error, brief = false } = {}) {
   if (instrumentKind === "etf" && ETF_INAPPLICABLE_REASONS[field]) {
-    return ETF_INAPPLICABLE_REASONS[field];
+    return `${VALUATION_DISCLOSURE.inapplicable}（${ETF_INAPPLICABLE_REASONS[field]}）`;
   }
-  if (failures.length > 0) {
-    return `来源未提供该字段：${failures.join("；")}`;
+  if (brief) {
+    return `${VALUATION_DISCLOSURE.unavailable}（估值来源未返回该字段，原因见估值补充）`;
   }
-  return "已接入的估值来源均未返回该字段";
+  const reason = error
+    ? `估值来源读取失败：${error}`
+    : failures.length > 0
+      ? `来源未提供该字段：${failures.join("；")}`
+      : "已接入的估值来源均未返回该字段";
+  return `${VALUATION_DISCLOSURE.unavailable}（${reason}）`;
 }
 
-// Renders a value, or an EXPLICIT "不可得（原因）" - never a bare "暂无",
-// which report-quality.mjs's facts-coverage detectors deliberately refuse to
-// count as a disclosure (a placeholder with no stated reason is a silent gap).
-function valuationValueOrReason(formatted, value, reason) {
-  return value === undefined ? `不可得（${reason}）` : formatted;
+function valuationValueOrReason(formatted, value, disclosure) {
+  return value === undefined ? disclosure : formatted;
 }
 
 export function summarizeValuation(valuation, { instrumentKind = "stock" } = {}) {
@@ -295,7 +339,7 @@ export function summarizeValuation(valuation, { instrumentKind = "stock" } = {})
     pe !== undefined && pe > 0 && pe < 30 ? "PE 低于 30" : ""
   ].filter(Boolean);
   const sourceText = valuation.sources?.length ? `；来源 ${valuation.sources.join("、")}` : "";
-  const reasonFor = (field) => missingValuationReason(field, { instrumentKind, failures });
+  const reasonFor = (field) => renderMissingValuationDisclosure(field, { instrumentKind, failures });
 
   const summary = [
     `PE ${valuationValueOrReason(formatNumber(pe), pe, reasonFor("pe"))}`,
@@ -381,7 +425,17 @@ export function summarizeOptionChainStats(optionChain) {
   };
 }
 
-export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, optionStats }) {
+// 2026-07-27 (adversarial review of ca4cc52, defect 4): this line was the
+// last place still shipping the exact placeholders the rest of that commit
+// removed - "目标价缺失" (no reason), "PE 暂无"/"PB 暂无" (the bare placeholder
+// the facts-coverage detectors refuse by design), and worst of all
+// "趋势分 0.00", a DERIVED score that reads like a measurement but is really
+// summarizeHistory's `?? 0` default when no history could be fetched at all.
+// Every one of them now states why, using the SAME vocabulary
+// summarizeValuation renders (so an ETF reads 不适用 in both places and a
+// source outage reads 不可得 in both). `instrumentKind` is threaded in by
+// buildDeterministicAnalysis, which already resolves it for summarizeValuation.
+export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, optionStats, instrumentKind = "stock" }) {
   const target = toNumber(valuation?.oneYearTarget);
   const price = toNumber(lastPrice);
   const targetUpside = target !== undefined && price !== undefined && price > 0
@@ -400,11 +454,25 @@ export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, o
   ].reduce((sum, value) => sum + value, 0);
   const score = valuationScore + clamp(trendScore / 2, -4, 5) + clamp(optionBias * 3, -2, 2);
   const label = score >= 7 ? "偏强" : score >= 3 ? "中性偏强" : score <= -3 ? "偏弱" : "中性";
+  const failures = Array.isArray(valuation?.failures) ? valuation.failures : [];
+  const disclose = (field) =>
+    renderMissingValuationDisclosure(field, { instrumentKind, failures, error: valuation?.error, brief: true });
+  // summarizeHistory's no-rows branch marks itself `available: false` and
+  // carries the reason in `summary`; a hand-built historyStats (every
+  // pre-2026-07-27 caller/test) has no such flag and is treated as available,
+  // so a genuine trendScore of exactly 0 still prints as 0.00.
+  const trendUnavailableReason = historyStats?.available === false
+    ? String(historyStats.summary ?? "历史走势不可用（原因未记录）").replace(/。$/u, "")
+    : null;
   const details = [
-    targetUpside === undefined ? "目标价缺失" : `目标价隐含空间 ${formatPercent(targetUpside)}`,
-    `PE ${formatNumber(pe)}`,
-    `PB ${formatNumber(pb)}`,
-    `趋势分 ${formatNumber(trendScore)}`,
+    targetUpside === undefined
+      ? `目标价隐含空间 ${disclose("targetPrice")}`
+      : `目标价隐含空间 ${formatPercent(targetUpside)}`,
+    `PE ${pe === undefined ? disclose("pe") : formatNumber(pe)}`,
+    `PB ${pb === undefined ? disclose("pb") : formatNumber(pb)}`,
+    trendUnavailableReason === null
+      ? `趋势分 ${formatNumber(trendScore)}`
+      : `趋势分 ${VALUATION_DISCLOSURE.unavailable}（${trendUnavailableReason}）`,
     // The option summary is a full sentence ending in "。"; this list is
     // itself joined with "；" and closed with one "。" below, so keeping the
     // inner full stop rendered "……参考。。" in every report.
@@ -462,6 +530,12 @@ export function summarizeHistory(history, currentPrice) {
         ? `历史走势读取失败：${error}`
         : "历史走势暂无可用数据（历史来源返回 0 条日线，无法计算均线）。",
       cheapness: "长期均线不可用，便宜程度暂记为待验证",
+      // trendScore stays 0 so every downstream arithmetic consumer
+      // (buildDeterministicAnalysis's three-path probabilities, this module's
+      // own upside score) keeps working on a number rather than NaN; the
+      // `available: false` flag is what tells a RENDERER that the 0 is a
+      // fallback, not a measurement (see summarizeUpsidePotential).
+      available: false,
       trendScore: 0,
       source: undefined,
       support: undefined,
@@ -496,6 +570,7 @@ export function summarizeHistory(history, currentPrice) {
   const sourceText = source ? `，来源 ${source}` : "";
   return {
     summary: `${rows[0]?.date} 到 ${rows.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日${sourceText}。`,
+    available: true,
     source,
     cheapness: vsMa180 === undefined
       ? "长期均线不可用，便宜程度待验证"

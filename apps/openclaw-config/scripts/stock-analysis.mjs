@@ -575,7 +575,11 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
     lastPrice: last,
     valuation: extraData.fundamentals,
     historyStats,
-    optionStats
+    optionStats,
+    // Same kind summarizeValuation above was given: both lines quote PE/PB, so
+    // both must disclose a missing one with the SAME vocabulary (an ETF reads
+    // 不适用 in both places, a source outage reads 不可得 in both).
+    instrumentKind
   });
   const newsTitles = selectDiverseNewsArticles(news, 6).map((entry) => entry.titleZh ?? entry.title).join("；");
   const nextMonthlyExpiry = nextUsMonthlyOptionExpiry(new Date());

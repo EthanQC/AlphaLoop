@@ -1,5 +1,11 @@
-// Phase 5 Task 4 (2026-07-15 plan): the ONLY three project imports this
-// otherwise-zero-dependency module has ever needed. Each is deliberately
+// Phase 5 Task 4 (2026-07-15 plan): the ONLY four project imports this
+// otherwise-zero-dependency module has ever needed (the fourth,
+// stock-analysis-metrics.mjs, was added 2026-07-27 so the valuation detectors
+// below are built from the literals the RENDERER actually emits rather than a
+// second, hand-typed copy of them - it pulls in nothing this file's import
+// graph did not already contain, since narrative-engine.mjs already reaches
+// report-news.mjs/report-data.mjs, and it has no path back into this file).
+// Each is deliberately
 // chosen to avoid a circular import that would loop back INTO this file (see
 // stock-facts-store.mjs's own comment on CONFIDENCE_COVERAGE_CHECKPOINTS for
 // why that constant lives there rather than in stock-analysis.mjs, which
@@ -10,6 +16,7 @@
 import { parseConclusionBox } from "./conclusion-box.mjs";
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD } from "./stock-facts-store.mjs";
 import { NON_CHINESE_DEGRADE_MARKER, NUMERIC_DEGRADE_MARKER, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
+import { ETF_INAPPLICABLE_REASONS, VALUATION_DISCLOSURE } from "./stock-analysis-metrics.mjs";
 
 const GENERIC_NEWS_PATTERN = /媒体报道与.+相关的公司新闻/u;
 const LONG_ENGLISH_WORD_PATTERN = /(?:\b[A-Za-z][A-Za-z'-]{2,}\b[\s,.:;!?()/-]*){18,}/u;
@@ -213,17 +220,116 @@ function extractStockSymbolSections(markdown) {
 // the rendering pipeline dropped a whole data point without disclosing why)
 // counts against the >=6/8 threshold.
 
-// 2026-07-27: the per-FIELD valuation disclosure stock-analysis-metrics.mjs's
-// summarizeValuation renders when ONE metric is unavailable while others are
-// present - e.g. an ETF, which structurally has no P/E, no book value, no EPS
-// and no sell-side one-year target ("PE 不可得（ETF 无市盈率口径，……）").
-// Declared once, here, because BOTH the whole-report stock.valuation_depth
-// gate and the per-symbol facts-coverage detector below have to agree on what
-// a disclosed PE/PB looks like. The parenthesised reason group is REQUIRED:
-// the bare "PE 暂无" placeholder this phrasing replaced must keep failing -
-// a disclosure only counts when it states a reason.
-const VALUATION_PE_DISCLOSED_PATTERN = /PE\s*(?:不可得|不适用)（[^）]{4,}）/u;
-const VALUATION_PB_DISCLOSED_PATTERN = /PB\s*(?:不可得|不适用)（[^）]{4,}）/u;
+// ---------------------------------------------------------------------------
+// Valuation evidence: scope, vocabulary, and the four states a field can be in
+// (2026-07-27, adversarial review of ca4cc52 - defects 1/2/3)
+// ---------------------------------------------------------------------------
+
+// Defect 3 - SCOPE. The PE/PB detectors used to run case-insensitively over
+// the WHOLE report, so any English prose elsewhere in the document could
+// satisfy them: a news headline containing "…Europe 5.5 percent…" reads as
+// "pe 5.5" to /PE\s+[0-9,.]+/i, and a genuine silent valuation gap shipped
+// masked by unrelated news text.
+//
+// Valuation evidence has exactly two renderer-owned homes
+// (buildDeterministicAnalysis in stock-analysis.mjs):
+//   - "- 估值补充：<summarizeValuation.summary>"      (基本面分析)
+//   - "- 综合上行潜力：…；PE …；PB …；…"              (投资逻辑/基本面分析/结论)
+// Both are anchored at the START of the renderer's own bullet, exactly like
+// SOURCE_SUMMARY_LINE_PATTERN above, and neither can be forged from inside a
+// news bullet (renderDetailedNewsLine always opens with "- <时间> <代码>：").
+// Narrative prose is appended as separate "- 叙事：…" bullets, so the model can
+// neither satisfy nor break this gate by paraphrasing - the same structural
+// guarantee the additive-narrative fix restored for every other checkpoint.
+const VALUATION_EVIDENCE_LINE_PATTERN = /^(?:-\s*)?(?:估值补充：|综合上行潜力：)/u;
+
+function extractValuationEvidence(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => VALUATION_EVIDENCE_LINE_PATTERN.test(line))
+    .join("\n");
+}
+
+// The disclosure vocabulary is IMPORTED from the renderer (stock-analysis-
+// metrics.mjs's VALUATION_DISCLOSURE), not re-typed here, so the gate and the
+// text it judges can never drift apart. Each field is in exactly one of four
+// states:
+//   real          - an actual number ("PE 27.76")
+//   inapplicable  - structurally absent, ETF only ("PE 不适用（ETF 无市盈率
+//                   口径，……）"). Accepting this is scoped to the ETF branch as
+//                   tightly as the renderer itself scopes it: the reason must
+//                   be the EXACT sentence ETF_INAPPLICABLE_REASONS holds for
+//                   that field, which summarizeValuation/summarizeUpsidePotential
+//                   emit only when instrumentKind === "etf". An equity - which
+//                   always HAS a P/E - can neither invent nor paraphrase its
+//                   way into this state (defect 2).
+//   unavailable   - the metric exists but no source returned it ("PE 不可得
+//                   （来源未提供该字段：…）"), or summarizeValuation's whole-block
+//                   failure ("估值读取失败：…"). Honest, reason-carrying, and
+//                   therefore shippable (defect 1) - and textually distinct
+//                   from the ETF case for the reader.
+//   missing       - neither a value nor a reason: a bare "PE 暂无", a bare
+//                   "PE 不可得" with no stated reason, or PE vanishing from the
+//                   report entirely. This is the silent gap the gate exists
+//                   to catch, and it still fails.
+const VALUATION_STATE = { real: "real", inapplicable: "inapplicable", unavailable: "unavailable", missing: "missing" };
+
+// Matches nothing, ever - the structural detector for a field the renderer has
+// no structural reason for (an ETF still HAS a market cap, so "市值 不适用" is
+// not a state this codebase can legitimately produce).
+const NEVER_MATCHES_PATTERN = /(?!)/u;
+
+function valuationFieldDetectors(label, field) {
+  const structuralReason = ETF_INAPPLICABLE_REASONS[field];
+  return {
+    // A signed number counts as real too: summarizeUpsidePotential renders the
+    // implied target upside as a percentage ("目标价隐含空间 +31.46%").
+    real: new RegExp(`${label}\\s+(?!暂无)[+-]?[0-9][0-9,.]*`, "u"),
+    inapplicable: structuralReason
+      ? new RegExp(`${label}\\s*${VALUATION_DISCLOSURE.inapplicable}（${escapeRegExp(structuralReason)}）`, "u")
+      : NEVER_MATCHES_PATTERN,
+    unavailable: new RegExp(`${label}\\s*${VALUATION_DISCLOSURE.unavailable}（[^）]{4,}）`, "u")
+  };
+}
+
+// summarizeValuation's whole-block failure branch: no source responded at all,
+// so no per-field line is rendered - the single sentence names the reason for
+// every field at once. Both spellings require an actual reason after them.
+const VALUATION_BLOCK_DISCLOSED_PATTERN = /估值读取失败：\S{4,}|估值数据暂无可用（[^）]{4,}）/u;
+
+const VALUATION_FIELD_DETECTORS = {
+  pe: valuationFieldDetectors("PE", "pe"),
+  pb: valuationFieldDetectors("PB", "pb"),
+  // summarizeValuation writes "一年目标价 …", summarizeUpsidePotential writes
+  // "目标价隐含空间 …" - one field, two renderer-owned labels.
+  targetPrice: valuationFieldDetectors("(?:一年目标价|目标价隐含空间)", "targetPrice")
+};
+
+// The facts-coverage counterpart of classifyValuationField: one regex that
+// matches EITHER disclosed state (structural or outage), built from the same
+// detectors so the two can never diverge.
+function valuationDisclosedPattern(field) {
+  const detectors = VALUATION_FIELD_DETECTORS[field];
+  return new RegExp(
+    `${detectors.inapplicable.source}|${detectors.unavailable.source}|${VALUATION_BLOCK_DISCLOSED_PATTERN.source}`,
+    "u"
+  );
+}
+
+function classifyValuationField(valuationEvidence, field) {
+  const detectors = VALUATION_FIELD_DETECTORS[field];
+  if (detectors.real.test(valuationEvidence)) {
+    return VALUATION_STATE.real;
+  }
+  if (detectors.inapplicable.test(valuationEvidence)) {
+    return VALUATION_STATE.inapplicable;
+  }
+  if (detectors.unavailable.test(valuationEvidence) || VALUATION_BLOCK_DISCLOSED_PATTERN.test(valuationEvidence)) {
+    return VALUATION_STATE.unavailable;
+  }
+  return VALUATION_STATE.missing;
+}
 
 const FACTS_COVERAGE_DETECTORS = {
   "quote.last": {
@@ -234,13 +340,20 @@ const FACTS_COVERAGE_DETECTORS = {
     backed: /涨跌幅[:：]\s*(?!暂无)[+-]?[0-9]/u,
     disclosed: /缺少前收数据/u
   },
+  // Both valuation checkpoints read the SAME scoped evidence and the SAME
+  // state machine the stock.valuation_depth gate below uses (`scope` narrows
+  // the section text to the renderer's own valuation bullets first - see
+  // extractValuationEvidence): "covered" here and "passes the gate" there can
+  // never mean two different things.
   "valuation.pe": {
-    backed: /PE\s+(?!暂无)[0-9,.]+/iu,
-    disclosed: new RegExp(`估值(?:读取失败|数据暂无可用)|${VALUATION_PE_DISCLOSED_PATTERN.source}`, "u")
+    scope: extractValuationEvidence,
+    backed: VALUATION_FIELD_DETECTORS.pe.real,
+    disclosed: valuationDisclosedPattern("pe")
   },
   "valuation.targetPrice": {
-    backed: /一年目标价\s*(?!暂无)[0-9,.]+/u,
-    disclosed: /目标价(?:缺失|数据不可得|均数据不可得)|一年目标价\s*(?:不可得|不适用)（[^）]{4,}）/u
+    scope: extractValuationEvidence,
+    backed: VALUATION_FIELD_DETECTORS.targetPrice.real,
+    disclosed: valuationDisclosedPattern("targetPrice")
   },
   "history.ma20": {
     backed: /均线[:：]\s*20\s*日\s*(?!暂无)[0-9]/u,
@@ -266,7 +379,15 @@ const FACTS_COVERAGE_DETECTORS = {
 export function countFactsCoverage(sectionText) {
   return CONFIDENCE_COVERAGE_CHECKPOINTS.filter((key) => {
     const detector = FACTS_COVERAGE_DETECTORS[key];
-    return Boolean(detector) && (detector.backed.test(sectionText) || detector.disclosed.test(sectionText));
+    if (!detector) {
+      return false;
+    }
+    // A detector may narrow the text it is allowed to look at (today: the two
+    // valuation checkpoints, see extractValuationEvidence) - a checkpoint can
+    // only ever be satisfied by the renderer's own evidence for THAT domain,
+    // never by prose that happens to contain a lookalike token.
+    const scoped = detector.scope ? detector.scope(sectionText) : sectionText;
+    return detector.backed.test(scoped) || detector.disclosed.test(scoped);
   }).length;
 }
 
@@ -279,17 +400,26 @@ export function validateStockAnalysisMarkdown(markdown) {
   if (!/^# OpenClaw 个股分析 \d{4}-\d{2}-\d{2}/u.test(text)) {
     failures.push("stock.title");
   }
-  // stock.valuation_depth: a real PE AND a real PB somewhere in the batch -
-  // or, for a batch where no covered instrument HAS them (an all-ETF batch:
-  // a fund has neither a P/E nor a book value), the explicit reason-carrying
-  // disclosure summarizeValuation renders instead. Requiring the
-  // parenthesised reason is what keeps this a gate rather than a loophole: a
-  // bare "PE 暂无" placeholder (or PE vanishing from the report entirely,
-  // which is how a paraphrasing narrative layer used to break this) still
-  // fails exactly as before.
-  const hasRealValuationDepth = /PE\s+(?!暂无)[0-9,.]+/iu.test(text) && /PB\s+(?!暂无)[0-9,.]+/iu.test(text);
-  const hasDisclosedValuationDepth = VALUATION_PE_DISCLOSED_PATTERN.test(text) && VALUATION_PB_DISCLOSED_PATTERN.test(text);
-  if (!hasRealValuationDepth && !hasDisclosedValuationDepth) {
+  // stock.valuation_depth: PE and PB must EACH be accounted for, judged only
+  // against the renderer's own valuation evidence (extractValuationEvidence).
+  // A field is accounted for when it carries a real number, or a disclosure
+  // that states WHY it is absent - structurally (ETF) or because no source
+  // returned it. Anything else (bare "暂无", a reason-less "不可得", or the
+  // field vanishing entirely, which is how a paraphrasing narrative layer used
+  // to break this) is a silent gap and still fails.
+  //
+  // 2026-07-27 review, defects 1+2: the previous form demanded a real PE AND a
+  // real PB, else a disclosed PE AND a disclosed PB - which (1) refused the
+  // whole-block "估值读取失败：…" disclosure the renderer actually emits when
+  // every valuation source is down, blocking the entire batch forever with no
+  // way to ship an honest report, (2) rejected the perfectly ordinary mixed
+  // state (real PE, disclosed PB), and (3) accepted the ETF's structural
+  // wording from an all-equity batch. Judging each field independently, with
+  // the structural branch scoped to the ETF reason, fixes all three without
+  // letting a single undisclosed gap through.
+  const valuationEvidence = extractValuationEvidence(text);
+  const valuationStates = [classifyValuationField(valuationEvidence, "pe"), classifyValuationField(valuationEvidence, "pb")];
+  if (valuationStates.includes(VALUATION_STATE.missing)) {
     failures.push("stock.valuation_depth");
   }
   if (!/综合上行潜力/u.test(text) || /只看期权链|只看期权/u.test(text)) {
