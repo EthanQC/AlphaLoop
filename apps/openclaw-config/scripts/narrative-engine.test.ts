@@ -336,6 +336,61 @@ describe("generateNarrativeSections: numeric pre-check edge cases", () => {
     expect(result.sections[0].degradeReason).toMatch(/999\.99/);
   });
 
+  // 2026-07-27 adversarial review of ca4cc52: report-quality.mjs's delivery
+  // gate (validateStockNarrativeNumbers) accepts a number that appears in the
+  // symbol's own deterministic text as well as one backed by a fact - the
+  // deterministic bullets legitimately state DERIVED numbers (三路概率、趋势分、
+  // 均线窗口长度、样本数). This pre-check only ever consulted `facts`, so it
+  // degraded sections over numbers the delivery gate would have accepted.
+  it("accepts a DERIVED number that the deterministic text itself states (aligned with the delivery gate)", async () => {
+    // 42 is nowhere in `facts()` - it is a three-path probability the
+    // deterministic bullet computed.
+    const backend = vi.fn(async () => ({ text: "上行路径概率约 42.00%，维持观察即可。" }));
+
+    const result = await narrativeEngine.generateNarrativeSections({
+      backend,
+      symbol: "AAPL.US",
+      facts: facts(),
+      sections: [section("conclusion", "上行路径（约 +42.00%）：若守住支撑位则短线偏上行。")]
+    });
+
+    expect(backend).toHaveBeenCalledTimes(1);
+    expect(result.sections[0]).toEqual({ key: "conclusion", narrative: true, text: "上行路径概率约 42.00%，维持观察即可。" });
+    expect(result.degradedSections).toEqual([]);
+  });
+
+  it("pools deterministic text across ALL sections, exactly like the delivery gate's per-symbol pooling", async () => {
+    const backend = vi.fn(async ({ sectionKey }: { sectionKey: string }) =>
+      sectionKey === "thesis" ? { text: "趋势分 7.35 显示中期动能仍在。" } : { text: "该段保持稳健。" }
+    );
+
+    const result = await narrativeEngine.generateNarrativeSections({
+      backend,
+      symbol: "AAPL.US",
+      facts: facts(),
+      // 7.35 lives in TRADING's deterministic text, not thesis's.
+      sections: [section("thesis", "中期动能仍需验证。"), section("trading", "趋势分 7.35；均线：20 日 210.50。")]
+    });
+
+    expect(result.sections[0]).toMatchObject({ key: "thesis", narrative: true });
+    expect(result.degradedSections).toEqual([]);
+  });
+
+  it("still degrades a number that is in NEITHER the facts table NOR any deterministic text", async () => {
+    const backend = vi.fn(async () => ({ text: "上行路径概率约 43.00%，维持观察即可。" }));
+
+    const result = await narrativeEngine.generateNarrativeSections({
+      backend,
+      symbol: "AAPL.US",
+      facts: facts(),
+      sections: [section("conclusion", "上行路径（约 +42.00%）：若守住支撑位则短线偏上行。")]
+    });
+
+    expect(backend).toHaveBeenCalledTimes(3);
+    expect(result.sections[0].narrative).toBe(false);
+    expect(result.sections[0].degradeReason).toMatch(/43\.00/);
+  });
+
   it("does not treat an embedded ISO date (options.nextExpiry-style) as a number to check", async () => {
     const backend = vi.fn(async () => ({ text: "下一次期权到期日参考 2026-08-15，请留意到期前后的流动性变化。" }));
 

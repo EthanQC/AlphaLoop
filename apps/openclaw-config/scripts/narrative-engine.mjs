@@ -166,21 +166,50 @@ function collectFactValues(facts) {
     .filter((value) => typeof value === "number" && Number.isFinite(value));
 }
 
-// Returns the FIRST number token in `text` that cannot be matched (within
-// tolerance) to ANY value_num across the whole facts map, or null if every
-// number token matches something. "Extra/unmatched number = failure" (task
-// brief) - deliberately does not try to pair each token to a SPECIFIC fact
-// key (the backend's phrasing is free-form prose, not a fixed per-key
-// template), so a token passes as soon as it lands within tolerance of ANY
-// one fact's value - matching validateNarrativeNumbers' asymmetric
-// contract in spirit (a stated number must be backed by SOMETHING real) while
-// not requiring this module to guess which specific key a free-form sentence
-// was citing.
-function findUnmatchedNumber(text, facts) {
+// 2026-07-27 (adversarial review of ca4cc52, defect 5) - the SECOND
+// legitimate origin of a number, aligning this pre-check with the delivery
+// gate it is the first line of defense for. report-quality.mjs's
+// validateStockNarrativeNumbers accepts a token that is either within
+// tolerance of a stock_facts value OR appears verbatim in that symbol's own
+// deterministic text, because buildDeterministicAnalysis legitimately states
+// DERIVED numbers that equal no single facts row: the three-path
+// probabilities, historyStats' trendScore and vs-long-average percentage, the
+// "20 日"/"60 日" window labels, the sample-size count, an HTTP status code
+// inside a disclosure sentence. This function only ever consulted `facts`, so
+// a model that faithfully rewrote a deterministic sentence containing one of
+// those numbers was degraded here even though the delivery gate would have
+// accepted it - the pre-check was strictly stricter than the gate it guards.
+//
+// Matching against the deterministic text is by EXACT numeric value (not
+// tolerance), identically to validateStockNarrativeNumbers' `Set.has` - a
+// paraphrase that shifts a digit still fails, and a number the deterministic
+// text never stated is still caught by the facts comparison alone.
+function collectDeterministicValues(deterministicTexts) {
+  const values = new Set();
+  for (const text of deterministicTexts) {
+    for (const token of extractNumberTokens(text)) {
+      values.add(token.value);
+    }
+  }
+  return values;
+}
+
+// Returns the FIRST number token in `text` that can be traced to NEITHER a
+// value_num across the whole facts map (within tolerance) NOR the symbol's own
+// deterministic text, or null if every number token is accounted for.
+// "Extra/unmatched number = failure" (task brief) - deliberately does not try
+// to pair each token to a SPECIFIC fact key (the backend's phrasing is
+// free-form prose, not a fixed per-key template), so a token passes as soon as
+// it lands within tolerance of ANY one fact's value - matching
+// validateNarrativeNumbers' asymmetric contract in spirit (a stated number
+// must be backed by SOMETHING real) while not requiring this module to guess
+// which specific key a free-form sentence was citing.
+function findUnmatchedNumber(text, facts, deterministicValues = new Set()) {
   const factValues = collectFactValues(facts);
   for (const token of extractNumberTokens(text)) {
     const tolerance = token.kind === "pct" ? PCT_TOLERANCE : PRICE_TOLERANCE;
-    const matched = factValues.some((factValue) => Math.abs(factValue - token.value) <= tolerance);
+    const matched = deterministicValues.has(token.value)
+      || factValues.some((factValue) => Math.abs(factValue - token.value) <= tolerance);
     if (!matched) {
       return token;
     }
@@ -197,17 +226,17 @@ function findUnmatchedNumber(text, facts) {
 // pre-check - defuse is a TRANSFORM (never itself a failure reason), applied
 // before the numeric check runs so the check (and the text a caller
 // eventually renders) always sees the SAME, already-defused string.
-function validateBackendOutput(rawText, facts) {
+function validateBackendOutput(rawText, facts, deterministicValues) {
   const text = String(rawText ?? "");
   if (!isMostlyChinese(text)) {
     return { ok: false, reason: "后端输出非中文（CJK 占比低于 30%）", marker: NON_CHINESE_DEGRADE_MARKER };
   }
   const defused = defuseMarkdownInText(text);
-  const unmatched = findUnmatchedNumber(defused, facts);
+  const unmatched = findUnmatchedNumber(defused, facts, deterministicValues);
   if (unmatched) {
     return {
       ok: false,
-      reason: `数字比对未通过：叙事包含数字 ${unmatched.raw}，未在事实表数值（±容差）中找到匹配`,
+      reason: `数字比对未通过：叙事包含数字 ${unmatched.raw}，未在事实表数值（±容差）或本标的确定性文本中找到匹配`,
       marker: NUMERIC_DEGRADE_MARKER
     };
   }
@@ -292,7 +321,7 @@ function buildFactsDigest(facts) {
 //
 // `retries` counts retry attempts actually CONSUMED (0 if the first call
 // already validated) - see this function's inline accounting comment.
-async function generateOneSection({ backend, symbol, facts, factsDigest, section }) {
+async function generateOneSection({ backend, symbol, facts, factsDigest, section, deterministicValues }) {
   let retryReason = null;
   let retries = 0;
 
@@ -317,7 +346,7 @@ async function generateOneSection({ backend, symbol, facts, factsDigest, section
       return { threw: true, error, retries };
     }
 
-    const validation = validateBackendOutput(backendOutput?.text, facts);
+    const validation = validateBackendOutput(backendOutput?.text, facts, deterministicValues);
     if (validation.ok) {
       return { narrative: true, text: validation.text, retries };
     }
@@ -367,6 +396,13 @@ async function generateOneSection({ backend, symbol, facts, factsDigest, section
 // }}
 export async function generateNarrativeSections({ backend, symbol, facts, sections = [] }) {
   const factsDigest = buildFactsDigest(facts);
+  // Pooled across ALL of this symbol's sections, exactly the way the delivery
+  // gate pools them (report-quality.mjs's deterministicTextBySymbol is built
+  // by stock-analysis.mjs's deterministicTextForRecord, which joins all eight
+  // section arrays): a number the trading section derived is still a
+  // first-party number when the thesis section's prose cites it, and the
+  // delivery gate would accept it either way.
+  const deterministicValues = collectDeterministicValues(sections.map((section) => section.deterministicText));
 
   const resolved = [];
   let retriesUsed = 0;
@@ -389,7 +425,7 @@ export async function generateNarrativeSections({ backend, symbol, facts, sectio
     // call must never race a not-yet-resolved earlier section, and a
     // mid-run throw must be observed before any LATER section is attempted
     // (see the backendThrew branch above).
-    const outcome = await generateOneSection({ backend, symbol, facts, factsDigest, section });
+    const outcome = await generateOneSection({ backend, symbol, facts, factsDigest, section, deterministicValues });
 
     if (outcome.threw) {
       backendThrew = true;
