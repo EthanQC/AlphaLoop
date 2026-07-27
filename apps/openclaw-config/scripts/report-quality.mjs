@@ -212,6 +212,19 @@ function extractStockSymbolSections(markdown) {
 // one counts as "covered" - only a key with NEITHER present (a silent gap:
 // the rendering pipeline dropped a whole data point without disclosing why)
 // counts against the >=6/8 threshold.
+
+// 2026-07-27: the per-FIELD valuation disclosure stock-analysis-metrics.mjs's
+// summarizeValuation renders when ONE metric is unavailable while others are
+// present - e.g. an ETF, which structurally has no P/E, no book value, no EPS
+// and no sell-side one-year target ("PE 不可得（ETF 无市盈率口径，……）").
+// Declared once, here, because BOTH the whole-report stock.valuation_depth
+// gate and the per-symbol facts-coverage detector below have to agree on what
+// a disclosed PE/PB looks like. The parenthesised reason group is REQUIRED:
+// the bare "PE 暂无" placeholder this phrasing replaced must keep failing -
+// a disclosure only counts when it states a reason.
+const VALUATION_PE_DISCLOSED_PATTERN = /PE\s*(?:不可得|不适用)（[^）]{4,}）/u;
+const VALUATION_PB_DISCLOSED_PATTERN = /PB\s*(?:不可得|不适用)（[^）]{4,}）/u;
+
 const FACTS_COVERAGE_DETECTORS = {
   "quote.last": {
     backed: /最新价格[:：]\s*(?!暂无)[0-9]/u,
@@ -223,11 +236,11 @@ const FACTS_COVERAGE_DETECTORS = {
   },
   "valuation.pe": {
     backed: /PE\s+(?!暂无)[0-9,.]+/iu,
-    disclosed: /估值(?:读取失败|数据暂无可用)/u
+    disclosed: new RegExp(`估值(?:读取失败|数据暂无可用)|${VALUATION_PE_DISCLOSED_PATTERN.source}`, "u")
   },
   "valuation.targetPrice": {
     backed: /一年目标价\s*(?!暂无)[0-9,.]+/u,
-    disclosed: /目标价(?:缺失|数据不可得|均数据不可得)/u
+    disclosed: /目标价(?:缺失|数据不可得|均数据不可得)|一年目标价\s*(?:不可得|不适用)（[^）]{4,}）/u
   },
   "history.ma20": {
     backed: /均线[:：]\s*20\s*日\s*(?!暂无)[0-9]/u,
@@ -247,7 +260,10 @@ const FACTS_COVERAGE_DETECTORS = {
   }
 };
 
-function countFactsCoverage(sectionText) {
+// Exported for tests: asserting "the gate passed" only proves >=6/8, which
+// cannot tell a genuinely 8/8 disclosure set apart from one that squeaked
+// through at exactly the threshold. Tests pin the exact count.
+export function countFactsCoverage(sectionText) {
   return CONFIDENCE_COVERAGE_CHECKPOINTS.filter((key) => {
     const detector = FACTS_COVERAGE_DETECTORS[key];
     return Boolean(detector) && (detector.backed.test(sectionText) || detector.disclosed.test(sectionText));
@@ -263,7 +279,17 @@ export function validateStockAnalysisMarkdown(markdown) {
   if (!/^# OpenClaw 个股分析 \d{4}-\d{2}-\d{2}/u.test(text)) {
     failures.push("stock.title");
   }
-  if (!/PE\s+(?!暂无)[0-9,.]+/iu.test(text) || !/PB\s+(?!暂无)[0-9,.]+/iu.test(text)) {
+  // stock.valuation_depth: a real PE AND a real PB somewhere in the batch -
+  // or, for a batch where no covered instrument HAS them (an all-ETF batch:
+  // a fund has neither a P/E nor a book value), the explicit reason-carrying
+  // disclosure summarizeValuation renders instead. Requiring the
+  // parenthesised reason is what keeps this a gate rather than a loophole: a
+  // bare "PE 暂无" placeholder (or PE vanishing from the report entirely,
+  // which is how a paraphrasing narrative layer used to break this) still
+  // fails exactly as before.
+  const hasRealValuationDepth = /PE\s+(?!暂无)[0-9,.]+/iu.test(text) && /PB\s+(?!暂无)[0-9,.]+/iu.test(text);
+  const hasDisclosedValuationDepth = VALUATION_PE_DISCLOSED_PATTERN.test(text) && VALUATION_PB_DISCLOSED_PATTERN.test(text);
+  if (!hasRealValuationDepth && !hasDisclosedValuationDepth) {
     failures.push("stock.valuation_depth");
   }
   if (!/综合上行潜力/u.test(text) || /只看期权链|只看期权/u.test(text)) {
@@ -708,7 +734,43 @@ function splitStockSubsections(sectionText) {
   return blocks;
 }
 
-export function validateStockNarrativeNumbers(markdown, factsBySymbol = {}, { pctTolerance = 0.1, priceTolerance = 0.01 } = {}) {
+// 2026-07-27 - `deterministicTextBySymbol`: the SECOND legitimate origin a
+// number in a rendered section can have. Since the narrative layer became
+// ADDITIVE (stock-analysis.mjs's sectionValues renders
+// buildDeterministicAnalysis's own bullets unconditionally and appends the
+// LLM's prose after them, instead of replacing them), every section now
+// carries first-party deterministic text on every run - not only on the
+// whole-symbol-degrade path exemption 1 covers. That deterministic text
+// legitimately states numbers that are DERIVED rather than copied from a
+// single stock_facts row: the three-path probabilities, historyStats'
+// trendScore and vs-long-average percentage, the "20 日"/"60 日" window
+// labels, the sample-size count, and the HTTP status code inside a
+// disclosure sentence. Re-deriving those inside this gate would duplicate
+// buildDeterministicAnalysis; ignoring the sections wholesale would blind the
+// gate to the narrative text sitting in the same block.
+//
+// So a token passes when it is EITHER within tolerance of one of that
+// symbol's stock_facts values, OR appears verbatim (same numeric value) in
+// that symbol's own pre-render deterministic text - which runAnalysis builds
+// from `record.analysis`, i.e. from the object graph, never from the markdown
+// being validated. A hand-edited/tampered number in the rendered markdown
+// therefore still fails: changing "最新价格：213.00" to "218.70" matches
+// neither a fact nor the deterministic text it was rendered from. Callers
+// that pass no deterministic text (legacy callers, ad-hoc validation) get
+// exactly the previous facts-only behaviour.
+function collectDeterministicNumbers(deterministicText) {
+  const values = new Set();
+  for (const token of extractStockNumberTokens(deterministicText)) {
+    values.add(token.value);
+  }
+  return values;
+}
+
+export function validateStockNarrativeNumbers(
+  markdown,
+  factsBySymbol = {},
+  { pctTolerance = 0.1, priceTolerance = 0.01, deterministicTextBySymbol = {} } = {}
+) {
   const text = normalizeText(markdown);
   if (!isNewFormatStockReport(text)) {
     return buildResult([]);
@@ -721,6 +783,7 @@ export function validateStockNarrativeNumbers(markdown, factsBySymbol = {}, { pc
       continue;
     }
     const factValues = collectStockFactValues(factsBySymbol[symbol]);
+    const deterministicValues = collectDeterministicNumbers(deterministicTextBySymbol[symbol]);
     for (const block of splitStockSubsections(section)) {
       if (EXEMPT_STOCK_SUBSECTION_HEADINGS.has(block.heading) || STOCK_DEGRADE_MARKER_PATTERN.test(block.body)) {
         // Exemptions 2/3/4 - see this function's header.
@@ -728,7 +791,8 @@ export function validateStockNarrativeNumbers(markdown, factsBySymbol = {}, { pc
       }
       for (const token of extractStockNumberTokens(block.body)) {
         const tolerance = token.kind === "pct" ? pctTolerance : priceTolerance;
-        const matched = factValues.some((value) => Math.abs(value - token.value) <= tolerance);
+        const matched = deterministicValues.has(token.value)
+          || factValues.some((value) => Math.abs(value - token.value) <= tolerance);
         if (!matched) {
           pushUnique(failures, `stock.numeric_match:${symbol}:${token.raw}`);
         }

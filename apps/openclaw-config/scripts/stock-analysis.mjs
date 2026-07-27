@@ -23,14 +23,36 @@ import {
 import { assertStockAnalysisQuality, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
 import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
-import { createNarrativeLlmBackend, generateNarrativeSections, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
+import {
+  createNarrativeLlmBackend,
+  generateNarrativeSections,
+  NON_CHINESE_DEGRADE_MARKER,
+  NUMERIC_DEGRADE_MARKER,
+  REPORT_DEGRADED_HEADER
+} from "./narrative-engine.mjs";
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD, getStockFacts } from "./stock-facts-store.mjs";
-import { buildYahooOptionChainUrls } from "./stock-analysis-sources.mjs";
+import {
+  buildFinnhubMetricUrl,
+  buildNasdaqHeaders,
+  buildNasdaqHistoricalUrl,
+  buildNasdaqOptionChainUrl,
+  buildNasdaqSummaryUrl,
+  buildStockAnalysisHistoryUrl,
+  buildStockAnalysisStatisticsUrl,
+  buildYahooOptionChainUrls,
+  INSTRUMENT_KIND_STOCK,
+  nasdaqAssetClassOrder,
+  resolveInstrumentKind
+} from "./stock-analysis-sources.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
   extractStockAnalysisStatistics,
   mergeFundamentalSnapshots,
+  normalizeFinnhubMetrics,
+  normalizeNasdaqHistorical,
+  normalizeNasdaqOptionChain,
   normalizeNasdaqSummary,
+  normalizeStockAnalysisHistory,
   summarizeHistory,
   summarizeOptionChainStats,
   summarizeUpsidePotential,
@@ -218,12 +240,12 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   // facts are persisted (immediately above) so each record's stock_facts
   // are already sitting in the db by the time generateNarrativeSections's
   // numeric pre-check needs them as ground truth. `narrativeBackend`
-  // defaults to createNarrativeLlmBackend() - the P10-gated throw - so
-  // TODAY's production runs always take the global-degrade path (every
-  // section falls back to its own deterministic text unchanged, plus the
-  // REPORT_DEGRADED_HEADER disclosure line renderBatchStockAnalysis adds
-  // right after each `## SYMBOL` heading); only a test-injected fake backend
-  // ever exercises the narrative-adopted path.
+  // defaults to createNarrativeLlmBackend(), which since P10 ignition is the
+  // LIVE OpenClaw gateway - production runs really do adopt model prose now
+  // (the older comment here still claimed every production run took the
+  // global-degrade path, which stopped being true the moment the gateway came
+  // up). Adopted prose is APPENDED to each section's deterministic bullets,
+  // never substituted for them - see sectionValues.
   await attachNarrativeSections(db, label, records, { narrativeBackend });
 
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
@@ -266,7 +288,8 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   // somehow renders a stock-analysis report without a "### 结论框" - not a
   // real path today, since buildDeterministicAnalysis always emits one.
   const factsBySymbol = Object.fromEntries(records.map((record) => [record.symbol, getStockFacts(db, label, record.symbol)]));
-  const numericCheck = validateStockNarrativeNumbers(markdown, factsBySymbol);
+  const deterministicTextBySymbol = Object.fromEntries(records.map((record) => [record.symbol, deterministicTextForRecord(record)]));
+  const numericCheck = validateStockNarrativeNumbers(markdown, factsBySymbol, { deterministicTextBySymbol });
   if (!numericCheck.ok) {
     throw new Error(`个股分析质量校验失败：${numericCheck.failures.join(", ")}`);
   }
@@ -396,21 +419,28 @@ export async function attachNarrativeSections(db, tradingDay, records, { narrati
 async function fetchStockAnalysisRecord(symbol, generatedAt) {
   const quotePayload = await runLongbridgeJsonWithRetry("quote", ["quote", symbol], { label: `Longbridge ${symbol} 行情` });
   const quote = normalizeQuotePayload(quotePayload, symbol);
+  // ETF vs. stock decides three different source paths (Nasdaq assetclass,
+  // StockAnalysis /etf/ vs /stocks/, and whether PE/PB/EPS/目标价 are
+  // "missing" or structurally inapplicable) - resolved once, threaded
+  // everywhere, and self-healing when the static table is wrong (each Nasdaq
+  // fetch retries the other asset class).
+  const instrumentKind = resolveInstrumentKind(symbol);
   const [history, fundamentals, optionChain] = await Promise.all([
-    fetchYahooHistory(symbol),
-    fetchFundamentalSnapshots(symbol),
-    fetchYahooOptionChain(symbol)
+    fetchStockHistory(symbol, { instrumentKind }),
+    fetchFundamentalSnapshots(symbol, { instrumentKind }),
+    fetchStockOptionChain(symbol, { instrumentKind })
   ]);
   const news = await fetchStockNews(symbol);
 
   return {
     symbol,
+    instrumentKind,
     quote,
     history,
     fundamentals,
     optionChain,
     news,
-    analysis: buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, generatedAt)
+    analysis: buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain, instrumentKind }, generatedAt)
   };
 }
 
@@ -537,8 +567,9 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
   const pct = last !== undefined && prevClose ? ((last - prevClose) / prevClose) * 100 : undefined;
   const support = low ?? prevClose ?? last;
   const resistance = high ?? last;
+  const instrumentKind = extraData.instrumentKind ?? resolveInstrumentKind(symbol);
   const historyStats = summarizeHistory(extraData.history, last);
-  const valuation = summarizeValuation(extraData.fundamentals);
+  const valuation = summarizeValuation(extraData.fundamentals, { instrumentKind });
   const optionStats = summarizeOptionChainStats(extraData.optionChain);
   const upsidePotential = summarizeUpsidePotential({
     lastPrice: last,
@@ -575,7 +606,7 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
       `最新价格：${formatNumber(last)}；涨跌幅：${formatPercent(pct)}；成交量：${formatNumber(volume)}。`,
       `日内区间：${formatNumber(low)} - ${formatNumber(high)}；开盘：${formatNumber(open)}；前收：${formatNumber(prevClose)}。`,
       `6 个月走势：${historyStats.summary}`,
-      `数据来源：Longbridge 行情；Longbridge/Yahoo Finance 多源新闻；Yahoo chart/options、Nasdaq、StockAnalysis 作为只读补充。`
+      `数据来源：Longbridge 行情；Longbridge/Yahoo Finance/Google News 多源新闻；历史走势 ${historyStats.source ?? "本次未取到（原因见上一条）"}；期权链 ${optionStats.source ?? "本次未取到（原因见期权段）"}；估值 ${extraData.fundamentals?.sources?.length ? extraData.fundamentals.sources.join("、") : "本次未取到（原因见基本面段）"}。`
     ],
     thesis: [
       "短线判断以价格相对前收、日内区间和新闻催化为主；中期判断仍需结合财报、指引和行业景气。",
@@ -921,36 +952,81 @@ const TITLE_TO_SECTION_KEY = {
   [CONCLUSION_SECTION_TITLE]: "conclusion"
 };
 
+// Label every bullet the narrative layer authored. Two jobs at once: the
+// reader can tell first-party evidence from LLM prose, and the rendering
+// contract below stays greppable.
+export const NARRATIVE_BULLET_PREFIX = "叙事：";
+
+const LOCAL_DEGRADE_MARKERS = [NUMERIC_DEGRADE_MARKER, NON_CHINESE_DEGRADE_MARKER];
+
+function extractLocalDegradeMarker(text) {
+  return LOCAL_DEGRADE_MARKERS.find((marker) => String(text ?? "").includes(marker));
+}
+
 // `narrativeSectionsByKey` is generateNarrativeSections' own `sections`
 // array (Task 3), re-keyed by section key - null/undefined for any caller
 // that never ran attachNarrativeSections (every pre-P5 test/call site),
 // which falls straight through to the ORIGINAL deterministic arrays exactly
-// as before (byte-for-byte unchanged rendering when narrative was never
-// attached at all).
+// as before.
 //
-// When a narrative result DOES exist for this section, its own `text` is
-// used verbatim (split back into one bullet per line) INSTEAD of the raw
-// analysis array - this is safe/byte-equivalent for the fallback case
-// specifically because attachNarrativeSections builds each section's
-// `deterministicText` as `analysis[key].join("\n")` in the first place, so
-// splitting an unmodified fallback text by "\n" reproduces the exact same
-// array. A locally-degraded section's text is deterministicText PLUS one
-// trailing marker line (narrative-engine.mjs), which naturally renders as
-// one extra disclosure bullet after the original ones - additive, never
-// replacing the original content.
+// 2026-07-27 - narrative is ADDITIVE, never a replacement. Until P10 lit up
+// the real gateway this function substituted `narrativeResult.text` for the
+// deterministic bullets outright, which was byte-equivalent while the backend
+// always threw (fallback text IS the deterministic text). The moment a real
+// model started answering, every frozen evidence sentence the report's
+// quality gates read - "最新价格：X", "PE X；PB X", "均线：20 日 X",
+// "期权链只读补充：…", "综合上行潜力：…", and the "历史走势读取失败：…" /
+// "期权链读取失败：…" DISCLOSURES - was paraphrased away ("最新报 232.11美元",
+// "PE 为 27.76", "历史走势读取未能成功"). Nothing was fabricated, but the
+// report silently stopped evidencing (and stopped disclosing) data it
+// actually had, and per-symbol facts coverage collapsed to 2/8.
+//
+// The deterministic bullets are therefore ALWAYS rendered, and the model's
+// prose is appended after them, one prefixed bullet per line. Coverage and
+// disclosure become structural properties of the renderer again - immune to
+// however the model phrases things - while the narrative still adds the
+// readable prose it was introduced for.
 function sectionValues(analysis, title, narrativeSectionsByKey) {
   const key = TITLE_TO_SECTION_KEY[title];
-  const narrativeResult = narrativeSectionsByKey?.[key];
-  if (narrativeResult) {
-    return narrativeResult.text === "" ? [] : narrativeResult.text.split("\n");
-  }
   // TITLE_TO_SECTION_KEY's values are, by construction, exactly
   // buildDeterministicAnalysis's own section-array property names (basic/
   // thesis/fundamentals/catalysts/risks/trading/options/conclusion) - a
   // single source for "which title reads which array", rather than a
   // second, independently-typed title->array map that could drift from
   // TITLE_TO_SECTION_KEY above.
-  return analysis[key] ?? [];
+  const deterministicValues = analysis[key] ?? [];
+  const narrativeResult = narrativeSectionsByKey?.[key];
+  if (!narrativeResult) {
+    return deterministicValues;
+  }
+
+  if (narrativeResult.narrative) {
+    const narrativeLines = String(narrativeResult.text ?? "")
+      .split("\n")
+      // A model that answers in its own bullet list would otherwise render as
+      // "- 叙事：- ……"; the renderer owns the bullet, the model owns the text.
+      .map((line) => line.trim().replace(/^[-*+]\s+/u, ""))
+      .filter(Boolean);
+    return [...deterministicValues, ...narrativeLines.map((line) => `${NARRATIVE_BULLET_PREFIX}${line}`)];
+  }
+
+  // Not adopted. Two sub-cases: a per-section validation-exhausted degrade
+  // (narrative-engine.mjs glued its marker onto a COPY of the deterministic
+  // text - append only the marker, never the duplicated bullets), or a
+  // global backend throw (text IS the deterministic text, disclosed once per
+  // symbol via REPORT_DEGRADED_HEADER - nothing to append here).
+  const marker = extractLocalDegradeMarker(narrativeResult.text);
+  return marker ? [...deterministicValues, `${NARRATIVE_BULLET_PREFIX}${marker}`] : deterministicValues;
+}
+
+// The pre-render, first-party text one symbol's report section bullets are
+// built from - handed to report-quality.mjs's stock.numeric_match gate as the
+// second legitimate origin for a number (see validateStockNarrativeNumbers'
+// own comment on `deterministicTextBySymbol`). Derived from the record object
+// graph, never from the rendered markdown, so a tampered number in the
+// markdown still has nothing to match against.
+export function deterministicTextForRecord(record) {
+  return NARRATIVE_SECTION_KEYS.map((key) => (record?.analysis?.[key] ?? []).join("\n")).join("\n");
 }
 
 function extractTradingLevel(line, side) {
@@ -1023,32 +1099,106 @@ function formatPercent(value) {
   return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${number.toFixed(2)}%` : "暂无";
 }
 
-async function fetchYahooHistory(symbol) {
-  const yahooSymbol = toYahooSymbol(symbol);
-  try {
-    const payload = await fetchJsonWithTimeout(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=6mo&interval=1d&includePrePost=false`
-    );
-    const result = payload?.chart?.result?.[0];
-    const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
-    const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
-      ? result.indicators.quote[0].close
-      : [];
-    return timestamps
-      .map((timestamp, index) => ({
-        date: new Date(Number(timestamp) * 1000).toISOString().slice(0, 10),
-        close: toNumber(closes[index])
-      }))
-      .filter((row) => row.close !== undefined);
-  } catch (error) {
-    return { error: formatFetchError(error, "Yahoo chart 历史走势接口") };
-  }
+// ---------------------------------------------------------------------------
+// Market-data fetch chains (2026-07-27 facts-coverage repair)
+//
+// Every chain below is ordered "most reliable from THIS deployment first,
+// Yahoo last" and returns either usable data or ONE aggregated `{error}`
+// naming every source it tried and why each failed - the reason string is
+// what the deterministic renderer turns into an explicit disclosure sentence
+// ("历史走势读取失败：…"), which is the only honest alternative to a value.
+//
+// Why the order changed: the mini's IP is hard-rate-limited by Yahoo (every
+// query1/query2 endpoint answers 429 no matter the user-agent), so history
+// and option-chain - which had Yahoo as their ONLY source - returned nothing
+// at all on every scheduled run, for months. Nasdaq's public quote API serves
+// both, asset-class aware; stockanalysis.com's JSON history is a second
+// history fallback; Finnhub's free tier serves the valuation metrics.
+//
+// `fetchJson`/`fetchText` are injectable so the chain ORDER and the failure
+// aggregation are unit-testable without a network - the same convention
+// news-sources.mjs uses for its own fetchImpl seam.
+// ---------------------------------------------------------------------------
+
+const HISTORY_LOOKBACK_DAYS = 200;
+
+function isoDay(date) {
+  return new Date(date).toISOString().slice(0, 10);
 }
 
-async function fetchYahooFundamentals(symbol) {
+export async function fetchStockHistory(symbol, {
+  instrumentKind = INSTRUMENT_KIND_STOCK,
+  fetchJson = fetchJsonWithTimeout,
+  now = new Date()
+} = {}) {
+  const failures = [];
+  const toDate = isoDay(now);
+  const fromDate = isoDay(now.getTime() - HISTORY_LOOKBACK_DAYS * 86_400_000);
+
+  for (const assetClass of nasdaqAssetClassOrder(instrumentKind)) {
+    const label = `Nasdaq 历史行情（assetclass=${assetClass}）`;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- a fallback chain is
+      // inherently sequential: the next source is only tried BECAUSE the
+      // previous one failed, and firing them in parallel would triple the
+      // outbound request volume against rate-limited public endpoints.
+      const payload = await fetchJson(buildNasdaqHistoricalUrl(symbol, assetClass, { fromDate, toDate }), buildNasdaqHeaders(symbol, assetClass));
+      const normalized = normalizeNasdaqHistorical(payload);
+      if (normalized.rows?.length) {
+        return normalized;
+      }
+      failures.push(`${label}：${normalized.error}`);
+    } catch (error) {
+      failures.push(formatFetchError(error, label));
+    }
+  }
+
+  try {
+    const payload = await fetchJson(buildStockAnalysisHistoryUrl(symbol, instrumentKind));
+    const normalized = normalizeStockAnalysisHistory(payload);
+    if (normalized.rows?.length) {
+      return normalized;
+    }
+    failures.push(`StockAnalysis 历史接口：${normalized.error}`);
+  } catch (error) {
+    failures.push(formatFetchError(error, "StockAnalysis 历史接口"));
+  }
+
+  try {
+    const rows = await fetchYahooHistoryRows(symbol, fetchJson);
+    if (rows.length) {
+      return { source: "yahoo-chart-history", rows };
+    }
+    failures.push("Yahoo chart 历史走势接口：返回 0 条日线");
+  } catch (error) {
+    failures.push(formatFetchError(error, "Yahoo chart 历史走势接口"));
+  }
+
+  return { error: failures.join("；") || "历史走势来源均未返回可用数据" };
+}
+
+async function fetchYahooHistoryRows(symbol, fetchJson) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const payload = await fetchJson(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=6mo&interval=1d&includePrePost=false`
+  );
+  const result = payload?.chart?.result?.[0];
+  const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
+  const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
+    ? result.indicators.quote[0].close
+    : [];
+  return timestamps
+    .map((timestamp, index) => ({
+      date: new Date(Number(timestamp) * 1000).toISOString().slice(0, 10),
+      close: toNumber(closes[index])
+    }))
+    .filter((row) => row.close !== undefined);
+}
+
+async function fetchYahooFundamentals(symbol, { fetchJson = fetchJsonWithTimeout } = {}) {
   const yahooSymbol = toYahooSymbol(symbol);
   try {
-    const payload = await fetchJsonWithTimeout(
+    const payload = await fetchJson(
       `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(yahooSymbol)}`
     );
     return {
@@ -1060,62 +1210,115 @@ async function fetchYahooFundamentals(symbol) {
   }
 }
 
-async function fetchFundamentalSnapshots(symbol) {
-  const [yahoo, nasdaq, stockAnalysis] = await Promise.all([
-    fetchYahooFundamentals(symbol),
-    fetchNasdaqSummary(symbol),
-    fetchStockAnalysisStatistics(symbol)
+// Finnhub free tier's /stock/metric is the most dependable PE/PB/EPS/市值
+// source available to this deployment (verified 2026-07-27 against the live
+// key). Its paid-only siblings (/stock/candle, /stock/option-chain,
+// /stock/price-target - all HTTP 403) are deliberately NOT called: paying a
+// 403 round-trip per symbol per run buys nothing, and the resulting gap is
+// disclosed in prose instead.
+export async function fetchFinnhubMetrics(symbol, { fetchJson = fetchJsonWithTimeout, apiKey = process.env.FINNHUB_API_KEY } = {}) {
+  const key = String(apiKey ?? "").trim();
+  if (!key) {
+    return { source: "finnhub-metric", error: "未配置 FINNHUB_API_KEY，Finnhub 估值指标未读取" };
+  }
+  try {
+    const payload = await fetchJson(buildFinnhubMetricUrl(symbol), { "X-Finnhub-Token": key });
+    return normalizeFinnhubMetrics(payload);
+  } catch (error) {
+    return { source: "finnhub-metric", error: formatFetchError(error, "Finnhub 指标接口") };
+  }
+}
+
+export async function fetchFundamentalSnapshots(symbol, {
+  instrumentKind = INSTRUMENT_KIND_STOCK,
+  fetchJson = fetchJsonWithTimeout,
+  fetchText = fetchTextWithTimeout,
+  finnhubApiKey = process.env.FINNHUB_API_KEY
+} = {}) {
+  const [finnhub, nasdaq, stockAnalysis, yahoo] = await Promise.all([
+    fetchFinnhubMetrics(symbol, { fetchJson, apiKey: finnhubApiKey }),
+    fetchNasdaqSummary(symbol, { instrumentKind, fetchJson }),
+    fetchStockAnalysisStatistics(symbol, { instrumentKind, fetchText }),
+    fetchYahooFundamentals(symbol, { fetchJson })
   ]);
-  const merged = mergeFundamentalSnapshots([yahoo, nasdaq, stockAnalysis]);
+  // Order = precedence for a field several sources report (first non-undefined
+  // wins, see mergeFundamentalSnapshots): Finnhub's TTM ratios first, then
+  // Nasdaq (the only remaining source of a sell-side one-year target), then
+  // StockAnalysis' scraped page, then Yahoo.
+  const merged = mergeFundamentalSnapshots([finnhub, nasdaq, stockAnalysis, yahoo]);
   if (merged.sources.length === 0) {
-    return {
-      error: [yahoo, nasdaq, stockAnalysis]
-        .map((entry) => entry?.error)
-        .filter(Boolean)
-        .join("；") || "估值来源均未返回可用数据"
-    };
+    return { error: merged.failures.join("；") || "估值来源均未返回可用数据" };
   }
   return merged;
 }
 
-async function fetchNasdaqSummary(symbol) {
-  const yahooSymbol = toYahooSymbol(symbol).toLowerCase();
-  try {
-    const payload = await fetchJsonWithTimeout(
-      `https://api.nasdaq.com/api/quote/${encodeURIComponent(yahooSymbol.toUpperCase())}/summary?assetclass=stocks`,
-      {
-        "accept": "application/json, text/plain, */*",
-        "origin": "https://www.nasdaq.com",
-        "referer": `https://www.nasdaq.com/market-activity/stocks/${encodeURIComponent(yahooSymbol)}`
+export async function fetchNasdaqSummary(symbol, { instrumentKind = INSTRUMENT_KIND_STOCK, fetchJson = fetchJsonWithTimeout } = {}) {
+  const failures = [];
+  for (const assetClass of nasdaqAssetClassOrder(instrumentKind)) {
+    const label = `Nasdaq 摘要接口（assetclass=${assetClass}）`;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- sequential fallback, see
+      // fetchStockHistory's own comment.
+      const payload = await fetchJson(buildNasdaqSummaryUrl(symbol, assetClass), buildNasdaqHeaders(symbol, assetClass));
+      const normalized = normalizeNasdaqSummary(payload);
+      if (!normalized.error) {
+        return normalized;
       }
-    );
-    return normalizeNasdaqSummary(payload);
-  } catch (error) {
-    return { source: "nasdaq-summary", error: formatFetchError(error, "Nasdaq 摘要接口") };
+      failures.push(`${label}：${normalized.error}`);
+    } catch (error) {
+      failures.push(formatFetchError(error, label));
+    }
   }
+  return { source: "nasdaq-summary", error: failures.join("；") };
 }
 
-async function fetchStockAnalysisStatistics(symbol) {
-  const yahooSymbol = toYahooSymbol(symbol).toLowerCase();
+async function fetchStockAnalysisStatistics(symbol, { instrumentKind = INSTRUMENT_KIND_STOCK, fetchText = fetchTextWithTimeout } = {}) {
   try {
-    const html = await fetchTextWithTimeout(`https://www.stockanalysis.com/stocks/${encodeURIComponent(yahooSymbol)}/statistics/`);
+    const html = await fetchText(buildStockAnalysisStatisticsUrl(symbol, instrumentKind));
     return extractStockAnalysisStatistics(html);
   } catch (error) {
     return { source: "stockanalysis-statistics", error: formatFetchError(error, "StockAnalysis 估值页面") };
   }
 }
 
-async function fetchYahooOptionChain(symbol) {
+export async function fetchStockOptionChain(symbol, {
+  instrumentKind = INSTRUMENT_KIND_STOCK,
+  fetchJson = fetchJsonWithTimeout
+} = {}) {
   const failures = [];
+
+  for (const assetClass of nasdaqAssetClassOrder(instrumentKind)) {
+    const label = `Nasdaq 期权链（assetclass=${assetClass}）`;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- sequential fallback, see
+      // fetchStockHistory's own comment.
+      const payload = await fetchJson(buildNasdaqOptionChainUrl(symbol, assetClass), buildNasdaqHeaders(symbol, assetClass));
+      const normalized = normalizeNasdaqOptionChain(payload);
+      if (!normalized.error) {
+        return normalized;
+      }
+      failures.push(`${label}：${normalized.error}`);
+    } catch (error) {
+      failures.push(formatFetchError(error, label));
+    }
+  }
+
   for (const url of buildYahooOptionChainUrls(symbol)) {
     try {
-      const payload = await fetchJsonWithTimeout(url);
-      return payload?.optionChain?.result?.[0] ?? {};
+      // eslint-disable-next-line no-await-in-loop -- sequential fallback, see
+      // fetchStockHistory's own comment.
+      const payload = await fetchJson(url);
+      const result = payload?.optionChain?.result?.[0];
+      if (result && (Array.isArray(result.expirationDates) || Array.isArray(result.options))) {
+        return { source: "yahoo-options", ...result };
+      }
+      failures.push(`Yahoo options ${url.hostname}：返回结构中没有期权链`);
     } catch (error) {
       failures.push(formatFetchError(error, `Yahoo options ${url.hostname}`));
     }
   }
-  return { error: failures.join("；") || "Yahoo options 期权链接口读取失败" };
+
+  return { error: failures.join("；") || "期权链来源均未返回可用数据" };
 }
 
 async function fetchStockNews(symbol) {
@@ -1276,6 +1479,19 @@ function formatFetchError(error, label) {
   const message = String(error?.message ?? error);
   if (/401|unauthorized/iu.test(message)) {
     return `${label}返回 401，当前维度待验证`;
+  }
+  // 403 on this pipeline means a paid tier, not a transient failure: every
+  // Finnhub endpoint outside the free set (candles, option chain, price
+  // target) answers exactly this. Naming it keeps the disclosure actionable
+  // instead of implying a retry would help.
+  if (/403|forbidden/iu.test(message)) {
+    return `${label}返回 403（该接口需要付费档权限），当前维度待验证`;
+  }
+  // Nasdaq answers 400 "Symbol not exists." when the asset class does not
+  // match the instrument - the fallback already retried the other class, so
+  // seeing this in a report means neither class recognized the ticker.
+  if (/\b400\b|bad request/iu.test(message)) {
+    return `${label}返回 400（该资产类别下无此标的），当前维度待验证`;
   }
   if (/404|not found/iu.test(message)) {
     return `${label}未找到数据，当前维度待验证`;

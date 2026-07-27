@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  countFactsCoverage,
   validateNarrativeNumbers,
   validateReportMarkdown,
   validateReportUrls,
@@ -791,5 +792,141 @@ describe("Phase 5 Task 4 - stock.numeric_match (validateStockNarrativeNumbers)",
     const result = validateStockNarrativeNumbers(markdown, {});
 
     expect(result).toEqual({ ok: true, failures: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-27 - honest-disclosure coverage. The rule these tests defend: a
+// checkpoint counts as covered when the section carries a REAL value for it,
+// OR states why it is unavailable. A bare "暂无" is neither, and must keep
+// failing the gate - otherwise "never fabricate, disclose honestly" quietly
+// degrades into "say nothing".
+// ---------------------------------------------------------------------------
+
+const UNAVAILABLE_HISTORY = {
+  error: "Nasdaq 历史行情（assetclass=stocks）触发限流，当前维度待验证；StockAnalysis 历史接口读取失败：503；Yahoo chart 历史走势接口触发限流，当前维度待验证"
+};
+const UNAVAILABLE_OPTION_CHAIN = {
+  error: "Nasdaq 期权链（assetclass=stocks）未返回合约（Symbol not exists.）；Yahoo options query2.finance.yahoo.com触发限流，当前维度待验证"
+};
+
+// One `## SYMBOL` slice - the same scope validateStockAnalysisMarkdown gives
+// each per-symbol gate, so countFactsCoverage here sees exactly what the gate
+// sees.
+function symbolSection(markdown: string, symbol: string): string {
+  const start = markdown.indexOf(`## ${symbol}\n`);
+  const rest = markdown.slice(start + `## ${symbol}\n`.length);
+  const next = rest.match(/\n##\s+/u);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+function buildStockRecord(
+  symbol: string,
+  {
+    history = stockHistoryFixture(),
+    fundamentals = stockFundamentalsFixture(),
+    optionChain = stockOptionChainFixture()
+  }: { history?: unknown; fundamentals?: unknown; optionChain?: unknown } = {}
+) {
+  const quote = stockQuoteFixture({ symbol });
+  const news = stockNewsFixture();
+  const analysis = buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, STOCK_GENERATED_AT);
+  const facts = buildStockFacts({ symbol, quote, history, fundamentals, optionChain, news, tradingDay: STOCK_GENERATED_AT.slice(0, 10) });
+  return {
+    record: { symbol, analysis, news } as Record<string, unknown>,
+    analysis,
+    factsByKey: Object.fromEntries(facts.map((fact: { factKey: string }) => [fact.factKey, fact]))
+  };
+}
+
+describe("stock.facts_coverage: disclosures count, bare placeholders do not", () => {
+  it("a symbol whose history/option/valuation sources ALL failed still clears the threshold on disclosures alone", () => {
+    // Paired with a healthy sibling so the batch-wide valuation gate has real
+    // PE/PB to read - the per-symbol coverage assertion below is the point.
+    const healthy = buildStockRecord("AAPL.US");
+    const dark = buildStockRecord("MSFT.US", {
+      history: UNAVAILABLE_HISTORY,
+      fundamentals: { error: "finnhub-metric：Finnhub 指标接口返回 403；nasdaq-summary：Nasdaq 摘要未返回该标的数据（Symbol not exists.）" },
+      optionChain: UNAVAILABLE_OPTION_CHAIN
+    });
+    const markdown = renderStockReport([{ record: healthy.record }, { record: dark.record }]);
+
+    // Each unavailable domain names its own reason in the rendered section.
+    expect(markdown).toContain("历史走势读取失败：");
+    expect(markdown).toContain("期权链读取失败：");
+    expect(markdown).toContain("估值读取失败：");
+    // All 8 checkpoints accounted for: 3 backed by real quote/news data, 5
+    // disclosed with a stated reason - not merely "above the threshold".
+    expect(countFactsCoverage(symbolSection(markdown, "MSFT.US"))).toBe(8);
+    expect(countFactsCoverage(symbolSection(markdown, "AAPL.US"))).toBe(8);
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("an ETF's structurally-inapplicable metrics are disclosed with a reason, and satisfy both the per-symbol and batch-wide valuation gates", () => {
+    // QQQM: a fund has no PE/PB/EPS and no sell-side one-year target, and
+    // this batch has no equity to borrow real ones from.
+    const etf = buildStockRecord("QQQM.US", {
+      history: UNAVAILABLE_HISTORY,
+      fundamentals: { sources: ["nasdaq-summary", "finnhub-metric"], failures: [], marketCap: 97_291_489_986, previousClose: 281.68 },
+      optionChain: UNAVAILABLE_OPTION_CHAIN
+    });
+    const markdown = renderStockReport([{ record: etf.record }]);
+
+    expect(markdown).toContain("PE 不可得（ETF 无市盈率口径");
+    expect(markdown).toContain("一年目标价 不可得（ETF 无卖方一年目标价");
+    expect(countFactsCoverage(symbolSection(markdown, "QQQM.US"))).toBe(8);
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("FAILS - naming the count - when those same gaps are rendered as bare '暂无' with no reason", () => {
+    const etf = buildStockRecord("QQQM.US", {
+      history: UNAVAILABLE_HISTORY,
+      fundamentals: { sources: ["nasdaq-summary"], failures: [], marketCap: 97_291_489_986 },
+      optionChain: UNAVAILABLE_OPTION_CHAIN
+    });
+    const silent = renderStockReport([{ record: etf.record }])
+      .replace(/PE 不可得（[^）]+）/gu, "PE 暂无")
+      .replace(/PB 不可得（[^）]+）/gu, "PB 暂无")
+      .replace(/一年目标价 不可得（[^）]+）/gu, "一年目标价 暂无")
+      .replace(/一年目标价均数据不可得/gu, "一年目标价暂无")
+      .replace(/目标价数据不可得/gu, "目标价暂无")
+      .replace(/目标价缺失/gu, "目标价暂无")
+      .replace(/历史走势读取失败：[^\n]*/gu, "历史走势暂无。")
+      .replace(/期权链读取失败：[^\n]*/gu, "期权链暂无。");
+
+    const result = validateStockAnalysisMarkdown(silent);
+
+    expect(result.ok).toBe(false);
+    // quote.last + quote.pct + news.count survive; the five silently-dropped
+    // checkpoints (pe / targetPrice / ma20 / ma60 / callOi) do not.
+    expect(result.failures).toContain("stock.facts_coverage:QQQM.US:3/8");
+    // ...and the batch-wide valuation gate refuses a bare placeholder too.
+    expect(result.failures).toContain("stock.valuation_depth");
+  });
+});
+
+describe("stock.numeric_match: deterministic derivations are backed, fabrications are not", () => {
+  it("accepts numbers the renderer itself derived (probabilities, trend score, window labels) via deterministicTextBySymbol", () => {
+    const { record, factsByKey, analysis } = buildStockRecord("AAPL.US");
+    const markdown = renderStockReport([{ record }]);
+    const deterministicText = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"]
+      .map((key) => (analysis as Record<string, string[]>)[key].join("\n"))
+      .join("\n");
+
+    expect(validateStockNarrativeNumbers(markdown, { "AAPL.US": factsByKey }, { deterministicTextBySymbol: { "AAPL.US": deterministicText } }))
+      .toEqual({ ok: true, failures: [] });
+  });
+
+  it("still fails a number that is in neither the facts table nor the deterministic text", () => {
+    const { record, factsByKey, analysis } = buildStockRecord("AAPL.US");
+    const deterministicText = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"]
+      .map((key) => (analysis as Record<string, string[]>)[key].join("\n"))
+      .join("\n");
+    const markdown = renderStockReport([{ record }]).replace("日内强弱：", "日内强弱（叙事补充 777.77）：");
+
+    const result = validateStockNarrativeNumbers(markdown, { "AAPL.US": factsByKey }, { deterministicTextBySymbol: { "AAPL.US": deterministicText } });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("stock.numeric_match:AAPL.US:777.77");
   });
 });

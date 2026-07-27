@@ -220,14 +220,55 @@ function validateBackendOutput(rawText, facts) {
 // meantime a stable, directly-assertable value for tests.
 // ---------------------------------------------------------------------------
 
+// 2026-07-27 readability fix: the digest used to paste `valueNum` and the
+// raw `unit` column together, so the model was handed (and dutifully echoed
+// into prose) strings like "-0.663357014465455pct", "232.11USD",
+// "35017357shares" and "12count". Values are now formatted the way a Chinese
+// reader expects, with thousands separators and at most two decimals.
+//
+// Rounding is capped at 2 decimals ON PURPOSE: validateBackendOutput's
+// numeric pre-check accepts a stated number within ±0.01 (price) / ±0.1
+// (percentage) of a fact, and 2-decimal rounding can never move a value by
+// more than 0.005 - so a model that faithfully copies the digest still
+// passes. Rounding any harder (e.g. to whole dollars for large prices) would
+// start failing that check and degrade sections for no reason.
+const DIGEST_UNIT_SUFFIXES = {
+  USD: " 美元",
+  pct: "%",
+  shares: " 股",
+  count: " 条",
+  contracts: " 张"
+};
+
+function formatDigestNumber(value) {
+  const fixed = Number(value).toFixed(2);
+  const trimmed = fixed.endsWith(".00") ? fixed.slice(0, -3) : fixed;
+  const [integerPart, fractionPart] = trimmed.split(".");
+  const grouped = integerPart.replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
+  return fractionPart ? `${grouped}.${fractionPart}` : grouped;
+}
+
+function formatDigestValue(fact) {
+  const hasNum = typeof fact?.valueNum === "number" && Number.isFinite(fact.valueNum);
+  if (!hasNum) {
+    return fact?.valueText ?? "数据不可得";
+  }
+  const number = formatDigestNumber(fact.valueNum);
+  const unit = fact?.unit ? String(fact.unit) : "";
+  if (DIGEST_UNIT_SUFFIXES[unit] !== undefined) {
+    return `${number}${DIGEST_UNIT_SUFFIXES[unit]}`;
+  }
+  // history.maLong carries the REAL window length as its unit (e.g. "126日").
+  if (/^\d+日$/u.test(unit)) {
+    return `${number} 美元（${unit}均线）`;
+  }
+  return unit ? `${number} ${unit}` : number;
+}
+
 function buildFactsDigest(facts) {
   return Object.entries(facts ?? {})
     .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-    .map(([factKey, fact]) => {
-      const hasNum = typeof fact?.valueNum === "number" && Number.isFinite(fact.valueNum);
-      const value = hasNum ? `${fact.valueNum}${fact?.unit ? fact.unit : ""}` : (fact?.valueText ?? "数据不可得");
-      return `${factKey}=${value}`;
-    })
+    .map(([factKey, fact]) => `${factKey}=${formatDigestValue(fact)}`)
     .join("; ");
 }
 

@@ -186,9 +186,11 @@ export function persistDailyFacts(db, tradingDay, facts) {
 //                                  // kept in the input shape for call-site
 //                                  // clarity/parity with fetchStockAnalysisRecord.
 //   quote: object,                // normalizeQuotePayload(...) shape
-//   history: Array|{error:string}, // fetchYahooHistory(...) shape
+//   history: Array|{rows,source}|{error:string}, // fetchStockHistory(...) shape
 //   fundamentals: object|{error:string}, // mergeFundamentalSnapshots(...) output
-//   optionChain: object|{error:string},  // Yahoo optionChain.result[0] shape
+//   optionChain: object|{error:string},  // fetchStockOptionChain(...) shape:
+//                                  // a summed Nasdaq snapshot, Yahoo's raw
+//                                  // optionChain.result[0], or an error
 //   news: Array,                  // merged news articles (only .length used)
 //   tradingDay: string            // e.g. '2026-07-15'
 // }} input
@@ -209,6 +211,9 @@ function buildStockQuoteFacts(quote, tradingDay) {
   const last = toNumber(quote?.last ?? quote?.last_done ?? quote?.lastDone);
   const prevClose = toNumber(quote?.prev_close ?? quote?.prevClose);
   const volume = toNumber(quote?.volume ?? quote?.turnover_volume);
+  const open = toNumber(quote?.open);
+  const high = toNumber(quote?.high);
+  const low = toNumber(quote?.low);
   // Signed percentage change (matches stock-analysis.mjs's buildDeterministicAnalysis
   // `pct` - that narrative renders a SIGNED "涨跌幅", unlike the daily report's
   // qqq.changePct above, which is unsigned - the fact must match what's
@@ -217,10 +222,20 @@ function buildStockQuoteFacts(quote, tradingDay) {
   const dataTime = quote?.timestamp ?? tradingDay;
   const source = "longbridge-quote";
 
+  // 2026-07-27: open/high/low/prevClose come back from the SAME Longbridge
+  // quote payload the four facts above already read, and the rendered report
+  // has always printed them ("日内区间 ... 开盘 ... 前收 ..."). They simply
+  // were never persisted, so a real, first-party number sat in the report
+  // with no fact row behind it. Recording them costs one extra row each and
+  // removes that has-data-but-no-fact gap.
   return [
     numberFact("quote.last", last, "USD", source, dataTime),
     numberFact("quote.pct", pct, "pct", source, dataTime),
-    numberFact("quote.volume", volume, "shares", source, dataTime)
+    numberFact("quote.volume", volume, "shares", source, dataTime),
+    numberFact("quote.open", open, "USD", open === undefined ? "数据不可得" : source, dataTime),
+    numberFact("quote.high", high, "USD", high === undefined ? "数据不可得" : source, dataTime),
+    numberFact("quote.low", low, "USD", low === undefined ? "数据不可得" : source, dataTime),
+    numberFact("quote.prevClose", prevClose, "USD", prevClose === undefined ? "数据不可得" : source, dataTime)
   ];
 }
 
@@ -273,8 +288,14 @@ function valuationFact(factKey, value, unit, mergedSourceLabel, dataTime) {
 function buildStockHistoryFacts(history, quote, tradingDay) {
   const currentPrice = toNumber(quote?.last ?? quote?.last_done ?? quote?.lastDone);
   const stats = summarizeHistory(history, currentPrice);
-  const dataTime = Array.isArray(history) && history.length ? (history.at(-1)?.date ?? tradingDay) : tradingDay;
-  const source = "yahoo-chart-history";
+  // History is no longer Yahoo-only (Nasdaq/StockAnalysis/Yahoo chain, see
+  // stock-analysis.mjs's fetchStockHistory): the fact must name the source
+  // that ACTUALLY produced the number, so `stats.source` wins whenever the
+  // envelope shape carried one. A bare row array (older callers/tests) has no
+  // source of its own and keeps the historical label.
+  const rows = Array.isArray(history) ? history : (Array.isArray(history?.rows) ? history.rows : []);
+  const dataTime = rows.length ? (rows.at(-1)?.date ?? tradingDay) : tradingDay;
+  const source = stats.source ?? "yahoo-chart-history";
   const maLongUnit = stats.longWindowDays !== undefined ? `${stats.longWindowDays}日` : null;
 
   return [
@@ -289,7 +310,10 @@ function buildStockHistoryFacts(history, quote, tradingDay) {
 // "期权交割与阻力支撑" section renders from.
 function buildStockOptionFacts(optionChain, tradingDay) {
   const stats = summarizeOptionChainStats(optionChain);
-  const source = "yahoo-options";
+  // Same "name the source that actually produced it" rule as
+  // buildStockHistoryFacts above - the option chain now comes from Nasdaq
+  // first, Yahoo only as the last fallback.
+  const source = stats.source ?? "yahoo-options";
   const hasExpiry = stats.expiration !== undefined;
 
   return [

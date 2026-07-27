@@ -1,7 +1,24 @@
 import { toNumber } from "./report-data.mjs";
 
+// 2026-07-27: `payload.data` is null (and `status.bCodeMessage` carries
+// "Symbol not exists.") whenever the requested assetclass does not match the
+// instrument - the exact response `QQQM/summary?assetclass=stocks` returns.
+// This used to fall through to `?? {}` and produce a snapshot with NO error
+// and EVERY field undefined, which mergeFundamentalSnapshots then counted as
+// a contributing source: the resulting `fundamentals` object was neither an
+// error nor carried a single value, so summarizeValuation rendered a bare
+// "PE 暂无" with no reason at all. That is precisely the silent gap the
+// facts-coverage gate exists to catch, so an empty payload is now an explicit,
+// reason-carrying error snapshot.
 export function normalizeNasdaqSummary(payload) {
-  const summaryData = payload?.data?.summaryData ?? {};
+  const summaryData = payload?.data?.summaryData;
+  if (!summaryData || typeof summaryData !== "object") {
+    const apiMessage = payload?.status?.bCodeMessage?.[0]?.errorMessage ?? payload?.message;
+    return {
+      source: "nasdaq-summary",
+      error: `Nasdaq 摘要未返回该标的数据（${String(apiMessage ?? "响应缺少 summaryData").slice(0, 80)}）`
+    };
+  }
   return {
     source: "nasdaq-summary",
     oneYearTarget: parseMoney(summaryData.OneYrTarget?.value),
@@ -22,25 +39,196 @@ export function extractStockAnalysisStatistics(html) {
   };
 }
 
+// Finnhub free tier, /stock/metric?metric=all (verified 2026-07-27 with the
+// production key on the mini: AMZN -> 128 metrics; QQQM -> 19 metrics with no
+// pe/pb at all, because a fund structurally has none). marketCapitalization
+// is denominated in MILLIONS of USD - multiplying it here keeps every
+// consumer on one unit (raw USD), the same unit Nasdaq's MarketCap string
+// parses to.
+export function normalizeFinnhubMetrics(payload) {
+  const metric = payload?.metric;
+  if (!metric || typeof metric !== "object") {
+    return { source: "finnhub-metric", error: "Finnhub 指标接口未返回 metric 字段" };
+  }
+  const marketCapMillions = toNumber(metric.marketCapitalization);
+  return {
+    source: "finnhub-metric",
+    trailingPE: toNumber(metric.peTTM ?? metric.peBasicExclExtraTTM ?? metric.peAnnual),
+    priceToBook: toNumber(metric.pbQuarterly ?? metric.pbAnnual),
+    epsTrailingTwelveMonths: toNumber(metric.epsTTM ?? metric.epsBasicExclExtraItemsTTM),
+    marketCap: marketCapMillions === undefined ? undefined : marketCapMillions * 1_000_000,
+    fiftyTwoWeekHighLow: formatFiftyTwoWeekRange(metric["52WeekHigh"], metric["52WeekLow"])
+  };
+}
+
+function formatFiftyTwoWeekRange(high, low) {
+  const highValue = toNumber(high);
+  const lowValue = toNumber(low);
+  if (highValue === undefined || lowValue === undefined) {
+    return undefined;
+  }
+  return `$${highValue}/$${lowValue}`;
+}
+
+// Nasdaq historical (api.nasdaq.com/api/quote/<SYM>/historical): rows are
+// NEWEST first with US-formatted dates ("07/24/2026") and $-prefixed closes
+// for equities (plain numbers for funds). Returned ascending so every
+// downstream consumer (summarizeHistory's slice(-20)/slice(-60)) keeps
+// reading "most recent last", exactly as it did for the Yahoo chart payload.
+export function normalizeNasdaqHistorical(payload) {
+  const rows = payload?.data?.tradesTable?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const apiMessage = payload?.status?.bCodeMessage?.[0]?.errorMessage ?? payload?.message;
+    return { source: "nasdaq-historical", error: `Nasdaq 历史行情未返回日线（${String(apiMessage ?? "空 tradesTable").slice(0, 80)}）` };
+  }
+  const normalized = rows
+    .map((row) => ({ date: parseUsDate(row?.date), close: parseMoney(row?.close) }))
+    .filter((row) => row.date !== undefined && row.close !== undefined)
+    .sort((left, right) => left.date.localeCompare(right.date));
+  if (normalized.length === 0) {
+    return { source: "nasdaq-historical", error: "Nasdaq 历史行情返回的日线无法解析（日期/收盘价字段为空）" };
+  }
+  return { source: "nasdaq-historical", rows: normalized };
+}
+
+// stockanalysis.com/api/symbol/{s|e}/<sym>/history: {status, data:[{t,o,h,l,c,...}]},
+// also newest-first, ISO dates, plain numeric closes.
+export function normalizeStockAnalysisHistory(payload) {
+  const rows = payload?.data;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { source: "stockanalysis-history", error: "StockAnalysis 历史接口未返回日线数据" };
+  }
+  const normalized = rows
+    .map((row) => ({ date: String(row?.t ?? "").slice(0, 10), close: toNumber(row?.c) }))
+    .filter((row) => /^\d{4}-\d{2}-\d{2}$/u.test(row.date) && row.close !== undefined)
+    .sort((left, right) => left.date.localeCompare(right.date));
+  if (normalized.length === 0) {
+    return { source: "stockanalysis-history", error: "StockAnalysis 历史接口返回的日线无法解析" };
+  }
+  return { source: "stockanalysis-history", rows: normalized };
+}
+
+const NASDAQ_MONTHS = {
+  january: "01", february: "02", march: "03", april: "04", may: "05", june: "06",
+  july: "07", august: "08", september: "09", october: "10", november: "11", december: "12"
+};
+
+// Nasdaq option chain (api.nasdaq.com/api/quote/<SYM>/option-chain): one flat
+// row list where an expiry GROUP is announced by a row whose `expirygroup` is
+// e.g. "July 27, 2026" (all other fields null) and every following row with an
+// empty `expirygroup` belongs to that expiry. Only the NEAREST expiry (the
+// first group) is summed - the same "最近到期" figure the Yahoo path reported.
+export function normalizeNasdaqOptionChain(payload) {
+  const rows = payload?.data?.table?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const apiMessage = payload?.status?.bCodeMessage?.[0]?.errorMessage ?? payload?.message;
+    return { source: "nasdaq-option-chain", error: `Nasdaq 期权链未返回合约（${String(apiMessage ?? "空 table").slice(0, 80)}）` };
+  }
+
+  let expiration;
+  let started = false;
+  let callOpenInterest = 0;
+  let putOpenInterest = 0;
+  let contractCount = 0;
+  for (const row of rows) {
+    const group = String(row?.expirygroup ?? "").trim();
+    if (group) {
+      if (started) {
+        break;
+      }
+      expiration = parseNasdaqExpiryGroup(group);
+      started = true;
+      continue;
+    }
+    if (!started) {
+      continue;
+    }
+    const callOi = parseCount(row?.c_Openinterest);
+    const putOi = parseCount(row?.p_Openinterest);
+    if (callOi === undefined && putOi === undefined) {
+      continue;
+    }
+    callOpenInterest += callOi ?? 0;
+    putOpenInterest += putOi ?? 0;
+    contractCount += 1;
+  }
+
+  if (!started || contractCount === 0) {
+    return { source: "nasdaq-option-chain", error: "Nasdaq 期权链未返回最近到期日的未平仓数据" };
+  }
+  return {
+    source: "nasdaq-option-chain",
+    expiration: expiration ?? "待确认",
+    callOpenInterest,
+    putOpenInterest,
+    contractCount
+  };
+}
+
+function parseNasdaqExpiryGroup(value) {
+  const match = /^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$/u.exec(String(value ?? "").trim());
+  if (!match) {
+    return undefined;
+  }
+  const month = NASDAQ_MONTHS[match[1].toLowerCase()];
+  if (!month) {
+    return undefined;
+  }
+  return `${match[3]}-${month}-${match[2].padStart(2, "0")}`;
+}
+
+function parseUsDate(value) {
+  const match = /^(\d{2})\/(\d{2})\/(\d{4})$/u.exec(String(value ?? "").trim());
+  return match ? `${match[3]}-${match[1]}-${match[2]}` : undefined;
+}
+
+// Nasdaq renders "no reported value" as "--" (and occasionally null) - those
+// must be skipped, never coerced to a 0 that would silently understate open
+// interest.
+function parseCount(value) {
+  const text = String(value ?? "").replace(/,/gu, "").trim();
+  if (!text || text === "--" || /^N\/A$/iu.test(text)) {
+    return undefined;
+  }
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+const MERGED_FUNDAMENTAL_KEYS = [
+  "trailingPE",
+  "forwardPE",
+  "priceToBook",
+  "epsTrailingTwelveMonths",
+  "marketCap",
+  "oneYearTarget",
+  "previousClose"
+];
+
+// A snapshot that carries NO usable field is not a source - counting it as
+// one is what let `fundamentals` end up "not an error, but also not a single
+// value" and rendered as an unexplained "暂无" (see normalizeNasdaqSummary's
+// own comment). Its failure reason is carried out on `merged.failures` so the
+// renderer can name WHY each field is missing instead of shrugging.
+function hasUsableFundamentalValues(normalized) {
+  return MERGED_FUNDAMENTAL_KEYS.some((key) => normalized[key] !== undefined) || Boolean(normalized.fiftyTwoWeekHighLow);
+}
+
 export function mergeFundamentalSnapshots(snapshots) {
-  const merged = { sources: [] };
+  const merged = { sources: [], failures: [] };
   for (const snapshot of snapshots.filter(Boolean)) {
     if (snapshot.error) {
+      merged.failures.push(`${snapshot.source ?? "未知来源"}：${snapshot.error}`);
       continue;
     }
     const normalized = normalizeFundamentalSnapshot(snapshot);
     if (!normalized) {
       continue;
     }
-    for (const key of [
-      "trailingPE",
-      "forwardPE",
-      "priceToBook",
-      "epsTrailingTwelveMonths",
-      "marketCap",
-      "oneYearTarget",
-      "previousClose"
-    ]) {
+    if (!hasUsableFundamentalValues(normalized)) {
+      merged.failures.push(`${normalized.source ?? "未知来源"}：返回结构完整但没有任何估值字段`);
+      continue;
+    }
+    for (const key of MERGED_FUNDAMENTAL_KEYS) {
       if (merged[key] === undefined && normalized[key] !== undefined) {
         merged[key] = normalized[key];
       }
@@ -53,17 +241,50 @@ export function mergeFundamentalSnapshots(snapshots) {
     }
   }
   merged.sources = Array.from(new Set(merged.sources));
+  merged.failures = Array.from(new Set(merged.failures));
   return merged;
 }
 
-export function summarizeValuation(valuation) {
+// Equity-only metrics: an ETF has no earnings, no book value and no
+// sell-side one-year target, so these are not "missing data" for a fund -
+// they are structurally inapplicable, and the report must say exactly that
+// (verified 2026-07-27: Finnhub free tier returns 19 metrics for QQQM with no
+// pe/pb key at all; Nasdaq's ETF summary carries no OneYrTarget).
+const ETF_INAPPLICABLE_REASONS = {
+  pe: "ETF 无市盈率口径，Finnhub 免费版对基金不返回该指标",
+  pb: "ETF 无市净率口径，基金不披露账面价值",
+  eps: "ETF 不披露每股收益",
+  targetPrice: "ETF 无卖方一年目标价，Nasdaq 基金摘要不含 OneYrTarget"
+};
+
+function missingValuationReason(field, { instrumentKind, failures }) {
+  if (instrumentKind === "etf" && ETF_INAPPLICABLE_REASONS[field]) {
+    return ETF_INAPPLICABLE_REASONS[field];
+  }
+  if (failures.length > 0) {
+    return `来源未提供该字段：${failures.join("；")}`;
+  }
+  return "已接入的估值来源均未返回该字段";
+}
+
+// Renders a value, or an EXPLICIT "不可得（原因）" - never a bare "暂无",
+// which report-quality.mjs's facts-coverage detectors deliberately refuse to
+// count as a disclosure (a placeholder with no stated reason is a silent gap).
+function valuationValueOrReason(formatted, value, reason) {
+  return value === undefined ? `不可得（${reason}）` : formatted;
+}
+
+export function summarizeValuation(valuation, { instrumentKind = "stock" } = {}) {
   if (!valuation || valuation.error) {
     return {
-      summary: valuation?.error ? `估值读取失败：${valuation.error}` : "估值数据暂无可用。",
+      summary: valuation?.error
+        ? `估值读取失败：${valuation.error}`
+        : "估值数据暂无可用（未收到任何估值来源的响应）。",
       cheapness: "PE/PB 缺失，估值便宜程度待验证"
     };
   }
 
+  const failures = Array.isArray(valuation.failures) ? valuation.failures : [];
   const pe = toNumber(valuation.trailingPE ?? valuation.forwardPE);
   const pb = toNumber(valuation.priceToBook);
   const marketCap = toNumber(valuation.marketCap);
@@ -74,20 +295,68 @@ export function summarizeValuation(valuation) {
     pe !== undefined && pe > 0 && pe < 30 ? "PE 低于 30" : ""
   ].filter(Boolean);
   const sourceText = valuation.sources?.length ? `；来源 ${valuation.sources.join("、")}` : "";
+  const reasonFor = (field) => missingValuationReason(field, { instrumentKind, failures });
+
+  const summary = [
+    `PE ${valuationValueOrReason(formatNumber(pe), pe, reasonFor("pe"))}`,
+    `PB ${valuationValueOrReason(formatNumber(pb), pb, reasonFor("pb"))}`,
+    `EPS ${valuationValueOrReason(formatNumber(eps), eps, reasonFor("eps"))}`,
+    `市值 ${valuationValueOrReason(formatCompactMoney(marketCap), marketCap, reasonFor("marketCap"))}`,
+    `一年目标价 ${valuationValueOrReason(formatNumber(oneYearTarget), oneYearTarget, reasonFor("targetPrice"))}`
+  ].join("；");
 
   return {
-    summary: `PE ${formatNumber(pe)}；PB ${formatNumber(pb)}；EPS ${formatNumber(eps)}；市值 ${formatCompactMoney(marketCap)}；一年目标价 ${formatNumber(oneYearTarget)}${sourceText}。`,
+    summary: `${summary}${sourceText}。`,
     cheapness: cheapSignals.length
       ? `估值信号：${cheapSignals.join("，")}，仍需同行分位确认`
-      : "PE/PB 未触发明显便宜信号，或数据缺失"
+      : instrumentKind === "etf"
+        ? "ETF 无市盈率/市净率口径，便宜程度改看均线折价与溢价"
+        : "PE/PB 未触发明显便宜信号，或数据缺失"
   };
 }
 
+// Accepts EITHER shape:
+//   - an already-summed snapshot ({source, expiration, callOpenInterest,
+//     putOpenInterest}) - what normalizeNasdaqOptionChain returns;
+//   - Yahoo's raw optionChain.result[0] ({expirationDates, options:[{calls,
+//     puts}]}) - the original, still-supported last link of the chain.
+// An `{error}` (or an empty/unrecognized object, which Yahoo returns as `{}`
+// when its payload has no result at all) renders the DISCLOSED branch with a
+// stated reason - never a fabricated "未平仓约 0.00", which is what the old
+// `?? {}` fallthrough silently produced.
 export function summarizeOptionChainStats(optionChain) {
   if (!optionChain || optionChain.error) {
-    const summary = optionChain?.error ? `期权链读取失败：${optionChain.error}` : "期权链暂无可用数据。";
+    const summary = optionChain?.error
+      ? `期权链读取失败：${optionChain.error}`
+      : "期权链暂无可用数据（未收到任何期权来源的响应）。";
     return {
       summary,
+      source: undefined,
+      expiration: undefined,
+      callOpenInterest: undefined,
+      putOpenInterest: undefined
+    };
+  }
+
+  const preSummedCall = toNumber(optionChain.callOpenInterest);
+  const preSummedPut = toNumber(optionChain.putOpenInterest);
+  if (preSummedCall !== undefined || preSummedPut !== undefined) {
+    const expiration = optionChain.expiration ?? "待确认";
+    const sourceText = optionChain.source ? `；来源 ${optionChain.source}` : "";
+    return {
+      source: optionChain.source,
+      expiration,
+      callOpenInterest: preSummedCall ?? 0,
+      putOpenInterest: preSummedPut ?? 0,
+      summary: `最近到期 ${expiration}，Call 未平仓约 ${formatNumber(preSummedCall ?? 0)}，Put 未平仓约 ${formatNumber(preSummedPut ?? 0)}；仅作现货波动参考${sourceText}。`
+    };
+  }
+
+  const hasYahooShape = Array.isArray(optionChain.expirationDates) || Array.isArray(optionChain.options);
+  if (!hasYahooShape) {
+    return {
+      summary: "期权链暂无可用数据（来源返回了空结构，既无到期日也无合约列表）。",
+      source: undefined,
       expiration: undefined,
       callOpenInterest: undefined,
       putOpenInterest: undefined
@@ -104,6 +373,7 @@ export function summarizeOptionChainStats(optionChain) {
   const putOpenInterest = puts.reduce((sum, row) => sum + (toNumber(row.openInterest) ?? 0), 0);
 
   return {
+    source: optionChain.source ?? "yahoo-options",
     expiration,
     callOpenInterest,
     putOpenInterest,
@@ -135,7 +405,10 @@ export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, o
     `PE ${formatNumber(pe)}`,
     `PB ${formatNumber(pb)}`,
     `趋势分 ${formatNumber(trendScore)}`,
-    optionStats?.summary ? `期权链：${optionStats.summary}` : "期权链暂无可用数据"
+    // The option summary is a full sentence ending in "。"; this list is
+    // itself joined with "；" and closed with one "。" below, so keeping the
+    // inner full stop rendered "……参考。。" in every report.
+    optionStats?.summary ? `期权链：${String(optionStats.summary).replace(/。$/u, "")}` : "期权链暂无可用数据"
   ];
   return `综合上行潜力：${label}；${details.join("；")}。`;
 }
@@ -163,12 +436,34 @@ export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, o
 // circular import: stock-analysis.mjs's runAnalysis needs to call INTO
 // report-facts.mjs (to persist stock_facts), so report-facts.mjs cannot
 // import back from stock-analysis.mjs.
-export function summarizeHistory(history, currentPrice) {
-  if (!Array.isArray(history) || history.length === 0) {
+// `history` may be a bare row array (every pre-2026-07-27 caller/test), or
+// the {rows, source, error} envelope the multi-source fetch chain now returns
+// so the rendered text can name WHICH source produced the numbers and, when
+// nothing worked, WHY each source failed.
+function normalizeHistoryInput(history) {
+  if (Array.isArray(history)) {
+    return { rows: history, source: undefined, error: undefined };
+  }
+  if (history && typeof history === "object") {
     return {
-      summary: history?.error ? `历史走势读取失败：${history.error}` : "历史走势暂无可用数据。",
+      rows: Array.isArray(history.rows) ? history.rows : [],
+      source: history.source,
+      error: history.error
+    };
+  }
+  return { rows: [], source: undefined, error: undefined };
+}
+
+export function summarizeHistory(history, currentPrice) {
+  const { rows, source, error } = normalizeHistoryInput(history);
+  if (rows.length === 0) {
+    return {
+      summary: error
+        ? `历史走势读取失败：${error}`
+        : "历史走势暂无可用数据（历史来源返回 0 条日线，无法计算均线）。",
       cheapness: "长期均线不可用，便宜程度暂记为待验证",
       trendScore: 0,
+      source: undefined,
       support: undefined,
       resistance: undefined,
       ma20: undefined,
@@ -178,7 +473,7 @@ export function summarizeHistory(history, currentPrice) {
     };
   }
 
-  const closes = history.map((row) => row.close).filter((value) => Number.isFinite(value));
+  const closes = rows.map((row) => row.close).filter((value) => Number.isFinite(value));
   const first = closes[0];
   const lastClose = currentPrice ?? closes.at(-1);
   const sixMonthReturn = first && lastClose ? ((lastClose - first) / first) * 100 : undefined;
@@ -198,8 +493,10 @@ export function summarizeHistory(history, currentPrice) {
     sixMonthReturn !== undefined ? Math.max(-5, Math.min(5, sixMonthReturn / 8)) : 0
   ].reduce((sum, value) => sum + value, 0);
 
+  const sourceText = source ? `，来源 ${source}` : "";
   return {
-    summary: `${history[0]?.date} 到 ${history.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日。`,
+    summary: `${rows[0]?.date} 到 ${rows.at(-1)?.date}，区间涨跌 ${formatPercent(sixMonthReturn)}，样本 ${closes.length} 个交易日${sourceText}。`,
+    source,
     cheapness: vsMa180 === undefined
       ? "长期均线不可用，便宜程度待验证"
       : vsMa180 < -5

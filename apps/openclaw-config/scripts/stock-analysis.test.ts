@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { parseConclusionBox } from "./conclusion-box.mjs";
 import { REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
-import { validateStockAnalysisMarkdown } from "./report-quality.mjs";
+import { validateStockAnalysisMarkdown, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
@@ -669,7 +669,12 @@ describe("attachNarrativeSections: a globally-degraded narrative run keeps rende
 });
 
 describe("attachNarrativeSections: fake backend's validated narrative flows into the rendered markdown", () => {
-  it("replaces one section's rendered bullets with the backend's own text while leaving gate-critical sections/phrases intact", async () => {
+  // 2026-07-27: this used to assert the OPPOSITE ("replaces one section's
+  // rendered bullets with the backend's own text"). Substitution is exactly
+  // what broke the live report - a real model paraphrases the frozen evidence
+  // sentences away - so the contract is now: deterministic bullets always
+  // render, adopted prose is appended after them under the 叙事 prefix.
+  it("appends the backend's own text after the section's deterministic bullets, never replacing them", async () => {
     const { db } = makeDb();
     const label = GENERATED_AT.slice(0, 10);
     const record = narrativeFixtureRecord();
@@ -694,8 +699,9 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
 
     const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
 
-    expect(markdown).toContain(rewrittenCatalysts);
-    expect(markdown).not.toContain(record.analysis.catalysts[0]);
+    expect(markdown).toContain(`- 叙事：${rewrittenCatalysts}`);
+    // The deterministic bullet the model rewrote is STILL there, above it.
+    expect(markdown).toContain(`- ${record.analysis.catalysts[0]}`);
     expect(markdown).not.toContain(REPORT_DEGRADED_HEADER);
     // Gate-critical phrases (PE/PB, 均线：20 日, 期权链只读补充, 综合上行潜力) all
     // live in sections OTHER than catalysts and survive regardless of
@@ -863,5 +869,267 @@ describe("persistPredictionsIfDelivered: predictions only ever written for a rea
       | undefined;
     expect(row).toBeDefined();
     expect(row?.symbol).toBe("AAPL.US");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-27 facts-coverage repair.
+//
+// Two independent defects were fixed together, and both are pinned here:
+//   1. the narrative layer REPLACED each section's deterministic bullets, so
+//      once the real gateway came up every gate-critical evidence sentence
+//      (and every honest "…读取失败：…" disclosure) got paraphrased away and
+//      per-symbol facts coverage collapsed to 2/8;
+//   2. history and the option chain had Yahoo as their ONLY source, and this
+//      deployment's IP is 429'd by Yahoo on every request, so both domains
+//      came back empty on every single run. Nasdaq (asset-class aware) +
+//      StockAnalysis + Finnhub are now wired ahead of it.
+// ---------------------------------------------------------------------------
+
+describe("fetchStockHistory: Nasdaq -> StockAnalysis -> Yahoo, with the reason for every failure", () => {
+  const NOW = new Date("2026-07-27T12:00:00.000Z");
+
+  function nasdaqHistoryPayload(close: number) {
+    return { data: { tradesTable: { rows: [{ date: "07/24/2026", close: String(close) }] } } };
+  }
+
+  it("uses Nasdaq first for an equity and never falls through when it answers", async () => {
+    const seen: string[] = [];
+    const result = await stockAnalysis.fetchStockHistory("AMZN.US", {
+      instrumentKind: "stock",
+      now: NOW,
+      fetchJson: async (url: unknown) => {
+        seen.push(String(url));
+        return nasdaqHistoryPayload(232.11);
+      }
+    });
+
+    expect(result.source).toBe("nasdaq-historical");
+    expect(result.rows).toEqual([{ date: "2026-07-24", close: 232.11 }]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("api.nasdaq.com");
+    expect(seen[0]).toContain("assetclass=stocks");
+  });
+
+  it("asks Nasdaq for assetclass=etf FIRST for a fund (assetclass=stocks answers 400 'Symbol not exists.')", async () => {
+    const seen: string[] = [];
+    const result = await stockAnalysis.fetchStockHistory("QQQM.US", {
+      instrumentKind: "etf",
+      now: NOW,
+      fetchJson: async (url: unknown) => {
+        seen.push(String(url));
+        return nasdaqHistoryPayload(281.68);
+      }
+    });
+
+    expect(seen[0]).toContain("assetclass=etf");
+    expect(result.rows).toEqual([{ date: "2026-07-24", close: 281.68 }]);
+  });
+
+  it("falls through Nasdaq(both classes) -> StockAnalysis when Nasdaq rejects the symbol", async () => {
+    const seen: string[] = [];
+    const result = await stockAnalysis.fetchStockHistory("AMZN.US", {
+      instrumentKind: "stock",
+      now: NOW,
+      fetchJson: async (url: unknown) => {
+        seen.push(String(url));
+        if (String(url).includes("api.nasdaq.com")) {
+          throw new Error("400 Bad Request");
+        }
+        return { status: 200, data: [{ t: "2026-07-24", c: 232.11 }] };
+      }
+    });
+
+    expect(seen.filter((url) => url.includes("api.nasdaq.com"))).toHaveLength(2);
+    expect(result.source).toBe("stockanalysis-history");
+    expect(result.rows).toEqual([{ date: "2026-07-24", close: 232.11 }]);
+  });
+
+  it("still reaches Yahoo chart as the last link", async () => {
+    const result = await stockAnalysis.fetchStockHistory("AMZN.US", {
+      instrumentKind: "stock",
+      now: NOW,
+      fetchJson: async (url: unknown) => {
+        if (String(url).includes("query1.finance.yahoo.com")) {
+          return { chart: { result: [{ timestamp: [1_753_315_200], indicators: { quote: [{ close: [232.11] }] } }] } };
+        }
+        throw new Error("429 Too Many Requests");
+      }
+    });
+
+    expect(result.source).toBe("yahoo-chart-history");
+    expect(result.rows).toHaveLength(1);
+  });
+
+  it("returns ONE aggregated error naming every source it tried when nothing worked", async () => {
+    const result = await stockAnalysis.fetchStockHistory("AMZN.US", {
+      instrumentKind: "stock",
+      now: NOW,
+      fetchJson: async () => {
+        throw new Error("429 Too Many Requests");
+      }
+    });
+
+    expect(result.rows).toBeUndefined();
+    expect(result.error).toContain("Nasdaq 历史行情");
+    expect(result.error).toContain("StockAnalysis 历史接口");
+    expect(result.error).toContain("Yahoo chart 历史走势接口");
+    expect(result.error).toContain("触发限流");
+  });
+});
+
+describe("fetchStockOptionChain: Nasdaq -> Yahoo", () => {
+  it("summarizes the nearest Nasdaq expiry without touching Yahoo", async () => {
+    const seen: string[] = [];
+    const result = await stockAnalysis.fetchStockOptionChain("AMZN.US", {
+      instrumentKind: "stock",
+      fetchJson: async (url: unknown) => {
+        seen.push(String(url));
+        return {
+          data: {
+            table: {
+              rows: [
+                { expirygroup: "July 31, 2026", c_Openinterest: null, p_Openinterest: null },
+                { expirygroup: "", c_Openinterest: "27", p_Openinterest: "68" }
+              ]
+            }
+          }
+        };
+      }
+    });
+
+    expect(result).toMatchObject({ source: "nasdaq-option-chain", expiration: "2026-07-31", callOpenInterest: 27, putOpenInterest: 68 });
+    expect(seen.every((url) => url.includes("api.nasdaq.com"))).toBe(true);
+  });
+
+  it("aggregates every source's reason when the whole chain fails (Yahoo 429 included)", async () => {
+    const result = await stockAnalysis.fetchStockOptionChain("AMZN.US", {
+      instrumentKind: "stock",
+      fetchJson: async () => {
+        throw new Error("429 Too Many Requests");
+      }
+    });
+
+    expect(result.error).toContain("Nasdaq 期权链");
+    expect(result.error).toContain("Yahoo options query2.finance.yahoo.com");
+  });
+});
+
+describe("fetchFinnhubMetrics / fetchFundamentalSnapshots", () => {
+  it("sends the key as a header and normalizes the free-tier metrics", async () => {
+    let sentHeaders: Record<string, string> = {};
+    const result = await stockAnalysis.fetchFinnhubMetrics("AMZN.US", {
+      apiKey: "test-key",
+      fetchJson: async (_url: unknown, headers: Record<string, string>) => {
+        sentHeaders = headers;
+        return { metric: { peTTM: 27.4988, pbQuarterly: 5.0684, marketCapitalization: 2_496_832.8 } };
+      }
+    });
+
+    expect(sentHeaders["X-Finnhub-Token"]).toBe("test-key");
+    expect(result).toMatchObject({ source: "finnhub-metric", trailingPE: 27.4988 });
+  });
+
+  it("discloses a missing key instead of silently skipping the source", async () => {
+    const result = await stockAnalysis.fetchFinnhubMetrics("AMZN.US", { apiKey: "", fetchJson: async () => ({}) });
+
+    expect(result.error).toContain("FINNHUB_API_KEY");
+  });
+
+  it("merges Finnhub valuation with Nasdaq's one-year target and carries each failed source's reason", async () => {
+    const merged = await stockAnalysis.fetchFundamentalSnapshots("AMZN.US", {
+      instrumentKind: "stock",
+      finnhubApiKey: "test-key",
+      fetchText: async () => {
+        throw new Error("404 Not Found");
+      },
+      fetchJson: async (url: unknown) => {
+        const href = String(url);
+        if (href.includes("finnhub.io")) {
+          return { metric: { peTTM: 27.4988, pbQuarterly: 5.0684, epsTTM: 8.3676, marketCapitalization: 2_496_832.8 } };
+        }
+        if (href.includes("api.nasdaq.com")) {
+          return { data: { summaryData: { OneYrTarget: { value: "$320.00" }, MarketCap: { value: "2,530,072,139,347" } } } };
+        }
+        throw new Error("429 Too Many Requests");
+      }
+    });
+
+    expect(merged).toMatchObject({ trailingPE: 27.4988, priceToBook: 5.0684, oneYearTarget: 320 });
+    expect(merged.sources).toEqual(["finnhub-metric", "nasdaq-summary"]);
+    expect(merged.failures.join("；")).toContain("stockanalysis-statistics");
+    expect(merged.failures.join("；")).toContain("yahoo-quote");
+  });
+});
+
+describe("rendering keeps every checkpoint visible no matter how the narrative layer rewrites the prose", () => {
+  const LABEL = GENERATED_AT.slice(0, 10);
+
+  // The exact failure mode observed on the mini: a compliant model returns
+  // fluent Chinese with no numbers of its own, so it passes every narrative
+  // pre-check - and used to take the whole evidence section with it.
+  const paraphrasingBackend = async () => ({ text: "本段已改写为流畅的中文叙述，仅做语言润色，不重复具体数值。" });
+
+  it("adopts all eight sections and STILL passes every stock gate, with facts coverage intact", async () => {
+    const { db } = makeDb();
+    const record = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, LABEL, [record]);
+
+    await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: paraphrasingBackend });
+    expect(record.narrative.degraded).toBe(false);
+    expect(record.narrative.sections.every((entry: { narrative: boolean }) => entry.narrative)).toBe(true);
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+
+    expect(markdown).toContain("- 叙事：本段已改写为流畅的中文叙述");
+    // Every frozen evidence phrase the gates read is still in the document.
+    expect(markdown).toMatch(/最新价格：[0-9]/u);
+    expect(markdown).toMatch(/涨跌幅：[+-]?[0-9]/u);
+    expect(markdown).toMatch(/PE\s+[0-9]/u);
+    expect(markdown).toMatch(/均线：20 日 [0-9]/u);
+    expect(markdown).toContain("期权链只读补充");
+    expect(markdown).toContain("综合上行潜力");
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("passes the delivery-time numeric gate: derived deterministic numbers are backed by the record, a tampered one is not", async () => {
+    const { db } = makeDb();
+    const record = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, LABEL, [record]);
+    await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: paraphrasingBackend });
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const factsBySymbol = { "AAPL.US": getStockFacts(db, LABEL, "AAPL.US") };
+    const deterministicTextBySymbol = { "AAPL.US": stockAnalysis.deterministicTextForRecord(record) };
+
+    expect(validateStockNarrativeNumbers(markdown, factsBySymbol, { deterministicTextBySymbol })).toEqual({ ok: true, failures: [] });
+
+    const tampered = markdown.replace("最新价格：210.50", "最新价格：918.70");
+    const tamperedResult = validateStockNarrativeNumbers(tampered, factsBySymbol, { deterministicTextBySymbol });
+    expect(tamperedResult.ok).toBe(false);
+    expect(tamperedResult.failures).toContain("stock.numeric_match:AAPL.US:918.70");
+  });
+
+  it("appends only the degrade marker (not a duplicated copy of the bullets) when a section's narrative is rejected", async () => {
+    const { db } = makeDb();
+    const record = narrativeFixtureRecord();
+    stockAnalysis.persistStockFactsForRecords(db, LABEL, [record]);
+
+    // A backend that keeps inventing an unbacked number exhausts its retries
+    // and degrades that section locally.
+    const fabricatingBackend = async ({ sectionKey }: { sectionKey: string }) =>
+      sectionKey === "catalysts" ? { text: "催化剂方面，本季度预计增长 4321.99 个基点。" } : { text: "本段改写为中文叙述。" };
+
+    await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: fabricatingBackend });
+
+    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const catalystsBlock = markdown.split("### 催化剂")[1].split("###")[0];
+
+    expect(catalystsBlock).toContain("（叙事降级：数字比对未通过）");
+    expect(catalystsBlock).not.toContain("4321.99");
+    // The deterministic bullet appears exactly once - the marker is appended,
+    // the bullets are not re-emitted alongside it.
+    expect(catalystsBlock.split(record.analysis.catalysts[0]).length - 1).toBe(1);
+    expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });
