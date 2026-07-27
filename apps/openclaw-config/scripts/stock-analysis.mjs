@@ -20,12 +20,13 @@ import {
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
-import { assertStockAnalysisQuality, validateStockNarrativeNumbers } from "./report-quality.mjs";
+import { assertStockAnalysisQuality, STOCK_NEWS_SECTION_TITLE, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
 import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
 import {
   createNarrativeLlmBackend,
   generateNarrativeSections,
+  NARRATIVE_BULLET_PREFIX,
   NON_CHINESE_DEGRADE_MARKER,
   NUMERIC_DEGRADE_MARKER,
   REPORT_DEGRADED_HEADER
@@ -47,6 +48,7 @@ import {
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
   extractStockAnalysisStatistics,
+  formatMovingAverage,
   mergeFundamentalSnapshots,
   normalizeFinnhubMetrics,
   normalizeNasdaqHistorical,
@@ -636,7 +638,11 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
     ],
     trading: [
       `短线支撑位参考：${formatNumber(historyStats.support ?? support)}；短线阻力位参考：${formatNumber(historyStats.resistance ?? resistance)}。`,
-      `均线：20 日 ${formatNumber(historyStats.ma20)}；60 日 ${formatNumber(historyStats.ma60)}；${historyStats.longWindowDays ?? "180"} 日 ${formatNumber(historyStats.ma180)}。`,
+      // 2026-07-27 (defect 5): "20 日"/"60 日" are FIXED labels, so a sample
+      // shorter than the window renders the disclosed reason instead of a
+      // shorter mean wearing a longer window's name (formatMovingAverage).
+      // The third figure keeps naming the window it really used.
+      `均线：20 日 ${formatMovingAverage(historyStats, "ma20")}；60 日 ${formatMovingAverage(historyStats, "ma60")}；${historyStats.longWindowDays ?? "180"} 日 ${formatNumber(historyStats.ma180)}。`,
       `日内强弱：${pct === undefined ? "缺少前收数据" : pct >= 0 ? "相对前收偏强" : "相对前收偏弱"}。`,
       "大单、卖压和做空比例必须分开验证，不能用盘口现象直接推断做空。"
     ],
@@ -852,6 +858,20 @@ function buildConclusionBoxParams({
   };
 }
 
+// 2026-07-27 (second adversarial pass, defect 3): ONE bullet is ONE line.
+// Externally-authored text reaches several rendered bullets - a news title via
+// buildDeterministicAnalysis's 当前新闻主线, a publisher name via
+// summarizeNewsSourceBreakdown, a source's raw error message via 数据缺口 - and
+// not every one of those fields funnels through report-news.mjs's singleLine.
+// A line break inside any of them split one bullet into TWO, and the second
+// line started wherever the external text chose, e.g.
+// "- 估值补充：PE 12.3；PB 4.5" - which report-quality.mjs selects LINE-WISE as
+// the renderer's own valuation evidence. Collapsing the break here means no
+// external string can ever open a line of this document.
+function bullet(value) {
+  return `- ${String(value ?? "").replace(/[\r\n\u2028\u2029]+/gu, " ")}`;
+}
+
 export function renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols = [] }) {
   const template = loadStockAnalysisTemplate();
   const lines = [
@@ -866,13 +886,13 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
     "",
     "## 本批次结论",
     "",
-    ...records.map((record) => `- ${record.symbol}：支撑位 ${extractTradingLevel(record.analysis.trading[0], "support")}；阻力位 ${extractTradingLevel(record.analysis.trading[0], "resistance")}；需要按新闻与成交量继续验证。`),
+    ...records.map((record) => bullet(`${record.symbol}：支撑位 ${extractTradingLevel(record.analysis.trading[0], "support")}；阻力位 ${extractTradingLevel(record.analysis.trading[0], "resistance")}；需要按新闻与成交量继续验证。`)),
     // Task H7: per-symbol isolation (see fetchStockAnalysisRecords) means a
     // batch can partially fail - disclose exactly which symbols were
     // skipped and why, instead of the previous all-or-nothing behavior
     // where a bad symbol silently took the whole report down with it.
     ...(failedSymbols.length > 0
-      ? [`- 数据缺口：${failedSymbols.map((entry) => `${entry.symbol}（获取失败：${entry.error}）`).join("；")}；已跳过，仅呈现可用标的分析。`]
+      ? [bullet(`数据缺口：${failedSymbols.map((entry) => `${entry.symbol}（获取失败：${entry.error}）`).join("；")}；已跳过，仅呈现可用标的分析。`)]
       : []),
     ""
   ];
@@ -897,7 +917,7 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
       lines.push(`### ${section.title}`, "");
       const values = sectionValues(record.analysis, section.title, narrativeSectionsByKey);
       for (const value of values) {
-        lines.push(`- ${value}`);
+        lines.push(bullet(value));
       }
       // Phase 5 Task 2 (2026-07-15 plan): the structured "### 结论框" block
       // is embedded INSIDE the existing, frozen "结论与复盘标签" section,
@@ -910,9 +930,12 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
       }
       lines.push("");
     }
-    lines.push("### 近期新闻", "");
+    // Heading text imported from report-quality.mjs (defect 2/3): the gates
+    // that must find EVERY symbol's news block - and must refuse to read
+    // valuation evidence out of one - key on this exact literal.
+    lines.push(`### ${STOCK_NEWS_SECTION_TITLE}`, "");
     const visibleNews = selectDiverseNewsArticles(record.news, 6);
-    lines.push(`- 来源分布：${summarizeNewsSourceBreakdown(record.news)}。`);
+    lines.push(bullet(`来源分布：${summarizeNewsSourceBreakdown(record.news)}。`));
     if (!visibleNews.some(hasNonLongbridgeNewsSource)) {
       lines.push("- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。");
     }
@@ -956,10 +979,11 @@ const TITLE_TO_SECTION_KEY = {
   [CONCLUSION_SECTION_TITLE]: "conclusion"
 };
 
-// Label every bullet the narrative layer authored. Two jobs at once: the
-// reader can tell first-party evidence from LLM prose, and the rendering
-// contract below stays greppable.
-export const NARRATIVE_BULLET_PREFIX = "叙事：";
+// Re-exported from narrative-engine.mjs (its home since 2026-07-27, so
+// report-quality.mjs's gates can import the same literal without a circular
+// import back into this file) - every existing importer of this name from
+// here keeps working.
+export { NARRATIVE_BULLET_PREFIX };
 
 const LOCAL_DEGRADE_MARKERS = [NUMERIC_DEGRADE_MARKER, NON_CHINESE_DEGRADE_MARKER];
 

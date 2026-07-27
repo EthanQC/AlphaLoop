@@ -15,11 +15,40 @@
 // filesystem, env, or a db connection merely by being imported).
 import { parseConclusionBox } from "./conclusion-box.mjs";
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD } from "./stock-facts-store.mjs";
-import { NON_CHINESE_DEGRADE_MARKER, NUMERIC_DEGRADE_MARKER, REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
-import { ETF_INAPPLICABLE_REASONS, VALUATION_DISCLOSURE } from "./stock-analysis-metrics.mjs";
+import {
+  NARRATIVE_BULLET_PREFIX,
+  NON_CHINESE_DEGRADE_MARKER,
+  NUMERIC_DEGRADE_MARKER,
+  REPORT_DEGRADED_HEADER
+} from "./narrative-engine.mjs";
+import { ETF_INAPPLICABLE_REASONS, INSUFFICIENT_SAMPLE_PREFIX, VALUATION_DISCLOSURE } from "./stock-analysis-metrics.mjs";
 
 const GENERIC_NEWS_PATTERN = /媒体报道与.+相关的公司新闻/u;
 const LONG_ENGLISH_WORD_PATTERN = /(?:\b[A-Za-z][A-Za-z'-]{2,}\b[\s,.:;!?()/-]*){18,}/u;
+
+// The two headings under which a report renders EXTERNAL content (news items
+// the pipeline did not author) - "### 近期新闻" for stock-analysis,
+// "### 多源新闻…" for daily/weekly. Every gate below treats them two ways, and
+// only these two ways:
+//   - news gates read them (and read EVERY one of them - a batch renders one
+//     per symbol, see extractNewsLines);
+//   - evidence gates refuse to read them at all (see
+//     extractDeterministicEvidenceLines).
+// STOCK_NEWS_SECTION_TITLE is exported and IMPORTED BY THE RENDERER
+// (stock-analysis.mjs's renderBatchStockAnalysis) rather than typed twice, so
+// the heading the renderer emits and the heading these gates look for cannot
+// drift apart. It lives here, not there, because stock-analysis.mjs already
+// imports this file - the reverse edge would be circular (same reasoning as
+// stock-facts-store.mjs's CONFIDENCE_COVERAGE_CHECKPOINTS).
+export const STOCK_NEWS_SECTION_TITLE = "近期新闻";
+const MULTI_SOURCE_NEWS_SECTION_TITLE = "多源新闻";
+const NEWS_SECTION_HEADING_PATTERN = new RegExp(
+  `^(?:${STOCK_NEWS_SECTION_TITLE}|${MULTI_SOURCE_NEWS_SECTION_TITLE})`,
+  "u"
+);
+// Level 1-3 headings delimit a section; deeper ones (####) are content INSIDE
+// it, matching what the pre-2026-07-27 extractNewsLines loop did.
+const SECTION_HEADING_PATTERN = /^#{1,3}(?!#)\s+(.+)$/u;
 
 // Phase 4 Task 6 - era-compatibility rule (binding, see this task's live
 // check requirement): reports rendered by the OLD renderMarketIntelligence
@@ -236,18 +265,76 @@ function extractStockSymbolSections(markdown) {
 //   - "- 估值补充：<summarizeValuation.summary>"      (基本面分析)
 //   - "- 综合上行潜力：…；PE …；PB …；…"              (投资逻辑/基本面分析/结论)
 // Both are anchored at the START of the renderer's own bullet, exactly like
-// SOURCE_SUMMARY_LINE_PATTERN above, and neither can be forged from inside a
-// news bullet (renderDetailedNewsLine always opens with "- <时间> <代码>：").
-// Narrative prose is appended as separate "- 叙事：…" bullets, so the model can
-// neither satisfy nor break this gate by paraphrasing - the same structural
-// guarantee the additive-narrative fix restored for every other checkpoint.
+// SOURCE_SUMMARY_LINE_PATTERN above.
+//
+// 2026-07-27, SECOND adversarial pass (defect 3). The original argument for
+// line anchoring was "a news bullet cannot forge this, because
+// renderDetailedNewsLine always opens with '- <时间> <代码>：'". That holds per
+// LINE, but a news ITEM was not guaranteed to be one line: not every field it
+// interpolates funnels through report-news.mjs's singleLine (a feed-supplied
+// `titleZh`, a `publisher`), so external content carrying a line break emitted
+// a SECOND line - starting wherever the attacker chose, e.g.
+// "- 估值补充：PE 12.3；PB 4.5". Line anchoring then read it as first-party
+// evidence. Two independent fixes, both landed:
+//   1. renderDetailedNewsLine now collapses line breaks, so one item is one
+//      line again (the source of the problem);
+//   2. evidence extraction became STRUCTURAL rather than purely line-shaped -
+//      lines inside a news section, and lines the narrative layer authored
+//      ("- 叙事：…", NARRATIVE_BULLET_PREFIX imported from narrative-engine.mjs
+//      rather than re-typed), are not evidence no matter how they are shaped.
+// Either one alone closes the hole; together, a regression in one still leaves
+// the gate honest.
 const VALUATION_EVIDENCE_LINE_PATTERN = /^(?:-\s*)?(?:估值补充：|综合上行潜力：)/u;
 
+// Defect 1: the SAME treatment for the upside gate. "综合上行潜力" used to be
+// searched for (and "只看期权链" searched against) across the whole document.
+// With the narrative additive, a model sentence containing "只看期权链" blocked
+// every batch forever, while model prose that merely mentioned 综合上行潜力
+// could satisfy the positive half with no deterministic bullet behind it.
+const UPSIDE_EVIDENCE_LINE_PATTERN = /^(?:-\s*)?综合上行潜力：/u;
+// An upside verdict drawn from the option chain alone is not "综合" (combined)
+// - the renderer's own bullet always carries 目标价/PE/PB/趋势分 alongside it.
+const OPTIONS_ONLY_UPSIDE_PATTERN = /只看期权链|只看期权/u;
+
+// Every line of `text` that the RENDERER authored as first-party evidence:
+// outside any news section, and not a narrative bullet. Deliberately
+// structural - it does not care what the line says, only where it came from.
+function extractDeterministicEvidenceLines(text) {
+  const lines = [];
+  let inNewsSection = false;
+  for (const rawLine of String(text ?? "").split("\n")) {
+    const trimmed = rawLine.trim();
+    const heading = SECTION_HEADING_PATTERN.exec(trimmed);
+    if (heading) {
+      inNewsSection = NEWS_SECTION_HEADING_PATTERN.test(heading[1].trim());
+      continue;
+    }
+    if (inNewsSection) {
+      continue;
+    }
+    if (trimmed.startsWith(`- ${NARRATIVE_BULLET_PREFIX}`) || trimmed.startsWith(NARRATIVE_BULLET_PREFIX)) {
+      continue;
+    }
+    // Belt and braces for a news bullet rendered outside a news section (no
+    // current code path does this): a detailed news line always carries both
+    // of these labels, and no deterministic evidence bullet carries either.
+    if (/媒体：/u.test(trimmed) && /渠道：/u.test(trimmed)) {
+      continue;
+    }
+    lines.push(trimmed);
+  }
+  return lines;
+}
+
 function extractValuationEvidence(text) {
-  return String(text ?? "")
-    .split("\n")
-    .map((line) => line.trim())
+  return extractDeterministicEvidenceLines(text)
     .filter((line) => VALUATION_EVIDENCE_LINE_PATTERN.test(line))
+    .join("\n");
+}
+
+function extractUpsideEvidence(text) {
+  return extractDeterministicEvidenceLines(text)
+    .filter((line) => UPSIDE_EVIDENCE_LINE_PATTERN.test(line))
     .join("\n");
 }
 
@@ -331,6 +418,19 @@ function classifyValuationField(valuationEvidence, field) {
   return VALUATION_STATE.missing;
 }
 
+// A fixed-label moving average is accounted for either by the whole-history
+// disclosure (no rows at all) or, since 2026-07-27 (defect 5), by the
+// per-window "N 日 不可得（样本不足 N 日，实际仅 M 个交易日）" sentence
+// summarizeHistory/formatMovingAverage render when the sample is shorter than
+// the window. INSUFFICIENT_SAMPLE_PREFIX and VALUATION_DISCLOSURE are imported
+// from the renderer's own module, never re-typed here.
+function movingAverageDisclosedPattern(windowDays) {
+  return new RegExp(
+    `历史走势(?:读取失败|暂无可用数据)|${windowDays}\\s*日\\s*${VALUATION_DISCLOSURE.unavailable}（${INSUFFICIENT_SAMPLE_PREFIX}[^）]{4,}）`,
+    "u"
+  );
+}
+
 const FACTS_COVERAGE_DETECTORS = {
   "quote.last": {
     backed: /最新价格[:：]\s*(?!暂无)[0-9]/u,
@@ -357,11 +457,11 @@ const FACTS_COVERAGE_DETECTORS = {
   },
   "history.ma20": {
     backed: /均线[:：]\s*20\s*日\s*(?!暂无)[0-9]/u,
-    disclosed: /历史走势(?:读取失败|暂无可用数据)/u
+    disclosed: movingAverageDisclosedPattern(20)
   },
   "history.ma60": {
     backed: /60\s*日\s*(?!暂无)[0-9]/u,
-    disclosed: /历史走势(?:读取失败|暂无可用数据)/u
+    disclosed: movingAverageDisclosedPattern(60)
   },
   "options.callOi": {
     backed: /Call\s*未平仓约\s*(?!暂无)[0-9]/u,
@@ -400,31 +500,67 @@ export function validateStockAnalysisMarkdown(markdown) {
   if (!/^# OpenClaw 个股分析 \d{4}-\d{2}-\d{2}/u.test(text)) {
     failures.push("stock.title");
   }
-  // stock.valuation_depth: PE and PB must EACH be accounted for, judged only
-  // against the renderer's own valuation evidence (extractValuationEvidence).
-  // A field is accounted for when it carries a real number, or a disclosure
-  // that states WHY it is absent - structurally (ETF) or because no source
-  // returned it. Anything else (bare "暂无", a reason-less "不可得", or the
-  // field vanishing entirely, which is how a paraphrasing narrative layer used
-  // to break this) is a silent gap and still fails.
-  //
-  // 2026-07-27 review, defects 1+2: the previous form demanded a real PE AND a
-  // real PB, else a disclosed PE AND a disclosed PB - which (1) refused the
-  // whole-block "估值读取失败：…" disclosure the renderer actually emits when
-  // every valuation source is down, blocking the entire batch forever with no
-  // way to ship an honest report, (2) rejected the perfectly ordinary mixed
-  // state (real PE, disclosed PB), and (3) accepted the ETF's structural
-  // wording from an all-equity batch. Judging each field independently, with
-  // the structural branch scoped to the ETF reason, fixes all three without
-  // letting a single undisclosed gap through.
-  const valuationEvidence = extractValuationEvidence(text);
-  const valuationStates = [classifyValuationField(valuationEvidence, "pe"), classifyValuationField(valuationEvidence, "pb")];
-  if (valuationStates.includes(VALUATION_STATE.missing)) {
-    failures.push("stock.valuation_depth");
+  // Per-symbol scope. A batch renders one `## SYMBOL` section per target, and
+  // every gate below judges ONE symbol's own evidence - a healthy sibling's
+  // real PE must never cover another symbol's silent gap (2026-07-27 second
+  // pass, defect 4: valuation_depth used to pool evidence batch-wide while
+  // stock.facts_coverage was already per-symbol, so the two disagreed about
+  // what "covered" means). A document with no symbol headings at all (a legacy
+  // single-block report) is judged as one unnamed scope, exactly as before, so
+  // this can never become a way for a gate to silently stop running.
+  const symbolSections = extractStockSymbolSections(text);
+  const symbolScopes = symbolSections.length > 0 ? symbolSections : [{ symbol: null, section: text }];
+  for (const { symbol, section } of symbolScopes) {
+    const scopeSuffix = symbol ? `:${symbol}` : "";
+
+    // stock.valuation_depth: PE and PB must EACH be accounted for, judged only
+    // against the renderer's own valuation evidence (extractValuationEvidence).
+    // A field is accounted for when it carries a real number, or a disclosure
+    // that states WHY it is absent - structurally (ETF) or because no source
+    // returned it. Anything else (bare "暂无", a reason-less "不可得", or the
+    // field vanishing entirely, which is how a paraphrasing narrative layer
+    // used to break this) is a silent gap and still fails.
+    //
+    // 2026-07-27 review, defects 1+2: the previous form demanded a real PE AND
+    // a real PB, else a disclosed PE AND a disclosed PB - which (1) refused the
+    // whole-block "估值读取失败：…" disclosure the renderer actually emits when
+    // every valuation source is down, blocking the entire batch forever with no
+    // way to ship an honest report, (2) rejected the perfectly ordinary mixed
+    // state (real PE, disclosed PB), and (3) accepted the ETF's structural
+    // wording from an all-equity batch. Judging each field independently, with
+    // the structural branch scoped to the ETF reason, fixes all three without
+    // letting a single undisclosed gap through.
+    const valuationEvidence = extractValuationEvidence(section);
+    const valuationStates = [classifyValuationField(valuationEvidence, "pe"), classifyValuationField(valuationEvidence, "pb")];
+    if (valuationStates.includes(VALUATION_STATE.missing)) {
+      failures.push(`stock.valuation_depth${scopeSuffix}`);
+    }
+
+    // stock.upside_depth (defect 1): both halves read the renderer's own
+    // "综合上行潜力：…" bullet and nothing else. Narrative prose can no longer
+    // satisfy the positive half without a deterministic bullet behind it, nor
+    // block an entire batch by containing the four characters "只看期权链".
+    const upsideEvidence = extractUpsideEvidence(section);
+    if (upsideEvidence === "" || OPTIONS_ONLY_UPSIDE_PATTERN.test(upsideEvidence)) {
+      failures.push(`stock.upside_depth${scopeSuffix}`);
+    }
+
+    // News content gates (defect 2): a batch renders one 近期新闻 block PER
+    // symbol, and extractNewsLines used to stop after the first, so symbols
+    // 2..N shipped unchecked. These two judge the CONTENT of one symbol's own
+    // news, so they are evaluated per symbol; stock.news_source_diversity
+    // below stays batch-wide on purpose - the renderer's own degradation
+    // notice ("本批次未读取到…") is a statement about the batch.
+    const scopedNewsLines = symbol ? extractNewsLines(section) : newsLines;
+    const scopedNewsText = scopedNewsLines.join("\n");
+    if (GENERIC_NEWS_PATTERN.test(scopedNewsText)) {
+      failures.push(`stock.news_generic_summary${scopeSuffix}`);
+    }
+    if (/英文摘要已读取|事件细节待核对/u.test(scopedNewsText)) {
+      failures.push(`stock.news_translation${scopeSuffix}`);
+    }
   }
-  if (!/综合上行潜力/u.test(text) || /只看期权链|只看期权/u.test(text)) {
-    failures.push("stock.upside_depth");
-  }
+
   if (!/均线：20 日/u.test(text)) {
     failures.push("stock.trend_depth");
   }
@@ -447,12 +583,6 @@ export function validateStockAnalysisMarkdown(markdown) {
       failures.push("stock.news_source_diversity");
     }
   }
-  if (GENERIC_NEWS_PATTERN.test(newsLines.join("\n"))) {
-    failures.push("stock.news_generic_summary");
-  }
-  if (/英文摘要已读取|事件细节待核对/u.test(newsLines.join("\n"))) {
-    failures.push("stock.news_translation");
-  }
 
   // Phase 5 Task 4 (2026-07-15 plan) - new-format-only gates (see
   // isNewFormatStockReport above for the era-compatibility rule these are
@@ -460,7 +590,7 @@ export function validateStockAnalysisMarkdown(markdown) {
   // (extractStockSymbolSections) - a batch report can mix a well-formed
   // symbol with a corrupted one, and each symbol must be judged on its own.
   if (isNewFormatStockReport(text)) {
-    for (const { symbol, section } of extractStockSymbolSections(text)) {
+    for (const { symbol, section } of symbolSections) {
       // stock.conclusion_box: parseConclusionBox is the SAME parser Task 2's
       // prediction persistence and Task 5's platform summary card use (single
       // source, never re-parsed ad hoc here) - it already enforces "confidence
@@ -510,17 +640,26 @@ function normalizeText(value) {
 // news bullet with "- <time> <symbol>：..." first.
 const SOURCE_SUMMARY_LINE_PATTERN = /^-\s*(?:新闻来源分布|来源分布)：(.+?)(?:。|$)/u;
 
+// 2026-07-27 (second adversarial pass, defect 2): this used to find the FIRST
+// news heading and stop at the next heading. A stock-analysis batch renders one
+// "### 近期新闻" block PER SYMBOL (renderBatchStockAnalysis), so every news gate
+// - generic-summary, translation, detail depth, and the 媒体/渠道 labels
+// extractSourceLabels harvests - only ever inspected symbol #1, and symbols
+// 2..N shipped completely unchecked. Now EVERY news block in the document is
+// collected; callers that need one symbol's own news pass that symbol's
+// section text in (validateStockAnalysisMarkdown's per-symbol scope).
 function extractNewsLines(markdown) {
-  const lines = markdown.split("\n");
-  const start = lines.findIndex((line) => /^###\s+多源新闻|^###\s+近期新闻/u.test(line.trim()));
-  if (start === -1) {
-    return [];
-  }
   const collected = [];
-  for (const line of lines.slice(start + 1)) {
+  let inNewsSection = false;
+  for (const line of markdown.split("\n")) {
     const trimmed = line.trim();
-    if (/^#{2,3}\s+/u.test(trimmed)) {
-      break;
+    const heading = SECTION_HEADING_PATTERN.exec(trimmed);
+    if (heading) {
+      inNewsSection = NEWS_SECTION_HEADING_PATTERN.test(heading[1].trim());
+      continue;
+    }
+    if (!inNewsSection) {
+      continue;
     }
     if (SOURCE_SUMMARY_LINE_PATTERN.test(trimmed)) {
       // The report's own source-distribution summary bullet (stock-analysis

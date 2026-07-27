@@ -201,7 +201,19 @@ export function renderDetailedNewsLine(article, formatTime = defaultFormatTime) 
     `影响：${impact}`,
     normalized.url ? `链接：${normalized.url}` : `来源索引：${normalized.source}:${normalized.id}`
   ].filter(Boolean);
-  return `${pieces.join("；")}。`;
+  // 2026-07-27 (adversarial review, defect 3): ONE news item must render as
+  // exactly ONE line. Not every field funnels through singleLine (a caller- or
+  // feed-supplied `titleZh` is taken as-is, and `publisher`/`sourceName` are
+  // only trimmed at the ends), so a line break embedded in external content
+  // used to split one bullet into two - and the second half is attacker-shaped
+  // text sitting at the start of its own line. report-quality.mjs selects the
+  // renderer's own evidence LINE-WISE ("- 估值补充：…", "- 综合上行潜力：…"), so a
+  // forged second line was indistinguishable from first-party evidence and
+  // could satisfy a valuation gate that a genuinely silent gap must fail.
+  // Collapsing every line break in the assembled bullet closes that at the
+  // source; report-quality.mjs additionally refuses evidence found inside a
+  // news section (defense in depth, not a substitute for this).
+  return `${pieces.join("；")}。`.replace(/[\r\n\u2028\u2029]+/gu, " ");
 }
 
 function summarizeDetailedNewsPoint(article) {

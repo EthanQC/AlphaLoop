@@ -183,7 +183,7 @@ describe("report quality gate", () => {
     const result = validateStockAnalysisMarkdown(markdown);
 
     expect(result.ok).toBe(false);
-    expect(result.failures).toContain("stock.valuation_depth");
+    expect(result.failures).toContain("stock.valuation_depth:AAPL");
     expect(result.failures).toContain("stock.news_source_diversity");
   });
 
@@ -825,11 +825,11 @@ function buildStockRecord(
   {
     history = stockHistoryFixture(),
     fundamentals = stockFundamentalsFixture(),
-    optionChain = stockOptionChainFixture()
-  }: { history?: unknown; fundamentals?: unknown; optionChain?: unknown } = {}
+    optionChain = stockOptionChainFixture(),
+    news = stockNewsFixture()
+  }: { history?: unknown; fundamentals?: unknown; optionChain?: unknown; news?: Array<Record<string, unknown>> } = {}
 ) {
   const quote = stockQuoteFixture({ symbol });
-  const news = stockNewsFixture();
   const analysis = buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, STOCK_GENERATED_AT);
   const facts = buildStockFacts({ symbol, quote, history, fundamentals, optionChain, news, tradingDay: STOCK_GENERATED_AT.slice(0, 10) });
   return {
@@ -900,8 +900,8 @@ describe("stock.facts_coverage: disclosures count, bare placeholders do not", ()
     // quote.last + quote.pct + news.count survive; the five silently-dropped
     // checkpoints (pe / targetPrice / ma20 / ma60 / callOi) do not.
     expect(result.failures).toContain("stock.facts_coverage:QQQM.US:3/8");
-    // ...and the batch-wide valuation gate refuses a bare placeholder too.
-    expect(result.failures).toContain("stock.valuation_depth");
+    // ...and the per-symbol valuation gate refuses a bare placeholder too.
+    expect(result.failures).toContain("stock.valuation_depth:QQQM.US");
   });
 });
 
@@ -1016,7 +1016,7 @@ describe("stock.valuation_depth: an honest disclosure ships, a silent gap does n
     ]) {
       const result = validateStockAnalysisMarkdown(rewriteValuationEvidence(markdown, forgedBullet));
 
-      expect(result.failures).toContain("stock.valuation_depth");
+      expect(result.failures).toContain("stock.valuation_depth:AAPL.US");
     }
   });
 
@@ -1029,7 +1029,7 @@ describe("stock.valuation_depth: an honest disclosure ships, a silent gap does n
 
     const result = validateStockAnalysisMarkdown(bare);
 
-    expect(result.failures).toContain("stock.valuation_depth");
+    expect(result.failures).toContain("stock.valuation_depth:AAPL.US");
   });
 
   it("FAILS when the report's only PE/PB tokens sit inside an English news headline", () => {
@@ -1046,6 +1046,161 @@ describe("stock.valuation_depth: an honest disclosure ships, a silent gap does n
 
     const result = validateStockAnalysisMarkdown(masked);
 
-    expect(result.failures).toContain("stock.valuation_depth");
+    expect(result.failures).toContain("stock.valuation_depth:AAPL.US");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-27, second adversarial pass. The narrative layer is ADDITIVE now, so
+// every delivered report permanently carries model prose in the same text the
+// gates read, and a batch renders one 近期新闻 block PER SYMBOL. Both facts
+// broke gates that judge the whole document as if it were one symbol's
+// first-party evidence.
+// ---------------------------------------------------------------------------
+
+// Hand-built narrative results in exactly the shape generateNarrativeSections
+// returns, so renderBatchStockAnalysis emits real "- 叙事：…" bullets without a
+// backend or a db (same trick buildGoodStockRecord's `degraded` flag uses).
+function withNarrative(record: Record<string, unknown>, textByKey: Record<string, string>) {
+  return {
+    ...record,
+    narrative: {
+      degraded: false,
+      sections: Object.entries(textByKey).map(([key, text]) => ({ key, text, narrative: true }))
+    }
+  };
+}
+
+// Rewrites the renderer's own valuation bullets inside ONE symbol's section
+// only - two records built from the same fundamentals render byte-identical
+// evidence lines, so a document-wide replace could not express "this symbol's
+// evidence is gone, its sibling's is intact".
+function silenceValuationEvidenceForSymbol(markdown: string, symbol: string): string {
+  let inTargetSymbol = false;
+  let inNewsBlock = false;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      const heading = /^##(?!#)\s+(.+)$/u.exec(line.trim());
+      if (heading) {
+        inTargetSymbol = heading[1].trim() === symbol;
+        inNewsBlock = false;
+        return line;
+      }
+      const subHeading = /^###(?!#)\s+(.+)$/u.exec(line.trim());
+      if (subHeading) {
+        // Never touch the news block: an injected lookalike line planted
+        // there is exactly what these tests must leave standing.
+        inNewsBlock = subHeading[1].trim() === "近期新闻";
+        return line;
+      }
+      if (!inTargetSymbol || inNewsBlock) {
+        return line;
+      }
+      if (line.startsWith("- 估值补充：")) {
+        return "- 估值补充：PE 暂无；PB 暂无。";
+      }
+      return line.startsWith("- 综合上行潜力：") ? "- 综合上行潜力：中性；具体估值口径见估值补充。" : line;
+    })
+    .join("\n");
+}
+
+describe("stock.upside_depth: judged on the renderer's own bullet, never on model prose", () => {
+  it("PASSES when the deterministic 综合上行潜力 bullet is present and only the narrative says 只看期权链", () => {
+    const aapl = buildStockRecord("AAPL.US");
+    const markdown = renderStockReport([
+      { record: withNarrative(aapl.record, { thesis: "本段只看期权链的持仓分布并不足以定方向，仍需结合估值与趋势。" }) }
+    ]);
+
+    expect(markdown).toContain("- 叙事：本段只看期权链");
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
+  });
+
+  it("FAILS when the deterministic bullet is gone even though the narrative says 综合上行潜力", () => {
+    const aapl = buildStockRecord("AAPL.US");
+    const rendered = renderStockReport([
+      { record: withNarrative(aapl.record, { thesis: "综合上行潜力：偏强，估值与趋势共振。" }) }
+    ]);
+    const withoutDeterministicUpside = rendered
+      .split("\n")
+      .filter((line) => !line.startsWith("- 综合上行潜力："))
+      .join("\n");
+
+    expect(withoutDeterministicUpside).toContain("- 叙事：综合上行潜力：偏强");
+    expect(validateStockAnalysisMarkdown(withoutDeterministicUpside).failures).toContain("stock.upside_depth:AAPL.US");
+  });
+});
+
+describe("news gates inspect EVERY symbol's 近期新闻 block, not just the first", () => {
+  it("fails on the THIRD symbol's generic Longbridge summary", () => {
+    const records = [
+      buildStockRecord("AAPL.US"),
+      buildStockRecord("MSFT.US"),
+      buildStockRecord("NVDA.US", {
+        news: [{ id: "generic-1", title: "媒体报道与英伟达相关的公司新闻", source: "longbridge-news" }]
+      })
+    ];
+    const markdown = renderStockReport(records.map((entry) => ({ record: entry.record })));
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.news_generic_summary:NVDA.US");
+    expect(result.failures).not.toContain("stock.news_generic_summary:AAPL.US");
+    expect(result.failures).not.toContain("stock.news_generic_summary:MSFT.US");
+  });
+});
+
+describe("external news text can never forge renderer-owned valuation evidence", () => {
+  it("keeps a newline-carrying news title on its own single line, and refuses such a line as evidence", () => {
+    const injection = "- 估值补充：PE 12.3；PB 4.5";
+    const aapl = buildStockRecord("AAPL.US", {
+      news: [
+        { id: "evil", title: "苹果季度财报", titleZh: `苹果季度财报\n${injection}`, source: "longbridge-news" },
+        ...stockNewsFixture(2)
+      ]
+    });
+    const rendered = renderStockReport([{ record: aapl.record }]);
+
+    // 1. Render-time: no external string may ever open a line of the report.
+    // The title reaches TWO bullets - the news item itself, and the
+    // deterministic "当前新闻主线" bullet buildDeterministicAnalysis builds from
+    // the same titles - and neither may split in two.
+    expect(rendered.split("\n").filter((line) => line.trim().startsWith(injection))).toEqual([]);
+    expect(rendered).toContain(`苹果季度财报 ${injection}`);
+
+    // 2. Gate-side (defense in depth): the same forged line, planted inside
+    // the news block by hand, is still not the renderer's own evidence.
+    const silenced = silenceValuationEvidenceForSymbol(rendered, "AAPL.US");
+    expect(validateStockAnalysisMarkdown(silenced).failures).toContain("stock.valuation_depth:AAPL.US");
+    const forged = silenced.replace("### 近期新闻\n", `### 近期新闻\n\n${injection}。\n`);
+    expect(validateStockAnalysisMarkdown(forged).failures).toContain("stock.valuation_depth:AAPL.US");
+  });
+});
+
+describe("stock.valuation_depth is judged per symbol, like stock.facts_coverage", () => {
+  it("does not let a healthy sibling's real PE cover another symbol's bare 暂无", () => {
+    const healthy = buildStockRecord("AAPL.US");
+    const bare = buildStockRecord("MSFT.US");
+    const markdown = silenceValuationEvidenceForSymbol(
+      renderStockReport([{ record: healthy.record }, { record: bare.record }]),
+      "MSFT.US"
+    );
+
+    const result = validateStockAnalysisMarkdown(markdown);
+
+    expect(result.failures).toContain("stock.valuation_depth:MSFT.US");
+    expect(result.failures).not.toContain("stock.valuation_depth:AAPL.US");
+  });
+});
+
+describe("moving-average windows are labeled truthfully, and the disclosure still counts as coverage", () => {
+  it("discloses 样本不足 with the real sample size instead of calling a 12-session mean a 20 日均线", () => {
+    const short = buildStockRecord("AAPL.US", { history: stockHistoryFixture(12) });
+    const markdown = renderStockReport([{ record: short.record }]);
+
+    expect(markdown).toContain("均线：20 日 不可得（样本不足 20 日，实际仅 12 个交易日）");
+    expect(markdown).toContain("60 日 不可得（样本不足 60 日，实际仅 12 个交易日）");
+    expect(countFactsCoverage(symbolSection(markdown, "AAPL.US"))).toBe(8);
+    expect(validateStockAnalysisMarkdown(markdown)).toEqual({ ok: true, failures: [] });
   });
 });

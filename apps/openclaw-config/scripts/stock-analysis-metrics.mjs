@@ -284,6 +284,30 @@ export const VALUATION_DISCLOSURE = {
   unavailable: "不可得"
 };
 
+// 2026-07-27 (second adversarial pass, defect 5): the honest wording for "this
+// metric needs an N-session window and the sample is shorter than that". Same
+// contract as every disclosure above - a stated reason, never a placeholder,
+// and never a shorter mean published under a longer window's label. Exported
+// because report-quality.mjs's facts-coverage detector for history.ma20/ma60
+// is built from this exact literal instead of a hand-typed copy.
+// Deliberately parenthesis-free: the detectors wrap a disclosure reason in
+// "（…）" and match it with `[^）]+`, which a nested full-width pair breaks.
+export const INSUFFICIENT_SAMPLE_PREFIX = "样本不足";
+
+export function insufficientSampleReason(windowDays, sampleDays) {
+  return `${INSUFFICIENT_SAMPLE_PREFIX} ${windowDays} 日，实际仅 ${sampleDays} 个交易日`;
+}
+
+// 2026-07-27 (second adversarial pass, defect 6): `目标价隐含空间` needs BOTH a
+// one-year target and a usable current price, so it can be unavailable for
+// three unrelated reasons. Naming the true one is the difference between "the
+// valuation sources are down" and "the quote had no price" for whoever reads
+// the report next.
+export const TARGET_UPSIDE_UNAVAILABLE_REASONS = {
+  missingPrice: "已取到一年目标价，但行情未返回可用现价，无法计算隐含空间",
+  invalidPrice: "已取到一年目标价，但行情返回的现价不是正数，无法计算隐含空间"
+};
+
 // Renders an EXPLICIT "<不适用|不可得>（原因）" - never a bare "暂无", which
 // report-quality.mjs's detectors deliberately refuse to count as a disclosure
 // (a placeholder with no stated reason is a silent gap).
@@ -464,9 +488,22 @@ export function summarizeUpsidePotential({ lastPrice, valuation, historyStats, o
   const trendUnavailableReason = historyStats?.available === false
     ? String(historyStats.summary ?? "历史走势不可用（原因未记录）").replace(/。$/u, "")
     : null;
+  // Defect 6: only the "no target came back" case is the valuation source's
+  // fault. When the target IS here and the PRICE is what's missing (or is not
+  // a positive number), say so - blaming the valuation source there sends the
+  // reader to the wrong bullet, and the ETF sentence would be plainly false.
+  const targetUpsideDisclosure = () => {
+    if (target === undefined) {
+      return disclose("targetPrice");
+    }
+    const reason = price === undefined
+      ? TARGET_UPSIDE_UNAVAILABLE_REASONS.missingPrice
+      : TARGET_UPSIDE_UNAVAILABLE_REASONS.invalidPrice;
+    return `${VALUATION_DISCLOSURE.unavailable}（${reason}）`;
+  };
   const details = [
     targetUpside === undefined
-      ? `目标价隐含空间 ${disclose("targetPrice")}`
+      ? `目标价隐含空间 ${targetUpsideDisclosure()}`
       : `目标价隐含空间 ${formatPercent(targetUpside)}`,
     `PE ${pe === undefined ? disclose("pe") : formatNumber(pe)}`,
     `PB ${pb === undefined ? disclose("pb") : formatNumber(pb)}`,
@@ -543,7 +580,9 @@ export function summarizeHistory(history, currentPrice) {
       ma20: undefined,
       ma60: undefined,
       ma180: undefined,
-      longWindowDays: undefined
+      longWindowDays: undefined,
+      sampleDays: 0,
+      movingAverageDisclosures: {}
     };
   }
 
@@ -551,9 +590,24 @@ export function summarizeHistory(history, currentPrice) {
   const first = closes[0];
   const lastClose = currentPrice ?? closes.at(-1);
   const sixMonthReturn = first && lastClose ? ((lastClose - first) / first) * 100 : undefined;
-  const ma20 = average(closes.slice(-20));
-  const ma60 = average(closes.slice(-60));
-  const longWindowDays = Math.min(closes.length, 180);
+  // 2026-07-27 (second adversarial pass, defect 5): `closes.slice(-20)` on a
+  // 12-element array is the WHOLE array, so a 12-session mean used to be
+  // published as "20 日均线" - the identical mislabeling this file's own header
+  // comment (see summarizeHistory's block above) documents and fixed for the
+  // 180-day average. Same treatment, opposite direction: the long window is
+  // labeled with the sessions it really had (`longWindowDays`), while the two
+  // FIXED-label windows below refuse to compute at all when the sample is
+  // short, and disclose the real count instead. Both are honest; only these
+  // two carry a hard-coded "20 日"/"60 日" label in the rendered text, which is
+  // what makes a shortened sample a lie rather than a narrower window.
+  const sampleDays = closes.length;
+  const ma20 = sampleDays >= 20 ? average(closes.slice(-20)) : undefined;
+  const ma60 = sampleDays >= 60 ? average(closes.slice(-60)) : undefined;
+  const movingAverageDisclosures = {
+    ma20: sampleDays >= 20 ? undefined : insufficientSampleReason(20, sampleDays),
+    ma60: sampleDays >= 60 ? undefined : insufficientSampleReason(60, sampleDays)
+  };
+  const longWindowDays = Math.min(sampleDays, 180);
   const ma180 = average(closes.slice(-longWindowDays));
   const recent = closes.slice(-20);
   const support = recent.length ? Math.min(...recent) : undefined;
@@ -561,9 +615,13 @@ export function summarizeHistory(history, currentPrice) {
   const vsMa180 = lastClose !== undefined && ma180 !== undefined && ma180 > 0
     ? ((lastClose - ma180) / ma180) * 100
     : undefined;
+  // An UNKNOWN moving average is not a bearish one: with ma20/ma60 now
+  // deliberately undefined for a short sample, the old `? 4 : -2` / `? 3 : -1`
+  // shape would have scored "we could not compute this" as a downtrend. A leg
+  // that cannot be evaluated contributes 0.
   const trendScore = [
-    ma20 !== undefined && lastClose !== undefined && lastClose > ma20 ? 4 : -2,
-    ma60 !== undefined && lastClose !== undefined && lastClose > ma60 ? 3 : -1,
+    ma20 === undefined || lastClose === undefined ? 0 : lastClose > ma20 ? 4 : -2,
+    ma60 === undefined || lastClose === undefined ? 0 : lastClose > ma60 ? 3 : -1,
     sixMonthReturn !== undefined ? Math.max(-5, Math.min(5, sixMonthReturn / 8)) : 0
   ].reduce((sum, value) => sum + value, 0);
 
@@ -583,8 +641,23 @@ export function summarizeHistory(history, currentPrice) {
     ma20,
     ma60,
     ma180,
-    longWindowDays
+    longWindowDays,
+    sampleDays,
+    movingAverageDisclosures
   };
+}
+
+// The rendered value for a fixed-label moving average: the number when the
+// full window really exists, otherwise the reason it does not (defect 5).
+// A caller-built historyStats with no `movingAverageDisclosures` (every
+// pre-2026-07-27 test/fixture) keeps the previous formatting exactly.
+export function formatMovingAverage(historyStats, key) {
+  const value = historyStats?.[key];
+  if (Number.isFinite(Number(value))) {
+    return formatNumber(value);
+  }
+  const reason = historyStats?.movingAverageDisclosures?.[key];
+  return reason ? `${VALUATION_DISCLOSURE.unavailable}（${reason}）` : formatNumber(value);
 }
 
 function average(values) {

@@ -96,6 +96,43 @@ describe("stock analysis metrics", () => {
       expect(summary).not.toContain("不可得");
     });
 
+    // 2026-07-27, second adversarial pass: `targetUpside` is undefined for
+    // three distinct causes (no target, no/invalid price, ETF), and the
+    // disclosure used to blame the valuation source for all of them.
+    it("names the missing PRICE - not a missing valuation field - when the target exists but the quote carries no price", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: undefined,
+        valuation: { sources: ["nasdaq-summary"], failures: [], oneYearTarget: 340, trailingPE: 24, priceToBook: 5 },
+        historyStats: { ma20: 290, ma60: 275, trendScore: 1, available: true },
+        optionStats: { summary: "期权链只读补充。" }
+      });
+
+      expect(summary).toContain("目标价隐含空间 不可得（已取到一年目标价，但行情未返回可用现价，无法计算隐含空间）");
+      expect(summary).not.toContain("目标价隐含空间 不可得（估值来源未返回该字段");
+    });
+
+    it("names a non-positive price explicitly rather than calling the field unreturned", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: 0,
+        valuation: { sources: ["nasdaq-summary"], failures: [], oneYearTarget: 340 },
+        historyStats: { ma20: 290, ma60: 275, trendScore: 1, available: true },
+        optionStats: { summary: "期权链只读补充。" }
+      });
+
+      expect(summary).toContain("目标价隐含空间 不可得（已取到一年目标价，但行情返回的现价不是正数，无法计算隐含空间）");
+    });
+
+    it("keeps blaming the valuation source only when the TARGET itself is the missing piece", () => {
+      const summary = metrics.summarizeUpsidePotential({
+        lastPrice: 295,
+        valuation: { sources: ["nasdaq-summary"], failures: [], trailingPE: 24, priceToBook: 5 },
+        historyStats: { ma20: 290, ma60: 275, trendScore: 1, available: true },
+        optionStats: { summary: "期权链只读补充。" }
+      });
+
+      expect(summary).toContain("目标价隐含空间 不可得（估值来源未返回该字段，原因见估值补充）");
+    });
+
     it("still prints a real trend score of exactly 0 when history WAS available", () => {
       const summary = metrics.summarizeUpsidePotential({
         lastPrice: 295,
@@ -146,6 +183,31 @@ describe("stock analysis metrics", () => {
 
       const empty = metrics.summarizeHistory([], 100);
       expect(empty.longWindowDays).toBeUndefined();
+    });
+
+    // 2026-07-27, second adversarial pass: closes.slice(-20)/slice(-60) return
+    // the WHOLE array when the sample is shorter than the window, so a
+    // 12-session mean used to be published under a "20 日" label - the exact
+    // mislabeling this file's own header comment documents (and fixed) for the
+    // 180-day average.
+    it("never passes a short sample off as a full 20/60-day average - it discloses the real sample size", () => {
+      const result = metrics.summarizeHistory(closes(12), 205);
+
+      expect(result.sampleDays).toBe(12);
+      expect(result.ma20).toBeUndefined();
+      expect(result.ma60).toBeUndefined();
+      expect(result.movingAverageDisclosures.ma20).toBe("样本不足 20 日，实际仅 12 个交易日");
+      expect(result.movingAverageDisclosures.ma60).toBe("样本不足 60 日，实际仅 12 个交易日");
+      // The long window keeps its existing, already-truthful label.
+      expect(result.longWindowDays).toBe(12);
+      expect(result.ma180).toEqual(expect.any(Number));
+    });
+
+    it("carries no moving-average disclosure once the full window is really available", () => {
+      const result = metrics.summarizeHistory(closes(60), 205);
+
+      expect(result.movingAverageDisclosures.ma20).toBeUndefined();
+      expect(result.movingAverageDisclosures.ma60).toBeUndefined();
     });
 
     it("computes ma20/ma60 as plain trailing averages of the closes", () => {

@@ -95,6 +95,19 @@ export const NON_CHINESE_DEGRADE_MARKER = "（叙事降级：后端输出非中�
 // the exact string" convention.
 export const REPORT_DEGRADED_HEADER = "叙事引擎不可用（纯事实表报告）";
 
+// Label every rendered bullet the narrative layer authored. Two jobs at once:
+// a reader can tell first-party evidence from model prose, and every gate that
+// must judge ONLY first-party evidence can skip these lines structurally.
+//
+// 2026-07-27 (adversarial review, defect 1): it lives here rather than in
+// stock-analysis.mjs (its original home, which still re-exports it) because
+// BOTH the renderer and report-quality.mjs need the literal, and
+// report-quality.mjs cannot import stock-analysis.mjs - that file already
+// imports report-quality.mjs, so the dependency would be circular. Same
+// single-source-without-a-cycle reasoning as stock-facts-store.mjs's
+// CONFIDENCE_COVERAGE_CHECKPOINTS.
+export const NARRATIVE_BULLET_PREFIX = "叙事：";
+
 // ---------------------------------------------------------------------------
 // CJK ratio check
 // ---------------------------------------------------------------------------
