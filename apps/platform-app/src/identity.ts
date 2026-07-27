@@ -10,6 +10,8 @@ import {
   verifyAccessToken,
   type JwksFetcher
 } from "./access-jwt.js";
+import { renderLoginPage } from "./render/login-page.js";
+import { resolveSessionMemberId } from "./session.js";
 
 /**
  * The minimal shape resolveIdentity needs from an incoming request. A real
@@ -39,7 +41,15 @@ const LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
  *      already enforces `revoked_at IS NULL` (token not revoked) AND
  *      `members.status = 'active'` (owning member still active) in one
  *      query - see database.ts.
- *   2. Else `Cf-Access-Authenticated-User-Email` -> MemberRepository
+ *   2. Else the `alphaloop_session` cookie -> session.ts's
+ *      resolveSessionMemberId (HMAC signature + expiry, both verified there)
+ *      -> MemberRepository.getById. This is the browser path added on
+ *      2026-07-27 when it became final that Cloudflare Access would never be
+ *      activated (see routes/login.ts). The cookie carries only a member id
+ *      and an expiry, so the member row is re-read on EVERY request and must
+ *      still be `status = 'active'` - revoking a member therefore kills their
+ *      outstanding sessions immediately, without a session table.
+ *   3. Else `Cf-Access-Authenticated-User-Email` -> MemberRepository
  *      .getByEmail. This header is ONLY trusted after verifyAccessJwt passes:
  *      in ENFORCE mode that means a cryptographically-verified
  *      `Cf-Access-Jwt-Assertion` whose email claim matches the header; the
@@ -49,13 +59,18 @@ const LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
  *      getByEmail does NOT filter by status (it's a plain lookup used
  *      elsewhere for that reason), so this function enforces
  *      `status === 'active'` itself here.
- *   3. Else -> null (caller renders renderUnauthorizedPage).
+ *   4. Else -> null (caller renders renderUnauthorizedPage, which since
+ *      2026-07-27 IS the login page - see renderUnauthorizedPage below).
  *
- * Bearer is checked first and wins if both are present - see the plan's
- * Global Constraints ("身份解析链...bearer 优先").
+ * Bearer is checked first and wins if several are present - see the plan's
+ * Global Constraints ("身份解析链...bearer 优先"). The session cookie slots in
+ * AFTER bearer and BEFORE the Access header; adding it changed nothing about
+ * the other two paths, and in particular did NOT loosen the Access path's
+ * fail-closed default.
  */
 export function resolveIdentity(req: IdentityRequest, db: DatabaseSync): Member | null {
-  const member = resolveViaBearerToken(req, db) ?? resolveViaAccessEmailHeader(req, db);
+  const member =
+    resolveViaBearerToken(req, db) ?? resolveViaSessionCookie(req, db) ?? resolveViaAccessEmailHeader(req, db);
   if (!member) {
     return null;
   }
@@ -116,6 +131,31 @@ function resolveViaBearerToken(req: IdentityRequest, db: DatabaseSync): Member |
   }
 
   return new ApiTokenRepository(db).verify(token);
+}
+
+/**
+ * The browser path (2026-07-27): a signed `alphaloop_session` cookie issued by
+ * routes/login.ts after a Feishu-delivered code was verified.
+ *
+ * session.ts owns the crypto (HMAC-SHA256 over `member id + expiry`,
+ * constant-time signature compare, expiry check, and a hard fail when
+ * PLATFORM_SESSION_SECRET is unset). This function owns the AUTHORIZATION half
+ * that must not live in a cookie: the member row is re-read here on every
+ * request, and a member who has since been revoked (or deleted) resolves to
+ * null even while holding a perfectly valid, unexpired cookie.
+ */
+function resolveViaSessionCookie(req: IdentityRequest, db: DatabaseSync): Member | null {
+  const memberId = resolveSessionMemberId(req);
+  if (!memberId) {
+    return null;
+  }
+
+  const member = new MemberRepository(db).getById(memberId);
+  if (!member || member.status !== "active") {
+    return null;
+  }
+
+  return member;
 }
 
 function resolveViaAccessEmailHeader(req: IdentityRequest, db: DatabaseSync): Member | null {
@@ -346,72 +386,31 @@ export function verifyAccessJwt(req: IdentityRequest): boolean {
   return identity.email.trim().toLowerCase() === headerEmail.toLowerCase();
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/gu, "&amp;")
-    .replace(/</gu, "&lt;")
-    .replace(/>/gu, "&gt;")
-    .replace(/"/gu, "&quot;")
-    .replace(/'/gu, "&#39;");
-}
-
 /**
- * Renders the 401 page shown when resolveIdentity returns null. This is
- * intentionally minimal/self-contained for Task 2 - the full site chrome
- * (sidenav, theme tokens, etc.) lands in Task 3's layout engine. It still
- * follows the platform-wide CSP contract: no external requests (no
- * `<script src>`/`<link>`/http(s) URLs), styling is inline-only (allowed by
- * `style-src 'unsafe-inline'`), and the per-request nonce is threaded
- * through (as a `<meta>` tag, since this page has no inline `<script>` to
- * attach it to yet) so callers already have a stable place to read it from
- * once later tasks add one.
+ * Renders the 401 body every identity-gated HTML route sends when
+ * resolveIdentity returns null.
+ *
+ * SINCE 2026-07-27 THIS IS THE LOGIN PAGE. It used to be a dead-end "401
+ * 未获授权" card, which was the honest answer while Cloudflare Access was
+ * expected to do the authenticating for us - the browser would simply never
+ * reach it. Access never happened, so the dead end had to become a door: the
+ * same render/login-page.ts screen the `/login` route serves, carrying the
+ * unchanged 未获授权 sentence as its banner. The STATUS is still 401 (the
+ * request really was unauthenticated, and no route's status behavior changed);
+ * only the body gained a way forward, which also means a member landing on a
+ * deep link can log in from the page they asked for instead of hunting for
+ * `/login`.
+ *
+ * The CSP contract is unchanged and stricter if anything: no external requests
+ * (no `<script src>`/`<link>`/http(s) URL), styles inline only (allowed by
+ * `style-src 'unsafe-inline'`), and no inline `<script>` at all - the nonce is
+ * still threaded through as a `<meta>` tag for callers that read it.
  */
 export function renderUnauthorizedPage(nonce: string): string {
-  const safeNonce = escapeHtml(nonce);
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csp-nonce" content="${safeNonce}">
-<title>未获授权 - AlphaLoop</title>
-<style>
-  body {
-    margin: 0;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #0b0f14;
-    color: #e6edf3;
-    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-  }
-  .card {
-    max-width: 32rem;
-    margin: 1rem;
-    padding: 2rem;
-    border-radius: 0.75rem;
-    background: #131a21;
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
-    text-align: center;
-  }
-  h1 {
-    margin: 0 0 0.75rem;
-    font-size: 1.25rem;
-  }
-  p {
-    margin: 0;
-    line-height: 1.6;
-    color: #9aa7b2;
-  }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>401 未获授权</h1>
-    <p>未获授权：请通过圈内白名单邮箱登录，或联系圈主开通成员。</p>
-  </div>
-</body>
-</html>
-`;
+  return renderLoginPage({
+    nonce,
+    step: "email",
+    heading: "未获授权",
+    error: "未获授权：请通过圈内白名单邮箱登录，或联系圈主开通成员。"
+  });
 }

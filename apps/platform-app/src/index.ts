@@ -15,9 +15,18 @@ import {
   createResearchWorker
 } from "./research/worker.js";
 import { createPlatformServer } from "./server.js";
+import { assertSessionSecretConfigured } from "./session.js";
 
 const repoRoot = resolveRepoRoot(process.cwd());
 loadLocalEnv(repoRoot);
+
+// Email-code login (2026-07-27, routes/login.ts): the session cookie is
+// worthless unless it is signed with a real secret, and there is deliberately
+// no default to fall back on - so refuse to serve at all rather than boot a
+// login nobody can complete (or, worse, one signed with something guessable).
+// Must run AFTER loadLocalEnv (that is what puts .env.local into process.env)
+// and BEFORE the server is built.
+assertSessionSecretConfigured();
 // PLATFORM_DB_PATH mirrors stock-analysis.mjs's STOCK_ANALYSIS_DB_PATH and
 // members.mjs's MEMBERS_DB_PATH: unset (and a no-op) in normal operation,
 // where the real runtime/trading.sqlite is used; lets a live/manual

@@ -107,3 +107,21 @@ node apps/openclaw-config/scripts/members.mjs revoke --member <memberId>
 - `PLATFORM_DB_PATH`：覆盖 platform-app 进程（`apps/platform-app/src/index.ts`）使用的交易数据库路径。
 - `MEMBERS_DB_PATH`：覆盖 `members.mjs` CLI 使用的交易数据库路径（与 `PLATFORM_DB_PATH` 是两个独立变量，命名不同但通常指向同一个库文件）。
 - `PLATFORM_APP_PORT`：覆盖 platform-app 监听端口，默认 `4314`。
+
+## 浏览器登录（邮箱验证码 + 飞书）
+
+Cloudflare Access 未启用（Zero Trust 需要付款方式），因此 `Cf-Access-Authenticated-User-Email`
+这条身份链路在生产环境永久 fail-closed。浏览器改走自建的邮箱验证码登录：
+
+1. 未登录访问任意页面 → 401，页面本身就是登录表单（也可直接访问 `/login`）。
+2. 输入圈内邮箱 → 无论邮箱是否在册都返回同一句「验证码已发送」（防成员枚举）；
+   只有「active 且已配置 `feishu_open_id`」的成员才真的会收到卡片。
+3. 6 位验证码通过成员本人的飞书私聊下发，10 分钟有效、一次性、最多 5 次错误尝试。
+4. 验证通过后下发签名会话 Cookie（`alphaloop_session`，HttpOnly / Secure / SameSite=Lax，30 天）。
+5. `/logout` 清除 Cookie。撤销成员（`members.mjs revoke`）会立即使其已签发的 Cookie 失效。
+
+限流：同一邮箱 15 分钟内最多 3 条、两条之间至少间隔 60 秒；同一 IP 15 分钟内最多 10 条。
+被限流时返回的仍是同一句「验证码已发送」。
+
+- `PLATFORM_SESSION_SECRET`：**必填**，会话 Cookie 的签名密钥。未设置时进程直接拒绝启动
+  （没有任何默认值）。生成方式：`openssl rand -base64 48`。轮换该值会立即失效所有会话。

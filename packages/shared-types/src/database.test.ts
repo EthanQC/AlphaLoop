@@ -14,6 +14,12 @@ import {
   OfficialPaperOrderLifecycleRepository,
   ResearchTaskRepository,
   MonthlyReviewRepository,
+  LoginCodeRepository,
+  LoginThrottleRepository,
+  LOGIN_CODE_MAX_ATTEMPTS,
+  buildLoginCodeHash,
+  generateLoginCode,
+  loginCodeHashMatches,
   openTradingDatabase,
   usEasternTradingDayUtcRange
 } from "./database.js";
@@ -923,6 +929,8 @@ function buildSeededV7Database(): DatabaseSync {
   migrate(db); // builds the full v0..v14 schema using the real migration code
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS login_codes;
+    DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
@@ -1200,6 +1208,8 @@ function buildSeededV8Database(): DatabaseSync {
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS login_codes;
+    DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
@@ -1339,6 +1349,8 @@ function buildSeededV9Database(): DatabaseSync {
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS login_codes;
+    DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
     DROP TABLE IF EXISTS strategy_cards;
     DROP TABLE IF EXISTS circuit_breaker_state;
@@ -2042,7 +2054,7 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
     const db = buildSeededV9Database();
     migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
     stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-    db.exec(`DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables - see buildSeededV7/V8/V9Database's identical technique
+    db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables - see buildSeededV7/V8/V9Database's identical technique
     db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
     seedMember(db, "mem_v10");
     db.prepare(`
@@ -2095,7 +2107,7 @@ function buildSeededV11Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-  db.exec(`DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables
+  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables
 
   db.exec("PRAGMA foreign_keys = OFF;");
   db.exec(`
@@ -2149,7 +2161,7 @@ function buildSeededV12Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db);
-  db.exec(`DROP TABLE IF EXISTS monthly_reviews;`); // peel off v14's own new table - see buildSeededV7/V8/V9Database's identical technique
+  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`); // peel off v14's own new table - see buildSeededV7/V8/V9Database's identical technique
 
   // buildSeededV9Database() drops circuit_breaker_state before resetting its
   // own user_version - the migrate(db) call above recreates it (v10's step)
@@ -2184,7 +2196,7 @@ function buildSeededV12Database(): DatabaseSync {
 function buildSeededV13Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10..v14
-  db.exec(`DROP TABLE IF EXISTS monthly_reviews;`);
+  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`);
 
   // buildSeededV9Database() drops circuit_breaker_state before resetting its
   // own user_version - the migrate(db) call above recreates it (v10's step)
@@ -3227,8 +3239,11 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
 });
 
 describe("v14 monthly_reviews migration (Phase 9 Task 1, 2026-07-16 plan)", () => {
-  it("SCHEMA_VERSION is 14", () => {
-    expect(SCHEMA_VERSION).toBe(14);
+  // SCHEMA_VERSION has since moved on to v15 (email-code login) - the exact
+  // current-version assertion lives in that block, the same way every earlier
+  // block here was relaxed when a later phase moved past it.
+  it("SCHEMA_VERSION is at least 14", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(14);
   });
 
   it("a fresh db lands at v14 with monthly_reviews present (columns/CHECK/UNIQUE/index per the plan's frozen DDL)", () => {
@@ -3500,5 +3515,316 @@ describe("MonthlyReviewRepository (Phase 9 Task 1, 2026-07-16 plan)", () => {
       expect(repo.getById("monthly_review_nope")).toBeNull();
       expect(repo.getByOwnerPeriod("mem_owner", "2026-07")).toBeNull();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v15: email-code login (2026-07-27)
+// ---------------------------------------------------------------------------
+
+describe("v15 login_codes + login_send_log migration (self-hosted email-code login)", () => {
+  it("SCHEMA_VERSION is 15", () => {
+    expect(SCHEMA_VERSION).toBe(15);
+  });
+
+  it("a fresh db lands at v15 with both tables and their indexes present", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+      .map((t) => t.name);
+    expect(tables).toContain("login_codes");
+    expect(tables).toContain("login_send_log");
+
+    const codeColumns = db.prepare("PRAGMA table_info(login_codes)").all() as Array<{ name: string; notnull: number }>;
+    const byName = Object.fromEntries(codeColumns.map((c) => [c.name, c]));
+    expect(byName.id).toBeDefined();
+    expect(byName.member_id?.notnull).toBe(1);
+    expect(byName.code_hash?.notnull).toBe(1);
+    expect(byName.expires_at?.notnull).toBe(1);
+    expect(byName.attempts?.notnull).toBe(1);
+    expect(byName.consumed_at?.notnull).toBe(0);
+    expect(byName.invalidated_at?.notnull).toBe(0);
+    expect(byName.created_at?.notnull).toBe(1);
+
+    const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+      .map((i) => i.name);
+    expect(indexes).toContain("login_codes_member_idx");
+    expect(indexes).toContain("login_send_log_scope_key_idx");
+  });
+
+  it("is idempotent", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("upgrades a populated v14 database in place, keeping its rows", () => {
+    // The real deployment path: runtime/trading.sqlite is at v14 with live
+    // member rows. Build that shape by migrating to the current version, then
+    // winding user_version back to 14 after dropping the v15 tables - i.e. a
+    // genuine "everything v14 had, nothing v15 adds" database.
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v15_legacy");
+    db.exec("DROP TABLE login_codes; DROP TABLE login_send_log; PRAGMA user_version = 14;");
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(15);
+    expect(new MemberRepository(db).getById("mem_v15_legacy")).not.toBeNull();
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+      .map((t) => t.name);
+    expect(tables).toContain("login_codes");
+    expect(tables).toContain("login_send_log");
+  });
+
+  it("login_codes.member_id must reference a real member (FK)", () => {
+    const db = memoryDb();
+    migrate(db);
+    expect(() =>
+      db
+        .prepare(`
+          INSERT INTO login_codes (id, member_id, code_hash, expires_at, attempts, created_at)
+          VALUES ('lc_ghost', 'ghost_member', 'scrypt:x:y', ?, 0, ?)
+        `)
+        .run(nowIso(), nowIso())
+    ).toThrow(/FOREIGN KEY constraint failed/);
+  });
+
+  it("login_send_log.scope CHECK rejects anything but 'email'/'ip'", () => {
+    const db = memoryDb();
+    migrate(db);
+    expect(() =>
+      db
+        .prepare(`INSERT INTO login_send_log (id, scope, key_hash, created_at) VALUES ('ls_bad', 'sms', 'h', ?)`)
+        .run(nowIso())
+    ).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      db
+        .prepare(`INSERT INTO login_send_log (id, scope, key_hash, created_at) VALUES ('ls_ok', 'email', 'h', ?)`)
+        .run(nowIso())
+    ).not.toThrow();
+  });
+});
+
+describe("generateLoginCode", () => {
+  it("always returns exactly 6 digits", () => {
+    for (let i = 0; i < 200; i += 1) {
+      expect(generateLoginCode()).toMatch(/^\d{6}$/u);
+    }
+  });
+
+  it("is not a constant (200 draws produce more than a handful of distinct values)", () => {
+    const seen = new Set<string>();
+    for (let i = 0; i < 200; i += 1) {
+      seen.add(generateLoginCode());
+    }
+    expect(seen.size).toBeGreaterThan(150);
+  });
+});
+
+describe("login code hashing", () => {
+  it("never stores anything resembling the plaintext code", () => {
+    const hash = buildLoginCodeHash("123456");
+    expect(hash).not.toContain("123456");
+    expect(hash.startsWith("scrypt:")).toBe(true);
+  });
+
+  it("salts per call: the same code hashes differently every time, and both verify", () => {
+    const a = buildLoginCodeHash("123456");
+    const b = buildLoginCodeHash("123456");
+    expect(a).not.toBe(b);
+    expect(loginCodeHashMatches(a, "123456")).toBe(true);
+    expect(loginCodeHashMatches(b, "123456")).toBe(true);
+  });
+
+  it("rejects the wrong code and malformed/foreign hash formats without throwing", () => {
+    const hash = buildLoginCodeHash("123456");
+    expect(loginCodeHashMatches(hash, "654321")).toBe(false);
+    expect(loginCodeHashMatches(hash, "")).toBe(false);
+    expect(loginCodeHashMatches("not-a-hash", "123456")).toBe(false);
+    expect(loginCodeHashMatches("scrypt:only-two-parts", "123456")).toBe(false);
+    expect(loginCodeHashMatches("sha256:aaa:bbb", "123456")).toBe(false);
+  });
+});
+
+describe("LoginCodeRepository", () => {
+  const T0 = "2026-07-27T10:00:00.000Z";
+  const plus = (baseIso: string, ms: number): string => new Date(Date.parse(baseIso) + ms).toISOString();
+
+  function setup(): { db: DatabaseSync; repo: LoginCodeRepository } {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_login");
+    seedMember(db, "mem_other");
+    return { db, repo: new LoginCodeRepository(db) };
+  }
+
+  it("issues a code whose plaintext never lands in the row", () => {
+    const { db, repo } = setup();
+    const issued = repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    expect(issued.memberId).toBe("mem_login");
+    expect(issued.attempts).toBe(0);
+    expect(issued.consumedAt).toBeUndefined();
+    expect(issued.invalidatedAt).toBeUndefined();
+
+    const row = db.prepare("SELECT code_hash FROM login_codes WHERE id = ?").get(issued.id) as { code_hash: string };
+    expect(row.code_hash).not.toContain("424242");
+  });
+
+  it("verifies the right code once, then refuses to let it be reused", () => {
+    const { repo } = setup();
+    repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    const first = repo.verify({ memberId: "mem_login", code: "424242", now: plus(T0, 1000) });
+    expect(first.ok).toBe(true);
+
+    const second = repo.verify({ memberId: "mem_login", code: "424242", now: plus(T0, 2000) });
+    expect(second).toEqual({ ok: false, reason: "no_active_code" });
+  });
+
+  it("rejects the wrong code and counts the attempt", () => {
+    const { repo } = setup();
+    const issued = repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    expect(repo.verify({ memberId: "mem_login", code: "111111", now: plus(T0, 1000) })).toEqual({
+      ok: false,
+      reason: "mismatch"
+    });
+    expect(repo.getById(issued.id)?.attempts).toBe(1);
+  });
+
+  it("rejects an expired code and tombstones it", () => {
+    const { repo } = setup();
+    const issued = repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    expect(repo.verify({ memberId: "mem_login", code: "424242", now: plus(T0, 600_001) })).toEqual({
+      ok: false,
+      reason: "expired"
+    });
+    expect(repo.getById(issued.id)?.invalidatedAt).toBeDefined();
+  });
+
+  it("invalidates after LOGIN_CODE_MAX_ATTEMPTS wrong guesses - the next attempt fails even with the right code", () => {
+    const { repo } = setup();
+    repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    for (let attempt = 1; attempt < LOGIN_CODE_MAX_ATTEMPTS; attempt += 1) {
+      expect(repo.verify({ memberId: "mem_login", code: "111111", now: plus(T0, attempt * 1000) }).ok).toBe(false);
+    }
+    expect(repo.verify({ memberId: "mem_login", code: "111111", now: plus(T0, 5000) })).toEqual({
+      ok: false,
+      reason: "too_many_attempts"
+    });
+
+    // Sixth attempt, correct code: the row is already dead.
+    expect(repo.verify({ memberId: "mem_login", code: "424242", now: plus(T0, 6000) })).toEqual({
+      ok: false,
+      reason: "no_active_code"
+    });
+  });
+
+  it("issuing a new code invalidates the member's previous live one", () => {
+    const { repo } = setup();
+    const first = repo.issue({ memberId: "mem_login", code: "111111", expiresAt: plus(T0, 600_000), now: T0 });
+    repo.issue({ memberId: "mem_login", code: "222222", expiresAt: plus(T0, 660_000), now: plus(T0, 60_000) });
+
+    expect(repo.getById(first.id)?.invalidatedAt).toBeDefined();
+    expect(repo.verify({ memberId: "mem_login", code: "111111", now: plus(T0, 61_000) }).ok).toBe(false);
+    expect(repo.verify({ memberId: "mem_login", code: "222222", now: plus(T0, 62_000) }).ok).toBe(true);
+  });
+
+  it("never lets one member's code authenticate another member", () => {
+    const { repo } = setup();
+    repo.issue({ memberId: "mem_login", code: "424242", expiresAt: plus(T0, 600_000), now: T0 });
+
+    expect(repo.verify({ memberId: "mem_other", code: "424242", now: plus(T0, 1000) })).toEqual({
+      ok: false,
+      reason: "no_active_code"
+    });
+  });
+
+  it("returns no_active_code for a member who was never sent one", () => {
+    const { repo } = setup();
+    expect(repo.verify({ memberId: "mem_other", code: "424242", now: T0 })).toEqual({
+      ok: false,
+      reason: "no_active_code"
+    });
+  });
+
+  it("prune deletes rows older than the cutoff and leaves newer ones", () => {
+    const { db, repo } = setup();
+    repo.issue({ memberId: "mem_login", code: "111111", expiresAt: plus(T0, 600_000), now: T0 });
+    repo.issue({ memberId: "mem_other", code: "222222", expiresAt: plus(T0, 600_000), now: plus(T0, 86_400_000) });
+
+    repo.prune(plus(T0, 3600_000));
+
+    const remaining = db.prepare("SELECT member_id FROM login_codes").all() as Array<{ member_id: string }>;
+    expect(remaining.map((r) => r.member_id)).toEqual(["mem_other"]);
+  });
+});
+
+describe("LoginThrottleRepository", () => {
+  const T0 = "2026-07-27T10:00:00.000Z";
+  const plus = (ms: number): string => new Date(Date.parse(T0) + ms).toISOString();
+
+  function setup(): LoginThrottleRepository {
+    const db = memoryDb();
+    migrate(db);
+    return new LoginThrottleRepository(db);
+  }
+
+  it("counts only records inside the window, per scope and key", () => {
+    const throttle = setup();
+    throttle.record("email", "a@example.com", T0);
+    throttle.record("email", "a@example.com", plus(60_000));
+    throttle.record("email", "b@example.com", plus(60_000));
+    throttle.record("ip", "203.0.113.9", plus(60_000));
+
+    expect(throttle.countSince("email", "a@example.com", T0)).toBe(2);
+    expect(throttle.countSince("email", "a@example.com", plus(30_000))).toBe(1);
+    expect(throttle.countSince("email", "b@example.com", T0)).toBe(1);
+    expect(throttle.countSince("ip", "203.0.113.9", T0)).toBe(1);
+    expect(throttle.countSince("ip", "a@example.com", T0)).toBe(0);
+  });
+
+  it("treats an email case-insensitively (the same address cannot double its budget by shouting)", () => {
+    const throttle = setup();
+    throttle.record("email", "Member@Example.COM", T0);
+    expect(throttle.countSince("email", "member@example.com", T0)).toBe(1);
+  });
+
+  it("stores the key hashed, never as a plaintext address", () => {
+    const db = memoryDb();
+    migrate(db);
+    new LoginThrottleRepository(db).record("email", "secret-person@example.com", T0);
+
+    const rows = db.prepare("SELECT key_hash FROM login_send_log").all() as Array<{ key_hash: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.key_hash).not.toContain("secret-person");
+    expect(rows[0]?.key_hash).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("lastSentAt returns the newest record, or null when there is none", () => {
+    const throttle = setup();
+    expect(throttle.lastSentAt("email", "a@example.com")).toBeNull();
+    throttle.record("email", "a@example.com", T0);
+    throttle.record("email", "a@example.com", plus(120_000));
+    expect(throttle.lastSentAt("email", "a@example.com")).toBe(plus(120_000));
+  });
+
+  it("prune drops rows older than the cutoff", () => {
+    const throttle = setup();
+    throttle.record("email", "a@example.com", T0);
+    throttle.record("email", "a@example.com", plus(7_200_000));
+
+    throttle.prune(plus(3_600_000));
+
+    expect(throttle.countSince("email", "a@example.com", T0)).toBe(1);
   });
 });

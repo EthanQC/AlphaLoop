@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -913,6 +913,62 @@ const MIGRATIONS: MigrationStep[] = [
       );
       CREATE INDEX IF NOT EXISTS monthly_reviews_owner_period_idx ON monthly_reviews(owner_id, period);
     `);
+  },
+  (db) => {
+    // Self-hosted email-code login (2026-07-27): Cloudflare ACCESS never got
+    // activated (Zero Trust needs a payment method the operator could not
+    // complete), so the `Cf-Access-Authenticated-User-Email` identity path
+    // stays permanently FAIL-CLOSED in production and no browser could log in
+    // at all. This step backs the replacement: a one-time 6-digit code
+    // delivered to the member's own Feishu DM, exchanged for a signed session
+    // cookie (apps/platform-app/src/session.ts).
+    //
+    // Two brand-new tables, nothing pre-existing rebuilt - a plain step
+    // suffices (no needsForeignKeysOff), same category as v14's
+    // monthly_reviews above.
+    //
+    // login_codes: one row per issued code.
+    //   - code_hash: NEVER the plaintext code. Format
+    //     `scrypt:<saltB64url>:<keyB64url>` (buildLoginCodeHash below). scrypt
+    //     with a per-row random salt rather than this file's plain-sha256
+    //     hashToken, because a 6-digit code has only ~20 bits of entropy: a
+    //     sha256 column would be exhaustively reversible in milliseconds by
+    //     anyone who could read the file, and a per-row salt additionally
+    //     rules out one precomputed table covering every row.
+    //   - attempts: wrong-guess counter; LOGIN_CODE_MAX_ATTEMPTS (5) wrong
+    //     guesses invalidate the row (see LoginCodeRepository.verify).
+    //   - consumed_at / invalidated_at: the single-use flag and the
+    //     expired/superseded/attempt-exhausted tombstone respectively. Both
+    //     NULL == "this code is still live"; issuing a new code for a member
+    //     invalidates their previous live one, so at most one is ever live.
+    //
+    // login_send_log: the send-throttle ledger (per-email AND per-IP), one row
+    // per code-send ATTEMPT. key_hash is a sha256 of `<scope>:<key>` - never
+    // the plaintext email/IP - so probing this endpoint with addresses that
+    // are not members cannot turn this table into a list of guessed emails.
+    // Rows are pruned by LoginThrottleRepository.prune once they age out of
+    // every window.
+    db.exec(`
+      CREATE TABLE login_codes (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id),
+        code_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        consumed_at TEXT,
+        invalidated_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS login_codes_member_idx ON login_codes(member_id, created_at);
+
+      CREATE TABLE login_send_log (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL CHECK(scope IN ('email','ip')),
+        key_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS login_send_log_scope_key_idx ON login_send_log(scope, key_hash, created_at);
+    `);
   }
 ];
 
@@ -1480,6 +1536,259 @@ export class ApiTokenRepository {
       .run(nowIso(), tokenId);
     return { changes: result.changes };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Email-code login (v15): one-time codes + send throttling
+// ---------------------------------------------------------------------------
+//
+// The storage half of apps/platform-app's self-hosted login (routes/login.ts).
+// POLICY LIVES IN THE ROUTE, NOT HERE: code length/TTL, how many codes per
+// window, the cooldown between sends, and every user-visible Chinese string
+// are the route's business. This layer owns exactly three invariants:
+//   1. the plaintext code is never written anywhere (buildLoginCodeHash),
+//   2. a code is single-use, expiring, and attempt-limited (verify), and
+//   3. throttle keys are stored hashed, never as plaintext emails/IPs.
+
+/** Wrong guesses tolerated before a code is invalidated outright. */
+export const LOGIN_CODE_MAX_ATTEMPTS = 5;
+
+/** scrypt output length, bytes. */
+const LOGIN_CODE_KEY_LENGTH = 32;
+
+/**
+ * Cryptographically-uniform 6-digit numeric code (`randomInt`, not
+ * `Math.random`, and not `randomBytes % 1e6` - which would bias the low
+ * values). Zero-padded, so "000042" is a legitimate code and the string form
+ * is always exactly 6 characters.
+ */
+export function generateLoginCode(): string {
+  return String(randomInt(0, 1_000_000)).padStart(6, "0");
+}
+
+function scryptLoginCode(code: string, salt: Buffer): Buffer {
+  return scryptSync(code, salt, LOGIN_CODE_KEY_LENGTH);
+}
+
+/**
+ * Hashes a login code for storage as `scrypt:<saltB64url>:<keyB64url>`. See
+ * the v15 migration comment for why this is scrypt-with-salt and not this
+ * file's sha256 `hashToken` (a 6-digit code carries ~20 bits of entropy).
+ */
+export function buildLoginCodeHash(code: string): string {
+  const salt = randomBytes(16);
+  return `scrypt:${salt.toString("base64url")}:${scryptLoginCode(code, salt).toString("base64url")}`;
+}
+
+/**
+ * Constant-time check of a candidate code against a stored hash. Returns
+ * false (never throws) for a malformed/foreign hash format. The comparison
+ * itself is `timingSafeEqual` so a near-miss code cannot be distinguished
+ * from a wildly wrong one by response timing.
+ */
+export function loginCodeHashMatches(storedHash: string, code: string): boolean {
+  const parts = storedHash.split(":");
+  if (parts.length !== 3 || parts[0] !== "scrypt") {
+    return false;
+  }
+  const [, saltB64, keyB64] = parts as [string, string, string];
+  try {
+    const expected = Buffer.from(keyB64, "base64url");
+    if (expected.length !== LOGIN_CODE_KEY_LENGTH) {
+      return false;
+    }
+    const actual = scryptLoginCode(code, Buffer.from(saltB64, "base64url"));
+    return timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+export interface LoginCode {
+  id: string;
+  memberId: string;
+  expiresAt: string;
+  attempts: number;
+  consumedAt?: string;
+  invalidatedAt?: string;
+  createdAt: string;
+}
+
+/**
+ * Why a verification failed. The ROUTE deliberately collapses every one of
+ * these into a single generic Chinese message - they exist for tests, audit
+ * reasoning and (sanitized) logs, never to be shown to the person typing the
+ * code, since telling an attacker "expired" vs "wrong" vs "no code at all"
+ * leaks whether a code was ever sent to that member.
+ */
+export type LoginCodeFailureReason = "no_active_code" | "expired" | "too_many_attempts" | "mismatch";
+
+export type LoginCodeVerifyResult =
+  | { ok: true; code: LoginCode }
+  | { ok: false; reason: LoginCodeFailureReason };
+
+function mapLoginCode(row: Record<string, unknown>): LoginCode {
+  return {
+    id: String(row.id),
+    memberId: String(row.member_id),
+    expiresAt: String(row.expires_at),
+    attempts: Number(row.attempts),
+    ...(row.consumed_at ? { consumedAt: String(row.consumed_at) } : {}),
+    ...(row.invalidated_at ? { invalidatedAt: String(row.invalidated_at) } : {}),
+    createdAt: String(row.created_at)
+  };
+}
+
+export class LoginCodeRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  /**
+   * Stores a freshly-generated code for `memberId`, first invalidating any
+   * code that member still had outstanding - so a member never has two live
+   * codes at once and re-requesting a code cannot be used to widen the guess
+   * surface (5 attempts per code, not 5 per code times N live codes).
+   *
+   * `expiresAt` is caller-supplied (ProposalRepository's precedent): the TTL
+   * policy belongs to the route, this layer only enforces whatever expiry it
+   * was handed.
+   */
+  issue(input: { memberId: string; code: string; expiresAt: string; now?: string }): LoginCode {
+    const now = input.now ?? nowIso();
+    this.invalidateOutstanding(input.memberId, now);
+
+    const id = createId("login_code");
+    this.db
+      .prepare(`
+        INSERT INTO login_codes (id, member_id, code_hash, expires_at, attempts, consumed_at, invalidated_at, created_at)
+        VALUES (?, ?, ?, ?, 0, NULL, NULL, ?)
+      `)
+      .run(id, input.memberId, buildLoginCodeHash(input.code), input.expiresAt, now);
+
+    return this.getById(id) as LoginCode;
+  }
+
+  /**
+   * Checks `code` against this member's single live code and, on success,
+   * consumes it (single-use). Every failure path is also a state change where
+   * it matters: an expired code is tombstoned, and the wrong-guess counter is
+   * incremented - reaching LOGIN_CODE_MAX_ATTEMPTS invalidates the code
+   * outright, so a later guess (even the CORRECT one) can no longer redeem it.
+   */
+  verify(input: { memberId: string; code: string; now?: string }): LoginCodeVerifyResult {
+    const now = input.now ?? nowIso();
+    const row = this.db
+      .prepare(`
+        SELECT * FROM login_codes
+        WHERE member_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+      `)
+      .get(input.memberId) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return { ok: false, reason: "no_active_code" };
+    }
+
+    const id = String(row.id);
+    if (Date.parse(String(row.expires_at)) <= Date.parse(now)) {
+      this.invalidateById(id, now);
+      return { ok: false, reason: "expired" };
+    }
+
+    const attempts = Number(row.attempts);
+    if (attempts >= LOGIN_CODE_MAX_ATTEMPTS) {
+      // Defense in depth: the counter path below already invalidates on the
+      // final wrong guess, so this is only reachable if a row was written by
+      // something else (or an older build) without tombstoning.
+      this.invalidateById(id, now);
+      return { ok: false, reason: "too_many_attempts" };
+    }
+
+    if (!loginCodeHashMatches(String(row.code_hash), input.code)) {
+      const nextAttempts = attempts + 1;
+      if (nextAttempts >= LOGIN_CODE_MAX_ATTEMPTS) {
+        this.db
+          .prepare(`UPDATE login_codes SET attempts = ?, invalidated_at = ? WHERE id = ?`)
+          .run(nextAttempts, now, id);
+        return { ok: false, reason: "too_many_attempts" };
+      }
+      this.db.prepare(`UPDATE login_codes SET attempts = ? WHERE id = ?`).run(nextAttempts, id);
+      return { ok: false, reason: "mismatch" };
+    }
+
+    this.db.prepare(`UPDATE login_codes SET consumed_at = ? WHERE id = ?`).run(now, id);
+    return { ok: true, code: this.getById(id) as LoginCode };
+  }
+
+  getById(id: string): LoginCode | null {
+    const row = this.db.prepare(`SELECT * FROM login_codes WHERE id = ? LIMIT 1`).get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? mapLoginCode(row) : null;
+  }
+
+  /** Tombstones every still-live code for a member (used on re-issue, and by
+   * a future "sign me out everywhere"). */
+  invalidateOutstanding(memberId: string, now: string = nowIso()): void {
+    this.db
+      .prepare(`
+        UPDATE login_codes SET invalidated_at = ?
+        WHERE member_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL
+      `)
+      .run(now, memberId);
+  }
+
+  /** Deletes rows created before `before` (housekeeping - a consumed or
+   * expired code has no reason to linger). */
+  prune(before: string): void {
+    this.db.prepare(`DELETE FROM login_codes WHERE created_at < ?`).run(before);
+  }
+
+  private invalidateById(id: string, now: string): void {
+    this.db.prepare(`UPDATE login_codes SET invalidated_at = ? WHERE id = ?`).run(now, id);
+  }
+}
+
+export type LoginThrottleScope = "email" | "ip";
+
+/**
+ * The send-throttle ledger. Deliberately dumb: it records attempts and
+ * answers "how many since X" / "when was the last one" - the actual limits
+ * (N per window, minimum gap between sends) live in routes/login.ts.
+ *
+ * Keys are lower-cased and stored as a sha256 of `<scope>:<key>` so the table
+ * never becomes a list of email addresses somebody guessed at the login form.
+ */
+export class LoginThrottleRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  record(scope: LoginThrottleScope, key: string, now: string = nowIso()): void {
+    this.db
+      .prepare(`INSERT INTO login_send_log (id, scope, key_hash, created_at) VALUES (?, ?, ?, ?)`)
+      .run(createId("login_send"), scope, hashThrottleKey(scope, key), now);
+  }
+
+  countSince(scope: LoginThrottleScope, key: string, since: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM login_send_log WHERE scope = ? AND key_hash = ? AND created_at >= ?`)
+      .get(scope, hashThrottleKey(scope, key), since) as { count: number };
+    return Number(row.count);
+  }
+
+  lastSentAt(scope: LoginThrottleScope, key: string): string | null {
+    const row = this.db
+      .prepare(`SELECT created_at FROM login_send_log WHERE scope = ? AND key_hash = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(scope, hashThrottleKey(scope, key)) as { created_at: string } | undefined;
+    return row ? String(row.created_at) : null;
+  }
+
+  prune(before: string): void {
+    this.db.prepare(`DELETE FROM login_send_log WHERE created_at < ?`).run(before);
+  }
+}
+
+function hashThrottleKey(scope: LoginThrottleScope, key: string): string {
+  return hashToken(`${scope}:${key.trim().toLowerCase()}`);
 }
 
 // Input to ProposalRepository.create(): every Proposal field EXCEPT the ones

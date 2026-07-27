@@ -15,6 +15,15 @@ import {
   resolveIdentity,
   verifyAccessJwt
 } from "./identity.js";
+import {
+  SESSION_COOKIE_NAME,
+  __resetSessionWarningsForTests,
+  createSessionToken
+} from "./session.js";
+
+// vitest.config.ts pins a fixed PLATFORM_SESSION_SECRET for the whole suite;
+// the one test below that removes it restores this value afterwards.
+const SAVED_SESSION_SECRET = process.env.PLATFORM_SESSION_SECRET;
 
 // Access-verification env handling. The pre-P10 resolveIdentity tests below
 // depend on the email header being trusted without a JWT, which under the P10
@@ -230,6 +239,150 @@ describe("resolveIdentity", () => {
   it("returns null when neither a bearer token nor the Access header is present", () => {
     const db = memoryDb();
     expect(resolveIdentity(req({}), db)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session cookie path (2026-07-27, the email-code login)
+// ---------------------------------------------------------------------------
+// The cookie's own crypto is pinned in session.test.ts; these cases pin the
+// half that must live HERE - that a valid cookie resolves to the member row,
+// that the row is re-read (so revocation bites immediately), and that adding
+// this path did not disturb the two that already existed. Wall-clock expiries
+// on purpose: resolveIdentity has no injectable clock, by design.
+
+function sessionHeaders(memberId: string, expiresAtMs: number = Date.now() + 60_000) {
+  return { cookie: `${SESSION_COOKIE_NAME}=${createSessionToken(memberId, expiresAtMs) ?? ""}` };
+}
+
+describe("resolveIdentity via the session cookie", () => {
+  it("resolves the member named by a valid signed cookie", () => {
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(resolveIdentity(req(sessionHeaders(member.id)), db)).toEqual(member);
+  });
+
+  it("re-reads the member row: a revoked member's live cookie stops resolving", () => {
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const headers = sessionHeaders(member.id);
+    expect(resolveIdentity(req(headers), db)).toEqual(member);
+
+    new MemberRepository(db).upsert({ ...member, status: "revoked" });
+
+    expect(resolveIdentity(req(headers), db)).toBeNull();
+  });
+
+  it("returns null for a cookie naming a member that does not exist", () => {
+    const db = memoryDb();
+    expect(resolveIdentity(req(sessionHeaders("member_ghost")), db)).toBeNull();
+  });
+
+  it("returns null for an expired cookie", () => {
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    expect(resolveIdentity(req(sessionHeaders(member.id, Date.now() - 1000)), db)).toBeNull();
+  });
+
+  it("returns null for a cookie whose signature does not check out", () => {
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const valid = createSessionToken(member.id, Date.now() + 60_000) as string;
+    const [version, payload] = valid.split(".") as [string, string];
+
+    expect(
+      resolveIdentity(req({ cookie: `${SESSION_COOKIE_NAME}=${version}.${payload}.AAAA` }), db)
+    ).toBeNull();
+    expect(resolveIdentity(req({ cookie: `${SESSION_COOKIE_NAME}=garbage` }), db)).toBeNull();
+  });
+
+  it("never resolves __legacy_system__ from a cookie, even if the row were active", () => {
+    const db = memoryDb();
+    const legacy = makeMember({
+      id: "__legacy_system__",
+      email: "__legacy_system__@alphaloop.invalid",
+      displayName: "Legacy System (migration placeholder)",
+      status: "active"
+    });
+    new MemberRepository(db).upsert(legacy);
+
+    expect(resolveIdentity(req(sessionHeaders(legacy.id)), db)).toBeNull();
+  });
+
+  it("loses to a valid bearer token when both are present (bearer stays first)", () => {
+    const db = memoryDb();
+    const bearerMember = makeMember({ id: "member_bearer", email: "bearer@example.com" });
+    const cookieMember = makeMember({ id: "member_cookie", email: "cookie@example.com" });
+    new MemberRepository(db).upsert(bearerMember);
+    new MemberRepository(db).upsert(cookieMember);
+    const { token } = new ApiTokenRepository(db).issue(bearerMember.id, "cli");
+
+    const resolved = resolveIdentity(
+      req({ authorization: `Bearer ${token}`, ...sessionHeaders(cookieMember.id) }),
+      db
+    );
+
+    expect(resolved).toEqual(bearerMember);
+  });
+
+  it("wins over the Access email header when both are present (cookie before header)", () => {
+    const db = memoryDb();
+    const cookieMember = makeMember({ id: "member_cookie", email: "cookie@example.com" });
+    const headerMember = makeMember({ id: "member_header", email: "header@example.com" });
+    new MemberRepository(db).upsert(cookieMember);
+    new MemberRepository(db).upsert(headerMember);
+
+    const resolved = resolveIdentity(
+      req({
+        ...sessionHeaders(cookieMember.id),
+        // beforeEach put the Access verifier in "disabled" mode, so this
+        // header WOULD otherwise resolve on its own.
+        "cf-access-authenticated-user-email": headerMember.email
+      }),
+      db
+    );
+
+    expect(resolved).toEqual(cookieMember);
+  });
+
+  it("falls through to the Access header when the cookie is junk (one bad path does not poison the chain)", () => {
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+
+    const resolved = resolveIdentity(
+      req({
+        cookie: `${SESSION_COOKIE_NAME}=not-a-real-token`,
+        "cf-access-authenticated-user-email": member.email
+      }),
+      db
+    );
+
+    expect(resolved).toEqual(member);
+  });
+
+  it("fails closed when PLATFORM_SESSION_SECRET is unset", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const db = memoryDb();
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    const headers = sessionHeaders(member.id);
+    expect(resolveIdentity(req(headers), db)).toEqual(member);
+
+    delete process.env.PLATFORM_SESSION_SECRET;
+    __resetSessionWarningsForTests();
+    try {
+      expect(resolveIdentity(req(headers), db)).toBeNull();
+    } finally {
+      process.env.PLATFORM_SESSION_SECRET = SAVED_SESSION_SECRET;
+      __resetSessionWarningsForTests();
+    }
   });
 });
 

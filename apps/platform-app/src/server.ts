@@ -8,6 +8,7 @@ import type { MemorydBackend } from "./data/memoryd-mirror.js";
 import { handleApiResearchRoute, type ResearchWorkerLike } from "./routes/api-research.js";
 import { handleApiStrategyRoute } from "./routes/api-strategy.js";
 import { handleHomeRoute } from "./routes/home.js";
+import { handleLoginRoute, type LoginRouteDeps } from "./routes/login.js";
 import { handleMemberCardRoute } from "./routes/member-card.js";
 import { handleNewsRoute } from "./routes/news.js";
 import { handlePaperRoute } from "./routes/paper.js";
@@ -44,6 +45,14 @@ export interface PlatformServerDeps {
    * collaborators) and pass it here, ticking it by hand rather than relying
    * on this route's fire-and-forget kick for timing. */
   researchWorker?: ResearchWorkerLike;
+  /** Feishu delivery for the email-code login (routes/login.ts). Omitted in
+   * production, where the route falls back to the real app-credential card
+   * channel (data/login-code-notifier.ts); tests inject a fake sender that
+   * captures the code instead of sending anything. */
+  loginCodeSender?: LoginRouteDeps["loginCodeSender"];
+  /** Test seam for login.ts's out-of-band code delivery - see its module
+   * header. Never set in production. */
+  onLoginSendSettled?: LoginRouteDeps["onSendSettled"];
   /** Injectable Feishu single-chat confirm notifier (Task 4, routes/
    * review.ts), fired fire-and-forget after `POST /api/reviews/:id/confirm`.
    * Defaults to createFeishuReviewNotifier()'s P10-gated placeholder (always
@@ -121,6 +130,28 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         return;
       }
       sendJson(res, 200, { ok: true, service: "platform-app" });
+      return;
+    }
+
+    // Email-code login (2026-07-27) dispatches before every identity-gated
+    // route below, because it is the ONLY surface in this app that must work
+    // without an identity - it is how a browser gets one. `/login`,
+    // `/login/verify` and `/logout` are the complete set; everything else
+    // still resolves an identity as before.
+    if (
+      handleLoginRoute(
+        req,
+        res,
+        url,
+        {
+          db: deps.db,
+          ...(deps.now ? { now: deps.now } : {}),
+          ...(deps.loginCodeSender ? { loginCodeSender: deps.loginCodeSender } : {}),
+          ...(deps.onLoginSendSettled ? { onSendSettled: deps.onLoginSendSettled } : {})
+        },
+        nonce
+      )
+    ) {
       return;
     }
 

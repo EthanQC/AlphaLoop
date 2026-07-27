@@ -29,7 +29,16 @@ const SERIAL_TEST_GLOBS = [
 // for the whole suite - route tests that authenticate via the Access header
 // keep working without editing each one, and identity.test.ts overrides it
 // per-test to exercise enforce/fail-closed modes.
-const TEST_ENV = { CF_ACCESS_DISABLED: "true" };
+// PLATFORM_SESSION_SECRET (2026-07-27, apps/platform-app/src/session.ts): the
+// email-code login signs its session cookie with this and fails closed when it
+// is unset. Pinning a fixed, obviously-fake value here keeps every suite that
+// merely happens to touch identity resolution working, exactly like the
+// CF_ACCESS_DISABLED pin above; session.test.ts and login.test.ts override or
+// delete it per-test to exercise the unconfigured/rotated cases.
+const TEST_ENV = {
+  CF_ACCESS_DISABLED: "true",
+  PLATFORM_SESSION_SECRET: "test-only-session-secret-not-a-real-one-0123456789"
+};
 
 export default defineConfig({
   test: {
