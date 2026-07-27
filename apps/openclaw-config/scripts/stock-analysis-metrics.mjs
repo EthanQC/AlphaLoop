@@ -577,6 +577,7 @@ export function summarizeHistory(history, currentPrice) {
       source: undefined,
       support: undefined,
       resistance: undefined,
+      supportWindowDays: undefined,
       ma20: undefined,
       ma60: undefined,
       ma180: undefined,
@@ -609,7 +610,14 @@ export function summarizeHistory(history, currentPrice) {
   };
   const longWindowDays = Math.min(sampleDays, 180);
   const ma180 = average(closes.slice(-longWindowDays));
+  // 2026-07-28: `closes.slice(-20)` on a shorter array is the WHOLE array, so
+  // these extremes are only a 20-session support/resistance when at least 20
+  // sessions exist. `supportWindowDays` publishes the window they were REALLY
+  // taken over so the renderer can label it truthfully instead of hard-coding
+  // "近20日" - the same treatment ma20/ma60 got for their fixed labels above.
+  // (One count covers both extremes: they come from the same `recent` slice.)
   const recent = closes.slice(-20);
+  const supportWindowDays = recent.length || undefined;
   const support = recent.length ? Math.min(...recent) : undefined;
   const resistance = recent.length ? Math.max(...recent) : undefined;
   const vsMa180 = lastClose !== undefined && ma180 !== undefined && ma180 > 0
@@ -638,6 +646,7 @@ export function summarizeHistory(history, currentPrice) {
     trendScore,
     support,
     resistance,
+    supportWindowDays,
     ma20,
     ma60,
     ma180,

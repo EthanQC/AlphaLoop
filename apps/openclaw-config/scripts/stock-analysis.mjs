@@ -737,7 +737,7 @@ function computeConfidence({ symbol, quote, news, extraData, generatedAt, histor
 // price implies a value BELOW current support (a genuine downside call) -
 // the range must stay a valid [low, high] pair regardless of which side
 // the target price lands on.
-function computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuationSources }) {
+function computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuationSources, supportLabel = "近20日支撑位" }) {
   const candidateHigh = targetPrice !== undefined ? targetPrice : rangeResistance;
   const candidates = [rangeSupport, candidateHigh].filter((value) => Number.isFinite(value));
   if (candidates.length === 0) {
@@ -746,9 +746,35 @@ function computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuati
   const low = Math.min(...candidates);
   const high = Math.max(...candidates);
   const basis = targetPrice !== undefined
-    ? `近20日支撑位 ${formatNumber(rangeSupport)} 美元与卖方一年目标价 ${formatNumber(targetPrice)} 美元${valuationSources ? `（来源：${valuationSources}）` : ""}`
-    : `近20日支撑位 ${formatNumber(rangeSupport)} 美元与阻力位 ${formatNumber(rangeResistance)} 美元（目标价数据不可得）`;
+    ? `${supportLabel} ${formatNumber(rangeSupport)} 美元与卖方一年目标价 ${formatNumber(targetPrice)} 美元${valuationSources ? `（来源：${valuationSources}）` : ""}`
+    : `${supportLabel} ${formatNumber(rangeSupport)} 美元与阻力位 ${formatNumber(rangeResistance)} 美元（目标价数据不可得）`;
   return { low, high, basis };
+}
+
+// 2026-07-28: the 合理价值区间 basis used to hard-code "近20日支撑位" for a
+// number that is only sometimes a 20-session low. `rangeSupport` is
+// `historyStats.support ?? (low ?? prevClose ?? last)`, so it is the day's
+// INTRADAY low whenever history is unavailable, and an N-session min whenever
+// the history sample is shorter than 20 sessions - both were being published
+// under a 20-day label. Name what the number really is, mirroring the same
+// "no silent mislabeling" rule stock-analysis-metrics.mjs applies to the
+// 20/60/180 日均线.
+//
+// A caller-built historyStats with a support but no `supportWindowDays` (every
+// pre-2026-07-28 hand-written fixture) keeps the previous "近20日支撑位" text
+// exactly, the same back-compat shape formatMovingAverage uses.
+function describeSupportBasis(historyStats, quote) {
+  if (Number.isFinite(historyStats?.support)) {
+    const windowDays = historyStats?.supportWindowDays;
+    return `近${Number.isFinite(windowDays) ? windowDays : 20}日支撑位`;
+  }
+  if (toNumber(quote?.low) !== undefined) {
+    return "日内最低价";
+  }
+  if (toNumber(quote?.prev_close ?? quote?.prevClose) !== undefined) {
+    return "前收盘价";
+  }
+  return "最新价";
 }
 
 function computePricePosition(last, low, high) {
@@ -845,7 +871,13 @@ function buildConclusionBoxParams({
     ? extraData.fundamentals.sources.join("、")
     : undefined;
 
-  const valueRange = computeValueRange({ rangeSupport, rangeResistance, targetPrice, valuationSources });
+  const valueRange = computeValueRange({
+    rangeSupport,
+    rangeResistance,
+    targetPrice,
+    valuationSources,
+    supportLabel: describeSupportBasis(historyStats, quote)
+  });
   const confidence = computeConfidence({ symbol, quote, news, extraData, generatedAt, historyStats, upsidePotential });
 
   return {

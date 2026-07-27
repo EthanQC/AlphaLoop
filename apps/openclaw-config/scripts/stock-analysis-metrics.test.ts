@@ -210,6 +210,18 @@ describe("stock analysis metrics", () => {
       expect(result.movingAverageDisclosures.ma60).toBeUndefined();
     });
 
+    // 2026-07-28: same "no silent mislabeling" rule applied to support/
+    // resistance. `closes.slice(-20)` on a 12-element array is the WHOLE
+    // array, so the min/max published as the conclusion box's "近20日支撑位"
+    // was really a 12-session extreme. Publish the window that was really
+    // used so the renderer can label it truthfully.
+    it("reports the REAL window the support/resistance extremes were taken over", () => {
+      expect(metrics.summarizeHistory(closes(126), 212).supportWindowDays).toBe(20);
+      expect(metrics.summarizeHistory(closes(12), 205).supportWindowDays).toBe(12);
+      expect(metrics.summarizeHistory([], 100).supportWindowDays).toBeUndefined();
+      expect(metrics.summarizeHistory({ error: "读取失败" }, 100).supportWindowDays).toBeUndefined();
+    });
+
     it("computes ma20/ma60 as plain trailing averages of the closes", () => {
       const result = metrics.summarizeHistory(closes(60), 205.9);
       const allCloses = closes(60).map((row) => row.close);

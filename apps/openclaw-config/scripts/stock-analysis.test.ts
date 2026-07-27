@@ -453,6 +453,52 @@ describe("buildDeterministicAnalysis: conclusion-box confidence heuristic", () =
 
     expect(analysis.conclusionBox.reviewDate).toBe("2026-08-15");
   });
+
+  // 2026-07-28: the 合理价值区间 basis hard-coded "近20日支撑位" regardless of
+  // where rangeSupport actually came from. With history unavailable it is the
+  // day's intraday LOW (`low ?? prevClose ?? last`), and with a short sample it
+  // is an N-session min - both were published under a 20-day label. Same
+  // "no silent mislabeling" rule this file's 20/60 日均线 handling already
+  // applies (stock-analysis-metrics.mjs, defect 5).
+  describe("合理价值区间 names the support level it really used", () => {
+    it("labels the intraday low as the intraday low when no history is available", () => {
+      const analysis = stockAnalysis.buildDeterministicAnalysis(
+        "AAPL.US",
+        stockQuote(),
+        stockNewsList(),
+        { history: { error: "Yahoo chart 历史走势接口触发限流" }, fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+        GENERATED_AT
+      );
+
+      expect(analysis.conclusionBox.valueRange.basis).not.toContain("近20日支撑位");
+      expect(analysis.conclusionBox.valueRange.basis).toContain("日内最低价 207.50 美元");
+    });
+
+    it("labels a short-sample support with the sessions it really covered", () => {
+      const analysis = stockAnalysis.buildDeterministicAnalysis(
+        "AAPL.US",
+        stockQuote(),
+        stockNewsList(),
+        { history: stockHistorySeries(12, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+        GENERATED_AT
+      );
+
+      expect(analysis.conclusionBox.valueRange.basis).toContain("近12日支撑位");
+      expect(analysis.conclusionBox.valueRange.basis).not.toContain("近20日支撑位");
+    });
+
+    it("still says 近20日支撑位 when a full 20-session window really exists", () => {
+      const analysis = stockAnalysis.buildDeterministicAnalysis(
+        "AAPL.US",
+        stockQuote(),
+        stockNewsList(),
+        { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+        GENERATED_AT
+      );
+
+      expect(analysis.conclusionBox.valueRange.basis).toContain("近20日支撑位");
+    });
+  });
 });
 
 describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen '结论与复盘标签' section", () => {
