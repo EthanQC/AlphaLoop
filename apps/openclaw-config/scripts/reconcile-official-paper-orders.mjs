@@ -399,6 +399,20 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 // submit_unconfirmed / timeout-failed row this pass) and the matched branch
 // (order already known by external_order_id whose freshly observed stage is
 // what finally proves it live/filled - FIX 1a).
+//
+// The three repository parameters are annotated (G3, 2026-07-28) because a
+// plain .mjs parameter is `any`, and `reports.save({...})` below is the exact
+// call that shipped without an ownerId (73177f0). With the annotation,
+// check-repository-writes.mjs can see the declared payload type and fail the
+// build if a required field goes missing again; without it the write is
+// invisible to every static check in this repo.
+/**
+ * @param {unknown} db
+ * @param {import("../../../packages/shared-types/dist/index.js").ProposalRepository} proposals
+ * @param {import("../../../packages/shared-types/dist/index.js").ExecutionReportRepository} reports
+ * @param {import("../../../packages/shared-types/dist/index.js").AuditLogRepository} audit
+ * @param {Record<string, any>} input
+ */
 function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
   const { ticketId, stage, symbol, side, quantity, limitPrice, externalOrderId, brokerStatusRaw, localStatus, observedAt } = input;
 
