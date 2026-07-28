@@ -36,8 +36,16 @@
 //      every run - a second, parallel "trade happened" record with no
 //      lifecycle awareness, and (being an idempotent INSERT OR REPLACE
 //      keyed by external_order_id) a second write on every subsequent
-//      reconcile pass too. DELETED: this file never writes execution_reports
-//      any more. Every discrepancy/decision it makes goes to audit_log only.
+//      reconcile pass too. DELETED: the per-observed-order write is gone, and
+//      every discrepancy/decision this file makes goes to audit_log.
+//      F6 (2026-07-28 round 3) correction: this used to read "this file never
+//      writes execution_reports any more ... audit_log ONLY", which stopped
+//      being true the moment FIX 1 below added reconcileStuckFailedProposal.
+//      That function DOES write exactly one execution_reports row - but only
+//      on the narrow path where it also moves a proposal off 'failed', i.e.
+//      once per corrected proposal, never once per observed order, and never
+//      on a routine status refresh (the proposal-status check makes a replay a
+//      no-op). See its own doc comment for the four conditions.
 //
 // Finding #5 (cancel-status mapping - WaitToCancel/PendingCancel silently
 // falling into "unknown" instead of a real in-progress-cancel stage) is

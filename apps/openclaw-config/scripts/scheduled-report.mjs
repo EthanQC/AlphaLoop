@@ -1182,12 +1182,22 @@ function classifyExecutionStatus(row, text) {
   return "执行记录已入库。";
 }
 
-// R5: the Chinese patterns come FIRST because they are what this repo's own
-// writers emit today - broker-executor's buildExecutionReportBody and
-// reconcile-official-paper-orders.mjs both write 标的/方向/数量/限价/成交价.
-// The English ones are kept for the pre-Chinese rows still in the table; the
-// set used to contain ONLY those, which is why every production row parsed as
-// "nothing known".
+// R5, corrected by F6 (2026-07-28 round 3). The Chinese patterns come FIRST
+// because they are what this repo's own writers emit today, but the two
+// writers do NOT emit the same fields, and this comment used to claim they
+// did ("both write 标的/方向/数量/限价/成交价"):
+//   - broker-executor's buildExecutionReportBody writes 工单/标的/方向/数量/状态/
+//     执行方 always, plus 外部订单号/券商状态/生命周期阶段/限价/成交价 when the
+//     ExecutionResult carries them;
+//   - reconcile-official-paper-orders.mjs's reconcileStuckFailedProposal
+//     writes 工单/状态/执行方/外部订单号/券商状态/生命周期阶段 (+限价 when the
+//     broker order carried a price) and 原因 - never 标的/方向/数量, which it
+//     keeps in `metadata` only. That is fine because extractExecutionFacts
+//     reads metadata first; it is NOT fine to describe it as prose that exists.
+// Both bodies were read back off rows produced by running the real writers.
+// The English patterns are for rows written before either writer emitted
+// Chinese; the set used to contain ONLY those, which is why every row parsed
+// as "nothing known".
 function extractSymbol(text) {
   const patterns = [
     /标的[：:]\s*([A-Z]{1,5}(?:\.[A-Z]{2})?)/iu,
