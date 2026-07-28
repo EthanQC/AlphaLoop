@@ -296,7 +296,123 @@ describe("buildFeishuCardPayload", () => {
   // (action) modules and, critically, say unsupported properties are now
   // REJECTED with an error instead of silently ignored - so the old payload was
   // not merely a dead button, it risked every card being refused outright.
-  const FEISHU_1_0_ONLY_SYNTAX = ['"tag":"action"', '"url":', '"multi_url"', '"value":'];
+  // 2026-07-28 (R4). That check used to be a substring scan for
+  // ['"tag":"action"', '"url":', '"multi_url"', '"value":']. Three of those are
+  // real 1.0 markers; `"value":` is not. In card JSON 2.0 `value` is LEGAL and
+  // required inside a callback behavior - behaviors:[{type:"callback",
+  // value:{...}}] - which is exactly what the approval button must emit, so the
+  // guard would have rejected correct 2.0 syntax and blocked that work. A
+  // substring scan cannot tell the two apart because it never sees where in the
+  // document the key sits.
+  //
+  // This walks the payload instead and judges each key BY POSITION:
+  //   - `action` / `note` modules: removed in 2.0 outright.
+  //   - `url` / `multi_url` / `value` on a COMPONENT (any node with a `tag`):
+  //     1.0 历史属性; 2.0 moves all three into `behaviors`.
+  //   - inside `behaviors`: `value` is legal on a `callback` behavior and only
+  //     there; navigation is `default_url`/`pc_url`/`ios_url`/`android_url`,
+  //     never a bare `url`/`multi_url`.
+  const REMOVED_IN_CARD_2_0_MODULES = new Set(["action", "note"]);
+  const CARD_1_0_COMPONENT_FIELDS = ["url", "multi_url", "value"] as const;
+
+  function findCard1_0Constructs(node: unknown, path = "$", insideBehaviors = false): string[] {
+    if (Array.isArray(node)) {
+      return node.flatMap((item, index) => findCard1_0Constructs(item, `${path}[${index}]`, insideBehaviors));
+    }
+    if (node === null || typeof node !== "object") {
+      return [];
+    }
+
+    const object = node as Record<string, unknown>;
+    const found: string[] = [];
+
+    if (insideBehaviors) {
+      if ("url" in object) {
+        found.push(`${path}.url — card 1.0 link field; 2.0 navigation uses default_url`);
+      }
+      if ("multi_url" in object) {
+        found.push(`${path}.multi_url — card 1.0 only`);
+      }
+      if ("value" in object && object.type !== "callback") {
+        found.push(`${path}.value on a "${String(object.type)}" behavior — 2.0 carries value only on a callback behavior`);
+      }
+    } else if (typeof object.tag === "string") {
+      if (REMOVED_IN_CARD_2_0_MODULES.has(object.tag)) {
+        found.push(`${path}.tag="${object.tag}" — module removed in card JSON 2.0`);
+      }
+      for (const field of CARD_1_0_COMPONENT_FIELDS) {
+        if (field in object) {
+          found.push(`${path}.${field} — card 1.0 component field; 2.0 puts it in behaviors`);
+        }
+      }
+    }
+
+    for (const [key, child] of Object.entries(object)) {
+      found.push(...findCard1_0Constructs(child, `${path}.${key}`, key === "behaviors"));
+    }
+    return found;
+  }
+
+  // The guard has to be shown to still BITE, or narrowing it is indistinguishable
+  // from deleting it. This is a genuine card 1.0 approval card, hand-written from
+  // the 1.0 docs rather than produced by anything in this repo.
+  const GENUINE_CARD_1_0_PAYLOAD = {
+    config: { wide_screen_mode: true },
+    header: { title: { tag: "plain_text", content: "审批" }, template: "blue" },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: "是否批准这笔交易？" } },
+      {
+        tag: "action",
+        actions: [
+          { tag: "button", text: { tag: "plain_text", content: "批准" }, type: "primary", value: { key: "approve:12345" } },
+          { tag: "button", text: { tag: "plain_text", content: "查看报告" }, type: "default", url: "https://example.com/r" },
+          { tag: "button", text: { tag: "plain_text", content: "多端" }, type: "default", multi_url: { url: "https://example.com/r" } }
+        ]
+      }
+    ]
+  };
+
+  it("flags every genuine card 1.0 construct - the guard still bites after being narrowed", () => {
+    const found = findCard1_0Constructs(GENUINE_CARD_1_0_PAYLOAD);
+
+    expect(found.some((entry) => entry.includes('tag="action"'))).toBe(true);
+    expect(found.some((entry) => entry.includes(".value —"))).toBe(true);
+    expect(found.some((entry) => entry.includes(".url —"))).toBe(true);
+    expect(found.some((entry) => entry.includes(".multi_url —"))).toBe(true);
+  });
+
+  // The shape the next task (the Feishu approval-button callback) must emit,
+  // written out here independently of buildFeishuCardPayload so the guard is
+  // proven against the DOCUMENTED 2.0 syntax and not merely against whatever
+  // this repo happens to produce.
+  it("passes a valid card 2.0 callback behavior - `value` inside behaviors is 2.0, not 1.0", () => {
+    const validCard2_0Callback = {
+      schema: "2.0",
+      config: { update_multi: true },
+      header: { title: { tag: "plain_text", content: "审批" }, template: "blue" },
+      body: {
+        elements: [
+          { tag: "markdown", content: "是否批准这笔交易？" },
+          {
+            tag: "button",
+            text: { tag: "plain_text", content: "批准" },
+            type: "primary",
+            behaviors: [{ type: "callback", value: { action: "approve", proposalId: "prop_12345" } }]
+          },
+          {
+            tag: "button",
+            text: { tag: "plain_text", content: "查看报告" },
+            type: "default",
+            behaviors: [{ type: "open_url", default_url: "https://example.com/r", pc_url: "https://example.com/r" }]
+          }
+        ]
+      }
+    };
+
+    expect(findCard1_0Constructs(validCard2_0Callback)).toEqual([]);
+    // ... and the substring scan this replaced would have rejected it.
+    expect(JSON.stringify(validCard2_0Callback)).toContain('"value":');
+  });
 
   it("expresses a link as a card 2.0 open_url behavior, never the 1.0 url field", () => {
     const card: InteractiveCard = {
@@ -324,9 +440,7 @@ describe("buildFeishuCardPayload", () => {
     // The button is a body element in its own right: 2.0 has no action module
     // to wrap it in.
     expect(elements.some((element) => element.tag === "action")).toBe(false);
-    for (const syntax of FEISHU_1_0_ONLY_SYNTAX) {
-      expect(JSON.stringify(payload)).not.toContain(syntax);
-    }
+    expect(findCard1_0Constructs(payload)).toEqual([]);
   });
 
   it("expresses a callback button as a card 2.0 callback behavior carrying the OpenClaw value", () => {
@@ -367,6 +481,9 @@ describe("buildFeishuCardPayload", () => {
     // travels inside the behavior now instead of a top-level `value`.
     expect(JSON.stringify(payload)).toContain('"value":{"value":"approve:12345"}');
     expect(elements.some((element) => element.tag === "action")).toBe(false);
+    // This card is the one the old substring guard would have rejected: it
+    // contains `"value":` and is nonetheless valid 2.0.
+    expect(findCard1_0Constructs(payload)).toEqual([]);
   });
 
   it("keeps a link button alongside callback buttons, both in 2.0 syntax", () => {
