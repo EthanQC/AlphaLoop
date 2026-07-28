@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
-import { analyzeOpenClawRuntimeSnapshot } from "./openclaw-runtime-doctor-core.mjs";
+import { analyzeOpenClawRuntimeSnapshot, readLaunchdJobStates } from "./openclaw-runtime-doctor-core.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime", "openclaw-cron-runner");
@@ -17,20 +17,21 @@ const snapshot = {
   cronRunnerListeners: readListeners("18792"),
   gatewayErrorLines: readGatewayErrorLines(),
   recentRunnerResults: readRecentRunnerResults(),
-  launchdJobLabels: readLoadedLaunchdJobLabels(),
+  // Round-3 finding F2: this is the REAL launchd probe, shared verbatim with
+  // openclaw-runtime-doctor-core.test.ts (which runs it against this
+  // machine's actual launchctl) rather than re-implemented here - a probe
+  // whose test drives a lookalike copy proves nothing about what the doctor
+  // itself sees.
+  launchdJobs: readLaunchdJobStates(),
   runtimeRoot,
   dbPath
 };
 
-// `launchdJobLabels` legitimately holds every launchd job on the whole
-// machine (hundreds of unrelated Apple/OS agents) - the full list is what
-// checkLaunchdJobs above needs to reliably detect a match, but dumping all of
-// it into this printed report would bury the findings that actually matter.
-// Only the labels this repo's own jobs care about are worth echoing back.
-const printedSnapshot = {
-  ...snapshot,
-  launchdJobLabels: snapshot.launchdJobLabels.filter((label) => label.startsWith("com.alphaloop.") || label.startsWith("com.openclaw."))
-};
+// `launchdJobs` is already scoped to exactly the labels this repo owns (it is
+// built from install-launchd-ownership.txt), so unlike the old whole-machine
+// `launchctl list` dump it can be printed verbatim - the state/domain columns
+// are the most useful part of the report when something is down.
+const printedSnapshot = snapshot;
 
 // task H2 fix round (this task, CRITICAL finding): analyzeOpenClawRuntimeSnapshot
 // now isolates each individual check's own throws internally (see that
@@ -124,20 +125,6 @@ function readRecentRunnerResults() {
       error: entry.error,
       stderrTail: tail(entry.stderrTail)
     }));
-}
-
-// task H2 (Phase 2.5 hardening): labels of every launchd job currently
-// loaded for this user, per `launchctl list`. Its columns are
-// PID\tStatus\tLabel (PID is "-" for a job that isn't currently running but
-// is still loaded) - the label has no internal whitespace, so grabbing the
-// last whitespace-separated token off each line is enough; the header row
-// ("PID Status Label") parses to a harmless "Label" entry that never matches
-// a real com.alphaloop.* job name below.
-function readLoadedLaunchdJobLabels() {
-  return tryExec("launchctl", ["list"])
-    .split(/\r?\n/u)
-    .map((line) => line.trim().split(/\s+/u).at(-1))
-    .filter(Boolean);
 }
 
 function tryExec(command, args) {

@@ -1,29 +1,152 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { readLaunchdOwnership } from "./install-launchd-ownership.mjs";
 import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
 import { newsEngineHealthStats } from "./news-store.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { isUsRegularMarketHours } from "./trading-schedule.mjs";
 
-// task H2 (Phase 2.5 hardening), extended in Phase 3 Task 8, extended again
-// in Phase 4 Task 8: the launchd jobs install-launchd.sh wires up (see that
-// script) - a dev machine legitimately runs none of them, so missing any one
-// is a warn, not a fail (see `warn()` below - only "error" severity flips
-// `ok` to false). com.alphaloop.platform-app (Phase 3 Task 8) and
-// com.alphaloop.rsshub (Phase 4 Task 8) each joined this list the moment
-// their own `.plist.template` was added alongside the rest -
-// install-launchd.sh's glob (`*.plist.template`) already covers new files
-// without modification, so this list is the only place that needed the
-// addition either time.
-const REQUIRED_LAUNCHD_JOBS = [
-  { label: "com.alphaloop.daily-backup", slug: "daily-backup" },
-  { label: "com.alphaloop.market-alerts", slug: "market-alerts" },
-  { label: "com.alphaloop.platform-app", slug: "platform-app" },
-  { label: "com.alphaloop.rsshub", slug: "rsshub" }
-];
+// The command that actually installs each domain's jobs. Round-3 finding F2:
+// the old hint named `pnpm launchd:install-backup-alerts` for every missing
+// job, but after ac741d8 that script installs ONLY user-scoped labels (it
+// filters on install-launchd-ownership.txt) - so for the six promoted
+// services the doctor was printing a command that installs them nowhere.
+const LAUNCHD_INSTALL_COMMAND = {
+  system: "sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh",
+  user: "pnpm launchd:install-backup-alerts"
+};
+
+// task H2 (Phase 2.5 hardening), extended in Phase 3 Task 8 and Phase 4 Task
+// 8, rebuilt for round-3 finding F2: which jobs must be loaded, and IN WHICH
+// LAUNCHD DOMAIN, now comes straight from install-launchd-ownership.txt - the
+// same manifest install-system-daemons.sh and install-launchd.sh are checked
+// against - instead of a fourth hand-maintained copy of the list. The list
+// used to name four labels and no domain at all, which is how it silently
+// went wrong twice over: it missed cron-runner / official-paper poll+pnl /
+// gateway / broker-executor entirely, and it compared the remaining ones
+// against `launchctl list`, which only ever reports the caller's own
+// gui/$UID domain.
+//
+// A dev machine legitimately runs none of these, so "not loaded anywhere" is
+// a warn, not a fail (see `warn()` below - only "error" severity flips `ok`
+// to false). Being loaded in the WRONG domain is a different matter and IS an
+// error: that is the two-owners-for-one-label race the manifest exists to
+// prevent (two broker-executors on one trading database), and no dev machine
+// gets into that state by accident.
+export const REQUIRED_LAUNCHD_JOBS = buildRequiredLaunchdJobs();
+
+function buildRequiredLaunchdJobs(rows = readLaunchdOwnership()) {
+  const jobs = rows
+    .filter((row) => row.scope === "system" || row.scope === "user")
+    .map((row) => ({ label: row.label, domain: row.scope, slug: launchdJobSlug(row.label) }));
+  // A slug is only a display/finding-code convenience; if two labels ever
+  // shortened to the same one, fall back to the full label for BOTH rather
+  // than emitting two findings that look like one job reported twice.
+  const slugCounts = new Map();
+  for (const job of jobs) {
+    slugCounts.set(job.slug, (slugCounts.get(job.slug) ?? 0) + 1);
+  }
+  return jobs.map((job) => (slugCounts.get(job.slug) > 1 ? { ...job, slug: job.label } : job));
+}
+
+// Strips the shared reverse-DNS prefixes so a finding code reads
+// `launchd-jobs.platform-app.not_loaded` rather than
+// `launchd-jobs.com.alphaloop.platform-app.not_loaded`. Longest prefix first:
+// com.openclaw.system.trading. must win over com.openclaw. .
+function launchdJobSlug(label) {
+  return String(label)
+    .replace(/^ai\.openclaw\.system\./u, "")
+    .replace(/^com\.openclaw\.system\.trading\./u, "")
+    .replace(/^com\.openclaw\.trading\./u, "")
+    .replace(/^com\.openclaw\./u, "")
+    .replace(/^com\.alphaloop\./u, "");
+}
+
+// Round-3 finding F2 - the launchd probe itself, living here (rather than in
+// the CLI) purely so the test suite can run THIS function, the one the doctor
+// actually calls, against a real `launchctl`.
+//
+// `launchctl list` answers only for the CALLER's own domain (gui/$UID).
+// Verified on the mini and on this laptop: a /Library/LaunchDaemons job that
+// is loaded and running does not appear in its output at all, while
+// `launchctl print system/<label>` exits 0 and prints `state = running`, and
+// exits 113 for a label that is not there. So each domain has to be asked
+// separately.
+//
+// Both domains are probed for EVERY required label, not just the one the
+// ownership manifest expects: "loaded, but in the wrong domain" is a real and
+// dangerous state (two owners writing one trading database) and it is
+// invisible to a probe that only looks where the label is supposed to be. It
+// is also the state a machine sits in between running the retire step and the
+// install step of the deploy runbook.
+export function readLaunchdJobStates(requiredJobs = REQUIRED_LAUNCHD_JOBS, launchctl = runLaunchctl) {
+  const userLabels = readUserDomainLaunchdLabels(launchctl);
+  const uid = process.getuid?.();
+  return requiredJobs.map((job) => {
+    const loadedDomains = [];
+    let userState = null;
+    let systemState = null;
+
+    if (userLabels.has(job.label)) {
+      loadedDomains.push("user");
+      userState = uid === undefined ? "unknown" : readLaunchdJobState(`gui/${uid}/${job.label}`, launchctl);
+    }
+    systemState = readLaunchdJobState(`system/${job.label}`, launchctl);
+    if (systemState !== null) {
+      loadedDomains.push("system");
+    }
+
+    return {
+      label: job.label,
+      expectedDomain: job.domain,
+      loadedDomains,
+      // Prefer the state from the domain that is supposed to own the job, so
+      // a correctly installed machine reports the state that matters.
+      state: (job.domain === "system" ? systemState ?? userState : userState ?? systemState) ?? null
+    };
+  });
+}
+
+// task H2 (Phase 2.5 hardening): labels of every launchd job currently loaded
+// for THIS USER, per `launchctl list`. Its columns are PID\tStatus\tLabel
+// (PID is "-" for a job that is loaded but not currently running) - the label
+// has no internal whitespace, so grabbing the last whitespace-separated token
+// off each line is enough; the header row ("PID Status Label") parses to a
+// harmless "Label" entry that never matches a real job name.
+function readUserDomainLaunchdLabels(launchctl) {
+  return new Set(
+    String(launchctl(["list"]) ?? "")
+      .split(/\r?\n/u)
+      .map((line) => line.trim().split(/\s+/u).at(-1))
+      .filter(Boolean)
+  );
+}
+
+// Returns the `state = ...` value when the job exists in that domain, `null`
+// when it does not - so "exists" and "is currently executing" stay
+// distinguishable (a periodic job between runs is legitimately loaded and not
+// running, which must not be reported as missing).
+function readLaunchdJobState(target, launchctl) {
+  const output = launchctl(["print", target]);
+  if (output === null) {
+    return null;
+  }
+  return String(output).match(/^\s*state\s*=\s*(.+?)\s*$/mu)?.[1] ?? "unknown";
+}
+
+// `null` on a non-zero exit, which for `launchctl print` IS the answer ("no
+// such job in this domain") and must not be flattened into an empty string.
+function runLaunchctl(args) {
+  try {
+    return execFileSync("launchctl", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return null;
+  }
+}
 
 // Phase 3 Task 8 - "platform-app-health" check: platform-app is a KeepAlive
 // server (unlike the periodic backup/alerts jobs above), so "is it loaded"
@@ -237,33 +360,78 @@ function warn(code, message) {
   return { severity: "warn", code, message };
 }
 
-// task H2 (Phase 2.5 hardening) - "launchd-jobs" check: is each job
-// install-launchd.sh installs actually loaded (per `launchctl list`)? Missing
-// either is only a warn (see REQUIRED_LAUNCHD_JOBS's own doc comment) with an
-// actionable hint naming the real install command - NOT `pnpm
-// launchd:install-user` (that pnpm script installs a completely different,
-// unrelated set of report/stock-analysis jobs via install-user-schedules.mjs;
-// pointing at it here would send an operator chasing the wrong script).
-// task H2 fix round (this task, install-path unification finding): a pnpm
-// alias for install-launchd.sh now exists (`launchd:install-backup-alerts`,
-// see package.json and both READMEs' Launchd sections) - the hint below
-// names that pnpm command instead of the raw `bash .../install-launchd.sh`
-// invocation, for the same reason and consistency with the
-// `launchd:install-user` hint an operator would already know.
+// "launchd-jobs" check, rewritten for round-3 finding F2 (verified on the
+// mini and locally: a loaded, running system daemon is INVISIBLE to
+// `launchctl list` - that command only reports the caller's own gui/$UID
+// domain - while `launchctl print system/<label>` returns 0 and prints
+// `state = running`; a label that does not exist there exits 113). The old
+// check compared every required label against `launchctl list` alone, so
+// after ac741d8 promoted six services to /Library/LaunchDaemons it reported
+// them missing forever, on a correctly installed machine, and told the
+// operator to run a script that no longer installs them.
+//
+// Input is `snapshot.launchdJobs`: one row per required job, carrying the
+// domains it was ACTUALLY found loaded in (see readLaunchdJobStates in
+// openclaw-runtime-doctor.mjs, which probes both domains). Three outcomes:
+//
+//   loaded in the expected domain              -> nothing (plus `state` is
+//                                                 carried in the snapshot for
+//                                                 the operator to eyeball)
+//   loaded nowhere                             -> warn + the install command
+//                                                 for ITS domain
+//   loaded in the other domain (or in both)    -> error: two owners for one
+//                                                 label is the exact race
+//                                                 install-launchd-ownership.txt
+//                                                 exists to prevent
 function checkLaunchdJobs(snapshot) {
-  const loaded = new Set(
-    (Array.isArray(snapshot.launchdJobLabels) ? snapshot.launchdJobLabels : []).map(String)
-  );
+  const rows = Array.isArray(snapshot.launchdJobs) ? snapshot.launchdJobs : [];
+  const byLabel = new Map(rows.map((row) => [String(row?.label), row]));
   const findings = [];
+
   for (const job of REQUIRED_LAUNCHD_JOBS) {
-    if (!loaded.has(job.label)) {
+    const row = byLabel.get(job.label);
+    if (!row) {
+      // The probe never ran for this label (an older caller, or a launchctl
+      // that could not be executed at all). Say so instead of silently
+      // treating "we did not look" as "it is fine".
+      findings.push(warn(
+        `launchd-jobs.${job.slug}.unknown`,
+        `未能探测 launchd 任务 ${job.label} 的加载状态（快照里没有这条记录），无法判断它是否在运行。`
+      ));
+      continue;
+    }
+
+    const loadedIn = (Array.isArray(row.loadedDomains) ? row.loadedDomains : []).map(String);
+    const install = LAUNCHD_INSTALL_COMMAND[job.domain];
+    const domainLabel = job.domain === "system" ? "系统域 /Library/LaunchDaemons" : "用户域 ~/Library/LaunchAgents";
+
+    if (loadedIn.length === 0) {
       findings.push(warn(
         `launchd-jobs.${job.slug}.not_loaded`,
-        `launchd 任务 ${job.label} 未加载（launchctl list 未命中）。部署机器上请执行 pnpm launchd:install-backup-alerts 安装；开发机上可以忽略。`
+        `launchd 任务 ${job.label} 未加载（${domainLabel} 与另一个域都没有命中）。部署机器上请执行 ${install} 安装；开发机上可以忽略。`
+      ));
+      continue;
+    }
+
+    const wrongDomains = loadedIn.filter((domain) => domain !== job.domain);
+    if (wrongDomains.length > 0) {
+      const both = loadedIn.includes(job.domain);
+      findings.push(error(
+        `launchd-jobs.${job.slug}.wrong_domain`,
+        both
+          ? `launchd 任务 ${job.label} 同时加载在系统域和用户域，两个实例会互相抢同一份数据库/端口。`
+            + `请执行 ${install}（它会先 bootout 并归档用户域副本，再 bootstrap 系统域实例）。`
+          : `launchd 任务 ${job.label} 加载在 ${describeDomains(wrongDomains)}，但它应当由 ${domainLabel} 拥有`
+            + `（见 install-launchd-ownership.txt）。请执行 ${install} 完成迁移。`
       ));
     }
   }
+
   return findings;
+}
+
+function describeDomains(domains) {
+  return domains.map((domain) => (domain === "system" ? "系统域" : "用户域")).join("、");
 }
 
 // Phase 3 Task 8 - "platform-app-health" check: launchd-jobs above only
@@ -280,14 +448,15 @@ function checkLaunchdJobs(snapshot) {
 //
 // Severity split (task brief): a dev machine legitimately does not run this
 // service at all, so connection failure/timeout is only a `warn`, with the
-// hint naming both `pnpm platform:dev` (manual dev run) and
-// `pnpm launchd:install-backup-alerts` (the same install-launchd.sh that
-// installs the other two launchd jobs above - its `*.plist.template` glob
-// already covers com.alphaloop.platform-app.plist.template with no changes
-// needed, see REQUIRED_LAUNCHD_JOBS's own comment). A response that DOES
-// arrive but is wrong (non-200, or a 200 whose body isn't the expected
-// `{ok:true, service:"platform-app"}` shape) means the process is up but
-// broken - that is an `error`, not a warn.
+// hint naming both `pnpm platform:dev` (manual dev run) and the installer
+// that really owns it. Round-3 finding F2: that installer is
+// install-system-daemons.sh, NOT `pnpm launchd:install-backup-alerts` -
+// com.alphaloop.platform-app moved to /Library/LaunchDaemons in ac741d8, and
+// install-launchd.sh now skips any label the ownership manifest does not
+// scope `user`, so the old hint pointed at a script that installs it
+// nowhere. A response that DOES arrive but is wrong (non-200, or a 200 whose
+// body isn't the expected `{ok:true, service:"platform-app"}` shape) means
+// the process is up but broken - that is an `error`, not a warn.
 //
 // Never throws/rejects on its own - every failure path below returns a
 // finding array instead, so this is safe to call directly even without
@@ -309,7 +478,8 @@ async function checkPlatformAppHealth(snapshot) {
   } catch (fetchError) {
     return [warn(
       "platform-app-health.unreachable",
-      `platform-app 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上尚未起服务是正常的——本地手动起服务请跑 pnpm platform:dev；需要常驻运行请跑 pnpm launchd:install-backup-alerts 安装 launchd 任务（会一并装上 com.alphaloop.platform-app）。`
+      `platform-app 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上尚未起服务是正常的——本地手动起服务请跑 pnpm platform:dev；`
+        + `需要常驻运行请跑 ${LAUNCHD_INSTALL_COMMAND.system} 安装 com.alphaloop.platform-app（它是系统域 daemon，pnpm launchd:install-backup-alerts 装不上它）。`
     )];
   } finally {
     clearTimeout(timeout);

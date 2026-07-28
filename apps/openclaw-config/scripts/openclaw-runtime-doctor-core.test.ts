@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -19,15 +20,20 @@ const HEALTHY_LISTENERS = {
   cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }]
 };
 
-// Phase 3 Task 8 added com.alphaloop.platform-app as a third required
-// launchd job alongside the original two from task H2. Phase 4 Task 8 adds
-// com.alphaloop.rsshub as a fourth.
-const ALL_LAUNCHD_JOBS_LOADED = [
-  "com.alphaloop.daily-backup",
-  "com.alphaloop.market-alerts",
-  "com.alphaloop.platform-app",
-  "com.alphaloop.rsshub"
-];
+// Round-3 finding F2: "everything is installed correctly" is now derived from
+// the real REQUIRED_LAUNCHD_JOBS (itself read from install-launchd-ownership.txt)
+// and built in the shape readLaunchdJobStates actually emits - the suite at
+// the bottom of this file pins that shape against a REAL launchctl on the
+// machine running the tests, so this fixture cannot quietly drift into an
+// input no producer ever emits.
+const ALL_LAUNCHD_JOBS_LOADED = doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+  label: job.label,
+  expectedDomain: job.domain,
+  loadedDomains: [job.domain],
+  state: "running"
+}));
+
+const otherDomain = (domain: string): string => (domain === "system" ? "user" : "system");
 
 // Phase 3 Task 8: analyzeOpenClawRuntimeSnapshot now always runs a real HTTP
 // check against platform-app's /health (see checkPlatformAppHealth) -
@@ -162,36 +168,222 @@ describe("OpenClaw runtime doctor core", () => {
   });
 });
 
-describe("launchd-jobs check (task H2, extended Phase 3 Task 8 with platform-app, Phase 4 Task 8 with rsshub)", () => {
-  it("warns, but does not fail, when none of the required jobs are loaded", async () => {
+describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aware)", () => {
+  it("requires every service the ownership manifest names, in the domain that manifest assigns it", () => {
+    // The pre-F2 list named four labels and no domain, so the six services
+    // ac741d8 promoted to /Library/LaunchDaemons were either absent from the
+    // doctor entirely (cron-runner, official-paper poll+pnl, gateway,
+    // broker-executor) or checked in the wrong place.
+    expect(doctor.REQUIRED_LAUNCHD_JOBS).toEqual([
+      { label: "ai.openclaw.system.gateway", domain: "system", slug: "gateway" },
+      { label: "com.openclaw.system.trading.broker-executor", domain: "system", slug: "broker-executor" },
+      { label: "com.alphaloop.platform-app", domain: "system", slug: "platform-app" },
+      { label: "com.alphaloop.market-alerts", domain: "system", slug: "market-alerts" },
+      { label: "com.alphaloop.daily-backup", domain: "system", slug: "daily-backup" },
+      { label: "com.openclaw.trading.cron-runner", domain: "system", slug: "cron-runner" },
+      { label: "com.openclaw.trading.official-paper.poll", domain: "system", slug: "official-paper.poll" },
+      { label: "com.openclaw.trading.official-paper.pnl", domain: "system", slug: "official-paper.pnl" },
+      { label: "com.alphaloop.rsshub", domain: "user", slug: "rsshub" }
+    ]);
+  });
+
+  it("warns, but does not fail, when none of the required jobs are loaded (a dev machine)", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: []
+      launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+        label: job.label,
+        expectedDomain: job.domain,
+        loadedDomains: [],
+        state: null
+      }))
+    });
+
+    expect(report.ok).toBe(true);
+    for (const job of doctor.REQUIRED_LAUNCHD_JOBS) {
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: `launchd-jobs.${job.slug}.not_loaded`, severity: "warn" })
+      ]));
+    }
+  });
+
+  it("names the installer that really installs each domain, not one that installs it nowhere", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+        label: job.label,
+        expectedDomain: job.domain,
+        loadedDomains: [],
+        state: null
+      }))
+    });
+
+    const messageFor = (slug: string): string =>
+      report.findings.find((finding: { code: string }) => finding.code === `launchd-jobs.${slug}.not_loaded`)?.message ?? "";
+
+    // The old hint sent every missing job to launchd:install-backup-alerts,
+    // which after ac741d8 installs ONLY user-scoped labels - so for a system
+    // daemon it was a command that installs it nowhere.
+    expect(messageFor("platform-app")).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+    expect(messageFor("platform-app")).not.toContain("launchd:install-backup-alerts");
+    expect(messageFor("cron-runner")).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+    // rsshub is the one job that legitimately stays user-level.
+    expect(messageFor("rsshub")).toContain("pnpm launchd:install-backup-alerts");
+    expect(messageFor("rsshub")).not.toContain("install-system-daemons.sh");
+  });
+
+  it("reports nothing once every job is loaded in its own domain", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding: { code: string }) => finding.code.startsWith("launchd-jobs."))).toBe(false);
+  });
+
+  // The regression this whole finding is about: a system daemon that IS
+  // loaded and running is invisible to `launchctl list`. Before F2 the doctor
+  // read only that command, so a correctly installed machine got a permanent
+  // "not loaded" warn for every promoted service.
+  it("does not report a correctly installed system daemon as missing", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
+    });
+
+    expect(report.findings.some((finding: { code: string }) => finding.code === "launchd-jobs.platform-app.not_loaded")).toBe(false);
+    expect(report.findings.some((finding: { code: string }) => finding.code === "launchd-jobs.official-paper.poll.not_loaded")).toBe(false);
+  });
+
+  it("fails when a job is loaded in the wrong domain - the state the mini is in until the runbook is run there", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+        label: job.label,
+        expectedDomain: job.domain,
+        // Exactly what `ls ~/Library/LaunchAgents` shows on the mini today:
+        // every promoted service still user-level.
+        loadedDomains: [otherDomain(job.domain)],
+        state: "running"
+      }))
+    });
+
+    expect(report.ok).toBe(false);
+    const wrong = report.findings.find((finding: { code: string }) => finding.code === "launchd-jobs.cron-runner.wrong_domain");
+    expect(wrong).toMatchObject({ severity: "error" });
+    expect(wrong?.message).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+  });
+
+  it("fails when both domains hold the same label, because two owners race one database", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.map((row) =>
+        row.label === "com.openclaw.system.trading.broker-executor"
+          ? { ...row, loadedDomains: ["system", "user"] }
+          : row)
+    });
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "launchd-jobs.broker-executor.wrong_domain", severity: "error" })
+    ]));
+  });
+
+  it("says so instead of staying silent when the probe produced no row for a job", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      launchdJobs: []
     });
 
     expect(report.ok).toBe(true);
     expect(report.findings).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: "launchd-jobs.daily-backup.not_loaded", severity: "warn" }),
-      expect.objectContaining({ code: "launchd-jobs.market-alerts.not_loaded", severity: "warn" }),
-      expect.objectContaining({ code: "launchd-jobs.platform-app.not_loaded", severity: "warn" }),
-      expect.objectContaining({ code: "launchd-jobs.rsshub.not_loaded", severity: "warn" })
+      expect.objectContaining({ code: "launchd-jobs.rsshub.unknown", severity: "warn" })
     ]));
   });
+});
 
-  it("reports nothing for launchd-jobs once all four are loaded", async () => {
+// Round-3 finding F2's premise, re-proved on whatever machine runs this suite
+// rather than taken on trust: `launchctl list` reports ONLY the caller's
+// gui/$UID domain, so a loaded system daemon is invisible to it. These tests
+// drive the REAL readLaunchdJobStates (the exact function
+// openclaw-runtime-doctor.mjs calls) against the REAL launchctl, using labels
+// discovered from this machine at run time - no recorded fixture, no
+// hand-written "what launchctl probably prints".
+describe("readLaunchdJobStates against the real launchctl (round-3 finding F2)", () => {
+  const launchctlList = execFileSync("launchctl", ["list"], { encoding: "utf8" });
+  const userDomainLabels = new Set(
+    launchctlList.split(/\r?\n/u).slice(1).map((line) => line.trim().split(/\s+/u).at(-1)).filter(Boolean) as string[]
+  );
+  // Every label the SYSTEM domain currently holds, straight from
+  // `launchctl print system` (its job table is the last column of the
+  // "<pid> <status> <label>" rows).
+  const systemDomainLabels = execFileSync("launchctl", ["print", "system"], { encoding: "utf8" })
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => /^(?:\d+|-)\s+(?:\d+|-)\s+\S+$/u.test(line))
+    .map((line) => line.split(/\s+/u).at(-1) as string);
+
+  it("proves the premise: system-domain daemons never show up in `launchctl list`", () => {
+    const systemOnly = systemDomainLabels.filter((label) => !userDomainLabels.has(label));
+    expect(systemOnly.length).toBeGreaterThan(0);
+    expect(systemDomainLabels.length).toBeGreaterThan(0);
+  });
+
+  it("finds a real system daemon in the system domain and a real agent in the user domain", () => {
+    const systemLabel = systemDomainLabels.find((label) => !userDomainLabels.has(label)) as string;
+    const userLabel = [...userDomainLabels].find((label) => !systemDomainLabels.includes(label)) as string;
+
+    const [systemRow, userRow, missingRow] = doctor.readLaunchdJobStates([
+      { label: systemLabel, domain: "system", slug: "sys" },
+      { label: userLabel, domain: "user", slug: "usr" },
+      { label: "com.alphaloop.definitely-not-installed-anywhere", domain: "system", slug: "missing" }
+    ]);
+
+    expect(systemRow.loadedDomains).toEqual(["system"]);
+    expect(typeof systemRow.state).toBe("string");
+    expect(userRow.loadedDomains).toEqual(["user"]);
+    expect(missingRow.loadedDomains).toEqual([]);
+    expect(missingRow.state).toBeNull();
+  });
+
+  // The end-to-end statement: feed the REAL probe's output straight into the
+  // REAL check. On a dev machine that is nine warns and ok:true - the point
+  // being that the wiring between producer and consumer holds without a
+  // hand-authored snapshot in between.
+  it("feeds the real probe's output into the real check without a hand-written snapshot", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: [...ALL_LAUNCHD_JOBS_LOADED, "com.openclaw.gateway"]
+      launchdJobs: doctor.readLaunchdJobStates()
     });
 
-    expect(report.ok).toBe(true);
-    expect(report.findings.some((finding) => finding.code.startsWith("launchd-jobs."))).toBe(false);
+    expect(report.findings.some((finding: { code: string }) => finding.code.endsWith(".unknown"))).toBe(false);
+    for (const finding of report.findings.filter((entry: { code: string }) => entry.code.startsWith("launchd-jobs."))) {
+      expect(finding.code).toMatch(/\.(?:not_loaded|wrong_domain)$/u);
+    }
   });
 });
 
@@ -215,7 +407,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
       // No dbPath at all - this check must work even when the db is the
       // thing that's broken (see market-alerts-poll.mjs's markAlerterDown).
@@ -244,7 +436,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       dbPath
     });
 
@@ -267,7 +459,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - outside market hours
       dbPath
     });
@@ -295,7 +487,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-13T15:00:00.000Z"), // Monday 11:00am US Eastern (EDT) - regular market hours
       dbPath
     });
@@ -323,7 +515,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - the multi-day gap is expected off-hours
       dbPath
     });
@@ -341,7 +533,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
     });
 
@@ -369,7 +561,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot,
       dbPath
     });
@@ -404,7 +596,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2027-01-01T15:00:00.000Z"), // >30min after last run; year 2027 uncovered
       dbPath
     });
@@ -438,7 +630,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - keeps this isolated from the stale-heartbeat check
       dbPath
     });
@@ -481,7 +673,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
 
@@ -504,7 +696,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
 
@@ -529,7 +721,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
 
@@ -554,7 +746,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       platformAppPort: freedPort,
       platformAppHealthTimeoutMs: 500
     });
@@ -565,7 +757,11 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     ]));
     const message = report.findings.find((entry) => entry.code === "platform-app-health.unreachable")?.message;
     expect(message).toContain("pnpm platform:dev");
-    expect(message).toContain("pnpm launchd:install-backup-alerts");
+    // Round-3 finding F2: platform-app is a system daemon since ac741d8, so
+    // the "run it permanently" hint has to name the installer that can
+    // actually install it. launchd:install-backup-alerts skips every label
+    // the ownership manifest does not scope `user`.
+    expect(message).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
   });
 
   it("warns (resolves rather than rejects) when the injected fetch implementation itself throws synchronously", async () => {
@@ -577,7 +773,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       fetchImpl: () => {
         throw new Error("boom - injected network failure");
       }
@@ -627,7 +823,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         rsshubBaseUrl: `http://127.0.0.1:${port}`
       });
 
@@ -655,7 +851,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         rsshubBaseUrl: `http://127.0.0.1:${port}`
       });
 
@@ -678,7 +874,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         rsshubBaseUrl: `http://127.0.0.1:${port}`
       });
 
@@ -703,7 +899,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         rsshubBaseUrl: `http://127.0.0.1:${port}`
       });
 
@@ -725,7 +921,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       rsshubBaseUrl: `http://127.0.0.1:${freedPort}`,
       rsshubHealthTimeoutMs: 500
     });
@@ -753,7 +949,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...PLATFORM_APP_HEALTH_DISABLED,
-        launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED
         // Deliberately no rsshubBaseUrl override - must fall through to
         // process.env.RSSHUB_BASE_URL (the real production resolution path).
       });
@@ -796,7 +992,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
       // no dbPath
     });
 
@@ -813,7 +1009,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       dbPath
     });
 
@@ -833,7 +1029,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // 24h later
       dbPath
     });
@@ -854,7 +1050,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // >48h later
       dbPath
     });
@@ -879,7 +1075,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       dbPath
     });
 
@@ -898,7 +1094,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       dbPath
     });
 
@@ -931,7 +1127,12 @@ describe("failure isolation across checks (task H2 fix round)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: [],
+      launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+        label: job.label,
+        expectedDomain: job.domain,
+        loadedDomains: [],
+        state: null
+      })),
       recentRunnerResults: [throwingRunnerResult]
     });
 
@@ -966,7 +1167,7 @@ describe("control-persona check (v2 persona deployment fix)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
-      launchdJobLabels: ALL_LAUNCHD_JOBS_LOADED
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
     };
   }
 
