@@ -88,15 +88,100 @@ describe("resolveSnapshotOwnerId", () => {
   });
 });
 
+/**
+ * G5 (2026-07-28 round 4): this fixture used to be a hand-written object
+ * literal - `{fetchedAt, primaryAsset:{net_assets,total_cash}, positions:[...],
+ * quotes:[...]}` - and every renderPnlReport assertion in this file, including
+ * the round-3 收支变化表 evidence, was measured against it. It was a shape the
+ * real pipeline cannot produce: no `source`, no `accountMode`, no `check`, no
+ * `assets`, positions with none of the fields normalizeOfficialPosition adds,
+ * and a primaryAsset with no `currency` - which validateOfficialPrimaryAsset
+ * rejects outright, so a real fetch could never have handed the renderer this.
+ *
+ * It is now assembled by running the same chain production runs, end to end:
+ * apps/longbridge-cli's own shape.ts builders emit the check / assets /
+ * positions / quote payloads (those functions ARE what `longbridge-cli trade
+ * check|assets|positions` prints), report-data.mjs's
+ * normalizeOfficialPaperSnapshot and normalizeQuotePayload consume them, and
+ * official-paper-monitor.mjs's own attachPriceSource decides priceSource/price
+ * - rather than this file asserting what it would have decided.
+ *
+ * `overrides` still replaces VALUES the way every call site in this file
+ * expects; what it no longer does is invent the snapshot's shape.
+ */
+const reportData = await import("./report-data.mjs");
+const longbridgeShape = await import("../../longbridge-cli/src/shape.ts");
+
+function producedSnapshot(input: {
+  fetchedAt: string;
+  assets: Parameters<typeof longbridgeShape.buildAssetsPayload>[0];
+  positions: Parameters<typeof longbridgeShape.buildPositionsPayload>[0];
+  quotes: Parameters<typeof longbridgeShape.buildQuoteRows>[1];
+}) {
+  const normalized = reportData.normalizeOfficialPaperSnapshot({
+    check: longbridgeShape.buildCheckPayload({
+      resolution: { active: "global", cached: "global", source: "default" },
+      probes: { global: { ok: true, latencyMs: 12 }, cn: { ok: true, latencyMs: 30 } }
+    }),
+    // `longbridge-cli trade assets|positions` prints a bare array (run.ts's
+    // `case "assets"` returns buildAssetsPayload(...) directly), which is what
+    // extractArrayPayload receives.
+    assets: longbridgeShape.buildAssetsPayload(input.assets),
+    positions: longbridgeShape.buildPositionsPayload(input.positions),
+    fetchedAt: input.fetchedAt
+  });
+  const quotes = normalized.positions.map((position: { symbol: string }) =>
+    reportData.normalizeQuotePayload(
+      longbridgeShape.buildQuoteRows([position.symbol], input.quotes),
+      position.symbol
+    )
+  );
+  const { positions, degradedSymbols } = officialPaperMonitor.attachPriceSource(normalized.positions, quotes);
+  return {
+    ...normalized,
+    positions,
+    quotes,
+    degraded: degradedSymbols.length > 0,
+    degradedReason: degradedSymbols.length > 0 ? `行情读取失败：${degradedSymbols.join("、")}` : null
+  };
+}
+
 function buildSnapshot(overrides: Record<string, unknown> = {}) {
   return {
-    fetchedAt: "2026-07-01T14:00:00.000Z",
-    primaryAsset: { net_assets: "1000", total_cash: "500" },
-    positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100, priceSource: "live", price: 106 }],
-    quotes: [{ symbol: "NVDA.US", last: 106 }],
+    ...producedSnapshot({
+      fetchedAt: "2026-07-01T14:00:00.000Z",
+      assets: [{ netAssets: "1000", totalCash: "500", currency: "USD", buyPower: "500", riskLevel: 1 }],
+      positions: [
+        { symbol: "NVDA.US", name: "NVIDIA", market: "US", currency: "USD", quantity: "10", available: "10", costPrice: "100" }
+      ],
+      quotes: [{ symbol: "NVDA.US", lastDone: "106" }]
+    }),
     ...overrides
   };
 }
+
+describe("the snapshot fixture these tests render is one the real pipeline produces", () => {
+  it("carries what only the real check/assets/positions chain puts there", () => {
+    const snapshot = buildSnapshot();
+    // Fields the hand-written literal never carried, each one written by a
+    // producer rather than by this file.
+    expect(snapshot.source).toBe("longbridge-official-paper");
+    expect(snapshot.accountMode).toBe("paper");
+    expect(snapshot.check).toMatchObject({ sessionStatus: "valid", okRegions: ["global", "cn"] });
+    // validateOfficialPrimaryAsset REJECTS an asset row with no currency, so
+    // the old fixture's `{net_assets, total_cash}` could not have come off a
+    // real fetch at all.
+    expect(snapshot.primaryAsset).toMatchObject({ currency: "USD", buy_power: "500" });
+    // normalizeOfficialPosition's own output, then attachPriceSource's verdict.
+    expect(snapshot.positions[0]).toMatchObject({
+      symbol: "NVDA.US",
+      assetClass: "stock",
+      costPrice: 100,
+      priceSource: "live",
+      price: 106
+    });
+  });
+});
 
 describe("saveSnapshot: writes owner_id", () => {
   it("writes the single active member's id as owner_id", () => {

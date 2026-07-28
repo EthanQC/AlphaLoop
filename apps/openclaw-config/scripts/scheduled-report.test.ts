@@ -784,15 +784,16 @@ describe("F4: execution status is classified from the row's structured outcome",
     expect(scheduledReport.summarizeExecutionRow(daily).status).toBe("报告记录已入库。");
   });
 
-  it("a Chinese success narrative that merely contains the word 'failed' is never read as a failure", () => {
-    // The exact sentence reconcile-official-paper-orders.mjs writes into every
-    // body. Structured stage wins; the prose is not consulted.
-    const row = {
-      category: "trade",
-      title: "AAPL.US 执行报告",
-      body: "状态：对账已确认成交（此前误判为提交未确认）\n- 已将提案状态由 failed 更正为 executed，并补记一条交易执行报告。",
-      metadata: JSON.stringify({ symbol: "AAPL.US", side: "sell", quantity: 10, lifecycleStage: "filled", localStatus: "accepted", brokerStatus: "Filled" })
-    };
-    expect(scheduledReport.summarizeExecutionRow(row).status).toBe("券商已确认成交。");
-  });
+  // G5 (2026-07-28 round 4): a case here used to hand-write a reconcile row -
+  // two lines lifted out of a twelve-line body, plus a six-field metadata
+  // object invented on the spot - under a comment claiming it was "the exact
+  // sentence reconcile-official-paper-orders.mjs writes into every body". The
+  // real writer's body also carries 工单/执行方/外部订单号/券商状态/生命周期阶段/
+  // 限价 and its metadata carries ticketId/proposalId/environment/assetClass/
+  // source/note, so the fixture was a shape no producer emits. Deleted rather
+  // than repaired: reconcile-official-paper-orders.test.ts's
+  // "classifies the REAL writer's row from its structured stage, not from the
+  // word 'failed' in its Chinese prose" already proves the same property by
+  // running the actual writer into a temp db and reading its row back out,
+  // which is strictly stronger than anything typed in here could be.
 });

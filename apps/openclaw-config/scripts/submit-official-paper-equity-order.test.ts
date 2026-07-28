@@ -6,7 +6,9 @@ import { describe, expect, it } from "vitest";
 // Phase 6 Task 4 (2026-07-15 plan): submit-official-paper-equity-order.mjs
 // used to POST a hand-built OrderTicket directly to broker-executor with no
 // proposal and no shared secret - that path is now permanently closed
-// server-side (403, see apps/broker-executor/src/index.test.ts). This script
+// server-side (403, pinned by apps/broker-executor/src/server.test.ts's "403s
+// when proposalId is missing from the body (also covers the retired
+// direct-ticket body shape)"). This script
 // is now a thin shell that makes NO network call at all and always refuses,
 // pointing operators at proposals.mjs create + approve instead. These tests
 // spawn the real script as a subprocess (not an in-process import) because

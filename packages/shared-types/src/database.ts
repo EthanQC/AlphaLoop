@@ -1154,8 +1154,20 @@ export class AuditLogRepository {
 // surfaced only inside the anonymous "未按成员归属" count). An unstamped row is
 // unattributable forever: nothing downstream can recover who placed the order.
 // So "no owner" now has to be WRITTEN as `ownerId: null` - an explicit
-// statement that this row belongs to nobody - and forgetting the field is a
-// compile error instead of a silent orphan.
+// statement that this row belongs to nobody.
+//
+// G5 (2026-07-28 round 4) - correcting what this paragraph used to claim. It
+// said "forgetting the field is a compile error instead of a silent orphan",
+// which was true only for the TypeScript caller (broker-executor) that had
+// never forgotten it. The caller that DID forget is a .mjs script in
+// apps/openclaw-config, a directory no compiler read at all: it had no
+// package.json and no tsconfig, so `pnpm typecheck` skipped it entirely. The
+// required field could not have stopped that omission, and the comment saying
+// otherwise is exactly the kind of claim that made the defect look fixed.
+// What enforces it for that caller now is
+// apps/openclaw-config/scripts/check-repository-writes.mjs (that directory's
+// `pnpm typecheck`), which resolves this type at the .mjs call site and fails
+// on a missing required property - see its header for what it does not cover.
 export type OwnedExecutionReport = ExecutionReport & { ownerId: string | null };
 
 export class ExecutionReportRepository {
@@ -2253,14 +2265,21 @@ export class CircuitBreakerRepository {
 // US/Eastern trading-day UTC boundary (Phase 8 Task 1, 2026-07-16 plan)
 //
 // Mirrors apps/openclaw-config/scripts/trading-schedule.mjs's PRIVATE
-// (unexported) `nyMidnightUtcIso`/`shiftDateLabel` helpers verbatim, rather
+// (unexported) `nyUtcOffsetMinutes`/`nyMidnightUtcIso` helpers verbatim, rather
 // than importing them: that script lives under apps/openclaw-config, and
 // packages/shared-types is a dependency OF apps (not the reverse) - importing
 // across that boundary would invert the dependency graph. trading-
 // schedule.test.ts already pins the DST-crossing behavior this depends on
 // (an EDT Monday: 00:00 America/New_York == 04:00Z, and an EST Monday: ==
-// 05:00Z) - any future drift between the two copies should be caught by
-// keeping the two files' comments cross-referenced, as this one does.
+// 05:00Z), and its PARITY_FUNCTION_NAMES check extracts both functions' text
+// from this file and from the .mjs and compares them normalized, so editing
+// either copy alone fails that suite.
+//
+// G5 (2026-07-28 round 4) corrected two things this paragraph used to say: it
+// named `shiftDateLabel` as one of the mirrored helpers (this file has never
+// had a copy of it - only the two named above), and it said drift "should be
+// caught by keeping the two files' comments cross-referenced", which is not a
+// mechanism. The executable parity check named above is.
 //
 // The boundary math: a `tradingDay` is a 'YYYY-MM-DD' US/Eastern CALENDAR
 // date (e.g. from trading-schedule.mjs's `currentUsEasternTradingDay`).

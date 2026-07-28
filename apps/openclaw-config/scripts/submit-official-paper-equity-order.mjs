@@ -7,7 +7,10 @@
 // proposal plus the `X-AlphaLoop-Broker-Secret` header (see
 // apps/broker-executor/src/index.ts's Global Constraints ①/②) - a bare
 // ticket body like this script used to send is rejected with 403 (pinned by
-// apps/broker-executor/src/index.test.ts's "manual script" negative test).
+// apps/broker-executor/src/server.test.ts's "403s when proposalId is missing
+// from the body (also covers the retired direct-ticket body shape)"; G5
+// 2026-07-28 corrected this reference, which named a file and a test title
+// that have never existed).
 //
 // This is now a thin shell: it makes NO network call and submits NOTHING.
 // It only prints the two-step replacement flow (create the trade as a
