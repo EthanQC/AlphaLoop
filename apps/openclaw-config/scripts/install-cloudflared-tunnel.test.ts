@@ -21,10 +21,33 @@ const script = readFileSync(
 
 const TOKEN = "eyJhIjoiYWJjMTIzIiwidCI6InR1bm5lbC1pZCIsInMiOiJzZWNyZXQifQ==";
 
+/**
+ * H3 (2026-07-28, round-5): this file left the typecheck backlog, and all five
+ * of its errors were this one signature.
+ *
+ * `resolveTunnelToken({ argv = [], env = {}, envFileText = "" } = {})` is plain
+ * JS, and TypeScript infers a parameter's type from its destructuring default:
+ * `[]` becomes `never[]` and `{}` becomes a bag with no properties, so every
+ * real argument read as "string is not assignable to never".
+ *
+ * This declares the contract the .mjs implements instead of casting to `any`.
+ * Be precise about what it buys: it typechecks this file's CALL SITES against
+ * the shape below - it cannot verify the .mjs still has that shape, since
+ * checkJs is off for the scripts directory. The lasting fix is JSDoc types on
+ * install-cloudflared-tunnel.mjs itself, which belongs to the install-script
+ * owner, not to this file.
+ */
+const resolveToken = resolveTunnelToken as (input?: {
+  argv?: string[];
+  env?: Record<string, string | undefined>;
+  envFileText?: string;
+  // `null` when no source supplies one - see the "returns null" case below.
+}) => string | null;
+
 describe("resolveTunnelToken", () => {
   it("prefers the --token argv flag over env and .env.local", () => {
     expect(
-      resolveTunnelToken({
+      resolveToken({
         argv: ["--token", "argv-token"],
         env: { CF_TUNNEL_TOKEN: "env-token" },
         envFileText: "CF_TUNNEL_TOKEN=file-token\n"
@@ -34,17 +57,17 @@ describe("resolveTunnelToken", () => {
 
   it("falls back to env.CF_TUNNEL_TOKEN, then to the .env.local text", () => {
     expect(
-      resolveTunnelToken({
+      resolveToken({
         env: { CF_TUNNEL_TOKEN: "env-token" },
         envFileText: "CF_TUNNEL_TOKEN=file-token\n"
       })
     ).toBe("env-token");
-    expect(resolveTunnelToken({ envFileText: "CF_TUNNEL_TOKEN=file-token\n" })).toBe("file-token");
+    expect(resolveToken({ envFileText: "CF_TUNNEL_TOKEN=file-token\n" })).toBe("file-token");
   });
 
   it("ignores an empty env value and still reads .env.local", () => {
     expect(
-      resolveTunnelToken({
+      resolveToken({
         env: { CF_TUNNEL_TOKEN: "  " },
         envFileText: "CF_TUNNEL_TOKEN=file-token\n"
       })
@@ -52,22 +75,22 @@ describe("resolveTunnelToken", () => {
   });
 
   it("returns null when no source provides a token", () => {
-    expect(resolveTunnelToken({})).toBeNull();
-    expect(resolveTunnelToken({ envFileText: "# nothing here\nOTHER=1\n" })).toBeNull();
+    expect(resolveToken({})).toBeNull();
+    expect(resolveToken({ envFileText: "# nothing here\nOTHER=1\n" })).toBeNull();
   });
 
   it("trims surrounding whitespace from the token", () => {
-    expect(resolveTunnelToken({ env: { CF_TUNNEL_TOKEN: `  ${TOKEN}\n` } })).toBe(TOKEN);
+    expect(resolveToken({ env: { CF_TUNNEL_TOKEN: `  ${TOKEN}\n` } })).toBe(TOKEN);
   });
 
   it("throws when --token is given without a value", () => {
-    expect(() => resolveTunnelToken({ argv: ["--token"] })).toThrow(/without a value/u);
-    expect(() => resolveTunnelToken({ argv: ["--token", "--dry-run"] })).toThrow(/without a value/u);
+    expect(() => resolveToken({ argv: ["--token"] })).toThrow(/without a value/u);
+    expect(() => resolveToken({ argv: ["--token", "--dry-run"] })).toThrow(/without a value/u);
   });
 
   it("throws on a token with interior whitespace (mispaste) instead of installing it", () => {
     expect(() =>
-      resolveTunnelToken({ env: { CF_TUNNEL_TOKEN: "eyJhIjoi YWJjMTIz" } })
+      resolveToken({ env: { CF_TUNNEL_TOKEN: "eyJhIjoi YWJjMTIz" } })
     ).toThrow(/malformed/u);
   });
 });

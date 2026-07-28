@@ -68,26 +68,43 @@
     "**/dist/**",
 
     // ------------------------------------------------------------------
-    // PRE-EXISTING BACKLOG - 37 files, 858 errors, all in
-    // apps/openclaw-config/scripts (measured 2026-07-28 with this exact
-    // config). Every other test file in the repo is checked: 88 of the 125
-    // under packages/** + apps/** (all 52 TypeScript-native ones, plus 36 of
-    // apps/openclaw-config's 73), and the 2 under test/ via
-    // tsconfig.tools.json - 90 of 127, against 1 of 126 before this file
-    // existed. This list is a ratchet, not a policy: test/typecheck-coverage
-    // .test.ts fails if it grows, if an entry names a file that no longer
-    // exists, or if a NEW test file is born outside both lists.
+    // PRE-EXISTING BACKLOG - 33 files, 818 errors, all in
+    // apps/openclaw-config/scripts (re-measured 2026-07-28 with this exact
+    // config, by emptying this list and counting). Every other test file in the
+    // repo is checked: 92 of the 125 under packages/** + apps/** (all 52
+    // TypeScript-native ones, plus 40 of apps/openclaw-config's 73), and the 3
+    // under test/ via tsconfig.tools.json - 95 of 128, against 1 of 126 before
+    // this file existed. This list is a ratchet, not a policy:
+    // test/typecheck-coverage.test.ts fails if it grows, if an entry names a
+    // file that no longer exists, or if a NEW test file is born outside both
+    // lists.
     //
-    // The backlog is overwhelmingly the .mjs boundary, not broken tests:
-    // TypeScript infers a plain-JS function's parameter from its destructuring
-    // defaults (`symbols = []` -> never[], `{ limit = 250 } = {}` -> a bag
-    // with no fromDate) and its return from a dynamically built object literal
-    // (-> `{}`), so real arguments read as excess properties and real result
-    // fields read as missing. Shrinking it means giving those .mjs modules
-    // JSDoc types - worth doing, out of scope here, and NOT worth faking with
-    // `any` casts in 858 places.
+    // H3 (2026-07-28, round-5) removed four entries, because they were not
+    // pre-existing at all: install-cloudflared-tunnel, openclaw-runtime-doctor-
+    // core, official-paper-monitor and stock-analysis are the files round 4
+    // wrote NEW tests into (an 851-line addition in the doctor's case) while
+    // this list kept them unchecked - new code being born outside the checker
+    // is the opposite of what a backlog is for. Their 57 errors were fixed
+    // test-side, since three of the four .mjs modules belong to other owners:
+    // an assertion that names the missing row/fact/entry wherever
+    // noUncheckedIndexedAccess bit, a runtime check that the producer's
+    // `reportKind` really is a DeepLinkKind, an accessor that fails by name when
+    // attachNarrativeSections attaches no `narrative`, and - only where the .mjs
+    // signature itself is uninferable - a declared alias for the contract it
+    // implements. Those aliases check this repo's CALL SITES; they cannot verify
+    // the .mjs still matches, which is why each one says so at its definition.
     //
-    // Counts are per file, from `tsc -p tsconfig.tests.json`:
+    // The rest of the backlog is overwhelmingly the .mjs boundary, not broken
+    // tests: TypeScript infers a plain-JS function's parameter from its
+    // destructuring defaults (`symbols = []` -> never[], `{ limit = 250 } = {}`
+    // -> a bag with no fromDate) and its return from a dynamically built object
+    // literal (-> `{}`), so real arguments read as excess properties and real
+    // result fields read as missing. Shrinking it means giving those .mjs
+    // modules JSDoc types - worth doing, out of scope here, and NOT worth faking
+    // with `any` casts in 818 places.
+    //
+    // Counts are per file, from `tsc -p tsconfig.tests.json` with that file's
+    // line removed:
     // ------------------------------------------------------------------
     "apps/openclaw-config/scripts/review-engine.test.ts", // 98
     "apps/openclaw-config/scripts/strategy-store.test.ts", // 83
@@ -99,7 +116,6 @@
     "apps/openclaw-config/scripts/narrative-engine.test.ts", // 52
     "apps/openclaw-config/scripts/news-sources.test.ts", // 36
     "apps/openclaw-config/scripts/review-consistency.test.ts", // 28
-    "apps/openclaw-config/scripts/stock-analysis.test.ts", // 25
     "apps/openclaw-config/scripts/_openclaw-gateway.test.ts", // 23
     "apps/openclaw-config/scripts/backup-trading-data.test.ts", // 22
     "apps/openclaw-config/scripts/report-quality.test.ts", // 20
@@ -110,9 +126,7 @@
     "apps/openclaw-config/scripts/stock-facts-store.test.ts", // 10
     "apps/openclaw-config/scripts/scheduled-report.test.ts", // 9
     "apps/openclaw-config/scripts/market-alerts.test.ts", // 9
-    "apps/openclaw-config/scripts/_longbridge.test.ts", // 7
-    "apps/openclaw-config/scripts/openclaw-runtime-doctor-core.test.ts", // 6
-    "apps/openclaw-config/scripts/official-paper-monitor.test.ts", // 6
+    "apps/openclaw-config/scripts/_longbridge.test.ts", // 9
     "apps/openclaw-config/scripts/news-store.test.ts", // 6
     "apps/openclaw-config/scripts/market-alerts-poll.test.ts", // 6
     "apps/openclaw-config/scripts/report-quality-bad-samples.test.ts", // 5
@@ -121,7 +135,6 @@
     "apps/openclaw-config/scripts/members.test.ts", // 5
     "apps/openclaw-config/scripts/market-alerts-seam.test.ts", // 5
     "apps/openclaw-config/scripts/market-alerts-engine.test.ts", // 5
-    "apps/openclaw-config/scripts/install-cloudflared-tunnel.test.ts", // 5
     "apps/openclaw-config/scripts/stock-analysis-metrics.test.ts", // 4
     "apps/openclaw-config/scripts/setup-feishu-user-auth.test.ts", // 4
     "apps/openclaw-config/scripts/render-openclaw-config.test.ts", // 4

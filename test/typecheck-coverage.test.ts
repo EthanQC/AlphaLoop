@@ -17,8 +17,8 @@ import { describe, expect, it } from "vitest";
  *  1. the tests project losing its include globs, or quietly relaxing
  *     strictness so that "green" stops meaning what it means for src;
  *  2. the pre-existing-backlog exclusion list GROWING, or keeping entries for
- *     files that no longer exist - a rename would turn an honest "37
- *     known-dirty files" into a smaller check that still claims 37;
+ *     files that no longer exist - a rename would turn an honest "33
+ *     known-dirty files" into a smaller check that still claims 33;
  *  3. a test file appearing somewhere no tsconfig include glob reaches.
  *
  * It deliberately does NOT run tsc: `pnpm typecheck` does that, and repeating
@@ -33,8 +33,13 @@ const TESTS_TSCONFIG = join(ROOT, "tsconfig.tests.json");
  * The exclusion list may only shrink. Raising this means accepting more
  * unchecked test files - the exact thing I10 set out to end - so it should be a
  * deliberate, argued edit rather than a side effect of adding one more file.
+ *
+ * 37 -> 33 (H3, 2026-07-28 round-5): the four files round 4 wrote its new tests
+ * into were sitting in the backlog, so that round's own code was born
+ * unchecked. They are out, and the ceiling came down with them - otherwise the
+ * next four files to go unchecked would fit in the slack this left behind.
  */
-const MAX_EXCLUDED_TEST_FILES = 37;
+const MAX_EXCLUDED_TEST_FILES = 33;
 
 /** tsconfig.json is JSONC, so TypeScript's own parser is the one that reads it. */
 const ts = createRequire(join(ROOT, "package.json"))("typescript") as typeof import("typescript");

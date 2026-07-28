@@ -14,13 +14,102 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import {
+  MemberRepository,
+  buildDeepLink,
+  openTradingDatabase,
+  type DeepLinkKind,
+  type ReportDeliveryPayload
+} from "../../../packages/shared-types/dist/index.js";
 import { parseConclusionBox } from "./conclusion-box.mjs";
 import { REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
 import { validateStockAnalysisMarkdown, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
+
+/**
+ * H3 (2026-07-28, round-5): this file left the typecheck backlog. Its 27 errors
+ * were four shapes, and each is answered by asserting what the checker could
+ * not know rather than by widening a type until it stops complaining.
+ *
+ *  1. stock-analysis.mjs is plain JS, so a parameter's type is inferred from
+ *     its destructuring default (`failedSymbols = []` -> never[]) and a return
+ *     type from a dynamically built object literal. `renderBatch` /
+ *     `fetchRecords` below declare the contract the .mjs implements. What that
+ *     buys is precise: this file's CALL SITES get checked; it cannot verify the
+ *     .mjs still has that shape, because checkJs is off for scripts/. The
+ *     lasting fix is JSDoc types on the .mjs itself.
+ *  2. `attachNarrativeSections` MUTATES each record, attaching `narrative` -
+ *     invisible to the type of the fixture that was passed in. narrativeOf
+ *     reads it and fails by name if the mutation did not happen, which today
+ *     would be a bare TypeError inside a matcher.
+ *  3. noUncheckedIndexedAccess makes every indexed read `T | undefined`;
+ *     `at` and `factOf` say WHICH row or fact was missing.
+ *  4. the delivery payloads carry `reportKind` widened to `string`, which is
+ *     not the `DeepLinkKind` ReportDeliveryPayload declares.
+ */
+type SectionEntry = { key: string; narrative: boolean; text: string };
+interface NarrativeState {
+  degraded: boolean;
+  degradedReason?: string;
+  degradedSections: unknown[];
+  sections: SectionEntry[];
+}
+
+function narrativeOf(record: unknown): NarrativeState {
+  const attached = (record as { narrative?: NarrativeState }).narrative;
+  if (attached === undefined) {
+    throw new Error("attachNarrativeSections attached no `narrative` to this record");
+  }
+  return attached;
+}
+
+function at<T>(items: readonly T[], index: number, what: string): T {
+  const item = items[index];
+  if (item === undefined) {
+    throw new Error(`${what}: expected an entry at index ${index}, got ${items.length}`);
+  }
+  return item;
+}
+
+function factOf(facts: object, key: string): { valueNum: number | null; valueText?: string } {
+  const fact = (facts as Record<string, unknown>)[key] as { valueNum: number | null; valueText?: string } | undefined;
+  if (fact === undefined) {
+    throw new Error(`no stock fact "${key}" was written (have: ${Object.keys(facts).join(", ") || "none"})`);
+  }
+  return fact;
+}
+
+const renderBatch = stockAnalysis.renderBatchStockAnalysis as (input: {
+  label: string;
+  generatedAt: string;
+  records: unknown[];
+  failedSymbols?: Array<{ symbol: string; error: string }>;
+}) => string;
+
+const fetchRecords = stockAnalysis.fetchStockAnalysisRecords as (
+  symbols: string[],
+  options?: { fetchRecord?: (symbol: string, generatedAt?: string) => Promise<unknown> }
+) => Promise<{ records: Array<{ symbol: string }>; failedSymbols: Array<{ symbol: string; error: string }> }>;
+
+
+/**
+ * `buildStockAnalysisDeliveryPayload` is plain JS, so its `reportKind` widens to
+ * `string` and the payload does not satisfy ReportDeliveryPayload. Rather than
+ * casting the check away, this asserts the producer's value: buildDeepLink
+ * throws a TypeError for a kind the router cannot address, so a payload naming a
+ * page that does not exist fails here instead of type-widening (H3).
+ */
+function asDeliveryPayload(payload: object): ReportDeliveryPayload {
+  const kind = (payload as { reportKind?: unknown }).reportKind;
+  expect(typeof kind, "the payload carries no reportKind").toBe("string");
+  expect(
+    () => buildDeepLink(kind as DeepLinkKind, "2026-07-28"),
+    `reportKind ${String(kind)} is not a page the platform can address`
+  ).not.toThrow();
+  return payload as unknown as ReportDeliveryPayload;
+}
 
 const tempDirs: string[] = [];
 
@@ -195,7 +284,7 @@ describe("fetchStockAnalysisRecords: per-symbol isolation", () => {
       return { symbol, analysis: {} };
     };
 
-    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(
+    const { records, failedSymbols } = await fetchRecords(
       ["AAPL.US", "BAD.US", "MSFT.US"],
       { fetchRecord }
     );
@@ -207,7 +296,7 @@ describe("fetchStockAnalysisRecords: per-symbol isolation", () => {
   it("returns every record when nothing fails", async () => {
     const fetchRecord = async (symbol: string) => ({ symbol, analysis: {} });
 
-    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(["AAPL.US"], { fetchRecord });
+    const { records, failedSymbols } = await fetchRecords(["AAPL.US"], { fetchRecord });
 
     expect(records).toHaveLength(1);
     expect(failedSymbols).toEqual([]);
@@ -218,7 +307,7 @@ describe("fetchStockAnalysisRecords: per-symbol isolation", () => {
       throw new Error("行情读取失败。");
     };
 
-    const { records, failedSymbols } = await stockAnalysis.fetchStockAnalysisRecords(["AAPL.US", "MSFT.US"], { fetchRecord });
+    const { records, failedSymbols } = await fetchRecords(["AAPL.US", "MSFT.US"], { fetchRecord });
 
     expect(records).toEqual([]);
     expect(failedSymbols).toEqual([
@@ -230,7 +319,7 @@ describe("fetchStockAnalysisRecords: per-symbol isolation", () => {
 
 describe("renderBatchStockAnalysis: discloses failed symbols instead of hiding the gap", () => {
   it("includes a data-gap disclosure line naming the failed symbol and reason", () => {
-    const markdown = stockAnalysis.renderBatchStockAnalysis({
+    const markdown = renderBatch({
       label: "2026-07-14",
       generatedAt: "2026-07-14T05:00:00.000Z",
       records: [],
@@ -243,7 +332,7 @@ describe("renderBatchStockAnalysis: discloses failed symbols instead of hiding t
   });
 
   it("omits the disclosure line when nothing failed", () => {
-    const markdown = stockAnalysis.renderBatchStockAnalysis({
+    const markdown = renderBatch({
       label: "2026-07-14",
       generatedAt: "2026-07-14T05:00:00.000Z",
       records: [],
@@ -309,8 +398,8 @@ describe("persistStockFactsForRecords: writes stock_facts per successful record"
 
     const aaplFacts = getStockFacts(db, "2026-07-14", "AAPL.US");
     const msftFacts = getStockFacts(db, "2026-07-14", "MSFT.US");
-    expect(aaplFacts["quote.last"].valueNum).toBe(210.5);
-    expect(msftFacts["quote.last"].valueNum).toBe(430.1);
+    expect(factOf(aaplFacts, "quote.last").valueNum).toBe(210.5);
+    expect(factOf(msftFacts, "quote.last").valueNum).toBe(430.1);
   });
 
   it("never writes facts for a symbol that isn't in `records` (failedSymbols are simply absent from the input)", () => {
@@ -329,7 +418,7 @@ describe("persistStockFactsForRecords: writes stock_facts per successful record"
     // Re-run for AAPL.US alone (e.g. a subsequent single-symbol `prepare`).
     stockAnalysis.persistStockFactsForRecords(db, "2026-07-14", [fakeRecord("AAPL.US")]);
 
-    expect(getStockFacts(db, "2026-07-14", "MSFT.US")["quote.last"].valueNum).toBe(430.1);
+    expect(factOf(getStockFacts(db, "2026-07-14", "MSFT.US"), "quote.last").valueNum).toBe(430.1);
   });
 });
 
@@ -510,7 +599,7 @@ describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen 
       { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
       generatedAt
     );
-    const markdown = stockAnalysis.renderBatchStockAnalysis({
+    const markdown = renderBatch({
       label: generatedAt.slice(0, 10),
       generatedAt,
       records: [{ symbol, analysis, news: stockNewsList() }],
@@ -551,7 +640,7 @@ describe("persistPredictionsForRecords: parses its OWN rendered output into anal
       { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
       generatedAt
     );
-    const markdown = stockAnalysis.renderBatchStockAnalysis({
+    const markdown = renderBatch({
       label: generatedAt.slice(0, 10),
       generatedAt,
       records: [{ symbol, analysis, news: stockNewsList() }],
@@ -600,7 +689,9 @@ describe("persistPredictionsForRecords: parses its OWN rendered output into anal
 
     const rows = db.prepare("SELECT * FROM analysis_predictions WHERE report_path = ?").all(reportPath) as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(1);
-    expect(rows[0].review_date).toBe(second.analysis.conclusionBox.reviewDate);
+    expect(at(rows, 0, "analysis_predictions rows for this report_path").review_date).toBe(
+      second.analysis.conclusionBox.reviewDate
+    );
   });
 
   it("does not touch a different report_path's rows", () => {
@@ -659,7 +750,7 @@ describe("attachNarrativeSections: a globally-degraded narrative run keeps rende
 
     const baseRecord = narrativeFixtureRecord();
     stockAnalysis.persistStockFactsForRecords(db, label, [baseRecord]);
-    const baselineMarkdown = stockAnalysis.renderBatchStockAnalysis({
+    const baselineMarkdown = renderBatch({
       label,
       generatedAt: GENERATED_AT,
       records: [baseRecord],
@@ -682,11 +773,11 @@ describe("attachNarrativeSections: a globally-degraded narrative run keeps rende
     };
     await stockAnalysis.attachNarrativeSections(db, label, [narrativeRecord], { narrativeBackend: unavailableBackend });
 
-    expect(narrativeRecord.narrative.degraded).toBe(true);
-    expect(narrativeRecord.narrative.degradedReason).toMatch(/openclaw gateway/);
-    expect(narrativeRecord.narrative.degradedSections).toHaveLength(8);
+    expect(narrativeOf(narrativeRecord).degraded).toBe(true);
+    expect(narrativeOf(narrativeRecord).degradedReason).toMatch(/openclaw gateway/);
+    expect(narrativeOf(narrativeRecord).degradedSections).toHaveLength(8);
 
-    const withNarrativeMarkdown = stockAnalysis.renderBatchStockAnalysis({
+    const withNarrativeMarkdown = renderBatch({
       label,
       generatedAt: GENERATED_AT,
       records: [narrativeRecord],
@@ -704,11 +795,11 @@ describe("attachNarrativeSections: a globally-degraded narrative run keeps rende
     expect(validateStockAnalysisMarkdown(withNarrativeMarkdown).ok).toBe(true);
   });
 
-  it("renderBatchStockAnalysis renders unchanged when `record.narrative` was never attached at all (pre-P5 direct callers)", () => {
+  it("renderBatchStockAnalysis renders unchanged when `narrativeOf(record)` was never attached at all (pre-P5 direct callers)", () => {
     const record = narrativeFixtureRecord();
     const label = GENERATED_AT.slice(0, 10);
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const markdown = renderBatch({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
 
     expect(markdown).not.toContain(REPORT_DEGRADED_HEADER);
   });
@@ -739,11 +830,11 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
 
     await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
 
-    expect(record.narrative.degraded).toBe(false);
-    const catalystsResult = record.narrative.sections.find((entry: { key: string }) => entry.key === "catalysts");
+    expect(narrativeOf(record).degraded).toBe(false);
+    const catalystsResult = narrativeOf(record).sections.find((entry: { key: string }) => entry.key === "catalysts");
     expect(catalystsResult).toMatchObject({ narrative: true, text: rewrittenCatalysts });
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const markdown = renderBatch({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
 
     expect(markdown).toContain(`- 叙事：${rewrittenCatalysts}`);
     // The deterministic bullet the model rewrote is STILL there, above it.
@@ -762,10 +853,10 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
   // attachNarrativeSections above always goes through) already calls
   // defuseMarkdownInText on the backend's raw output BEFORE accepting it as
   // `narrative: true` text (see narrative-engine.mjs:201) - a defused-but-
-  // otherwise-valid text is what actually reaches record.narrative.sections.
+  // otherwise-valid text is what actually reaches narrativeOf(record).sections.
   // This regression test locks that existing protection in place rather
   // than reapplying a redundant second defuse pass in this file.
-  it("a backend section containing markdown-link injection syntax is already defused by the time it reaches record.narrative (existing protection in narrative-engine.mjs, not stock-analysis.mjs)", async () => {
+  it("a backend section containing markdown-link injection syntax is already defused by the time it reaches narrativeOf(record) (existing protection in narrative-engine.mjs, not stock-analysis.mjs)", async () => {
     const { db } = makeDb();
     const label = GENERATED_AT.slice(0, 10);
     const record = narrativeFixtureRecord();
@@ -777,11 +868,12 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
 
     await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
 
-    const catalystsResult = record.narrative.sections.find((entry: { key: string }) => entry.key === "catalysts");
-    expect(catalystsResult.text).not.toContain("[点击查看](https://evil.example.com/phish)");
-    expect(catalystsResult.text).toContain("［点击查看］(https://evil.example.com/phish)");
+    const catalystsResult = narrativeOf(record).sections.find((entry) => entry.key === "catalysts");
+    expect(catalystsResult, "no catalysts section came back from attachNarrativeSections").toBeDefined();
+    expect(catalystsResult?.text).not.toContain("[点击查看](https://evil.example.com/phish)");
+    expect(catalystsResult?.text).toContain("［点击查看］(https://evil.example.com/phish)");
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const markdown = renderBatch({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
     expect(markdown).not.toContain("[点击查看](https://evil.example.com/phish)");
   });
 });
@@ -883,7 +975,7 @@ describe("persistPredictionsIfDelivered: predictions only ever written for a rea
       { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
       generatedAt
     );
-    const markdown = stockAnalysis.renderBatchStockAnalysis({
+    const markdown = renderBatch({
       label: generatedAt.slice(0, 10),
       generatedAt,
       records: [{ symbol, analysis, news: stockNewsList() }],
@@ -1066,8 +1158,11 @@ describe("fetchFinnhubMetrics / fetchFundamentalSnapshots", () => {
     let sentHeaders: Record<string, string> = {};
     const result = await stockAnalysis.fetchFinnhubMetrics("AMZN.US", {
       apiKey: "test-key",
-      fetchJson: async (_url: unknown, headers: Record<string, string>) => {
-        sentHeaders = headers;
+      // Typed as `{}` to match what TypeScript infers for the .mjs's
+      // `extraHeaders` parameter; the cast is where this test states what the
+      // production caller actually passes.
+      fetchJson: async (_url: unknown, headers: {} = {}) => {
+        sentHeaders = headers as Record<string, string>;
         return { metric: { peTTM: 27.4988, pbQuarterly: 5.0684, marketCapitalization: 2_496_832.8 } };
       }
     });
@@ -1102,6 +1197,12 @@ describe("fetchFinnhubMetrics / fetchFundamentalSnapshots", () => {
     });
 
     expect(merged).toMatchObject({ trailingPE: 27.4988, priceToBook: 5.0684, oneYearTarget: 320 });
+    // fetchFundamentalSnapshots returns either a merged snapshot or `{error}`;
+    // reaching for `sources` without deciding which would read as a merge that
+    // silently produced nothing.
+    if ("error" in merged) {
+      throw new Error(`fetchFundamentalSnapshots degraded instead of merging: ${String(merged.error)}`);
+    }
     expect(merged.sources).toEqual(["finnhub-metric", "nasdaq-summary"]);
     expect(merged.failures.join("；")).toContain("stockanalysis-statistics");
     expect(merged.failures.join("；")).toContain("yahoo-quote");
@@ -1122,10 +1223,10 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
     stockAnalysis.persistStockFactsForRecords(db, LABEL, [record]);
 
     await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: paraphrasingBackend });
-    expect(record.narrative.degraded).toBe(false);
-    expect(record.narrative.sections.every((entry: { narrative: boolean }) => entry.narrative)).toBe(true);
+    expect(narrativeOf(record).degraded).toBe(false);
+    expect(narrativeOf(record).sections.every((entry: { narrative: boolean }) => entry.narrative)).toBe(true);
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const markdown = renderBatch({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
 
     expect(markdown).toContain("- 叙事：本段已改写为流畅的中文叙述");
     // Every frozen evidence phrase the gates read is still in the document.
@@ -1144,7 +1245,7 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
     stockAnalysis.persistStockFactsForRecords(db, LABEL, [record]);
     await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: paraphrasingBackend });
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const markdown = renderBatch({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
     const factsBySymbol = { "AAPL.US": getStockFacts(db, LABEL, "AAPL.US") };
     const deterministicTextBySymbol = { "AAPL.US": stockAnalysis.deterministicTextForRecord(record) };
 
@@ -1168,14 +1269,19 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
 
     await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: fabricatingBackend });
 
-    const markdown = stockAnalysis.renderBatchStockAnalysis({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
-    const catalystsBlock = markdown.split("### 催化剂")[1].split("###")[0];
+    const markdown = renderBatch({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
+    const catalystsBlock = at(
+      at(markdown.split("### 催化剂"), 1, "the rendered markdown has no 催化剂 section").split("###"),
+      0,
+      "the 催化剂 section is empty"
+    );
 
     expect(catalystsBlock).toContain("（叙事降级：数字比对未通过）");
     expect(catalystsBlock).not.toContain("4321.99");
     // The deterministic bullet appears exactly once - the marker is appended,
     // the bullets are not re-emitted alongside it.
-    expect(catalystsBlock.split(record.analysis.catalysts[0]).length - 1).toBe(1);
+    const firstCatalystBullet = at(record.analysis.catalysts as string[], 0, "the fixture has no catalyst bullets");
+    expect(catalystsBlock.split(firstCatalystBullet).length - 1).toBe(1);
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });
@@ -1207,12 +1313,12 @@ describe("stock-analysis Feishu delivery payload (spec drift A3)", () => {
     const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
     process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
     try {
-      const card = notifications.buildReportConclusionCard(stockAnalysis.buildStockAnalysisDeliveryPayload({
+      const card = notifications.buildReportConclusionCard(asDeliveryPayload(stockAnalysis.buildStockAnalysisDeliveryPayload({
         label: "2026-07-28",
         markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83；阻力位 312.51。",
         markdownPath: "/tmp/reports/2026-07-28.md",
         pdfPath: "/tmp/reports/2026-07-28.pdf"
-      }));
+      })));
 
       expect(card.url).toEqual({ text: "查看完整报告", href: "https://reports.qingverse.com/stock-analysis/2026-07-28" });
       expect(card.lines.join("\n")).toContain("AAPL.US：支撑位 276.83；阻力位 312.51。");
@@ -1341,7 +1447,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       return new Response(JSON.stringify({ code: 0, msg: "success", data: { message_id: "om_batch" } }), { status: 200 });
     }) as typeof fetch;
 
-    const result = await notifications.deliverReportToFeishu(realBatchPayload());
+    const result = await notifications.deliverReportToFeishu(asDeliveryPayload(realBatchPayload()));
 
     expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-app-chat-id");
@@ -1381,7 +1487,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       return new Response(JSON.stringify({ code: 0, msg: "success", data: { message_id: "om_batch" } }), { status: 200 });
     }) as typeof fetch;
 
-    const delivery = await notifications.deliverReportToFeishu(realBatchPayload());
+    const delivery = await notifications.deliverReportToFeishu(asDeliveryPayload(realBatchPayload()));
 
     // Preconditions, measured rather than assumed: the public card really did
     // ship, really did go to one person, and the group really did not get it.
@@ -1424,7 +1530,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch;
 
-    const delivery = await notifications.deliverReportToFeishu(realBatchPayload());
+    const delivery = await notifications.deliverReportToFeishu(asDeliveryPayload(realBatchPayload()));
     const { state, envelope } = stockAnalysis.buildStockAnalysisRunSummary({
       delivery,
       runId: "stock_analysis_run_test",
@@ -1479,7 +1585,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
     process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
     process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
 
-    const result = await notifications.deliverReportToFeishu(realBatchPayload());
+    const result = await notifications.deliverReportToFeishu(asDeliveryPayload(realBatchPayload()));
 
     expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-user-plugin-bot-post");

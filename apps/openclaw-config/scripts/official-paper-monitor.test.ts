@@ -16,11 +16,39 @@ import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import {
+  MemberRepository,
+  buildDeepLink,
+  openTradingDatabase,
+  type DeepLinkKind,
+  type ReportDeliveryPayload
+} from "../../../packages/shared-types/dist/index.js";
 
 const officialPaperMonitor = await import("./official-paper-monitor.mjs");
 
 const tempDirs: string[] = [];
+
+/**
+ * H3 (2026-07-28, round-5): this file left the typecheck backlog, and four of
+ * its errors were one thing - `buildPnlDeliveryPayload` is plain JS, so its
+ * return type is inferred from a dynamically built object literal and
+ * `reportKind` widens to `string`, which is not the `DeepLinkKind` that
+ * `ReportDeliveryPayload` declares.
+ *
+ * Casting that away would delete the check. This asserts the producer's value
+ * instead: buildDeepLink throws a TypeError for any kind the router cannot
+ * address, so a payload whose reportKind is not a real page fails HERE, in the
+ * test that hands it to the delivery layer, rather than silently type-widening.
+ */
+function asDeliveryPayload(payload: Record<string, unknown>): ReportDeliveryPayload {
+  const kind = payload.reportKind;
+  expect(typeof kind, "the payload carries no reportKind").toBe("string");
+  expect(
+    () => buildDeepLink(kind as DeepLinkKind, "2026-07-01"),
+    `reportKind ${String(kind)} is not a page the platform can address`
+  ).not.toThrow();
+  return payload as unknown as ReportDeliveryPayload;
+}
 
 function makeDb(): { db: DatabaseSync; dbPath: string } {
   const dir = mkdtempSync(join(tmpdir(), "alphaloop-official-paper-"));
@@ -151,7 +179,14 @@ function producedSnapshot(input: {
   // (official-paper-monitor.mjs:381-388): a symbol whose quote never arrives
   // becomes `{symbol, error}` and lets attachPriceSource decide the degradation,
   // instead of a test typing `priceSource: "cost"` into a position by hand (H2).
-  const quotes = normalized.positions.map((position: { symbol: string }) => {
+  const quotes = normalized.positions.map((position: { symbol: string } | null) => {
+    // normalizeOfficialPaperSnapshot's positions element type includes null
+    // (normalizeOfficialPosition returns null for a row with no symbol). A null
+    // here would mean the fixture fed the normalizer a row it dropped, which is
+    // a broken fixture, not a case worth rendering.
+    if (position === null) {
+      throw new Error("the position rows this fixture supplied did not survive normalizeOfficialPosition");
+    }
     try {
       return reportData.normalizeQuotePayload(
         longbridgeShape.buildQuoteRows([position.symbol], input.quotes),
@@ -626,7 +661,9 @@ describe("pollOfficialPaperPerMember", () => {
 
     const seenTokens: string[] = [];
     const fetchImpl = async (_member: { id: string }, creds: { env: Record<string, string> }) => {
-      seenTokens.push(creds.env.LONGBRIDGE_ACCESS_TOKEN);
+      // Recorded rather than asserted here so the failure names the member whose
+      // env arrived without a token, instead of throwing inside the poll loop.
+      seenTokens.push(creds.env.LONGBRIDGE_ACCESS_TOKEN ?? "<no LONGBRIDGE_ACCESS_TOKEN in this member's env>");
       return buildSnapshot();
     };
 
@@ -887,7 +924,7 @@ describe("the PnL report cannot reach the shared group chat (spec drift R2)", ()
     // The exact content the verifier saw arrive in the group.
     expect(payload.markdown).toContain("QQQ.US：数量 1，成本 663.88 USD");
 
-    const result = await notifications.deliverReportToFeishu(payload);
+    const result = await notifications.deliverReportToFeishu(asDeliveryPayload(payload));
 
     expect(result.sent).toBe(false);
     expect(existsSync(spawnMarkerPath)).toBe(false);
@@ -903,7 +940,7 @@ describe("the PnL report cannot reach the shared group chat (spec drift R2)", ()
     const payload = realPnlPayload(db);
     const spawnMarkerPath = useSharedChatChannel(tempDirs[tempDirs.length - 1] as string);
 
-    const result = await notifications.deliverReportToFeishu(payload);
+    const result = await notifications.deliverReportToFeishu(asDeliveryPayload(payload));
 
     expect(result.sent).toBe(false);
     expect(existsSync(spawnMarkerPath)).toBe(false);
@@ -957,14 +994,20 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
   });
 
   it("refuses to build a payload with no declared scope rather than defaulting to one", () => {
-    expect(() => officialPaperMonitor.buildPnlDeliveryPayload({
+    // Omitting `scope` is the point of the case, so the argument deliberately
+    // does not satisfy the shape TypeScript infers from the .mjs destructuring.
+    // The cast says that out loud rather than the file being excluded from the
+    // checker so that nobody has to (H3).
+    const noScope = {
       current: buildSnapshot(),
       previousDay: null,
       previousWeek: null,
       markdown: "# x",
       markdownPath: "/tmp/x.md",
       pdfPath: "/tmp/x.pdf"
-    })).toThrow(/scope/);
+    } as unknown as Parameters<typeof officialPaperMonitor.buildPnlDeliveryPayload>[0];
+
+    expect(() => officialPaperMonitor.buildPnlDeliveryPayload(noScope)).toThrow(/scope/);
   });
 
   // 2026-07-28 (spec drift R3/N4). `summarizeAsset` coerced a missing
@@ -1084,7 +1127,7 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
       process.env.PLATFORM_PUBLIC_BASE_URL = baseUrl;
     }
     try {
-      const card = notifications.buildReportConclusionCard(pnlPayload());
+      const card = notifications.buildReportConclusionCard(asDeliveryPayload(pnlPayload()));
       return { card, payload: notifications.buildFeishuCardPayload(card) as Record<string, unknown> };
     } finally {
       if (previousBaseUrl === undefined) {
