@@ -62,20 +62,32 @@ function seedSnapshot(
 
 function createApprovedProposal(
   db: DatabaseSync,
-  overrides: Partial<NewProposal> = {},
+  // `Partial<NewProposal>` alone rejects an EXPLICIT `undefined` under this
+  // repo's exactOptionalPropertyTypes, and the "approved proposal with no
+  // limit price" case below overrides exactly that way - so limitPrice, and
+  // only limitPrice, accepts it.
+  overrides: Omit<Partial<NewProposal>, "limitPrice"> & { limitPrice?: number | undefined } = {},
   decision: "approved" | "approved_half" = "approved"
 ): Proposal {
   const repo = new ProposalRepository(db);
+  // limitPrice is peeled off and re-added conditionally: NewProposal declares
+  // it `limitPrice?: number`, and under exactOptionalPropertyTypes an explicit
+  // `undefined` is NOT the same as absent. Absence is therefore expressed the
+  // way production expresses it (see server.ts's finalizeExecution call), and
+  // `"limitPrice" in overrides` is what distinguishes "caller wants no limit
+  // price" from "caller said nothing, use the default".
+  const { limitPrice: limitPriceOverride, ...restOverrides } = overrides;
+  const limitPrice = "limitPrice" in overrides ? limitPriceOverride : 100;
   const created = repo.create({
     ownerId: "mem_owner",
     symbol: "AAPL.US",
     side: "buy",
     quantity: 10,
     orderType: "limit",
-    limitPrice: 100,
     reason: "test proposal",
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-    ...overrides
+    ...restOverrides,
+    ...(limitPrice === undefined ? {} : { limitPrice })
   });
 
   const consumeResult = repo.consumeApproval(created.approvalToken as string, {

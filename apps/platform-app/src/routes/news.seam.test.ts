@@ -13,9 +13,11 @@
  * re-implements rather than imports its store reader) - this test file is
  * the one place that's an acceptable exception: it exists specifically to
  * prove the two sides agree, so it imports the engine-side .mjs modules
- * directly by relative path (test files are excluded from this app's tsconfig
- * project - see tsconfig.json's `exclude` - so this never affects
- * `pnpm typecheck`/`pnpm build`).
+ * directly by relative path. It stays out of this app's BUILD (tsconfig.json
+ * excludes the test files, so nothing here is emitted to dist), but as of I10
+ * it IS typechecked: root tsconfig.tests.json compiles every test file with
+ * `allowJs`, which resolves the three .mjs imports below - which is why they
+ * no longer carry `@ts-expect-error`.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,12 +31,22 @@ import { ApiTokenRepository, MemberRepository, openTradingDatabase, type Member 
 
 import { createPlatformServer } from "../server.js";
 
-// @ts-expect-error - plain .mjs, no type declarations; see module header.
 import { collectL1News } from "../../../openclaw-config/scripts/news-sources.mjs";
-// @ts-expect-error - plain .mjs, no type declarations; see module header.
 import { buildEventFromCluster, clusterArticles } from "../../../openclaw-config/scripts/news-engine.mjs";
-// @ts-expect-error - plain .mjs, no type declarations; see module header.
 import { upsertEventWithSources } from "../../../openclaw-config/scripts/news-store.mjs";
+
+// collectL1News is plain JS, so TypeScript infers its parameter from the
+// destructuring defaults in news-sources.mjs (`symbols = []` -> never[],
+// `fetchImpl = fetch` -> the full DOM fetch signature). That inference is an
+// artifact of JS defaults, not the module's real contract, and it rejects both
+// a real symbol list and a partial-Response fake. This alias states the two
+// arguments this seam passes; the call below still runs the REAL .mjs function.
+const collectL1NewsSeam = collectL1News as unknown as (input: {
+  symbols: string[];
+  env?: Record<string, string | undefined>;
+  fetchImpl?: unknown;
+  longbridgeNewsFetcher?: () => Promise<unknown[]>;
+}) => Promise<{ articles: Array<{ title: string }>; warnings: string[] }>;
 
 const CLS_XML = `<?xml version="1.0"?><rss><channel>
   <item>
@@ -121,7 +133,7 @@ describe("Phase 4 Task 7 seam: collectL1News -> clusterArticles -> buildEventFro
   });
 
   it("clusters the two-source fixture into one event and renders it exactly once with both sources and an impact badge", async () => {
-    const { articles, warnings } = await collectL1News({
+    const { articles, warnings } = await collectL1NewsSeam({
       symbols: ["QQQ.US"],
       env: { RSSHUB_BASE_URL: "http://fake-rsshub.invalid" },
       fetchImpl: fakeFetch,
@@ -139,7 +151,7 @@ describe("Phase 4 Task 7 seam: collectL1News -> clusterArticles -> buildEventFro
       cluster.articles.some((article) => article.title.includes("美联储维持利率不变"))
     );
     expect(fedCluster).toBeDefined();
-    expect(fedCluster.articles).toHaveLength(2);
+    expect(fedCluster?.articles).toHaveLength(2);
 
     const event = buildEventFromCluster(fedCluster, ["QQQ.US"]);
     expect(event.sources).toHaveLength(2);

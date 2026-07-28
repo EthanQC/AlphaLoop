@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { LongbridgeAdapter } from "./adapter.js";
+import type { FinanceCalendarRequest, LongbridgeAdapter } from "./adapter.js";
 import { CheckFailedError, runCommand } from "./run.js";
 
 function fakeAdapter(overrides: Partial<LongbridgeAdapter> = {}): LongbridgeAdapter {
@@ -100,7 +100,7 @@ describe("runCommand data commands", () => {
   });
 
   it("defaults the finance-calendar window to today + 14 days", async () => {
-    let received: { start: string; end: string; market?: string; category: string } | undefined;
+    let received: FinanceCalendarRequest | undefined;
     await runCommand(
       { kind: "finance-calendar", category: "macrodata", stars: [], market: "US" },
       deps({

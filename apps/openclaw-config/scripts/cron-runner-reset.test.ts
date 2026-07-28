@@ -46,7 +46,7 @@ describe("cron-runner-reset", () => {
     const dbPath = join(dbDir, "trading.sqlite");
 
     const haltedState = haltedStateFor("daily");
-    expect(haltedState.jobFailureState.daily.halted).toBe(true);
+    expect(haltedState.jobFailureState.daily?.halted).toBe(true);
     writeFileSync(statePath, `${JSON.stringify(state.serializeRunnerState(haltedState), null, 2)}\n`, "utf8");
 
     const result = reset.resetCronRunnerJob("daily", { statePath, dbPath });

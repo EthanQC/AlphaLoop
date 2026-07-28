@@ -46,7 +46,12 @@ describe("Nasdaq asset-class handling", () => {
   });
 
   it("builds historical/option-chain/summary URLs carrying the requested asset class", () => {
-    expect(String(buildNasdaqHistoricalUrl("AMZN.US", "stocks", { fromDate: "2026-01-08", toDate: "2026-07-27", limit: 250 })))
+    // fromDate/toDate have no default in buildNasdaqHistoricalUrl's
+    // destructuring, so TypeScript infers the options bag as `{ limit?: number }`
+    // and treats them as excess - an artifact of inferring a JS signature, not
+    // a contract: the function reads both (searchParams fromdate/todate).
+    expect(String(buildNasdaqHistoricalUrl("AMZN.US", "stocks",
+      { fromDate: "2026-01-08", toDate: "2026-07-27", limit: 250 } as { limit?: number })))
       .toBe("https://api.nasdaq.com/api/quote/AMZN/historical?assetclass=stocks&fromdate=2026-01-08&todate=2026-07-27&limit=250");
 
     const optionChain = buildNasdaqOptionChainUrl("QQQM.US", "etf");

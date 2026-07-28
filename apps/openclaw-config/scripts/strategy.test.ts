@@ -12,7 +12,14 @@ const cli = await import("./strategy.mjs");
 
 const tempDirs: string[] = [];
 
-function makeDb(): { db: DatabaseSync; dbPath: string; options: { dbPath: string; memorydBackend: (args: unknown) => Promise<{ ok: boolean; memoryId?: string; reason?: string }> } } {
+// The backend parameter is the concrete record the CLI passes (not `unknown`):
+// a fake declared with a narrower parameter than the seam is exactly the
+// mismatch strictFunctionTypes exists to catch, so the seam type is written
+// once here and both fakes below are checked against it.
+type MemorydBackendArgs = { scope: string; type: string; title: string; content: string; tags: string[] };
+type MemorydBackendSeam = (args: MemorydBackendArgs) => Promise<{ ok: boolean; memoryId?: string; reason?: string }>;
+
+function makeDb(): { db: DatabaseSync; dbPath: string; options: { dbPath: string; memorydBackend: MemorydBackendSeam } } {
   const dir = mkdtempSync(join(tmpdir(), "alphaloop-strategy-cli-"));
   tempDirs.push(dir);
   const dbPath = join(dir, "trading.sqlite");
@@ -154,7 +161,7 @@ describe("runThesisCreate", () => {
 
     const rows = auditRows(db, "thesis create");
     expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0].payload).thesisId).toBe(result.thesis.id);
+    expect(JSON.parse(String(rows[0]?.payload)).thesisId).toBe(result.thesis.id);
   });
 
   // Mirror degradation MUST NOT fail the create - the SQL row is already

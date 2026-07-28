@@ -2,6 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import { computeExposure } from "./portfolio-exposure.mjs";
 
+// portfolio-exposure.mjs is plain JS, so TypeScript infers computeExposure's
+// parameter from its body - and that inference is narrower than what the
+// function actually handles: it explicitly branches on `netAssets === undefined`
+// and defaults a missing `positions` to []. This alias states the snapshot
+// shapes the module documents; the calls below still run the REAL function.
+const computeExposureSnapshot = computeExposure as (snapshot: {
+  netAssets?: number | null | undefined;
+  marketValue: number;
+  positions?: Array<{ symbol: string; quantity: number; marketValue?: number }>;
+}) => ReturnType<typeof computeExposure>;
+
 // These tests characterize the exposure math extracted from
 // official-paper-monitor.mjs's private `buildStrategyReflection`
 // (netAssets > 0 ? (marketValue / netAssets) * 100 : 0, budget fixed at 10%).
@@ -59,7 +70,7 @@ describe("computeExposure", () => {
   });
 
   it("returns a null exposureRatio when netAssets is undefined", () => {
-    const result = computeExposure({ netAssets: undefined, marketValue: 500, positions: [] });
+    const result = computeExposureSnapshot({ netAssets: undefined, marketValue: 500, positions: [] });
 
     expect(result.exposureRatio).toBeNull();
     expect(result.overBudget).toBe(false);
@@ -94,7 +105,7 @@ describe("computeExposure", () => {
   });
 
   it("defaults positions to an empty array when omitted", () => {
-    const result = computeExposure({ netAssets: 1000, marketValue: 50 });
+    const result = computeExposureSnapshot({ netAssets: 1000, marketValue: 50 });
 
     expect(result.detail).toContain("持仓 0 笔");
   });

@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-// @ts-expect-error - .mjs CLI helper without type declarations
+// .mjs CLI helper without type declarations. Since I10 the test files are
+// typechecked (root tsconfig.tests.json, `allowJs: true`), so this import
+// resolves and TypeScript infers the module's types from the JS itself.
 import { buildNextConfig, installControlPersona } from "./render-openclaw-config.mjs";
 
 function makeExisting() {

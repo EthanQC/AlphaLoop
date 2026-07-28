@@ -25,7 +25,7 @@ import {
   usEasternTradingDayUtcRange
 } from "./database.js";
 import type { NewProposal } from "./database.js";
-import type { Member } from "./domain.js";
+import type { ExecutionResultStatus, Member } from "./domain.js";
 import { nowIso } from "./domain.js";
 
 function memoryDb(): DatabaseSync {
@@ -1392,11 +1392,11 @@ describe("v10 circuit_breaker_state table migration (Phase 6 Task 1)", () => {
     expect(Object.keys(byName).sort()).toEqual(
       ["owner_id", "paused_until", "reason", "weekly_loss_pct", "tripped_at"].sort()
     );
-    expect(byName.owner_id.pk).toBe(1);
-    expect(byName.paused_until.notnull).toBe(1);
-    expect(byName.reason.notnull).toBe(1);
-    expect(byName.weekly_loss_pct.notnull).toBe(0);
-    expect(byName.tripped_at.notnull).toBe(1);
+    expect(byName.owner_id?.pk).toBe(1);
+    expect(byName.paused_until?.notnull).toBe(1);
+    expect(byName.reason?.notnull).toBe(1);
+    expect(byName.weekly_loss_pct?.notnull).toBe(0);
+    expect(byName.tripped_at?.notnull).toBe(1);
   });
 
   it("upgrades a v9 db with data in every pre-existing table to v10 with zero row loss, and is idempotent", () => {
@@ -2000,21 +2000,21 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
       { name: string; notnull: number }
     >;
     const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
-    expect(byName.external_order_id.notnull).toBe(0);
+    expect(byName.external_order_id?.notnull).toBe(0);
     // Every other column keeps its NOT NULL exactly as before the rebuild.
     // (`id` itself is excluded here: SQLite does not imply NOT NULL for a
     // TEXT PRIMARY KEY the way the SQL standard does, so `id.notnull` was
     // already 0 pre-rebuild too - not something this migration changes.)
-    expect(byName.provider.notnull).toBe(1);
-    expect(byName.symbol.notnull).toBe(1);
-    expect(byName.quantity.notnull).toBe(1);
-    expect(byName.broker_status.notnull).toBe(1);
-    expect(byName.local_status.notnull).toBe(1);
-    expect(byName.lifecycle_stage.notnull).toBe(1);
-    expect(byName.submitted_at.notnull).toBe(1);
-    expect(byName.last_observed_at.notnull).toBe(1);
-    expect(byName.raw.notnull).toBe(1);
-    expect(byName.notes.notnull).toBe(1);
+    expect(byName.provider?.notnull).toBe(1);
+    expect(byName.symbol?.notnull).toBe(1);
+    expect(byName.quantity?.notnull).toBe(1);
+    expect(byName.broker_status?.notnull).toBe(1);
+    expect(byName.local_status?.notnull).toBe(1);
+    expect(byName.lifecycle_stage?.notnull).toBe(1);
+    expect(byName.submitted_at?.notnull).toBe(1);
+    expect(byName.last_observed_at?.notnull).toBe(1);
+    expect(byName.raw?.notnull).toBe(1);
+    expect(byName.notes?.notnull).toBe(1);
 
     const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
     const indexNames = indexes.map((i) => i.name);
@@ -2247,12 +2247,12 @@ describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1
         "status", "visibility", "memory_slug", "created_at", "updated_at"
       ].sort()
     );
-    expect(cardByName.owner_id.notnull).toBe(1);
-    expect(cardByName.name.notnull).toBe(1);
-    expect(cardByName.status.notnull).toBe(1);
-    expect(cardByName.visibility.notnull).toBe(1);
-    expect(cardByName.created_at.notnull).toBe(1);
-    expect(cardByName.updated_at.notnull).toBe(1);
+    expect(cardByName.owner_id?.notnull).toBe(1);
+    expect(cardByName.name?.notnull).toBe(1);
+    expect(cardByName.status?.notnull).toBe(1);
+    expect(cardByName.visibility?.notnull).toBe(1);
+    expect(cardByName.created_at?.notnull).toBe(1);
+    expect(cardByName.updated_at?.notnull).toBe(1);
 
     const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
     const indexNames = indexes.map((i) => i.name);
@@ -2263,10 +2263,10 @@ describe("v12 strategy_cards + theses evidence columns migration (Phase 7 Task 1
       { name: string; notnull: number; dflt_value: string | null }
     >;
     const thesesByName = Object.fromEntries(thesesColumns.map((c) => [c.name, c]));
-    expect(thesesByName.bull_points.notnull).toBe(1);
-    expect(thesesByName.bull_points.dflt_value).toBe("'[]'");
-    expect(thesesByName.bear_points.notnull).toBe(1);
-    expect(thesesByName.bear_points.dflt_value).toBe("'[]'");
+    expect(thesesByName.bull_points?.notnull).toBe(1);
+    expect(thesesByName.bull_points?.dflt_value).toBe("'[]'");
+    expect(thesesByName.bear_points?.notnull).toBe(1);
+    expect(thesesByName.bear_points?.dflt_value).toBe("'[]'");
     for (const col of [
       "id", "owner_id", "symbol", "direction", "target_low", "target_high", "invalidation_price",
       "visibility", "status", "memory_slug", "created_at", "updated_at"
@@ -2439,11 +2439,11 @@ describe("v13 research_tasks result columns migration (Phase 8 Task 1, 2026-07-1
     >;
     const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
     expect(byName.result_json).toBeDefined();
-    expect(byName.result_json.notnull).toBe(0);
+    expect(byName.result_json?.notnull).toBe(0);
     expect(byName.confidence).toBeDefined();
-    expect(byName.confidence.notnull).toBe(0);
+    expect(byName.confidence?.notnull).toBe(0);
     expect(byName.title).toBeDefined();
-    expect(byName.title.notnull).toBe(0);
+    expect(byName.title?.notnull).toBe(0);
 
     // Every pre-existing column/index from v3 is still intact.
     for (const col of [
@@ -3172,7 +3172,17 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     // Counted: stage 'unknown_broker_status' (unknown status may be a live resting sell).
     repo.insertSubmitting({ ...base, ticketId: "t_sell_unknown", symbol: "TSLA.US", side: "sell", quantity: 7 });
     repo.finalizeExecution("t_sell_unknown", {
-      externalOrderId: "ext_sell_unknown", brokerStatus: "SomeNewLongbridgeStatus", localStatus: "unknown",
+      externalOrderId: "ext_sell_unknown", brokerStatus: "SomeNewLongbridgeStatus",
+      // "unknown" is what the REAL producer emits: mapBrokerStatusToStage
+      // (apps/broker-executor/src/broker-status-map.ts) returns
+      // {stage:"unknown_broker_status", localStatus:"unknown"} for any status
+      // it does not recognize, and reconcile-official-paper-orders.mjs writes
+      // that straight into local_status. finalizeExecution's parameter is
+      // nonetheless typed ExecutionResultStatus, which has no "unknown"
+      // member - the type is narrower than the column's real contents. The
+      // cast keeps this row honest about production data rather than
+      // softening the test to a value the mapper would never produce.
+      localStatus: "unknown" as ExecutionResultStatus,
       lifecycleStage: "unknown_broker_status", notes: [], observedAt: nowIso()
     });
 
@@ -3201,9 +3211,10 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
   it("save() upsert protects an already-assigned ticket_id (audit #2 direction): a later same-order write cannot overwrite it, only fill a null one", () => {
     const { db, repo } = setup();
     const base = {
-      id: "life_1", externalOrderId: "EXT-1", provider: "longbridge-paper", environment: "paper",
-      accountMode: "paper", symbol: "AAPL.US", assetClass: "stock" as const, side: "buy" as const,
-      quantity: 1, limitPrice: 100, brokerStatus: "New", localStatus: "accepted",
+      id: "life_1", externalOrderId: "EXT-1", provider: "longbridge-paper" as const,
+      environment: "paper" as const, accountMode: "paper" as const,
+      symbol: "AAPL.US", assetClass: "stock" as const, side: "buy" as const,
+      quantity: 1, limitPrice: 100, brokerStatus: "New", localStatus: "accepted" as const,
       lifecycleStage: "submitted" as const, submittedAt: nowIso(), lastObservedAt: nowIso(),
       raw: null, notes: []
     };
@@ -3216,8 +3227,12 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     expect(row.ticket_id).toBe("ticket_correct");
     expect(row.broker_status).toBe("Filled"); // other fields still update
 
-    // But a currently-null ticket_id IS fillable by a later write.
-    repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2", ticketId: null });
+    // But a currently-null ticket_id IS fillable by a later write. `base` has
+    // no ticketId at all, which is the pre-broker-call shape the type
+    // describes (`ticketId?: string`) and which save() binds as SQL NULL
+    // (`record.ticketId ?? null`) - the same row state the old explicit
+    // `ticketId: null` produced.
+    repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2" });
     repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2", ticketId: "ticket_filled_in" });
     const row2 = db.prepare("SELECT ticket_id FROM official_paper_order_lifecycle WHERE external_order_id = 'EXT-2'").get() as { ticket_id: string };
     expect(row2.ticket_id).toBe("ticket_filled_in");
@@ -3265,19 +3280,19 @@ describe("v14 monthly_reviews migration (Phase 9 Task 1, 2026-07-16 plan)", () =
     const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
     expect(byName.id).toBeDefined();
     expect(byName.owner_id).toBeDefined();
-    expect(byName.owner_id.notnull).toBe(1);
+    expect(byName.owner_id?.notnull).toBe(1);
     expect(byName.period).toBeDefined();
-    expect(byName.period.notnull).toBe(1);
+    expect(byName.period?.notnull).toBe(1);
     expect(byName.result_json).toBeDefined();
-    expect(byName.result_json.notnull).toBe(0);
+    expect(byName.result_json?.notnull).toBe(0);
     expect(byName.status).toBeDefined();
-    expect(byName.status.notnull).toBe(1);
+    expect(byName.status?.notnull).toBe(1);
     expect(byName.confirmed_at).toBeDefined();
-    expect(byName.confirmed_at.notnull).toBe(0);
+    expect(byName.confirmed_at?.notnull).toBe(0);
     expect(byName.created_at).toBeDefined();
-    expect(byName.created_at.notnull).toBe(1);
+    expect(byName.created_at?.notnull).toBe(1);
     expect(byName.updated_at).toBeDefined();
-    expect(byName.updated_at.notnull).toBe(1);
+    expect(byName.updated_at?.notnull).toBe(1);
 
     const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
     expect(indexes.map((i) => i.name)).toContain("monthly_reviews_owner_period_idx");

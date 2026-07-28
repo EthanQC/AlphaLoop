@@ -1,0 +1,130 @@
+{
+  // ==========================================================================
+  // I10 (2026-07-28, round-4 verifier): static coverage for the TEST files.
+  //
+  // WHAT WAS BROKEN
+  // ---------------
+  // 125 of the repo's 126 *.test.ts files were typechecked by nothing. Every
+  // composite project excludes them (`"exclude": ["src/**/*.test.ts"]` in
+  // packages/shared-types, apps/broker-executor, apps/longbridge-cli,
+  // apps/platform-app - correct for a BUILD, since rootDir/outDir would emit
+  // the tests into dist); apps/openclaw-config has no tsconfig at all and its
+  // `typecheck` script is the bespoke check-repository-writes.mjs; and
+  // tsconfig.tools.json only includes vitest.config.ts + test/**. Net: exactly
+  // one test file (test/build-freshness.test.ts) was under tsc.
+  // Proven non-theoretical: appending
+  //   const __typecheck_probe__: number = "this is definitely not a number";
+  // to apps/openclaw-config/scripts/personal-page.test.ts left `pnpm typecheck`
+  // fully green.
+  //
+  // That matters more than "tests are just tests": the tests are where this
+  // repo asserts its contracts, so an unchecked test can keep asserting
+  // against a shape the production types no longer have - and did (see the
+  // findings fixed alongside this file: a fake CardTransport returning a
+  // `messageId` its own annotation did not declare, three `@ts-expect-error`
+  // directives guarding imports that resolve fine, a RuleSet fixture whose
+  // `as const` array was not the mutable type evaluateRisk declares).
+  //
+  // THE OPTIONS ARE DELIBERATELY THE SAME AS PRODUCTION'S
+  // ----------------------------------------------------
+  // This extends the same tsconfig.base.json every src project extends -
+  // strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes, all of it.
+  // Relaxing strictness here was measured (dropping noUncheckedIndexedAccess
+  // removes 285 of the errors) and rejected: diluting the checker in the one
+  // layer that asserts the contracts is the failure this task exists to undo.
+  // The only deltas below are about the module GRAPH, not about strictness.
+  //
+  // REQUIRES A BUILT WORKSPACE: ~60 files under apps/openclaw-config/scripts
+  // import packages/shared-types/dist/index.js BY PATH (production does too -
+  // see test/global-setup.ts), so the root `typecheck` script runs `tsc -b`
+  // before this project. `tsc -b` is incremental; a no-op build is ~0.15s.
+  // ==========================================================================
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // The 73 files under apps/openclaw-config/scripts drive plain .mjs
+    // production scripts. Without allowJs every one of those imports is an
+    // unresolved module and the whole directory is unverifiable; with it,
+    // TypeScript resolves them and infers what it can from the JS.
+    "allowJs": true,
+    // ...but it does not DIAGNOSE the .mjs itself. That was measured by
+    // check-repository-writes.mjs (see its header): 2526 errors under this
+    // repo's strict base, 148 even with strict off - JS-inference noise in ~75
+    // files this project does not own. checkJs stays off; the .mjs files keep
+    // their own guard.
+    "checkJs": false,
+    // apps/openclaw-config/scripts/personal-page.test.ts imports
+    // ../../broker-executor/src/server.ts by its real extension (it drives the
+    // REAL execution-report writer). Legal because this project never emits.
+    "allowImportingTsExtensions": true,
+    "maxNodeModuleJsDepth": 0
+  },
+  "include": ["packages/**/*.test.ts", "apps/**/*.test.ts"],
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**",
+
+    // ------------------------------------------------------------------
+    // PRE-EXISTING BACKLOG - 37 files, 858 errors, all in
+    // apps/openclaw-config/scripts (measured 2026-07-28 with this exact
+    // config). Every other test file in the repo is checked: 88 of the 125
+    // under packages/** + apps/** (all 52 TypeScript-native ones, plus 36 of
+    // apps/openclaw-config's 73), and the 2 under test/ via
+    // tsconfig.tools.json - 90 of 127, against 1 of 126 before this file
+    // existed. This list is a ratchet, not a policy: test/typecheck-coverage
+    // .test.ts fails if it grows, if an entry names a file that no longer
+    // exists, or if a NEW test file is born outside both lists.
+    //
+    // The backlog is overwhelmingly the .mjs boundary, not broken tests:
+    // TypeScript infers a plain-JS function's parameter from its destructuring
+    // defaults (`symbols = []` -> never[], `{ limit = 250 } = {}` -> a bag
+    // with no fromDate) and its return from a dynamically built object literal
+    // (-> `{}`), so real arguments read as excess properties and real result
+    // fields read as missing. Shrinking it means giving those .mjs modules
+    // JSDoc types - worth doing, out of scope here, and NOT worth faking with
+    // `any` casts in 858 places.
+    //
+    // Counts are per file, from `tsc -p tsconfig.tests.json`:
+    // ------------------------------------------------------------------
+    "apps/openclaw-config/scripts/review-engine.test.ts", // 98
+    "apps/openclaw-config/scripts/strategy-store.test.ts", // 83
+    "apps/openclaw-config/scripts/news-agent-search.test.ts", // 70
+    "apps/openclaw-config/scripts/report-facts.test.ts", // 64
+    "apps/openclaw-config/scripts/research-engine.test.ts", // 62
+    "apps/openclaw-config/scripts/thesis-outcome.test.ts", // 57
+    "apps/openclaw-config/scripts/market-alerts-cards.test.ts", // 54
+    "apps/openclaw-config/scripts/narrative-engine.test.ts", // 52
+    "apps/openclaw-config/scripts/news-sources.test.ts", // 36
+    "apps/openclaw-config/scripts/review-consistency.test.ts", // 28
+    "apps/openclaw-config/scripts/stock-analysis.test.ts", // 25
+    "apps/openclaw-config/scripts/_openclaw-gateway.test.ts", // 23
+    "apps/openclaw-config/scripts/backup-trading-data.test.ts", // 22
+    "apps/openclaw-config/scripts/report-quality.test.ts", // 20
+    "apps/openclaw-config/scripts/market-alerts-store.test.ts", // 16
+    "apps/openclaw-config/scripts/openclaw-cron-runner.test.ts", // 14
+    "apps/openclaw-config/scripts/reviews.test.ts", // 13
+    "apps/openclaw-config/scripts/news-engine.test.ts", // 11
+    "apps/openclaw-config/scripts/stock-facts-store.test.ts", // 10
+    "apps/openclaw-config/scripts/scheduled-report.test.ts", // 9
+    "apps/openclaw-config/scripts/market-alerts.test.ts", // 9
+    "apps/openclaw-config/scripts/_longbridge.test.ts", // 7
+    "apps/openclaw-config/scripts/openclaw-runtime-doctor-core.test.ts", // 6
+    "apps/openclaw-config/scripts/official-paper-monitor.test.ts", // 6
+    "apps/openclaw-config/scripts/news-store.test.ts", // 6
+    "apps/openclaw-config/scripts/market-alerts-poll.test.ts", // 6
+    "apps/openclaw-config/scripts/report-quality-bad-samples.test.ts", // 5
+    "apps/openclaw-config/scripts/report-data.test.ts", // 5
+    "apps/openclaw-config/scripts/openclaw-cron-runner-state.test.ts", // 5
+    "apps/openclaw-config/scripts/members.test.ts", // 5
+    "apps/openclaw-config/scripts/market-alerts-seam.test.ts", // 5
+    "apps/openclaw-config/scripts/market-alerts-engine.test.ts", // 5
+    "apps/openclaw-config/scripts/install-cloudflared-tunnel.test.ts", // 5
+    "apps/openclaw-config/scripts/stock-analysis-metrics.test.ts", // 4
+    "apps/openclaw-config/scripts/setup-feishu-user-auth.test.ts", // 4
+    "apps/openclaw-config/scripts/render-openclaw-config.test.ts", // 4
+    "apps/openclaw-config/scripts/env-file.test.ts" // 4
+  ]
+}

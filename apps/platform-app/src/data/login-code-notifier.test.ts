@@ -8,7 +8,12 @@ import {
   createFeishuLoginCodeSender
 } from "./login-code-notifier.js";
 
-function fakeTransport(result: { ok: boolean; error?: string } = { ok: true, messageId: "om_1" }): {
+// The result type mirrors CardTransport["sendCard"]'s declared return - the
+// local annotation used to omit `messageId`, so the default value below was a
+// shape the real interface does not describe.
+function fakeTransport(
+  result: { ok: boolean; messageId?: string; error?: string } = { ok: true, messageId: "om_1" }
+): {
   transport: CardTransport;
   calls: Array<{ target: { chatId?: string; openId?: string }; cardJson: unknown }>;
 } {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import type { RuleSet } from "@packages/shared-types";
+
 import { evaluateRisk } from "./risk.js";
 
 describe("evaluateRisk", () => {
@@ -408,7 +410,11 @@ describe("evaluateRisk", () => {
   });
 });
 
-function baseRules() {
+// Annotated with the shared RuleSet rather than inferred: an inferred literal
+// drifts silently (the `as const` array was `readonly`, i.e. NOT the mutable
+// OptionStrategy[] evaluateRisk declares), and the point of this helper is to
+// hand evaluateRisk exactly the shape production hands it.
+function baseRules(): RuleSet {
   return {
     version: "v1.0.0",
     scope: "paper" as const,
@@ -417,7 +423,7 @@ function baseRules() {
     maxConcurrentIdeas: 8,
     maxHighConvictionIdeas: 2,
     maxDailyNewRiskPercent: 20,
-    allowedOptionStrategies: ["covered_call", "cash_secured_put", "long_call", "long_put"] as const,
+    allowedOptionStrategies: ["covered_call", "cash_secured_put", "long_call", "long_put"],
     notes: []
   };
 }

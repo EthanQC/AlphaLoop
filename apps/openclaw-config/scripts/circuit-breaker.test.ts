@@ -165,9 +165,9 @@ describe("checkAndTripCircuit", () => {
     const result = circuitBreaker.checkAndTripCircuit(db, "member_1", NOW);
 
     expect(result.tripped).toBe(true);
-    expect(result.card.title).toBe("⛔ 熔断触发");
-    expect(result.card.lines.join(" ")).toMatch(/-3\.01%/);
-    expect(result.card.lines.join(" ")).toMatch(/暂停/);
+    expect(result.card?.title).toBe("⛔ 熔断触发");
+    expect(result.card?.lines.join(" ")).toMatch(/-3\.01%/);
+    expect(result.card?.lines.join(" ")).toMatch(/暂停/);
 
     const state = new CircuitBreakerRepository(db).getState("member_1");
     expect(state).not.toBeNull();

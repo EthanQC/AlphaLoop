@@ -179,7 +179,9 @@ describe("mirrorRecord: fire-and-forget contract", () => {
     let threw = false;
     let result: unknown;
     try {
-      // @ts-expect-error - deliberately not async, exercising the sync-throw path
+      // `backend` is deliberately not async, exercising the sync-throw path.
+      // (mirrorRecord comes from plain .mjs, so its parameter is inferred and
+      // accepts this - no @ts-expect-error to satisfy.)
       result = await memorydMirror.mirrorRecord(backend, {
         ownerId: "owner_1",
         recordType: "thesis",
@@ -231,7 +233,11 @@ describe("mirrorRecord: fire-and-forget contract", () => {
 
 describe("createMemorydBackend", () => {
   it("returns a function that always throws/rejects with the documented P10-gate message", async () => {
-    const backend = memorydMirror.createMemorydBackend();
+    // createMemorydBackend returns `async function memorydBackend()` - it
+    // declares no parameters because it ignores them and throws. The call site
+    // passes the record the CLI would pass, so the cast states what the seam
+    // really accepts rather than the zero-arity TypeScript infers.
+    const backend = memorydMirror.createMemorydBackend() as (args: unknown) => Promise<never>;
     await expect(
       backend({ scope: "alphaloop-member-owner_1", type: "fact", title: "t", content: "c", tags: [] })
     ).rejects.toThrow(

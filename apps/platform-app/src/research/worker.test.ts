@@ -297,7 +297,9 @@ describe("createResearchWorker (Phase 8 Task 3, 2026-07-16 plan)", () => {
       await worker.tick();
 
       expect(notify).toHaveBeenCalledTimes(1);
-      const [taskArg, memberArg] = notify.mock.calls[0] as [unknown, Member];
+      const firstCall = notify.mock.calls[0];
+      expect(firstCall).toBeDefined();
+      const [taskArg, memberArg] = firstCall as unknown as [unknown, Member];
       expect((taskArg as { id: string }).id).toBe(result.task.id);
       expect(memberArg.feishuOpenId).toBe("ou_123");
     });

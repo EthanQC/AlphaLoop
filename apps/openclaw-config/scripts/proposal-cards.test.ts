@@ -280,7 +280,7 @@ describe("proposal card platform deep link", () => {
     const db = makeDb();
     seedMember(db);
     const proposal = fullProposal(db);
-    const decided = { ...proposal, status: "approved", decidedAt: "2026-07-16T02:00:00.000Z", decidedBy: "member_1" };
+    const decided = { ...proposal, status: "approved" as const, decidedAt: "2026-07-16T02:00:00.000Z", decidedBy: "member_1" };
 
     const card = composeDecisionUpdate(decided);
 

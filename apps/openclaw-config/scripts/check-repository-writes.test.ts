@@ -5,9 +5,10 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-// @ts-expect-error - .mjs sibling with no declaration file, like every other
-// script in this directory (see the module's own header for why this directory
-// is not compiled).
+// A .mjs sibling with no declaration file, like every other script in this
+// directory. As of I10 the test files ARE typechecked (root
+// tsconfig.tests.json, `allowJs: true`), so the import resolves and its types
+// are inferred from the JS - no @ts-expect-error needed or accepted.
 import { checkRepositoryWrites, defaultRoots } from "./check-repository-writes.mjs";
 
 /**

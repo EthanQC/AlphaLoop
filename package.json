@@ -49,7 +49,7 @@
     "backup:daily": "node apps/openclaw-config/scripts/backup-trading-data.mjs",
     "backup:restore": "node apps/openclaw-config/scripts/restore-trading-data.mjs",
     "test": "vitest run",
-    "typecheck": "pnpm -r run typecheck && tsc -p tsconfig.tools.json"
+    "typecheck": "pnpm -r run typecheck && tsc -p tsconfig.tools.json && tsc -b && tsc -p tsconfig.tests.json"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
