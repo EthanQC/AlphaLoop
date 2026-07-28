@@ -148,11 +148,31 @@ describe("resolveSnapshotOwnerId", () => {
  * The remaining override call sites are honest only about what they claim:
  * `buildSnapshot({fetchedAt})` shifts a timestamp and keeps every produced
  * field; `buildSnapshot({primaryAsset: {net_assets: null, ...}})` and
- * NO_ASSET_SNAPSHOT deliberately inject shapes a fetch DEGRADES into, to
- * exercise the renderer's missing-value branches. Those are renderer-branch
- * tests, not evidence about what the pipeline emits. Any NEW assertion about
- * what a reader sees for a NORMAL account should call producedSnapshot, not
- * buildSnapshot-with-an-override.
+ * NO_ASSET_SNAPSHOT exercise the renderer's missing-value branches.
+ *
+ * CORRECTED 2026-07-28 (H4, round-5): the sentence here used to say those two
+ * "deliberately inject shapes a fetch DEGRADES into". They do not. There is
+ * exactly one degraded shape a failed fetch produces -
+ * report-data.mjs:45 buildDegradedOfficialPaperSnapshot - and it sets
+ * `primaryAsset: {net_assets: "0", total_cash: "0", buy_power: "0", currency:
+ * "USD", risk_level: "unknown"}`. Nothing in the repo emits a snapshot with an
+ * absent or null-valued primaryAsset: fetchOfficialPaperSnapshot either
+ * normalizes (and validateOfficialPrimaryAsset rejects a row without figures)
+ * or hands back that all-zero degraded object, and findComparisonSnapshot just
+ * replays a saved `raw` blob.
+ *
+ * Which means the cases below are renderer-branch tests for a shape the
+ * pipeline does not currently produce - and the defect they were written for
+ * is still live through the door that IS reachable. Running the real degraded
+ * producer through renderPnlReport/buildPnlDeliveryPayload today prints
+ * 「净资产 0.00 USD，现金 0.00 USD，持仓估值 0.00 USD」 and 「暴露 0.00%…剩余…约 0.00 USD」
+ * (measured 2026-07-28), which is verbatim the "wiped-out account" headline the
+ * R3/N4 fix below exists to prevent. Fixing that means changing what
+ * buildDegradedOfficialPaperSnapshot emits (nulls, not "0"), which is
+ * report-data.mjs's contract and every consumer of it - not this fixture's.
+ *
+ * Any NEW assertion about what a reader sees for a NORMAL account should call
+ * producedSnapshot, not buildSnapshot-with-an-override.
  */
 const reportData = await import("./report-data.mjs");
 const longbridgeShape = await import("../../longbridge-cli/src/shape.ts");
