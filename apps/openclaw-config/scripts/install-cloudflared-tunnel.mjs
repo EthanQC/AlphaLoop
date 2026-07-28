@@ -21,6 +21,24 @@
 // target plist path) without installing anything - the P10 ignition
 // checklist runs it before the Cloudflare side exists.
 //
+// NOT THE ONLY WAY TO RUN A CONNECTOR, and not the one the mini uses. There
+// are two supported shapes, they use DIFFERENT launchd labels, and launchd
+// will happily run both at once:
+//
+//   com.cloudflare.cloudflared         system LaunchDaemon (root:wheel) in
+//     /Library/LaunchDaemons, installed by `cloudflared service install`,
+//     named tunnel with ingress + credentials in /etc/cloudflared/. This is
+//     what the mini runs today (measured read-only 2026-07-28: state =
+//     running, serving https://reports.qingverse.com -> HTTP/2 200).
+//   com.alphaloop.cloudflared-tunnel   the user LaunchAgent below, token
+//     form, ingress configured in the Zero Trust dashboard instead of on
+//     disk. For a machine that has no connector yet.
+//
+// Installing this one on a machine that already runs the system daemon adds
+// a SECOND connector beside the live public entry point, so main() refuses
+// unless `--force` is passed. See install-launchd-ownership.txt's
+// com.cloudflare.cloudflared row for the ownership decision and evidence.
+//
 // Everything effectful lives in main() behind the isMainModule guard; the
 // exported helpers are pure so install-cloudflared-tunnel.test.ts can cover
 // them without touching launchctl, brew, or the filesystem.
@@ -33,6 +51,13 @@ import { fileURLToPath } from "node:url";
 import { parseEnvText } from "./env-file.mjs";
 
 export const TUNNEL_LABEL = "com.alphaloop.cloudflared-tunnel";
+
+// The other connector shape (see the header). Its presence is detected by
+// the plist path rather than by asking launchctl, because
+// `launchctl print system/<label>` needs root and this installer runs
+// unprivileged - the plist file itself is world-readable.
+export const SYSTEM_TUNNEL_DAEMON_LABEL = "com.cloudflare.cloudflared";
+export const SYSTEM_TUNNEL_DAEMON_PLIST = `/Library/LaunchDaemons/${SYSTEM_TUNNEL_DAEMON_LABEL}.plist`;
 
 // Where Homebrew installs cloudflared on Apple Silicon / Intel respectively.
 // Checked directly (in addition to `which`) because the installer itself may
@@ -83,6 +108,26 @@ export function resolveTunnelToken({ argv = [], env = {}, envFileText = "" } = {
     );
   }
   return token;
+}
+
+/**
+ * Guards against standing up a second connector next to a live one. Returns
+ * the refusal message when this installer must not run, or null when it may.
+ * Pure so the decision is testable without touching /Library/LaunchDaemons.
+ */
+export function describeSystemDaemonConflict({ systemDaemonPresent = false, force = false } = {}) {
+  if (!systemDaemonPresent || force) {
+    return null;
+  }
+  return (
+    `${SYSTEM_TUNNEL_DAEMON_LABEL} is already installed at ${SYSTEM_TUNNEL_DAEMON_PLIST} - ` +
+    `installing ${TUNNEL_LABEL} would run a SECOND cloudflared connector beside it. ` +
+    "That system daemon is this machine's public entry point and is owned by " +
+    "`cloudflared service install` (config in /etc/cloudflared/), not by this repo. " +
+    "To change the tunnel, edit /etc/cloudflared/config.yml and " +
+    `\`sudo launchctl kickstart -k system/${SYSTEM_TUNNEL_DAEMON_LABEL}\`. ` +
+    "Pass --force only if you deliberately want both connectors running."
+  );
 }
 
 /**
@@ -195,6 +240,8 @@ function ensureCloudflaredInstalled() {
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
+  const force = args.includes("--force");
+  const systemDaemonPresent = existsSync(SYSTEM_TUNNEL_DAEMON_PLIST);
   const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
   const envLocalPath = join(repoRoot, ".env.local");
   const envFileText = existsSync(envLocalPath) ? readFileSync(envLocalPath, "utf8") : "";
@@ -211,9 +258,19 @@ async function main() {
       tokenPresent: token !== null,
       cloudflaredInstalled: cloudflaredBin !== null,
       cloudflaredBin,
-      brewAvailable: findExecutable(BREW_CANDIDATE_PATHS, "brew") !== null
+      brewAvailable: findExecutable(BREW_CANDIDATE_PATHS, "brew") !== null,
+      systemDaemonLabel: SYSTEM_TUNNEL_DAEMON_LABEL,
+      systemDaemonPresent,
+      wouldRefuse: describeSystemDaemonConflict({ systemDaemonPresent, force }) !== null
     }, null, 2));
     return;
+  }
+
+  // Before the token check and before ensureCloudflaredInstalled(), which may
+  // brew-install: refusing must not have side effects.
+  const conflict = describeSystemDaemonConflict({ systemDaemonPresent, force });
+  if (conflict) {
+    throw new Error(conflict);
   }
 
   if (!token) {

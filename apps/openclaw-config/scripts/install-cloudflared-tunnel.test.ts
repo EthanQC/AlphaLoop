@@ -5,9 +5,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   CLOUDFLARED_CANDIDATE_PATHS,
+  SYSTEM_TUNNEL_DAEMON_LABEL,
+  SYSTEM_TUNNEL_DAEMON_PLIST,
   TUNNEL_LABEL,
   buildLaunchdPath,
   buildTunnelPlist,
+  describeSystemDaemonConflict,
   resolveTunnelToken
 } from "./install-cloudflared-tunnel.mjs";
 
@@ -157,5 +160,46 @@ describe("cloudflared tunnel installer script contract", () => {
   it("supports --dry-run readiness reporting and only runs effects as a main module", () => {
     expect(script).toContain('"--dry-run"');
     expect(script).toContain("isMainModule");
+  });
+
+  // The refusal must be decided before ensureCloudflaredInstalled(), which
+  // shells out to `brew install`: aborting the install is not allowed to
+  // leave a package behind on a machine we then refused to touch.
+  it("checks for the system daemon before any brew install or plist write", () => {
+    const conflictIndex = script.indexOf("const conflict = describeSystemDaemonConflict");
+    expect(conflictIndex).toBeGreaterThan(-1);
+    expect(conflictIndex).toBeLessThan(script.indexOf("ensureCloudflaredInstalled()", conflictIndex));
+    expect(conflictIndex).toBeLessThan(script.indexOf("writeFileSync(plistPath"));
+  });
+});
+
+// The mini runs the OTHER connector shape: a root-owned system LaunchDaemon
+// com.cloudflare.cloudflared (named tunnel, /etc/cloudflared/config.yml)
+// serving the public reports host. Its label differs from this installer's,
+// so launchd would run both side by side rather than one replacing the
+// other - hence a refusal rather than an overwrite.
+describe("describeSystemDaemonConflict", () => {
+  it("refuses when the system cloudflared daemon is already installed", () => {
+    const message = describeSystemDaemonConflict({ systemDaemonPresent: true });
+    expect(message).toContain(SYSTEM_TUNNEL_DAEMON_LABEL);
+    expect(message).toContain(SYSTEM_TUNNEL_DAEMON_PLIST);
+    expect(message).toContain("--force");
+  });
+
+  it("allows the install when no system daemon is present", () => {
+    expect(describeSystemDaemonConflict({ systemDaemonPresent: false })).toBeNull();
+  });
+
+  it("lets --force override the refusal for a deliberate second connector", () => {
+    expect(describeSystemDaemonConflict({ systemDaemonPresent: true, force: true })).toBeNull();
+  });
+
+  it("defaults to allowing, so the guard can never fire on a missing argument", () => {
+    expect(describeSystemDaemonConflict()).toBeNull();
+  });
+
+  it("names the two labels distinctly, which is why both can run at once", () => {
+    expect(SYSTEM_TUNNEL_DAEMON_LABEL).not.toBe(TUNNEL_LABEL);
+    expect(SYSTEM_TUNNEL_DAEMON_PLIST).toBe("/Library/LaunchDaemons/com.cloudflare.cloudflared.plist");
   });
 });

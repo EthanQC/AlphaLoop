@@ -76,3 +76,33 @@ retired  com.openclaw.trading.broker-executor
 # the gateway alone. Every other label above is order-independent.
 external ai.openclaw.gateway
 external com.openclaw.gateway
+
+# The public entry point. Listed because "which installer owns this label" was
+# genuinely ambiguous until 2026-07-28 and the wrong answer stands up a second
+# tunnel connector next to the live one.
+#
+# Read-only measurement on the mini, 2026-07-28:
+#   /Library/LaunchDaemons/com.cloudflare.cloudflared.plist  root:wheel, Jul 27
+#   launchctl print system/com.cloudflare.cloudflared        state = running
+#   argv: /opt/homebrew/bin/cloudflared --config /etc/cloudflared/config.yml
+#         tunnel run          (named tunnel; credentials in root-only
+#         /etc/cloudflared/<tunnel-uuid>.json, mode 600)
+#   https://reports.qingverse.com/health -> HTTP/2 200 via Cloudflare anycast
+#   (104.21.27.3 / 172.67.139.197, cf-cache-status header present)
+#
+# That daemon is installed by `cloudflared service install`, NOT by this repo,
+# so its scope is "external" - nothing here writes or removes it. It also wins
+# on the exact axis this manifest exists for: it is a system daemon, so it
+# comes back after a reboot with no GUI login, which is why the eight labels
+# above were moved out of ~/Library/LaunchAgents in the first place.
+#
+# install-cloudflared-tunnel.mjs installs a DIFFERENT label
+# (com.alphaloop.cloudflared-tunnel, a user LaunchAgent running the token
+# form `cloudflared tunnel run --token ...`). Because the labels differ,
+# launchd would happily run both, and the repo installer would add a second
+# connector alongside the live one. It therefore refuses to install when
+# com.cloudflare.cloudflared is present, unless run with --force. Its own
+# label is deliberately NOT listed here: on a machine with the system daemon
+# it must never be installed, and a machine without one is a fresh install
+# where the operator picks a path explicitly.
+external com.cloudflare.cloudflared
