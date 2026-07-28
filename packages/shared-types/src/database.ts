@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -968,6 +968,47 @@ const MIGRATIONS: MigrationStep[] = [
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS login_send_log_scope_key_idx ON login_send_log(scope, key_hash, created_at);
+    `);
+  },
+  (db) => {
+    // Task 5 (2026-07-28 spec-drift remediation): personal_pages backs
+    // requirements §3.2 "个人页（每人一份，随日报生成）" - the per-owner page
+    // that the owner's holdings/strategy content moved INTO when Task 4 took
+    // it out of the public daily/weekly body. One row per (owner, kind, date);
+    // apps/openclaw-config/scripts/personal-page.mjs writes it, and the
+    // owner-only platform route reads it back.
+    //
+    // A brand-new table, nothing pre-existing rebuilt - a plain step suffices
+    // (no needsForeignKeysOff), same category as v14's monthly_reviews and
+    // v15's login_codes above.
+    //
+    // - owner_id REFERENCES members(id): §3.2's "个人页只有本人可见" is
+    //   enforced at read time by the route's resolveIdentity, but a page whose
+    //   owner is not a real member could never be shown to anyone and would
+    //   only ever be a leak waiting to happen - the FK makes it impossible to
+    //   write one.
+    // - CHECK(kind IN ('daily','weekly')): the only two report kinds §3.2/§3.3
+    //   attach a personal page to. A typo'd kind would silently produce a page
+    //   nothing ever reads, so it fails loud at write time instead.
+    // - UNIQUE(owner_id, kind, date): the "每人一份" invariant. Re-running a
+    //   day's report must refresh that day's page in place (the generator's
+    //   ON CONFLICT target), never accumulate a second copy.
+    // - created_at is the generation time of the markdown CURRENTLY stored in
+    //   the row: a regenerate overwrites markdown and created_at together, so
+    //   a reader can always trust "this text was produced at this time"
+    //   (the alternative - freezing created_at at the first generation -
+    //   would date fresh content by a stale timestamp).
+    db.exec(`
+      CREATE TABLE personal_pages (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES members(id),
+        kind TEXT NOT NULL CHECK(kind IN ('daily','weekly')),
+        date TEXT NOT NULL,
+        markdown TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(owner_id, kind, date)
+      );
+      CREATE INDEX IF NOT EXISTS personal_pages_owner_date_idx ON personal_pages(owner_id, kind, date);
     `);
   }
 ];

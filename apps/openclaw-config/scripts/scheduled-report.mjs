@@ -21,6 +21,7 @@ import {
   toNumber
 } from "./report-data.mjs";
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
+import { generatePersonalPages } from "./personal-page.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
 import { assertReportQuality, findPersonalContentLeaks, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
@@ -96,12 +97,47 @@ async function prepareReport(reportKind, info) {
 
   assertReportQuality(report, { kind: reportKind });
   writeFileSync(reportPath, `${report}\n`, "utf8");
+
+  // Requirements §3.2「个人页（每人一份，随日报生成）」: the public body above
+  // deliberately carries no holdings/strategy content (Task 4), so the same
+  // run must produce each active member's own page - otherwise that content
+  // exists nowhere at all. Generated AFTER the public report passed its
+  // quality gate, from the same db handle and the same window label, and
+  // persisted into personal_pages (schema v16) rather than onto disk: the page
+  // is owner-private and must not sit next to the world-readable report file.
+  //
+  // Per-member failures are collected, not thrown: one member's page failing
+  // must not cost the other members theirs, nor destroy an already-written
+  // public report. They are recorded in the state file and printed, so a
+  // silent gap is impossible.
+  const personalPages = generatePersonalPages({
+    db,
+    kind: reportKind,
+    date: info.label,
+    helpers: {
+      renderOfficialPaperSnapshot,
+      summarizeOfficialAccount,
+      summarizeOfficialPositions
+    }
+  });
+  if (personalPages.failures.length > 0) {
+    console.error(JSON.stringify({
+      personalPagesFailed: personalPages.failures,
+      kind: reportKind,
+      label: info.label
+    }, null, 2));
+  }
+
   const pdfPath = await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
   updateState(info, {
     preparedAt: new Date().toISOString(),
     path: reportPath,
     pdfPath,
     kind: reportKind,
+    personalPages: {
+      generated: personalPages.generated.map((entry) => ({ ownerId: entry.ownerId, id: entry.id })),
+      failures: personalPages.failures
+    },
     requiredDataSources: {
       officialPaperSnapshot: true,
       marketNews: true,
@@ -120,7 +156,10 @@ async function prepareReport(reportKind, info) {
   return {
     path: reportPath,
     pdfPath,
-    markdown: report
+    markdown: report,
+    // Handed back (not just written to the state file) so the delivery
+    // orchestration can address each member's own page without re-reading it.
+    personalPages
   };
 }
 

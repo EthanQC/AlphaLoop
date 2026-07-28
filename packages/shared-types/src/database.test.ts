@@ -929,6 +929,7 @@ function buildSeededV7Database(): DatabaseSync {
   migrate(db); // builds the full v0..v14 schema using the real migration code
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS personal_pages;
     DROP TABLE IF EXISTS login_codes;
     DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
@@ -1208,6 +1209,7 @@ function buildSeededV8Database(): DatabaseSync {
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS personal_pages;
     DROP TABLE IF EXISTS login_codes;
     DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
@@ -1349,6 +1351,7 @@ function buildSeededV9Database(): DatabaseSync {
   migrate(db);
   stripResearchTasksV13ColumnsIfPresent(db);
   db.exec(`
+    DROP TABLE IF EXISTS personal_pages;
     DROP TABLE IF EXISTS login_codes;
     DROP TABLE IF EXISTS login_send_log;
     DROP TABLE IF EXISTS monthly_reviews;
@@ -2054,7 +2057,7 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
     const db = buildSeededV9Database();
     migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12 AND v13
     stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-    db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables - see buildSeededV7/V8/V9Database's identical technique
+    db.exec(`DROP TABLE IF EXISTS personal_pages; DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v16's/v15's/v14's/v12's own new tables - see buildSeededV7/V8/V9Database's identical technique
     db.exec("PRAGMA user_version = 10"); // roll the VERSION COUNTER back only, same technique buildSeededV7/V9Database already rely on - table shapes are already latest, and re-running the v11 step against an already-nullable table is itself part of what this test proves is safe
     seedMember(db, "mem_v10");
     db.prepare(`
@@ -2107,7 +2110,7 @@ function buildSeededV11Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db); // peel off v13's own new columns - see the shared helper's own doc comment
-  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v14's/v12's own new tables
+  db.exec(`DROP TABLE IF EXISTS personal_pages; DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews; DROP TABLE IF EXISTS strategy_cards;`); // peel off v16's/v15's/v14's/v12's own new tables
 
   db.exec("PRAGMA foreign_keys = OFF;");
   db.exec(`
@@ -2161,7 +2164,7 @@ function buildSeededV12Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10, v11, v12, v13 AND v14
   stripResearchTasksV13ColumnsIfPresent(db);
-  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`); // peel off v14's own new table - see buildSeededV7/V8/V9Database's identical technique
+  db.exec(`DROP TABLE IF EXISTS personal_pages; DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`); // peel off v16's/v15's/v14's own new tables - see buildSeededV7/V8/V9Database's identical technique
 
   // buildSeededV9Database() drops circuit_breaker_state before resetting its
   // own user_version - the migrate(db) call above recreates it (v10's step)
@@ -2196,7 +2199,7 @@ function buildSeededV12Database(): DatabaseSync {
 function buildSeededV13Database(): DatabaseSync {
   const db = buildSeededV9Database();
   migrate(db); // fixture-build only: advances the underlying schema through v10..v14
-  db.exec(`DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`);
+  db.exec(`DROP TABLE IF EXISTS personal_pages; DROP TABLE IF EXISTS login_codes; DROP TABLE IF EXISTS login_send_log; DROP TABLE IF EXISTS monthly_reviews;`);
 
   // buildSeededV9Database() drops circuit_breaker_state before resetting its
   // own user_version - the migrate(db) call above recreates it (v10's step)
@@ -3523,8 +3526,12 @@ describe("MonthlyReviewRepository (Phase 9 Task 1, 2026-07-16 plan)", () => {
 // ---------------------------------------------------------------------------
 
 describe("v15 login_codes + login_send_log migration (self-hosted email-code login)", () => {
-  it("SCHEMA_VERSION is 15", () => {
-    expect(SCHEMA_VERSION).toBe(15);
+  // SCHEMA_VERSION has since moved on to v16 (personal_pages, 2026-07-28
+  // spec-drift remediation Task 5) - the exact current-version assertion lives
+  // in that block, the same way every earlier block here was relaxed when a
+  // later phase moved past it.
+  it("SCHEMA_VERSION is at least 15", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(15);
   });
 
   it("a fresh db lands at v15 with both tables and their indexes present", () => {
@@ -3570,11 +3577,14 @@ describe("v15 login_codes + login_send_log migration (self-hosted email-code log
     const db = memoryDb();
     migrate(db);
     seedMember(db, "mem_v15_legacy");
-    db.exec("DROP TABLE login_codes; DROP TABLE login_send_log; PRAGMA user_version = 14;");
+    db.exec("DROP TABLE IF EXISTS personal_pages; DROP TABLE login_codes; DROP TABLE login_send_log; PRAGMA user_version = 14;");
 
     migrate(db);
 
-    expect(getSchemaVersion(db)).toBe(15);
+    // migrate() always runs the chain to the END, so a v14 db lands on the
+    // current SCHEMA_VERSION, not on 15 - what this test pins is that v15's
+    // own two tables arrive and the pre-existing member row survives.
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     expect(new MemberRepository(db).getById("mem_v15_legacy")).not.toBeNull();
     const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
       .map((t) => t.name);
@@ -3826,5 +3836,86 @@ describe("LoginThrottleRepository", () => {
     throttle.prune(plus(3_600_000));
 
     expect(throttle.countSince("email", "a@example.com", T0)).toBe(1);
+  });
+});
+
+describe("v16 personal_pages migration (2026-07-28 spec-drift remediation Task 5, 个人页)", () => {
+  it("SCHEMA_VERSION is 16", () => {
+    expect(SCHEMA_VERSION).toBe(16);
+  });
+
+  it("a fresh db lands at v16 with personal_pages present (columns/CHECK/UNIQUE/FK/index)", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+      .map((t) => t.name);
+    expect(tables).toContain("personal_pages");
+
+    const columns = db.prepare("PRAGMA table_info(personal_pages)").all() as Array<{ name: string; notnull: number }>;
+    expect(columns.map((c) => c.name)).toEqual(["id", "owner_id", "kind", "date", "markdown", "created_at"]);
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+    expect(byName.owner_id?.notnull).toBe(1);
+    expect(byName.kind?.notnull).toBe(1);
+    expect(byName.date?.notnull).toBe(1);
+    expect(byName.markdown?.notnull).toBe(1);
+    expect(byName.created_at?.notnull).toBe(1);
+
+    const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+      .map((i) => i.name);
+    expect(indexes).toContain("personal_pages_owner_date_idx");
+
+    const foreignKeys = db.prepare("PRAGMA foreign_key_list(personal_pages)").all() as Array<
+      { table: string; from: string; to: string }
+    >;
+    expect(foreignKeys).toHaveLength(1);
+    expect(foreignKeys[0]?.table).toBe("members");
+    expect(foreignKeys[0]?.from).toBe("owner_id");
+    expect(foreignKeys[0]?.to).toBe("id");
+  });
+
+  it("is idempotent", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("upgrades a populated v15 database in place, keeping its rows", () => {
+    // The real deployment path: runtime/trading.sqlite is at v15 with live
+    // member and snapshot rows. v16 adds nothing but personal_pages, so
+    // dropping that table and winding user_version back to 15 reproduces
+    // exactly the deployed shape - the same technique every earlier block
+    // here uses.
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v16_legacy");
+    db.exec("DROP TABLE personal_pages; PRAGMA user_version = 15;");
+    expect(getSchemaVersion(db)).toBe(15);
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(new MemberRepository(db).getById("mem_v16_legacy")).not.toBeNull();
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+      .map((t) => t.name);
+    expect(tables).toContain("personal_pages");
+  });
+
+  it("enforces one page per (owner, kind, date), a real member, and a known kind", () => {
+    const db = memoryDb();
+    migrate(db);
+    db.exec("PRAGMA foreign_keys = ON;");
+    seedMember(db, "mem_v16");
+
+    const insert = `INSERT INTO personal_pages (id, owner_id, kind, date, markdown, created_at) VALUES (?, ?, ?, ?, ?, ?)`;
+    db.prepare(insert).run("pp_1", "mem_v16", "daily", "2026-07-28", "# 我的个人页", nowIso());
+    db.prepare(insert).run("pp_2", "mem_v16", "weekly", "2026-07-28", "# 我的个人页", nowIso());
+
+    expect(() => db.prepare(insert).run("pp_3", "mem_v16", "daily", "2026-07-28", "# dup", nowIso())).toThrow(/UNIQUE/iu);
+    expect(() => db.prepare(insert).run("pp_4", "nobody", "daily", "2026-07-28", "# ghost", nowIso())).toThrow(/FOREIGN KEY/iu);
+    expect(() => db.prepare(insert).run("pp_5", "mem_v16", "monthly", "2026-07-28", "# bad kind", nowIso())).toThrow(/CHECK/iu);
   });
 });
