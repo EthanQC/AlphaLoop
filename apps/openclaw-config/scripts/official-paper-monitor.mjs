@@ -334,8 +334,8 @@ export function attachPriceSource(positions, quotes) {
 export function saveSnapshot(db, snapshot, reason, explicitOwnerId) {
   const id = createId("official_paper_snapshot");
   const primary = snapshot.primaryAsset ?? {};
-  const netAssets = toNumber(primary.net_assets ?? primary.netAssets);
-  const totalCash = toNumber(primary.total_cash ?? primary.totalCash);
+  const netAssets = readAssetFigure(primary.net_assets, primary.netAssets);
+  const totalCash = readAssetFigure(primary.total_cash, primary.totalCash);
   const marketValue = estimateMarketValue(snapshot);
   const ownerId = explicitOwnerId ?? resolveSnapshotOwnerId(db);
   db.prepare(`
@@ -364,21 +364,27 @@ export function saveSnapshot(db, snapshot, reason, explicitOwnerId) {
 // was priced by fallback (cost/zero) rather than a live quote.
 export function buildStrategyReflection(snapshot) {
   const primary = snapshot.primaryAsset ?? {};
-  const netAssets = toNumber(primary.net_assets ?? primary.netAssets) ?? 0;
+  // 2026-07-28 (spec drift R3/N4, same class as summarizeAsset): this used to
+  // be `?? 0`, which turned "the snapshot carried no asset account" into a real
+  // zero net-asset account - and then divided by it. computeExposure already
+  // has an honest null path (exposureRatio null, detail says so); it just was
+  // never reachable from here.
+  const netAssets = readAssetFigure(primary.net_assets, primary.netAssets);
   const marketValue = estimateMarketValue(snapshot);
   const exposure = computeExposure({ netAssets, marketValue, positions: snapshot.positions });
-  // netAssets was already coerced to 0 above, so exposure.exposureRatio is never
-  // actually null here; the `?? 0` only guards the type (computeExposure allows a
-  // null netAssets for other callers, e.g. the alert engine) without changing behavior.
-  const exposurePercent = (exposure.exposureRatio ?? 0) * 100;
+  const exposurePercent = exposure.exposureRatio === null ? null : exposure.exposureRatio * 100;
   const budgetPercent = exposure.budgetRatio * 100;
-  const remainingBudget = Math.max(0, netAssets * budgetPercent / 100 - marketValue);
+  const remainingBudget = netAssets === null
+    ? null
+    : Math.max(0, netAssets * budgetPercent / 100 - marketValue);
   const degraded = Boolean(snapshot.degraded);
   const degradedCount = countDegradedPositions(snapshot.positions);
   const degradedNote = degraded
     ? `（含 ${degradedCount} 笔持仓因行情读取失败按成本/0 估值，敞口与市值为估计值，非真实值）`
     : "";
-  const summary = `官方模拟盘当前暴露 ${exposurePercent.toFixed(2)}%${degradedNote}，剩余 OpenClaw 自由发挥预算约 ${remainingBudget.toFixed(2)} USD。`;
+  const summary = exposurePercent === null || remainingBudget === null
+    ? `本次快照没有返回账户资金数据（净资产未知），无法计算暴露比例与剩余预算${degradedNote}；持仓估值 ${formatMoney(marketValue)}。`
+    : `官方模拟盘当前暴露 ${exposurePercent.toFixed(2)}%${degradedNote}，剩余 OpenClaw 自由发挥预算约 ${remainingBudget.toFixed(2)} USD。`;
   return {
     summary,
     exposurePercent,
@@ -386,7 +392,12 @@ export function buildStrategyReflection(snapshot) {
     remainingBudget,
     positionCount: snapshot.positions.length,
     degraded,
-    action: exposure.overBudget ? "停止新增并等待降仓" : "允许继续观察，新增前仍需通过 broker-executor 预算检查"
+    // Unknown net assets cannot clear a budget check, so the action is the
+    // conservative one - never the "allowed" branch computeExposure returns by
+    // default when it has nothing to compare.
+    action: netAssets === null
+      ? "暂停新增，先修复账户资金数据读取"
+      : (exposure.overBudget ? "停止新增并等待降仓" : "允许继续观察，新增前仍需通过 broker-executor 预算检查")
   };
 }
 
@@ -438,6 +449,7 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
   }
   const label = current.fetchedAt.slice(0, 10);
   const currentAsset = summarizeAsset(current);
+  const missingFigures = describeMissingAssetFigures(currentAsset);
   const degradedCount = countDegradedPositions(current.positions);
   const reflection = buildStrategyReflection(current);
 
@@ -462,7 +474,14 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
     reportKind: "official-paper",
     reportDate: label,
     conclusion: {
-      headline: `净资产 ${formatMoney(currentAsset.netAssets)}，现金 ${formatMoney(currentAsset.totalCash)}，持仓估值 ${formatMoney(currentAsset.marketValue)}`,
+      // The headline is the one line a reader takes at face value, so a figure
+      // the snapshot did not supply says 暂无 AND says it is not a zero
+      // (spec drift R3): 「净资产 0.00 USD」 on a missing fetch reads as a
+      // wiped-out account.
+      headline: [
+        `净资产 ${formatMoney(currentAsset.netAssets)}，现金 ${formatMoney(currentAsset.totalCash)}，持仓估值 ${formatMoney(currentAsset.marketValue)}`,
+        missingFigures ? `（${missingFigures}：本次快照未返回账户资金数据，不是 0）` : ""
+      ].join(""),
       bullets
     }
   };
@@ -473,7 +492,7 @@ function renderComparisonBullet(label, currentAsset, baseSnapshot) {
     return `${label}：无可比快照，本次不计算变化。`;
   }
   const base = summarizeAsset(baseSnapshot);
-  return `${label}：净资产 ${formatDelta(currentAsset.netAssets - base.netAssets)}，现金 ${formatDelta(currentAsset.totalCash - base.totalCash)}`;
+  return `${label}：净资产 ${formatFigureDelta(currentAsset.netAssets, base.netAssets)}，现金 ${formatFigureDelta(currentAsset.totalCash, base.totalCash)}`;
 }
 
 function renderPositionsBullet(snapshot, degradedCount) {
@@ -533,8 +552,8 @@ function renderComparisonRow(label, current, base) {
     formatMoney(current.netAssets),
     formatMoney(current.totalCash),
     formatMoney(current.marketValue),
-    base ? formatDelta(current.netAssets - base.netAssets) : "基准",
-    base ? formatDelta(current.totalCash - base.totalCash) : "基准"
+    base ? formatFigureDelta(current.netAssets, base.netAssets) : "基准",
+    base ? formatFigureDelta(current.totalCash, base.totalCash) : "基准"
   ].join(" | ").replace(/^/u, "| ").replace(/$/u, " |");
 }
 
@@ -556,13 +575,56 @@ function renderPositionLines(snapshot) {
   });
 }
 
+/**
+ * The account figures a card/table line needs, with MISSING kept distinct from
+ * ZERO (2026-07-28 spec drift R3/N4).
+ *
+ * These used to be `?? 0`. That was survivable while the numbers only appeared
+ * in the markdown table; once the last round promoted them into the card
+ * HEADLINE, a snapshot with no `primaryAsset` produced the authoritative-looking
+ * 「净资产 0.00 USD，现金 0.00 USD，持仓估值 0.00 USD」 - a wiped-out account, not
+ * a missing fetch. `null` here, and every consumer discloses it.
+ *
+ * `marketValue` stays a number on purpose: it is computed from the positions
+ * this snapshot actually carries, so 0 there genuinely means "nothing held".
+ */
 function summarizeAsset(snapshot) {
   const primary = snapshot.primaryAsset ?? {};
   return {
-    netAssets: toNumber(primary.net_assets ?? primary.netAssets) ?? 0,
-    totalCash: toNumber(primary.total_cash ?? primary.totalCash) ?? 0,
+    netAssets: readAssetFigure(primary.net_assets, primary.netAssets),
+    totalCash: readAssetFigure(primary.total_cash, primary.totalCash),
     marketValue: estimateMarketValue(snapshot)
   };
+}
+
+/**
+ * First readable figure among the broker's field spellings, or `null`.
+ *
+ * Not just `toNumber(a ?? b)`: `Number(null)` and `Number("")` are both 0, so a
+ * field the broker returned as an explicit null or an empty string would have
+ * been read as a real zero balance.
+ */
+function readAssetFigure(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined || candidate === "") {
+      continue;
+    }
+    const parsed = toNumber(candidate);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+/** Names the figures this snapshot could not supply, for a single honest
+ * disclosure clause; `null` when everything is present. */
+function describeMissingAssetFigures(asset) {
+  const missing = [
+    ...(asset.netAssets === null ? ["净资产"] : []),
+    ...(asset.totalCash === null ? ["现金"] : [])
+  ];
+  return missing.length === 0 ? null : missing.join("、");
 }
 
 // Trusts `position.price` (set by attachPriceSource for every position that
@@ -598,14 +660,33 @@ function findComparisonSnapshot(db, fetchedAt, mode) {
   return JSON.parse(String(target.raw));
 }
 
+// `Number(null)` is 0, so these have to reject null/undefined BEFORE
+// converting - otherwise every "we have no figure" sentinel prints as a
+// confident 0.00 USD, which is the whole defect summarizeAsset just stopped
+// producing.
 function formatMoney(value) {
+  if (value === null || value === undefined) {
+    return "暂无";
+  }
   const number = Number(value);
   return Number.isFinite(number) ? `${number.toFixed(2)} USD` : "暂无";
 }
 
 function formatDelta(value) {
+  if (value === null || value === undefined) {
+    return "暂无";
+  }
   const number = Number(value);
   return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${number.toFixed(2)} USD` : "暂无";
+}
+
+/** A change between two figures, or a statement of why there is none. A
+ * subtraction involving a missing operand is not a 0 change. */
+function formatFigureDelta(current, base) {
+  if (current === null || base === null) {
+    return "无法计算（缺少账户资金数据）";
+  }
+  return formatDelta(current - base);
 }
 
 function formatShanghaiTime(value) {

@@ -600,6 +600,75 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     })).toThrow(/scope/);
   });
 
+  // 2026-07-28 (spec drift R3/N4). `summarizeAsset` coerced a missing
+  // primaryAsset to 0, which was survivable while the figures only appeared in
+  // the markdown table and became a lie once they were promoted into the card
+  // HEADLINE: 「净资产 0.00 USD，现金 0.00 USD，持仓估值 0.00 USD」 describes a
+  // wiped-out account, not a snapshot whose asset fetch returned nothing.
+  describe("a snapshot with no account figures says so instead of reporting zeros", () => {
+    const NO_ASSET_SNAPSHOT = { primaryAsset: undefined, positions: [], quotes: [] };
+
+    it("headlines 暂无 with the reason, never 0.00 USD", () => {
+      const payload = pnlPayload({ current: buildSnapshot(NO_ASSET_SNAPSHOT) });
+
+      expect(payload.conclusion.headline).toContain("净资产 暂无");
+      expect(payload.conclusion.headline).toContain("现金 暂无");
+      expect(payload.conclusion.headline).toContain("不是 0");
+      expect(payload.conclusion.headline).not.toContain("净资产 0.00 USD");
+      expect(payload.conclusion.headline).not.toContain("现金 0.00 USD");
+    });
+
+    it("does not compute an exposure ratio or a remaining budget off the missing net assets", () => {
+      const payload = pnlPayload({ current: buildSnapshot(NO_ASSET_SNAPSHOT) });
+      const bullets = payload.conclusion.bullets.join("\n");
+
+      expect(bullets).toContain("无法计算暴露比例与剩余预算");
+      expect(bullets).not.toMatch(/暴露 0\.00%/u);
+      expect(bullets).not.toMatch(/预算约 0\.00 USD/u);
+      // An unknown balance cannot clear a budget check.
+      expect(bullets).toContain("暂停新增");
+    });
+
+    it("reports 无法计算 for a change against a baseline, not a 0 change", () => {
+      const payload = pnlPayload({
+        current: buildSnapshot(NO_ASSET_SNAPSHOT),
+        previousDay: buildSnapshot({ primaryAsset: { net_assets: "1000", total_cash: "200" } })
+      });
+
+      expect(payload.conclusion.bullets.join("\n")).toContain("无法计算（缺少账户资金数据）");
+      expect(payload.conclusion.bullets.join("\n")).not.toContain("+0.00 USD");
+    });
+
+    it("keeps the same honesty in the markdown table the report writes to disk", () => {
+      const markdown = officialPaperMonitor.renderPnlReport(buildSnapshot(NO_ASSET_SNAPSHOT), null, null);
+
+      expect(markdown).toContain("| 当前 | 暂无 | 暂无 |");
+    });
+
+    it("persists NULL rather than a 0 balance for a broker field that came back null", () => {
+      const { db } = makeDb();
+      const id = officialPaperMonitor.saveSnapshot(
+        db,
+        buildSnapshot({ primaryAsset: { net_assets: null, total_cash: null } }),
+        "manual"
+      );
+
+      const row = db.prepare("SELECT net_assets, total_cash FROM official_paper_snapshots WHERE id = ?").get(id);
+      expect(row).toEqual({ net_assets: null, total_cash: null });
+    });
+
+    // A real zero still reads as a real zero - the fix must not turn every 0
+    // into 暂无.
+    it("still reports a genuine zero balance as 0.00 USD", () => {
+      const payload = pnlPayload({
+        current: buildSnapshot({ primaryAsset: { net_assets: 0, total_cash: 0 }, positions: [], quotes: [] })
+      });
+
+      expect(payload.conclusion.headline).toContain("净资产 0.00 USD");
+      expect(payload.conclusion.headline).not.toContain("不是 0");
+    });
+  });
+
   it("carries the numbers the markdown table hides from the card", () => {
     const payload = pnlPayload();
     const text = [payload.conclusion.headline, ...payload.conclusion.bullets].join("\n");
