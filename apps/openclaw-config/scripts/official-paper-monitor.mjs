@@ -165,7 +165,12 @@ async function sendPnlReport(db, forceRun = false) {
     previousWeek,
     markdown,
     markdownPath,
-    pdfPath
+    pdfPath,
+    // Read back the owner the row was ACTUALLY written with, rather than
+    // re-running resolveSnapshotOwnerId - the card's recipient and the page's
+    // 403 gate then answer to the same value by construction, even if the
+    // member table changes between the two calls.
+    scope: resolvePnlReportScope(db, snapshotId)
   }));
   // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
   // already persisted by this point, so a Feishu delivery failure must not
@@ -181,6 +186,58 @@ async function sendPnlReport(db, forceRun = false) {
   }
 
   console.log(JSON.stringify({ delivered: delivery.sent, snapshotId, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
+}
+
+/**
+ * The `ReportScope` for a PnL card: WHO is allowed to read this account's
+ * balances (2026-07-28 spec drift R2).
+ *
+ * The platform decides who may open /official-paper/<date> from
+ * `official_paper_snapshots.owner_id` on that date's `post_open_pnl` row
+ * (routes/reports.ts resolveOfficialPaperAttributions). This reads back the
+ * SAME row this run just wrote, so the card and the page cannot disagree about
+ * who owns the numbers.
+ *
+ * Three honest outcomes, no fourth:
+ *   - one real member with a Feishu open_id -> owner-private to that member.
+ *   - the `__shared__` sentinel (0 or >1 active members, so the writer could
+ *     not attribute the snapshot) -> owner-unresolved. The platform page is
+ *     closed to EVERYONE in this state; a card that went anywhere would be
+ *     handing one account's balances to whoever the default target is.
+ *   - a real member who has not bound a Feishu account -> owner-unresolved.
+ *     There is no DM to send to, and "no DM available" must never degrade into
+ *     "send it to the group".
+ */
+export function resolvePnlReportScope(db, snapshotId) {
+  const row = db.prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = ?").get(snapshotId);
+  const ownerId = typeof row?.owner_id === "string" ? row.owner_id.trim() : "";
+
+  if (ownerId === "" || ownerId === SHARED_OWNER_SENTINEL) {
+    return {
+      visibility: "owner-unresolved",
+      reason: ownerId === SHARED_OWNER_SENTINEL
+        ? `本次快照的归属是 ${SHARED_OWNER_SENTINEL}（当前不是恰好 1 位活跃成员，无法归属到某一个人），平台上的 /official-paper 页面对所有人关闭`
+        : "本次快照没有写入归属成员（owner_id 为空），无法确认这份账户数据属于谁"
+    };
+  }
+
+  const member = new MemberRepository(db).getById(ownerId);
+  if (!member) {
+    return {
+      visibility: "owner-unresolved",
+      reason: `快照归属 ${ownerId}，但成员表里没有这个成员，无法确认收件人`
+    };
+  }
+
+  const ownerOpenId = member.feishuOpenId?.trim() ?? "";
+  if (ownerOpenId === "") {
+    return {
+      visibility: "owner-unresolved",
+      reason: `成员 ${member.displayName}（${ownerId}）尚未绑定飞书 open_id，模拟盘收支变化只能在平台查看；绑定后下一次报告即可送达单聊`
+    };
+  }
+
+  return { visibility: "owner-private", ownerOpenId };
 }
 
 // Audit item (b), 2026-07-14 (task H4): the manual `snapshot` subcommand used
@@ -347,12 +404,17 @@ function countDegradedPositions(positions) {
  * extractor only reads "- " lines, so the numbers this whole report exists to
  * deliver never reached the reader.
  *
- * Two deliberate decisions:
+ * Three deliberate decisions:
  *
- *   - `audience: "dm"`. /official-paper is owner-private, so the account's
- *     balances must never be routed to the circle's group chat. It is the
- *     current default, stated explicitly so a future change of default cannot
- *     silently publish these numbers.
+ *   - `scope`, from the caller (resolvePnlReportScope). 2026-07-28 (R2): this
+ *     used to say only `audience: "dm"` and trust that to keep the balances
+ *     private. It did not. `audience` says which CHANNEL a card belongs to, not
+ *     who may read it, and the legacy user-plugin channel has no DM to offer -
+ *     so it published 「QQQ.US：数量 1，成本 663.88 USD…」 to the shared group
+ *     and recorded sent:true. The payload now DECLARES that this content
+ *     belongs to exactly one member, and names them; a snapshot that cannot be
+ *     attributed declares that instead and is refused rather than redirected.
+ *     `audience: "dm"` is kept as the channel hint it always was.
  *   - `reportKind: "official-paper"`. 2026-07-28 (R1): this used to be omitted
  *     on the grounds that "there is no /official-paper deep-link page", which
  *     was circular - the page has always been served (routes/reports.ts
@@ -366,7 +428,14 @@ function countDegradedPositions(positions) {
  * "no baseline exists" and "nothing moved" are different facts, and only one of
  * them is true here.
  */
-export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, markdown, markdownPath, pdfPath }) {
+export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, markdown, markdownPath, pdfPath, scope }) {
+  if (!scope || typeof scope.visibility !== "string") {
+    // Refusing here rather than defaulting: every default is a guess about who
+    // may read one member's account balances, and the delivery layer would have
+    // to un-guess it. A caller that cannot resolve an owner passes
+    // {visibility: "owner-unresolved", reason} - saying so is always possible.
+    throw new TypeError("buildPnlDeliveryPayload requires an explicit `scope` (see resolvePnlReportScope): 模拟盘收支变化 is owner-private and must declare who may read it.");
+  }
   const label = current.fetchedAt.slice(0, 10);
   const currentAsset = summarizeAsset(current);
   const degradedCount = countDegradedPositions(current.positions);
@@ -384,6 +453,7 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
     markdown,
     markdownPath,
     pdfPath,
+    scope,
     audience: "dm",
     // `label` is `fetchedAt.slice(0, 10)` - the exact same string the writer
     // used for the filename and the exact key routes/reports.ts matches

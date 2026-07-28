@@ -53,6 +53,47 @@ export interface ReportConclusion {
   bullets: string[];
 }
 
+/**
+ * WHO a report card is allowed to reach - DECLARED by the producer, never
+ * inferred by the delivery layer (2026-07-28 spec drift R2).
+ *
+ * The previous rule was "a payload with an `openId` is owner-private". That is
+ * a routing field, not a statement of intent, and the 模拟盘收支变化 report
+ * walked straight through it: it is every bit as owner-private as a member's
+ * personal page (its platform page 403s anyone but the account's owner), but it
+ * carried `audience: "dm"` and NO `openId`, so on the legacy shared-chat
+ * channel it was published to the whole circle and recorded `sent: true`. The
+ * verifier captured the group message: 「QQQ.US：数量 1，成本 663.88 USD…」.
+ *
+ * The union is the point: `owner-private` cannot be constructed without naming
+ * the owner it is private TO. A producer that knows content belongs to one
+ * member but cannot name their Feishu id says `owner-unresolved` WITH the
+ * reason, and delivery fails closed - it never degrades into "send it
+ * somewhere".
+ */
+export type ReportScope =
+  /**
+   * 圈子公开: the whole circle may read it (日报/周报 发布卡, 个股分析 -
+   * requirements §1.2「个股分析是公共资产，谁都能看」). May go to the group
+   * chat, and is the ONLY thing a fixed-shared-chat channel will carry.
+   */
+  | { visibility: "circle-public" }
+  /**
+   * 归属单一成员: only this member may read it (个人页摘要、个股/个人复盘、
+   * 模拟盘收支变化). `ownerOpenId` is that member's Feishu open_id and is
+   * REQUIRED - an owner-private card with no addressable owner is not a
+   * routing decision to be made later, it is undeliverable.
+   */
+  | { visibility: "owner-private"; ownerOpenId: string }
+  /**
+   * 归属单一成员，但成员无法定位: the content belongs to exactly one owner and
+   * the producer could not resolve who / how to reach them. `reason` is shown
+   * to the operator verbatim. Always refused, on every channel - guessing a
+   * recipient for owner-private content is the failure this type exists to
+   * make impossible.
+   */
+  | { visibility: "owner-unresolved"; reason: string };
+
 export interface ReportDeliveryPayload {
   title: string;
   markdown: string;
@@ -65,11 +106,24 @@ export interface ReportDeliveryPayload {
   pdfPath?: string;
   maxSectionChars?: number;
   /**
-   * Per-owner Feishu open_id. When set it wins over the global notification
-   * target, so an owner-scoped report (个股分析/个人复盘) lands in that
-   * member's own DM instead of the shared 报告发布 channel. Callers that own
-   * no single member (daily/weekly are 公共通知) leave it unset and get the
-   * global target from resolveFeishuAppTarget.
+   * WHO may read this report. Set it on every report; see `ReportScope`.
+   *
+   * When present it decides routing outright. When absent the delivery layer
+   * falls back to reading `openId`/`audience` (see `classifyReportScope`),
+   * which is how the callers written before this field still work - but an
+   * undeclared payload is treated as "not proven safe for a shared surface"
+   * and is refused by any channel that only has one shared chat.
+   */
+  scope?: ReportScope;
+  /**
+   * Per-owner Feishu open_id: WHERE the card goes.
+   *
+   * @deprecated as a privacy signal. Declare `scope` instead. Setting this
+   * alone is still honored as `{visibility: "owner-private", ownerOpenId}` so
+   * the pre-2026-07-28 personal-page callers keep working unchanged, but a
+   * routing field cannot express "there is no one to route to", which is
+   * exactly the case that leaked. Setting both `scope` and a CONTRADICTING
+   * `openId` is refused rather than silently resolved.
    */
   openId?: string;
   /**
@@ -90,9 +144,15 @@ export interface ReportDeliveryPayload {
    *             still ships, to the global DM/notify target, and the result
    *             says so (`groupFallback`) instead of pretending it reached the
    *             group.
-   *   "dm" (default) - 个人通道：个人页摘要、提醒、审批、复盘。Pair it with
-   *             `openId` to address one member; an `openId` always wins, so an
-   *             owner-scoped payload never leaks into the group.
+   *   "dm" (default) - 个人通道：个人页摘要、提醒、审批、复盘。
+   *
+   * NOT a privacy signal. `audience: "dm"` says "this is not the group's
+   * publication card"; it does NOT say the content is owner-private, and the
+   * 模拟盘 report proved the difference matters - it declared "dm", named no
+   * owner, and was published to the group by a channel that has no DM to
+   * offer. Declare `scope` for that. `audience: "group"` IS read as
+   * `circle-public` when no `scope` is given, since it is an explicit
+   * statement about the shared surface.
    *
    * Honored by the app-credential channel, which is the only one production
    * uses. The legacy user-plugin and degraded-webhook channels each post to
@@ -284,10 +344,19 @@ export async function sendNotification(payload: NotificationPayload): Promise<No
  * for basic delivery.
  */
 export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
+  // Before any channel is chosen: a payload that declares owner-private
+  // content with no reachable owner is undeliverable on ALL of them, and the
+  // honest answer is a refusal with the producer's own reason - not a card
+  // sent to whoever the deployment's default target happens to be.
+  const scope = classifyReportScope(payload);
+  if (scope.kind === "undeliverable") {
+    return { sent: false, target: "none", reason: scope.reason, deliveries: [] };
+  }
+
   const credentials = resolveFeishuAppCredentials();
   if (credentials) {
     try {
-      return await deliverReportViaAppCredentials(payload);
+      return await deliverReportViaAppCredentials(payload, scope);
     } catch (error) {
       return {
         sent: false,
@@ -301,7 +370,7 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
   const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
   if (!pluginBotReadiness.enabled) {
     if (allowReportFallbackDelivery()) {
-      return tryDeliverReportViaFallback(payload, pluginBotReadiness.reason);
+      return tryDeliverReportViaFallback(payload, scope, pluginBotReadiness.reason);
     }
 
     return {
@@ -317,11 +386,11 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
   }
 
   try {
-    return await deliverReportViaUserPlugin(payload);
+    return await deliverReportViaUserPlugin(payload, scope);
   } catch (error) {
     const primaryError = sanitizeNotificationError(error);
     if (allowReportFallbackDelivery()) {
-      return tryDeliverReportViaFallback(payload, primaryError);
+      return tryDeliverReportViaFallback(payload, scope, primaryError);
     }
 
     return {
@@ -342,10 +411,15 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
  * MESSAGE shape differs: post messages carrying the whole body instead of a
  * conclusion card, because there is no platform page to link to for the rest.
  *
- * Alerts always go to the deployment's global/ops target. They are never
- * owner-scoped, so there is no `openId` on the payload and no group/DM split
- * to make: FEISHU_GROUP_CHAT_ID belongs to public report cards (§4), an alert
- * belongs to whoever operates the runner.
+ * Alerts always go to the deployment's global/ops target, which is why
+ * `OperationalAlertPayload` has no `ReportScope` and no `openId`: an alert is
+ * addressed to whoever OPERATES the runner, not to a member who owns content.
+ * The 2026-07-28 R2 audit walked every call site of this function and of
+ * deliverReportToFeishu; the only producer here is openclaw-cron-runner.mjs
+ * (cron failures, halt escalations, discovery gaps, state-persistence
+ * failures), none of which carry one member's private data. If an alert ever
+ * needs to, it must become a report with a declared scope rather than growing
+ * a second, weaker privacy story on this side.
  */
 export async function deliverOperationalAlertToFeishu(
   payload: OperationalAlertPayload
@@ -594,13 +668,26 @@ async function postFeishuAppMessage(
 }
 
 // Unreachable today: allowReportFallbackDelivery() is a constant `false`, so
-// nothing calls this. If it is ever re-enabled it needs the same owner-scoped
-// guard deliverReportViaUserPlugin now carries (spec drift A4) - it posts to
-// FEISHU_WEBHOOK_URL or the global app target and likewise cannot address one
-// member's DM, so an `openId` payload would leak here exactly the same way. No
-// guard is added now because a code path with no reachable call site cannot be
-// tested, and an untested guard is a guess.
-async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryError?: string): Promise<ReportDeliveryResult> {
+// nothing calls this. It posts to FEISHU_WEBHOOK_URL or the global app target
+// and, like the legacy user-plugin channel, cannot address one member's DM - so
+// it enforces the SAME rule, through the same
+// refuseNonPublicOnSharedChatChannel the user-plugin tests exercise. Sharing
+// the decision rather than re-implementing it here is deliberate: only the call
+// site is unreachable, the behavior itself is covered.
+async function deliverReportViaFallback(
+  payload: ReportDeliveryPayload,
+  scope: ReportScopeDecision,
+  primaryError?: string
+): Promise<ReportDeliveryResult> {
+  const refusal = refuseNonPublicOnSharedChatChannel(
+    scope,
+    "feishu-webhook",
+    "degraded FEISHU_WEBHOOK_URL / global app target"
+  );
+  if (refusal) {
+    return refusal;
+  }
+
   const chunks = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
   const deliveries: ReportDeliveryEntry[] = [];
   const summaryResult = await sendFallbackNotification(buildDegradedFallbackPayload({
@@ -674,13 +761,16 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
 // reads the same on all three channels (app credentials, legacy user-plugin,
 // degraded fallback). splitReportIntoChapterMessages still serves those other
 // two, which have no card transport of their own.
-async function deliverReportViaAppCredentials(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
-  const resolved = resolveReportDeliveryTarget(payload);
+async function deliverReportViaAppCredentials(
+  payload: ReportDeliveryPayload,
+  scope: ReportScopeDecision
+): Promise<ReportDeliveryResult> {
+  const resolved = resolveReportDeliveryTarget(scope);
   if (!resolved) {
     return {
       sent: false,
       target: "none",
-      reason: "No Feishu report target could be resolved. Pass `openId` on the report payload, set FEISHU_GROUP_CHAT_ID (public reports) / FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
+      reason: "No Feishu report target could be resolved. Declare `scope: {visibility: \"owner-private\", ownerOpenId}` on the report payload, set FEISHU_GROUP_CHAT_ID (public reports) / FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
       deliveries: []
     };
   }
@@ -816,6 +906,122 @@ function resolveReportDeepLink(payload: ReportDeliveryPayload): ReportDeepLink {
     : { href };
 }
 
+/**
+ * What `classifyReportScope` decided. `undeclared` is deliberately a state of
+ * its own rather than being folded into either of the real ones: "the producer
+ * did not say" is not the same claim as "the producer said this is public",
+ * and only one of them may be published to a shared chat.
+ */
+type ReportScopeDecision =
+  | { kind: "circle-public" }
+  | { kind: "owner-private"; ownerOpenId: string }
+  | { kind: "undeclared" }
+  | { kind: "undeliverable"; reason: string };
+
+/**
+ * Read the producer's declaration off the payload (see `ReportScope`).
+ *
+ * Precedence, and why:
+ *   1. `scope` - the declaration. Nothing overrides it; a `scope` that
+ *      disagrees with `openId` is a contradiction the delivery layer refuses
+ *      instead of picking a winner, because either choice could be the leak.
+ *   2. `openId` with no `scope` - the legacy signal, read as owner-private to
+ *      that member. Every pre-2026-07-28 owner-scoped caller (personal-page
+ *      cards) works unchanged.
+ *   3. `audience: "group"` with no `scope` - an explicit statement about the
+ *      shared surface, read as circle-public.
+ *   4. anything else - `undeclared`. NOT public: see the shared-chat channels,
+ *      which refuse it.
+ */
+function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecision {
+  const routingOpenId = payload.openId?.trim() ?? "";
+  const scope = payload.scope;
+
+  if (scope) {
+    if (scope.visibility === "owner-unresolved") {
+      return {
+        kind: "undeliverable",
+        reason: [
+          `报告「${payload.title}」声明为单一成员私有，但生产方无法确定归属成员，因此不投递：${scope.reason}`,
+          "（内容仍在平台上按归属做了访问控制；把它发给默认目标会把某个成员的账户内容给错人。）"
+        ].join("")
+      };
+    }
+
+    if (scope.visibility === "owner-private") {
+      const ownerOpenId = scope.ownerOpenId?.trim() ?? "";
+      if (ownerOpenId === "") {
+        return {
+          kind: "undeliverable",
+          reason: `报告「${payload.title}」声明为单一成员私有（scope.visibility="owner-private"），但 ownerOpenId 为空，没有可投递的对象。请改用 {visibility:"owner-unresolved", reason} 说明原因，或补上该成员的飞书 open_id。`
+        };
+      }
+      if (routingOpenId !== "" && routingOpenId !== ownerOpenId) {
+        return {
+          kind: "undeliverable",
+          reason: `报告「${payload.title}」自相矛盾：scope 声明归属 ${ownerOpenId}，payload.openId 却指向 ${routingOpenId}。两者都可能是正确的收件人，投递任何一方都可能把私有内容发错人，因此拒绝。`
+        };
+      }
+      return { kind: "owner-private", ownerOpenId };
+    }
+
+    if (routingOpenId !== "") {
+      return {
+        kind: "undeliverable",
+        reason: `报告「${payload.title}」自相矛盾：scope 声明为圈子公开（circle-public），却又用 payload.openId 指定了单个成员 ${routingOpenId}。公开卡不该定向发给一个人，定向卡也不该按公开处理，因此拒绝。`
+      };
+    }
+    return { kind: "circle-public" };
+  }
+
+  if (routingOpenId !== "") {
+    return { kind: "owner-private", ownerOpenId: routingOpenId };
+  }
+  if (payload.audience === "group") {
+    return { kind: "circle-public" };
+  }
+  return { kind: "undeclared" };
+}
+
+/**
+ * The refusal a channel with ONE fixed shared chat owes a payload it cannot
+ * safely carry. `null` means "this is declared circle-public, ship it" - the
+ * only case such a channel may deliver.
+ *
+ * Shared by the legacy user-plugin channel and the degraded webhook/app
+ * fallback. The fallback's call site is unreachable today
+ * (`allowReportFallbackDelivery()` is a constant `false`), which is why the
+ * rule lives HERE rather than being re-implemented there: the behavior is
+ * covered by the user-plugin tests, and the fallback gets the identical,
+ * already-exercised decision rather than a fresh untested guess.
+ */
+function refuseNonPublicOnSharedChatChannel(
+  scope: ReportScopeDecision,
+  target: NotificationDeliveryTarget,
+  chatDescription: string
+): ReportDeliveryResult | null {
+  if (scope.kind === "circle-public") {
+    return null;
+  }
+
+  const why = scope.kind === "owner-private"
+    ? `这份报告归属成员 ${scope.ownerOpenId}，投递出去等于把 TA 的私有内容公开给该会话里的所有人。`
+    : "这份报告没有声明可见范围（scope），无法证明它可以公开；未经声明的内容一律不进共享会话。";
+
+  return {
+    sent: false,
+    target,
+    reason: [
+      `Refused on the shared-chat channel (${chatDescription}): it can only post to that one chat and cannot address a single member.`,
+      why,
+      scope.kind === "owner-private"
+        ? "Configure FEISHU_APP_ID/FEISHU_APP_SECRET (or an OpenClaw Feishu app account) so per-owner DMs can be addressed."
+        : 'Declare `scope: {visibility: "circle-public"}` on the payload if it really is a public report.'
+    ].join(" "),
+    deliveries: []
+  };
+}
+
 interface ResolvedReportTarget {
   target: FeishuAppTarget;
   groupFallback?: boolean;
@@ -823,35 +1029,37 @@ interface ResolvedReportTarget {
 }
 
 /**
- * Who gets this report card (§4 群/单聊分工):
+ * Who gets this report card (§4 群/单聊分工), decided from the DECLARED scope
+ * (`classifyReportScope`) rather than from whichever routing field happens to
+ * be set:
  *
- *   1. `openId` on the payload - an owner-scoped report (个人页/个股分析/个人
- *      复盘). Wins over everything, including `audience: "group"`, so private
- *      content can never be routed into the shared group by a caller that set
- *      both.
- *   2. `audience: "group"` + `FEISHU_GROUP_CHAT_ID` - the public report card
- *      lands in the circle's group chat.
- *   3. `audience: "group"` with no group configured - the card still ships, to
+ *   1. `owner-private` - that member's own DM. Nothing can override it, so
+ *      private content can never be routed into the shared group.
+ *   2. `circle-public` + `FEISHU_GROUP_CHAT_ID` - the circle's group chat.
+ *   3. `circle-public` with no group configured - the card still ships, to
  *      whatever the global target is, and the caller is told (groupFallback)
  *      so the run log shows a public report that did not reach the group.
- *   4. otherwise - the global target, exactly as before.
+ *   4. `undeclared` - the deployment's global notify/ops target, exactly as
+ *      before this field existed. This is NOT a safety claim: it is where an
+ *      undeclared report has always gone, and it is precisely why the
+ *      shared-chat channels refuse the same payload rather than copying this
+ *      leniency.
  *
  * Wrapped in try/catch because resolveFeishuAppTarget touches sqlite and the
  * filesystem, and report delivery must degrade rather than throw.
  */
-function resolveReportDeliveryTarget(payload: ReportDeliveryPayload): ResolvedReportTarget | null {
-  const openId = payload.openId?.trim();
-  if (openId) {
+function resolveReportDeliveryTarget(scope: ReportScopeDecision): ResolvedReportTarget | null {
+  if (scope.kind === "owner-private") {
     return {
       target: {
         targetType: "open_id",
-        targetId: openId,
-        source: "report-payload:openId"
+        targetId: scope.ownerOpenId,
+        source: "report-payload:scope.ownerOpenId"
       }
     };
   }
 
-  if (payload.audience === "group") {
+  if (scope.kind === "circle-public") {
     const groupChatId = process.env.FEISHU_GROUP_CHAT_ID?.trim();
     if (groupChatId) {
       return {
@@ -891,10 +1099,11 @@ function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
 // non-2xx webhook), and deliverReportToFeishu must not.
 async function tryDeliverReportViaFallback(
   payload: ReportDeliveryPayload,
+  scope: ReportScopeDecision,
   primaryError?: string
 ): Promise<ReportDeliveryResult> {
   try {
-    return await deliverReportViaFallback(payload, primaryError);
+    return await deliverReportViaFallback(payload, scope, primaryError);
   } catch (error) {
     return {
       sent: false,
@@ -908,32 +1117,29 @@ async function tryDeliverReportViaFallback(
 /**
  * The legacy feishu-user-plugin MCP channel. It posts to ONE fixed chat -
  * resolveFeishuUserPluginBotChatId(), the shared 炒股这一块 group - and has no
- * way to address a second target.
+ * way to address a second target. Only a report DECLARED circle-public ships
+ * here; everything else is refused (refuseNonPublicOnSharedChatChannel).
  *
- * 2026-07-28 (spec drift A4). It also ignored `payload.openId` entirely, so
- * whenever app credentials were absent every member's OWN personal page card
- * went to that shared group and came back recorded as delivered: each member's
- * private positions published to everyone, and a run log showing a clean
- * delivery. An owner-scoped payload is refused here instead - honoring `openId`
- * is not an option on a channel with one hard-wired chat id, and a refusal an
- * operator can read beats a leak nobody can see.
- *
- * `audience: "group"` needs no special handling: this channel's one chat IS the
- * group, which is why a public report still ships through it.
+ * 2026-07-28 (spec drift A4, then R2). The first version of this guard keyed on
+ * `payload.openId`, which caught the personal-page cards and missed the 模拟盘
+ * 收支变化 report entirely: equally owner-private, but it carried `audience:
+ * "dm"` and no `openId`, so it was published to the shared group and recorded
+ * `sent: true`. Inferring privacy from a routing field can only ever catch the
+ * payloads that happen to carry that field, which is why the question is now
+ * answered by the producer's own `scope` declaration - and why an UNDECLARED
+ * payload is refused too rather than assumed publishable.
  */
-async function deliverReportViaUserPlugin(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
-  const ownerOpenId = payload.openId?.trim();
-  if (ownerOpenId) {
-    return {
-      sent: false,
-      target: "feishu-user-plugin-bot-post",
-      reason: [
-        `Owner-scoped report refused on the legacy feishu-user-plugin channel: it can only post to the shared bot chat (${resolveFeishuUserPluginBotChatIdForDiagnostics()}),`,
-        `so delivering this report would publish ${ownerOpenId}'s private page to everyone in that chat.`,
-        "Configure FEISHU_APP_ID/FEISHU_APP_SECRET (or an OpenClaw Feishu app account) so per-owner DMs can be addressed."
-      ].join(" "),
-      deliveries: []
-    };
+async function deliverReportViaUserPlugin(
+  payload: ReportDeliveryPayload,
+  scope: ReportScopeDecision
+): Promise<ReportDeliveryResult> {
+  const refusal = refuseNonPublicOnSharedChatChannel(
+    scope,
+    "feishu-user-plugin-bot-post",
+    `legacy feishu-user-plugin, chat ${resolveFeishuUserPluginBotChatIdForDiagnostics()}`
+  );
+  if (refusal) {
+    return refusal;
   }
 
   const deliveries: ReportDeliveryEntry[] = [];

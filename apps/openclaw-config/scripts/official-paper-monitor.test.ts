@@ -9,7 +9,7 @@
 //   3. audit item (b): the manual `snapshot` path now asserts the paper-
 //      account environment, same as poll/pnl, instead of skipping it.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -39,7 +39,11 @@ afterEach(() => {
   }
 });
 
-function seedMember(db: DatabaseSync, id: string, overrides: Partial<{ status: string }> = {}): void {
+function seedMember(
+  db: DatabaseSync,
+  id: string,
+  overrides: Partial<{ status: string; feishuOpenId: string }> = {}
+): void {
   new MemberRepository(db).upsert({
     id,
     email: `${id}@example.com`,
@@ -48,6 +52,7 @@ function seedMember(db: DatabaseSync, id: string, overrides: Partial<{ status: s
     stockTags: [],
     showPerformance: true,
     status: (overrides.status as "active" | "revoked") ?? "active",
+    ...(overrides.feishuOpenId === undefined ? {} : { feishuOpenId: overrides.feishuOpenId }),
     createdAt: "2026-07-01T00:00:00.000Z"
   });
 }
@@ -386,6 +391,164 @@ describe("official-paper-monitor.mjs CLI entry: unknown command -> JSON envelope
   });
 });
 
+// 2026-07-28 (spec drift R2). The 模拟盘收支变化 report is owner-private -
+// /official-paper/<date> 403s anyone who is not the snapshot's attributed
+// owner - but it declared nothing, so the misdelivery guard (which keyed on
+// `payload.openId`) let it through and the legacy shared-chat channel
+// published the account's positions to the whole circle, recorded sent:true.
+//
+// resolvePnlReportScope answers the question the platform's own 403 answers,
+// from the SAME row: official_paper_snapshots.owner_id for this run's
+// post_open_pnl snapshot.
+describe("resolvePnlReportScope: the card's recipient is the page's owner (spec drift R2)", () => {
+  it("declares owner-private to the member the snapshot was actually attributed to", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl");
+
+    expect(officialPaperMonitor.resolvePnlReportScope(db, snapshotId)).toEqual({
+      visibility: "owner-private",
+      ownerOpenId: "ou_member_1"
+    });
+  });
+
+  it("declares owner-unresolved for a __shared__ snapshot, which the platform shows to nobody", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    seedMember(db, "member_2", { feishuOpenId: "ou_member_2" });
+    // Two active members -> the writer cannot attribute the account.
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl");
+
+    const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+    expect(scope.visibility).toBe("owner-unresolved");
+    expect(scope.reason).toContain(officialPaperMonitor.SHARED_OWNER_SENTINEL);
+  });
+
+  it("declares owner-unresolved - not a fallback recipient - when the owner has no Feishu binding", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl");
+
+    const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+    expect(scope.visibility).toBe("owner-unresolved");
+    expect(scope.reason).toContain("飞书 open_id");
+  });
+});
+
+// The end-to-end version of the same defect, driven through the REAL producer
+// and the REAL delivery function rather than a hand-written payload: the
+// verifier reproduced the leak by executing renderPnlReport's own output and
+// captured `send_message_as_bot chat_id="oc_shared_group_chat" ... sent = true`.
+// This asserts the shared chat is never even contacted.
+describe("the PnL report cannot reach the shared group chat (spec drift R2)", () => {
+  const envKeys = [
+    "LARK_APP_ID",
+    "LARK_APP_SECRET",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ACCOUNT_ID",
+    "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "FEISHU_USER_PLUGIN_COMMAND",
+    "FEISHU_USER_PLUGIN_ARGS",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "FEISHU_USER_PLUGIN_DISABLED"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+
+  afterEach(() => {
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+  });
+
+  /** Forces the legacy user-plugin channel (the one with a single shared chat)
+   * and returns the path of a marker the fake plugin writes if it is spawned at
+   * all. App credentials are made genuinely unresolvable so the machine running
+   * the suite cannot decide which channel is exercised. */
+  function useSharedChatChannel(dir: string): string {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+    }
+    const spawnMarkerPath = join(dir, "plugin-was-spawned.log");
+    const scriptPath = join(dir, "fake-plugin.mjs");
+    writeFileSync(
+      scriptPath,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawnMarkerPath)}, "spawned", "utf8");\n`,
+      "utf8"
+    );
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+    return spawnMarkerPath;
+  }
+
+  /** The payload sendPnlReport itself builds, from a snapshot this run
+   * persisted - not a fixture shaped to be convenient. */
+  function realPnlPayload(db: DatabaseSync) {
+    const snapshot = buildSnapshot({
+      primaryAsset: { net_assets: "1200", total_cash: "140" },
+      positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 731.42 }],
+      quotes: [{ symbol: "QQQ.US", last: 731.42 }]
+    });
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, snapshot, "post_open_pnl");
+    const markdown = officialPaperMonitor.renderPnlReport(snapshot, null, null);
+    return officialPaperMonitor.buildPnlDeliveryPayload({
+      current: snapshot,
+      previousDay: null,
+      previousWeek: null,
+      markdown,
+      markdownPath: "/tmp/reports/2026-07-01-post-open.md",
+      pdfPath: "/tmp/reports/2026-07-01-post-open.pdf",
+      scope: officialPaperMonitor.resolvePnlReportScope(db, snapshotId)
+    });
+  }
+
+  it("is refused, not published, when the only channel is the shared group chat", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    const payload = realPnlPayload(db);
+    const spawnMarkerPath = useSharedChatChannel(tempDirs[tempDirs.length - 1] as string);
+
+    // The exact content the verifier saw arrive in the group.
+    expect(payload.markdown).toContain("QQQ.US：数量 1，成本 663.88 USD");
+
+    const result = await notifications.deliverReportToFeishu(payload);
+
+    expect(result.sent).toBe(false);
+    expect(existsSync(spawnMarkerPath)).toBe(false);
+    expect(result.reason).toContain("ou_member_1");
+    expect(result.deliveries).toEqual([]);
+  });
+
+  it("is refused with the attribution reason when the snapshot belongs to nobody in particular", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    const { db } = makeDb();
+    // No members at all -> the writer stamps the __shared__ sentinel, and the
+    // platform page is closed to everyone.
+    const payload = realPnlPayload(db);
+    const spawnMarkerPath = useSharedChatChannel(tempDirs[tempDirs.length - 1] as string);
+
+    const result = await notifications.deliverReportToFeishu(payload);
+
+    expect(result.sent).toBe(false);
+    expect(existsSync(spawnMarkerPath)).toBe(false);
+    expect(result.reason).toContain(officialPaperMonitor.SHARED_OWNER_SENTINEL);
+  });
+});
+
 // 2026-07-28 (spec drift A3). sendPnlReport handed deliverReportToFeishu only
 // {title, markdown, markdownPath, pdfPath}. Under the one-card delivery path
 // that produced a card with neither the numbers nor a link: the 收支变化表 is a
@@ -399,9 +562,11 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     current?: Record<string, unknown>;
     previousDay?: Record<string, unknown> | null;
     previousWeek?: Record<string, unknown> | null;
+    scope?: Record<string, unknown>;
   } = {}) {
     const current = overrides.current ?? buildSnapshot({ primaryAsset: { net_assets: "1200", total_cash: "140" } });
     return officialPaperMonitor.buildPnlDeliveryPayload({
+      scope: overrides.scope ?? { visibility: "owner-private", ownerOpenId: "ou_paper_owner" },
       current,
       previousDay: overrides.previousDay === undefined
         ? buildSnapshot({ fetchedAt: "2026-06-30T14:00:00.000Z", primaryAsset: { net_assets: "1000", total_cash: "200" } })
@@ -419,6 +584,20 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     // /official-paper is owner-private: the account's balances must never be
     // routed to the circle's group chat.
     expect(payload.audience).toBe("dm");
+    // R2: and it SAYS so, rather than leaving the delivery layer to infer it
+    // from `audience` (a channel hint) or from an openId that isn't there.
+    expect(payload.scope).toEqual({ visibility: "owner-private", ownerOpenId: "ou_paper_owner" });
+  });
+
+  it("refuses to build a payload with no declared scope rather than defaulting to one", () => {
+    expect(() => officialPaperMonitor.buildPnlDeliveryPayload({
+      current: buildSnapshot(),
+      previousDay: null,
+      previousWeek: null,
+      markdown: "# x",
+      markdownPath: "/tmp/x.md",
+      pdfPath: "/tmp/x.pdf"
+    })).toThrow(/scope/);
   });
 
   it("carries the numbers the markdown table hides from the card", () => {

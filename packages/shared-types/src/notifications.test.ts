@@ -562,6 +562,10 @@ rl.on("line", (line) => {
     // throwing out of deliverReportToFeishu is exactly what took the cron
     // runner down for every scheduled report.
     const result = await deliverReportToFeishu({
+      // Declared public, because this channel's one chat IS the group and an
+      // UNDECLARED payload is now refused before it gets here (R2). The subject
+      // of this test is the PDF step's prose failure, not the scope rule.
+      scope: { visibility: "circle-public" },
       title: "测试报告",
       markdown: "# 测试报告\n\n内容",
       pdfPath
@@ -623,6 +627,81 @@ rl.on("line", (line) => {
     expect(result.deliveries.every((entry) => !entry.sent)).toBe(true);
   });
 
+  // 2026-07-28 (R2). The openId-shaped guard above catches only payloads that
+  // happen to carry an openId. The 模拟盘收支变化 report is just as
+  // owner-private and carried NONE - `audience: "dm"` and nothing else - so it
+  // walked through and was published here. An UNDECLARED payload is refused for
+  // the same reason a declared-private one is: nothing about it proves it may
+  // be shown to everyone in a shared chat.
+  it("refuses a payload that declares no scope at all, rather than assuming it is publishable", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-undeclared-"));
+    const scriptPath = join(tempDir, "fake-plugin.mjs");
+    const spawnMarkerPath = join(tempDir, "plugin-was-spawned.log");
+    writeFileSync(
+      scriptPath,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawnMarkerPath)}, "spawned", "utf8");\n${FAKE_PLUGIN_SCRIPT}`,
+      "utf8"
+    );
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 模拟盘收支变化 2026-07-28",
+      markdown: "# OpenClaw 模拟盘收支变化 2026-07-28\n\n- QQQ.US：数量 1，成本 663.88 USD。",
+      audience: "dm"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(existsSync(spawnMarkerPath)).toBe(false);
+    expect(result.reason).toMatch(/scope/);
+    expect(result.deliveries).toEqual([]);
+  });
+
+  // The declared form of the same refusal: an owner-private payload is refused
+  // whether it named its owner through `scope` or the legacy `openId`.
+  it("refuses a scope-declared owner-private report and names the owner it belongs to", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-declared-private-"));
+    const scriptPath = join(tempDir, "fake-plugin.mjs");
+    const spawnMarkerPath = join(tempDir, "plugin-was-spawned.log");
+    writeFileSync(
+      scriptPath,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawnMarkerPath)}, "spawned", "utf8");\n${FAKE_PLUGIN_SCRIPT}`,
+      "utf8"
+    );
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 模拟盘收支变化 2026-07-28",
+      markdown: "# OpenClaw 模拟盘收支变化 2026-07-28\n\n- QQQ.US：数量 1，成本 663.88 USD。",
+      scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" },
+      audience: "dm"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(existsSync(spawnMarkerPath)).toBe(false);
+    expect(result.reason).toMatch(/ou_paper_owner/);
+    expect(result.reason).toMatch(/FEISHU_APP_ID/);
+  });
+
   // A public report is what this channel's one chat is FOR, so it still ships.
   it("still delivers a group-audience report on that channel, which is the group", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "notifications-group-audience-"));
@@ -650,6 +729,18 @@ rl.on("line", (line) => {
 
     expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-user-plugin-bot-post");
+
+    // ... and identically when the same report says so with the explicit
+    // marker instead of relying on `audience: "group"` being read as one.
+    const declared = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: "# OpenClaw 日报 2026-07-28\n\n## 1. 今日结论\n\n- 市场信号：QQQ 走平。",
+      scope: { visibility: "circle-public" },
+      reportKind: "daily",
+      reportDate: "2026-07-28"
+    });
+
+    expect(declared.sent).toBe(true);
   });
 });
 
@@ -970,6 +1061,107 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(sends).toHaveLength(1);
     expect(sends[0]!.url).toContain("receive_id_type=open_id");
     expect(sends[0]!.body.receive_id).toBe("ou_owner_specific");
+  });
+
+  // 2026-07-28 (R2). The declared marker, on the channel production actually
+  // uses. `scope` decides routing outright - it is not a hint the group
+  // configuration can override.
+  it("routes a scope-declared owner-private report to that owner's DM even with a group chat configured", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 模拟盘收支变化 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" },
+      audience: "dm",
+      reportKind: "official-paper",
+      reportDate: "2026-07-28"
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=open_id");
+    expect(sends[0]!.body.receive_id).toBe("ou_paper_owner");
+  });
+
+  // "We know this belongs to one person and we do not know who" must never
+  // degrade into "send it to the default target". Refused on the app-credential
+  // channel too, which is the one that HAS a DM to offer - the refusal is about
+  // the content, not about the channel's capabilities.
+  it("refuses an owner-unresolved report on every channel and repeats the producer's reason", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 模拟盘收支变化 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: {
+        visibility: "owner-unresolved",
+        reason: "本次快照的归属是 __shared__（当前不是恰好 1 位活跃成员）"
+      },
+      audience: "dm"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.reason).toContain("__shared__");
+    expect(result.deliveries).toEqual([]);
+    // Not a single HTTP call: nothing was attempted, so nothing can be
+    // half-delivered or logged as delivered.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a payload whose scope and openId name different owners instead of picking one", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "owner-private", ownerOpenId: "ou_alice" },
+      openId: "ou_bob"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toContain("ou_alice");
+    expect(result.reason).toContain("ou_bob");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a payload that declares itself public while addressing one member", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "circle-public" },
+      openId: "ou_bob"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toContain("ou_bob");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses an owner-private declaration that names a blank owner", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "owner-private", ownerOpenId: "   " }
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toMatch(/owner-unresolved/);
+    expect(calls).toHaveLength(0);
   });
 
   it("stays at one message for a long report - no chapter fan-out to fall back to", async () => {
