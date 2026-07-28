@@ -447,6 +447,15 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
   reports.save({
     id: reportId,
     category: "trade",
+    // N2 (2026-07-28 verifier): stamp the owner at the WRITE, exactly as
+    // broker-executor's own success path does. This writer used to omit
+    // ownerId entirely, so a reconciled real fill landed with owner_id NULL -
+    // invisible on the member's own weekly 「本周我的交易 vs 策略一致性回顾」
+    // and countable only inside the anonymous unattributed disclosure. The
+    // proposal whose status this same function just corrected is the
+    // server-side owner of record; there is no other moment at which the
+    // attribution can still be recovered.
+    ownerId: proposal.ownerId,
     title: `${symbol} 执行报告`,
     body: [
       `工单：${ticketId}`,

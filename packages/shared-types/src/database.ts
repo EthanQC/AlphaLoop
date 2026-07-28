@@ -1146,7 +1146,17 @@ export class AuditLogRepository {
 // have NO owner (see the v17 migration's backfill decision: history that
 // predates per-member accounts stays unattributed instead of being assigned a
 // fabricated owner).
-export type OwnedExecutionReport = ExecutionReport & { ownerId?: string | null };
+//
+// N2 (2026-07-28 verifier): the field is REQUIRED, not optional. It used to be
+// `ownerId?: string | null`, and reconcile-official-paper-orders.mjs's writer
+// simply never passed it - which typechecked, wrote NULL, and made a
+// reconciled REAL fill invisible on its own owner's weekly §3.3 section (it
+// surfaced only inside the anonymous "未按成员归属" count). An unstamped row is
+// unattributable forever: nothing downstream can recover who placed the order.
+// So "no owner" now has to be WRITTEN as `ownerId: null` - an explicit
+// statement that this row belongs to nobody - and forgetting the field is a
+// compile error instead of a silent orphan.
+export type OwnedExecutionReport = ExecutionReport & { ownerId: string | null };
 
 export class ExecutionReportRepository {
   constructor(private readonly db: DatabaseSync) {}

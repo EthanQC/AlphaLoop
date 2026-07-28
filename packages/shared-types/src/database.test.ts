@@ -4053,7 +4053,10 @@ describe("v17 execution_reports.owner_id migration (C1: per-member fills were pu
       title: "复盘",
       body: "body",
       metadata: {},
-      createdAt: nowIso()
+      // N2: "belongs to nobody" is now stated, not omitted - the field is
+      // required precisely so a forgotten stamp cannot masquerade as this.
+      createdAt: nowIso(),
+      ownerId: null
     });
 
     const stored = db

@@ -460,6 +460,36 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
     expect(reports[0]?.metadata?.proposalId).toBe(proposal.id);
   });
 
+  // N2 (2026-07-28 verifier): this writer used to call reports.save() with no
+  // ownerId at all, so a reconciled REAL fill was written with owner_id NULL.
+  // The owner-scoped read (selectExecutionReports, `WHERE owner_id = ?`) then
+  // could never return it, so the member's own weekly §3.3 section did not show
+  // their own reconciled trade - it appeared only inside the anonymous
+  // "未按成员归属" count. Asserted against the raw column, not the type.
+  it("stamps the reconciled report with the proposal's owner, so the owner-scoped read can see it", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "NVDA.US", side: "sell", quantity: 4, limitPrice: 130 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+
+    insertLifecycleRow(db, {
+      id: "row_owner_stamp", ticketId, externalOrderId: null,
+      symbol: "NVDA.US", side: "sell", quantity: 4, limitPrice: 130,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_OWNED", symbol: "NVDA.US", side: "Sell", quantity: 4, price: 130, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" })
+    ]);
+
+    const stored = db
+      .prepare(`SELECT owner_id FROM execution_reports WHERE category = 'trade'`)
+      .all() as Array<{ owner_id: string | null }>;
+    expect(stored).toEqual([{ owner_id: "member_1" }]);
+  });
+
   it("does NOT transition the proposal when the adopted stage is cancelled/rejected", async () => {
     const db = makeDb();
     seedMember(db, "member_1");
