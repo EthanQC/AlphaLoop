@@ -4,6 +4,13 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  describeRuntimeChanges,
+  diffRuntimeEntries,
+  hasRuntimeChanges,
+  snapshotRuntimeEntries
+} from "./runtime-root-snapshot.js";
+
 /**
  * G1 (2026-07-28, round-4 verifier): the suite used to be able to run against a
  * PREVIOUS build's output, and did.
@@ -105,7 +112,7 @@ export function staleProjects(): string[] {
   return BUILT_PROJECTS.filter((project) => !report.includes(`'${join(ROOT, project)}' is up to date`));
 }
 
-export default async function setup(): Promise<void> {
+export default async function setup(): Promise<() => void> {
   const startedAt = Date.now();
   runTsc(["-b"]);
 
@@ -136,4 +143,18 @@ export default async function setup(): Promise<void> {
     projects: [...BUILT_PROJECTS],
     forced: missing.length > 0
   });
+
+  // H1's whole-run backstop. test/runtime-write-guard.ts fails the individual
+  // test that writes into the real runtime/, but its window opens at the first
+  // beforeEach - it cannot see a write that happens while a test file is being
+  // IMPORTED (five production .mjs modules touch runtimeRoot at import time),
+  // nor one that lands after the last test finished. This compares the whole
+  // directory across the whole run and fails the run if anything moved.
+  const before = snapshotRuntimeEntries();
+  return () => {
+    const changes = diffRuntimeEntries(before, snapshotRuntimeEntries());
+    if (hasRuntimeChanges(changes)) {
+      throw new Error(describeRuntimeChanges(changes, "this test run"));
+    }
+  };
 }

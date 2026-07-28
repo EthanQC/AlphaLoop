@@ -114,7 +114,19 @@ export async function runLongbridgeText(category, args, options = {}) {
   // return value) can still get isolation via that env's own
   // LONGBRIDGE_RATE_LIMIT_DIR convention; the module-level shared `runtimeRoot`
   // is the unchanged default for every existing (non-per-member) caller.
-  const rateLimitDir = options.rateLimitDir ?? options.env?.LONGBRIDGE_RATE_LIMIT_DIR ?? runtimeRoot;
+  //
+  // H1 (2026-07-28, round-5) added the third term. The header above describes a
+  // per-member SUBPROCESS isolating this module's rate-limit files, but only the
+  // in-process `options.env` path ever did that: a process actually STARTED with
+  // buildMemberSubprocessEnv would carry LONGBRIDGE_RATE_LIMIT_DIR in its own
+  // process.env, where nothing looked, and would have gone on writing the shared
+  // account's ledger. Reading the same variable from this process's env closes
+  // that, and gives entry points that thread no options at all (fetchMacroCalendar
+  // -> fetchRequiredLongbridgeJson passes only `{label}`) a way to be isolated by
+  // their caller. Set in no .env, plist or installer in this repo, and nowhere on
+  // the deploy machine (checked 2026-07-28), so no existing run changes behavior.
+  const rateLimitDir =
+    options.rateLimitDir ?? options.env?.LONGBRIDGE_RATE_LIMIT_DIR ?? process.env.LONGBRIDGE_RATE_LIMIT_DIR ?? runtimeRoot;
   mkdirSync(rateLimitDir, { recursive: true });
   const statePath = join(rateLimitDir, `longbridge-rate-limit-${category}.json`);
   const lockPath = join(rateLimitDir, `longbridge-rate-limit-${category}.lock`);

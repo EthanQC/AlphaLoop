@@ -28,6 +28,28 @@ function makeStubCli(script: string): string {
   return path;
 }
 
+/**
+ * H1 (2026-07-28, round-5): every call below MUST carry a rate-limit directory.
+ *
+ * `runLongbridgeText` resolves it as
+ * `options.rateLimitDir ?? options.env?.LONGBRIDGE_RATE_LIMIT_DIR ?? runtimeRoot`,
+ * and `runtimeRoot` is the repo's own `runtime/` - the directory that holds the
+ * LIVE ledger on the deploy machine. Five calls in this file used to pass no
+ * options at all, so running this one file rewrote
+ * runtime/longbridge-rate-limit-{quote,trade}.json with fresh timestamps
+ * (measured: both files' sha256 and mtime changed).
+ *
+ * A temp directory per call keeps every case exercising the real lock/state
+ * path against a directory of its own. test/runtime-write-guard.ts now fails any
+ * test that writes into the real runtime root, so a regression here is a test
+ * failure rather than silent damage to a broker rate limit.
+ */
+function makeRateLimitDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "openclaw-longbridge-ratelimit-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
 afterEach(() => {
   delete process.env.LONGBRIDGE_CLI_PATH;
   delete process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS;
@@ -46,11 +68,12 @@ process.exit(0);
 `);
     process.env.LONGBRIDGE_CLI_PATH = stubPath;
     process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS = "1";
+    const rateLimitDir = makeRateLimitDir();
     const { runLongbridgeJson, runLongbridgeJsonWithRetry } = await import("./_longbridge.mjs");
 
-    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"])).rejects.toThrow(/empty/iu);
+    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"], { rateLimitDir })).rejects.toThrow(/empty/iu);
     await expect(
-      runLongbridgeJsonWithRetry("quote", ["quote", "AAPL.US"], { attempts: 1 })
+      runLongbridgeJsonWithRetry("quote", ["quote", "AAPL.US"], { attempts: 1, rateLimitDir })
     ).rejects.toThrow(/empty/iu);
   });
 
@@ -60,9 +83,10 @@ process.stdout.write("   \\n  \\n");
 process.exit(0);
 `);
     process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const rateLimitDir = makeRateLimitDir();
     const { runLongbridgeJson } = await import("./_longbridge.mjs");
 
-    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"])).rejects.toThrow(/empty/iu);
+    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"], { rateLimitDir })).rejects.toThrow(/empty/iu);
   });
 
   it("still parses real JSON stdout correctly (empty-stdout fix must not break the normal path)", async () => {
@@ -71,9 +95,10 @@ process.stdout.write(JSON.stringify({ symbol: "AAPL.US", last: "210.5" }));
 process.exit(0);
 `);
     process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const rateLimitDir = makeRateLimitDir();
     const { runLongbridgeJson } = await import("./_longbridge.mjs");
 
-    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"])).resolves.toEqual({
+    await expect(runLongbridgeJson("quote", ["quote", "AAPL.US"], { rateLimitDir })).resolves.toEqual({
       symbol: "AAPL.US",
       last: "210.5"
     });
@@ -142,6 +167,62 @@ process.exit(0);
     expect(existsSync(join(rateLimitDir, "longbridge-rate-limit-trade.json"))).toBe(true);
   });
 
+  // H1 (2026-07-28, round-5). The two overrides above only reach callers that
+  // thread `options`; an entry point that threads none (scheduled-report.mjs's
+  // fetchMacroCalendar -> fetchRequiredLongbridgeJson passes only `{label}`) had
+  // no way to be isolated, and a process actually STARTED with
+  // buildMemberSubprocessEnv would have carried LONGBRIDGE_RATE_LIMIT_DIR in its
+  // own env where nothing read it - and written the shared account's ledger.
+  it("honors LONGBRIDGE_RATE_LIMIT_DIR from the process's own env when no options are threaded", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ ok: true }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const rateLimitDir = makeRateLimitDir();
+    const previous = process.env.LONGBRIDGE_RATE_LIMIT_DIR;
+    process.env.LONGBRIDGE_RATE_LIMIT_DIR = rateLimitDir;
+    try {
+      const { runLongbridgeJson } = await import("./_longbridge.mjs?ratelimit-process-env");
+
+      await runLongbridgeJson("quote", ["quote", "AAPL.US"]);
+
+      expect(existsSync(join(rateLimitDir, "longbridge-rate-limit-quote.json"))).toBe(true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.LONGBRIDGE_RATE_LIMIT_DIR;
+      } else {
+        process.env.LONGBRIDGE_RATE_LIMIT_DIR = previous;
+      }
+    }
+  });
+
+  it("still prefers an explicit rateLimitDir over the process env fallback", async () => {
+    const stubPath = makeStubCli(`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ ok: true }));
+process.exit(0);
+`);
+    process.env.LONGBRIDGE_CLI_PATH = stubPath;
+    const explicitDir = makeRateLimitDir();
+    const envDir = makeRateLimitDir();
+    const previous = process.env.LONGBRIDGE_RATE_LIMIT_DIR;
+    process.env.LONGBRIDGE_RATE_LIMIT_DIR = envDir;
+    try {
+      const { runLongbridgeJson } = await import("./_longbridge.mjs?ratelimit-precedence");
+
+      await runLongbridgeJson("trade", ["assets"], { rateLimitDir: explicitDir });
+
+      expect(existsSync(join(explicitDir, "longbridge-rate-limit-trade.json"))).toBe(true);
+      expect(existsSync(join(envDir, "longbridge-rate-limit-trade.json"))).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.LONGBRIDGE_RATE_LIMIT_DIR;
+      } else {
+        process.env.LONGBRIDGE_RATE_LIMIT_DIR = previous;
+      }
+    }
+  });
+
   it("passes options.env through to the CLI subprocess verbatim", async () => {
     const stubPath = makeStubCli(`#!/usr/bin/env node
 process.stdout.write(JSON.stringify({ seen: process.env.OPENCLAW_TEST_MARKER ?? null }));
@@ -151,7 +232,8 @@ process.exit(0);
     const { runLongbridgeJson } = await import("./_longbridge.mjs?env-passthrough");
 
     const result = await runLongbridgeJson("quote", ["quote", "AAPL.US"], {
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, OPENCLAW_TEST_MARKER: "member-value" }
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, OPENCLAW_TEST_MARKER: "member-value" },
+      rateLimitDir: makeRateLimitDir()
     });
 
     expect(result).toEqual({ seen: "member-value" });
@@ -169,7 +251,11 @@ process.exit(0);
     const { runLongbridgeJson } = await import("./_longbridge.mjs?region-cache-override");
 
     await runLongbridgeJson("trade", ["check"], {
-      env: { PATH: process.env.PATH, HOME: memberHome }
+      // `env` alone does NOT isolate the rate-limit ledger: without
+      // LONGBRIDGE_RATE_LIMIT_DIR in it, or an explicit rateLimitDir, the trade
+      // state file lands in the repo's real runtime/ (H1).
+      env: { PATH: process.env.PATH, HOME: memberHome },
+      rateLimitDir: makeRateLimitDir()
     });
 
     const regionCachePath = join(memberHome, ".longbridge", "openapi", "region-cache");

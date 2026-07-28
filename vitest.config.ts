@@ -40,6 +40,16 @@ const TEST_ENV = {
   PLATFORM_SESSION_SECRET: "test-only-session-secret-not-a-real-one-0123456789"
 };
 
+// H1 (2026-07-28): running apps/openclaw-config/scripts/_longbridge.test.ts
+// rewrote the repo's REAL runtime/longbridge-rate-limit-{quote,trade}.json -
+// on the deploy machine, the live ledger protecting a broker rate limit, in the
+// same directory as trading.sqlite. This setup file watches the real runtime
+// root around every single test and fails the test that touched it. Both
+// projects list it: setupFiles are per-project in Vitest 4, so a project
+// without this line is a lane where the whole class comes back.
+// See test/runtime-write-guard.ts.
+const GUARD_SETUP_FILES = ["./test/runtime-write-guard.ts"];
+
 export default defineConfig({
   test: {
     maxWorkers: 6,
@@ -58,6 +68,7 @@ export default defineConfig({
           name: "serial-subprocess",
           environment: "node",
           env: TEST_ENV,
+          setupFiles: [...GUARD_SETUP_FILES],
           include: [...SERIAL_TEST_GLOBS],
           fileParallelism: false,
           // These files spawn real child processes and wait on poll/backoff
@@ -74,6 +85,7 @@ export default defineConfig({
           name: "main",
           environment: "node",
           env: TEST_ENV,
+          setupFiles: [...GUARD_SETUP_FILES],
           include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "test/**/*.test.ts"],
           exclude: ["**/node_modules/**", ...SERIAL_TEST_GLOBS]
         }

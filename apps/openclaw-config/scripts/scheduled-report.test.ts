@@ -308,6 +308,7 @@ describe("Phase 4 Task 7: clustered news section (### 多源新闻（事件聚�
 describe("fetchMacroCalendar degrades instead of crashing the whole report (task H7)", () => {
   const originalCliPath = process.env.LONGBRIDGE_CLI_PATH;
   const originalAttempts = process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS;
+  const originalRateLimitDir = process.env.LONGBRIDGE_RATE_LIMIT_DIR;
 
   it("returns a degraded {entries: [], warnings} shape when the Longbridge CLI fails instead of throwing", async () => {
     const { mkdtempSync, chmodSync, writeFileSync, rmSync } = await import("node:fs");
@@ -322,6 +323,12 @@ process.exit(1);
     chmodSync(stubPath, 0o755);
     process.env.LONGBRIDGE_CLI_PATH = stubPath;
     process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS = "1";
+    // H1 (2026-07-28): the rate limiter records this call BEFORE the CLI runs,
+    // and fetchMacroCalendar threads no options, so without this the degraded-
+    // path test rewrote the repo's real runtime/longbridge-rate-limit-quote.json
+    // - the live ledger on the deploy machine. Caught by
+    // test/runtime-write-guard.ts, which fails any test that touches runtime/.
+    process.env.LONGBRIDGE_RATE_LIMIT_DIR = mkdtempSync(join(tmpdir(), "openclaw-macro-ratelimit-"));
 
     try {
       const result = await scheduledReport.fetchMacroCalendar({ label: "2026-07-14" });
@@ -339,6 +346,11 @@ process.exit(1);
         delete process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS;
       } else {
         process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS = originalAttempts;
+      }
+      if (originalRateLimitDir === undefined) {
+        delete process.env.LONGBRIDGE_RATE_LIMIT_DIR;
+      } else {
+        process.env.LONGBRIDGE_RATE_LIMIT_DIR = originalRateLimitDir;
       }
     }
   });
