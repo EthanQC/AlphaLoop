@@ -2290,17 +2290,25 @@ function addDays(label, days) {
 // unparsable file is an empty state, never a crash: the file is runtime
 // bookkeeping, and losing it must degrade to "send the cards" rather than kill
 // the run.
-function readState() {
+//
+// R7 (2026-07-28 verifier): both halves take the file path, and the module-level
+// pair below binds it to the real runtime file. The idempotency guard only
+// works if the key `updateState` WRITES is the key `readDeliveredPersonalCards`
+// LOOKS UP - had `info.kind` ever been undefined, every run would have written
+// `undefined:<date>` and quietly re-sent every card - and a test cannot exercise
+// that agreement without going through an actual file. It must never be the
+// production one, hence the parameter.
+export function readDeliveryState(path) {
   try {
-    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
 }
 
-function updateState(info, patch) {
-  const state = readState();
+export function writeDeliveryStateEntry(path, info, patch) {
+  const state = readDeliveryState(path);
 
   const key = `${info.kind}:${info.label}`;
   state[key] = {
@@ -2312,7 +2320,16 @@ function updateState(info, patch) {
     },
     ...patch
   };
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  return state;
+}
+
+function readState() {
+  return readDeliveryState(statePath);
+}
+
+function updateState(info, patch) {
+  writeDeliveryStateEntry(statePath, info, patch);
 }
 
 function assertKind(value) {

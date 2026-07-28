@@ -13,7 +13,7 @@
 // each active member gets their OWN page as one card, addressed to their own
 // open_id, carrying a /daily/<date>/me deep link - and a member the delivery
 // cannot reach is disclosed with a reason rather than silently dropped.
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -484,11 +484,154 @@ describe("C4: a single member's card failure does not force a full-run retry", (
   });
 });
 
-// deliverReport drives real Longbridge/Feishu and is not exported, so the wiring
-// of the three pieces above is pinned at the source level. Without it each piece
-// could be individually correct while nothing called them - which is precisely
-// the shape of the defect (updateState already WROTE personalCards; no reader
-// existed).
+// R7 (2026-07-28 verifier): the three-run scenarios above hand one run's
+// `delivered` array to the next IN MEMORY, and the wiring below is a source
+// regex. Neither exercises the thing that can actually break: the state file
+// itself, and the agreement between the `kind:label` key the writer stores
+// under and the one the reader looks up. Had `info.kind` been undefined,
+// idempotency would have silently never fired and every case here would still
+// have passed. This drives the real writer and the real reader against a real
+// JSON file on disk - a temp one; the production runtime file is never touched.
+describe("R7: the idempotency record survives a real round-trip through the state file", () => {
+  function stateFile(): string {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-report-state-"));
+    tempDirs.push(dir);
+    return join(dir, "report-delivery-state.json");
+  }
+
+  const window = {
+    kind: "daily" as const,
+    label: DATE,
+    startLabel: "2026-07-27",
+    endLabel: DATE,
+    start: new Date("2026-07-27T20:00:00+08:00"),
+    end: new Date("2026-07-28T20:00:00+08:00")
+  };
+
+  it("re-running after a persisted run sends nothing a second time, and the third run agrees", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const path = stateFile();
+
+    const first = capturingDeliver();
+    const firstResult = await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: scheduledReport.readDeliveredPersonalCards(
+        scheduledReport.readDeliveryState(path),
+        "daily",
+        DATE
+      ),
+      deliver: first.deliver
+    });
+    expect(first.payloads).toHaveLength(2);
+    scheduledReport.writeDeliveryStateEntry(path, window, { personalCards: firstResult });
+
+    // The file is real JSON on disk, keyed exactly as the reader looks it up.
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(onDisk)).toEqual([`daily:${DATE}`]);
+
+    for (const run of [2, 3]) {
+      const next = capturingDeliver();
+      const result = await scheduledReport.deliverPersonalPageCards({
+        db,
+        reportKind: "daily",
+        date: DATE,
+        previouslyDelivered: scheduledReport.readDeliveredPersonalCards(
+          scheduledReport.readDeliveryState(path),
+          "daily",
+          DATE
+        ),
+        deliver: next.deliver
+      });
+      expect(next.payloads, `run ${run} re-sent a card`).toEqual([]);
+      expect(result.delivered.map((entry: { ownerId: string }) => entry.ownerId).sort()).toEqual([
+        "member_a",
+        "member_b"
+      ]);
+      scheduledReport.writeDeliveryStateEntry(path, window, { personalCards: result });
+    }
+  });
+
+  it("a member who failed is retried after the round-trip, and the one who succeeded is not", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const path = stateFile();
+
+    const first = capturingDeliver({ ou_alpha: { sent: false, reason: "invalid receive_id" } });
+    const firstResult = await scheduledReport.deliverPersonalPageCards({
+      db, reportKind: "daily", date: DATE, deliver: first.deliver
+    });
+    scheduledReport.writeDeliveryStateEntry(path, window, { personalCards: firstResult });
+
+    const second = capturingDeliver();
+    await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: scheduledReport.readDeliveredPersonalCards(
+        scheduledReport.readDeliveryState(path),
+        "daily",
+        DATE
+      ),
+      deliver: second.deliver
+    });
+
+    expect(second.payloads.map((payload) => payload.openId)).toEqual(["ou_alpha"]);
+  });
+
+  it("the persisted daily record does not suppress the weekly card of the same date", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const path = stateFile();
+
+    const first = capturingDeliver();
+    const firstResult = await scheduledReport.deliverPersonalPageCards({
+      db, reportKind: "daily", date: DATE, deliver: first.deliver
+    });
+    scheduledReport.writeDeliveryStateEntry(path, window, { personalCards: firstResult });
+
+    // Same date, other kind: the key differs, so nothing is suppressed. This is
+    // the assertion that fails if writer and reader ever stop agreeing on the
+    // `kind:label` key.
+    expect(
+      scheduledReport.readDeliveredPersonalCards(scheduledReport.readDeliveryState(path), "weekly", DATE)
+    ).toEqual([]);
+    expect(
+      scheduledReport
+        .readDeliveredPersonalCards(scheduledReport.readDeliveryState(path), "daily", DATE)
+        .map((entry: { ownerId: string }) => entry.ownerId)
+        .sort()
+    ).toEqual(["member_a", "member_b"]);
+  });
+
+  it("a lost or corrupt state file degrades to sending, never to crashing", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const path = stateFile();
+    writeFileSync(path, "{ this is not json", "utf8");
+
+    const run = capturingDeliver();
+    await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: scheduledReport.readDeliveredPersonalCards(
+        scheduledReport.readDeliveryState(path),
+        "daily",
+        DATE
+      ),
+      deliver: run.deliver
+    });
+    expect(run.payloads).toHaveLength(2);
+  });
+});
+
+// deliverReport itself drives real Longbridge/Feishu and is not exported, so
+// the fact that IT calls the round-tripped pair above (rather than each piece
+// merely being correct in isolation) is pinned at the source level. This is a
+// wiring check only - the behaviour is covered by the file round-trip above.
 describe("C4: deliverReport actually uses the idempotency record and the outcome decision", () => {
   const source = readFileSync(new URL("./scheduled-report.mjs", import.meta.url), "utf8");
 
