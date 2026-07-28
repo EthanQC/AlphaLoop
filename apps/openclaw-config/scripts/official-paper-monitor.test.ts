@@ -106,8 +106,25 @@ describe("resolveSnapshotOwnerId", () => {
  * official-paper-monitor.mjs's own attachPriceSource decides priceSource/price
  * - rather than this file asserting what it would have decided.
  *
- * `overrides` still replaces VALUES the way every call site in this file
- * expects; what it no longer does is invent the snapshot's shape.
+ * WHAT `overrides` DOES AND DOES NOT PROVE (corrected 2026-07-28, I9)
+ * ------------------------------------------------------------------
+ * The original wording here - "`overrides` still replaces VALUES ... what it no
+ * longer does is invent the snapshot's shape" - was false, and false for the
+ * one block G5 was written for. `buildSnapshot` spreads `...overrides` at the
+ * TOP level, so an override of `primaryAsset` / `positions` / `quotes` does not
+ * adjust a produced value: it REPLACES the produced object with a literal this
+ * file typed out. The 收支变化表 block below (R4/F8) overrode exactly those three
+ * fields - the only three its table reads - so its evidence was still measured
+ * against hand-written input. It now calls producedSnapshot directly.
+ *
+ * The remaining override call sites are honest only about what they claim:
+ * `buildSnapshot({fetchedAt})` shifts a timestamp and keeps every produced
+ * field; `buildSnapshot({primaryAsset: {net_assets: null, ...}})` and
+ * NO_ASSET_SNAPSHOT deliberately inject shapes a fetch DEGRADES into, to
+ * exercise the renderer's missing-value branches. Those are renderer-branch
+ * tests, not evidence about what the pipeline emits. Any NEW assertion about
+ * what a reader sees for a NORMAL account should call producedSnapshot, not
+ * buildSnapshot-with-an-override.
  */
 const reportData = await import("./report-data.mjs");
 const longbridgeShape = await import("../../longbridge-cli/src/shape.ts");
@@ -313,17 +330,33 @@ describe("renderPnlReport: report reading discloses per-position degradation", (
 // These assert the rendered LINES, so they fail on the text a reader actually
 // gets rather than on a helper's return value.
 describe("renderPnlReport 收支变化表: every row says what it actually is (spec drift R4/F8)", () => {
-  const CURRENT = buildSnapshot({
+  // I9 (2026-07-28, round-4 verifier): these two used to be
+  // `buildSnapshot({primaryAsset, positions, quotes})`, and buildSnapshot
+  // spreads `...overrides` at the TOP level - so the three fields the 收支变化表
+  // actually reads were replaced wholesale by hand-written literals, including
+  // a primaryAsset with no `currency` (the exact shape
+  // validateOfficialPrimaryAsset rejects) and positions carrying none of the
+  // fields normalizeOfficialPosition adds. G5's fix had not reached the block
+  // it was written for. They now go through producedSnapshot, so every figure
+  // the table prints came out of the real chain: the balances are what
+  // buildAssetsPayload emitted, the 持仓估值 is what attachPriceSource computed
+  // from a real quote row, and 663.88/600 are quote prices rather than numbers
+  // this file typed into a `price` field.
+  const CURRENT = producedSnapshot({
     fetchedAt: "2026-07-28T14:00:00.000Z",
-    primaryAsset: { net_assets: "100123.45", total_cash: "40000" },
-    positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 663.88 }],
-    quotes: [{ symbol: "QQQ.US", last: 663.88 }]
+    assets: [{ netAssets: "100123.45", totalCash: "40000", currency: "USD", buyPower: "40000", riskLevel: 1 }],
+    positions: [
+      { symbol: "QQQ.US", name: "Invesco QQQ", market: "US", currency: "USD", quantity: "1", available: "1", costPrice: "663.88" }
+    ],
+    quotes: [{ symbol: "QQQ.US", lastDone: "663.88" }]
   });
-  const PREVIOUS_DAY = buildSnapshot({
+  const PREVIOUS_DAY = producedSnapshot({
     fetchedAt: "2026-07-27T14:00:00.000Z",
-    primaryAsset: { net_assets: "99000", total_cash: "40000" },
-    positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 600 }],
-    quotes: [{ symbol: "QQQ.US", last: 600 }]
+    assets: [{ netAssets: "99000", totalCash: "40000", currency: "USD", buyPower: "40000", riskLevel: 1 }],
+    positions: [
+      { symbol: "QQQ.US", name: "Invesco QQQ", market: "US", currency: "USD", quantity: "1", available: "1", costPrice: "663.88" }
+    ],
+    quotes: [{ symbol: "QQQ.US", lastDone: "600" }]
   });
 
   function tableLines(markdown: string): string[] {
