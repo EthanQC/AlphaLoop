@@ -137,11 +137,17 @@ node apps/openclaw-config/scripts/render-openclaw-config.mjs
 zsh -lc 'docker start rsshub 2>/dev/null || docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub'
 
 # 8. 验收：不应再出现任何 launchd-jobs.* 发现项。
-#    ⚠ 这一步不是只读的。doctor 的 news-engine-health / alerts-poller-health 两项会
-#    openTradingDatabase(runtime/trading.sqlite)，而该函数结尾必定跑 migrate() + chmod 600
-#    + WAL pragma——所以这条命令会就地把真实交易库升到 SCHEMA_VERSION 17。
-#    作为部署的最后一步没问题（第 0 步已经把对应 schema 的代码拉下来了）；但**不要**拿它
-#    当「先探一下这台机器」的只读命令——在一台你还没准备好迁移的机器上跑，它会当场迁移。
+#    这一步对交易库是只读的（3d19dfc 之后）。doctor 的三个读库检查项
+#    （news-engine-health / alerts-poller-health / official-paper-health）改走
+#    `new DatabaseSync(path, { readOnly: true })`，不再调 openTradingDatabase，
+#    因此既不会 migrate()，也不会把一个不存在的库凭空建出来再对着空库报健康。
+#    2026-07-28 实测：对着真实 runtime/trading.sqlite 跑完整条命令，文件 sha256 不变。
+#    唯一残留副作用是 WAL 读取本身会生成 -shm/-wal 边车文件，库本体和数据不受影响。
+#    ⚠ 所以 migration 不再发生在这一步：真正把交易库升到 SCHEMA_VERSION 17 的是第 3 步
+#    起来的那几个 daemon（broker-executor / platform-app / cron-runner 启动时都调
+#    openTradingDatabase，该函数结尾必定跑 migrate()）。第 3 步之后如果这几个服务没起来，
+#    库就还停在旧 schema，doctor 会以 db_unreachable / 具体查询失败的形式报出来，
+#    而不是替你迁移。
 pnpm openclaw:runtime:doctor
 ```
 

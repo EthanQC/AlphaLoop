@@ -518,8 +518,19 @@ const MINI_RSSHUB_PRINT_OK = MINI_RSSHUB_PRINT_FAILED.replace("\tlast exit code 
 
 // A resident daemon that is up, in the shape `launchctl print system/<label>`
 // really answers - measured on the mini for ai.openclaw.system.gateway
-// (`state = running`, `runs = 10`, `pid = 21802`, no `last exit code` line at
-// all while it has never exited).
+// (`state = running`, `runs = 10`, `pid = 21802`, `last exit code = 0`).
+//
+// Corrected 2026-07-28 (round-4 verification): this comment used to claim the
+// mini printed "no `last exit code` line at all while it has never exited",
+// which the fixture below contradicts on its own - and re-measuring
+// `launchctl print system/ai.openclaw.system.gateway` on the mini shows the
+// line IS there (`last exit code = 0`). The job that genuinely has no such
+// line is com.alphaloop.platform-app, which is what describeLaunchdExit's
+// comment in openclaw-runtime-doctor-core.mjs refers to; both shapes were
+// re-measured read-only on 2026-07-28 and both are exercised below - the
+// crashed-and-restarted case rewrites this line to `= 1`, and the
+// no-exit-code case deletes it outright (`.replace("\tlast exit code = 0\n",
+// "")`).
 const MINI_RESIDENT_PRINT_RUNNING = `system/ai.openclaw.system.gateway = {
 	active count = 1
 	path = /Library/LaunchDaemons/ai.openclaw.system.gateway.plist
