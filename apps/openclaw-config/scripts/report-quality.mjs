@@ -78,6 +78,77 @@ function isNewFormatReport(text) {
   return text.includes(NEW_FORMAT_SECTION_MARKER);
 }
 
+// Task 4 (2026-07-28 spec-drift plan) - report.no_personal_content.
+// 2026-07-12 requirements §3.1: the PUBLIC daily/weekly report is "不含任何个人
+// 持仓与策略内容". It used to carry the owner's whole account (renderCoreSummary's
+// 模拟盘 bullet, renderOfficialPaperSnapshot's block, renderNextTracking's 仓位
+// bullet), which stayed invisible only because the deployment has exactly one
+// member - the second member added would have been able to read the first one's
+// positions off /daily/<date>. This is the regression guard that keeps those
+// fields out for good; the data itself moves to the per-owner personal page.
+//
+// Two deliberate scoping decisions:
+//
+//   1. ADJACENCY, not the bare word. Every leak is a RENDERED `label：value`
+//      pair, so the number sits immediately after the label (only a colon or
+//      spaces between). Chinese prose never does that - a headline says
+//      "现金储备升至 3,800 亿", "持仓比例升至 12%", "净资产收益率为 8%", always
+//      with words in between. Banning the bare word would instead hand any
+//      finance headline the power to halt delivery of the whole report (the
+//      exact crash-loop class H7 and URL_HARD_FAILURE_THRESHOLD were fixed for),
+//      while catching nothing extra: a headline is not the owner's account.
+//   2. NEWS SECTIONS ARE NOT SCANNED (stripNewsSections). Their content is
+//      third-party text this pipeline neither authors nor controls, and the
+//      renderer never puts snapshot data there - the same read/refuse split
+//      extractDeterministicEvidenceLines already draws.
+//
+// Unlike the news gates above, this one is NOT era-gated: leaking a member's
+// account is not a formatting era, and a legacy-format report that carries it
+// must be blocked too. That is safe for an already-prepared file on disk
+// because deliverReport (scheduled-report.mjs) treats a leaking prepared report
+// as stale and re-renders it, instead of hard-failing the run.
+const PERSONAL_CONTENT_FIELDS = [
+  { field: "净资产", pattern: /净资产\s*[：:]?\s*(?:约)?\s*[0-9]/u },
+  { field: "现金", pattern: /现金\s*[：:]?\s*(?:约)?\s*[0-9]/u },
+  { field: "购买力", pattern: /购买力\s*[：:]?\s*(?:约)?\s*[0-9]/u },
+  { field: "持仓", pattern: /持仓\s*[：:]?\s*(?:约)?\s*[0-9A-Z]/u },
+  // renderOfficialPaperSnapshot's per-position bullet: "- QQQ.US（纳指 100
+  // 交易型开放式指数基金）：20.0000 …". Anchored at the bullet start, so a news
+  // bullet (always "- <日期> <标的>：…", whose leading token contains "-") can
+  // never match it.
+  { field: "持仓明细", pattern: /^-\s*[A-Z][A-Z0-9]*(?:\.[A-Z]+)?（[^）\n]*）：\s*[0-9]/mu },
+  { field: "模拟盘暴露", pattern: /暴露\s*[：:]?\s*[0-9]+(?:\.[0-9]+)?\s*%/u },
+  { field: "剩余预算", pattern: /剩余[^\n。；]{0,12}预算[^\n。；0-9]{0,8}[0-9]/u }
+];
+
+// Exported so scheduled-report.mjs can tell an already-prepared report that
+// still carries personal content apart from a fresh one (see deliverReport) -
+// the same list, in one place, rather than a second hand-typed copy.
+export function findPersonalContentLeaks(markdown) {
+  const scanned = stripNewsSections(normalizeText(markdown));
+  return PERSONAL_CONTENT_FIELDS
+    .filter(({ pattern }) => pattern.test(scanned))
+    .map(({ field }) => field);
+}
+
+// Drops every "### 近期新闻"/"### 多源新闻…" block, keeping the rest of the
+// document. Section boundaries follow the same rule extractNewsLines uses:
+// level 1-3 headings delimit, deeper ones (#### event cards) are content.
+function stripNewsSections(text) {
+  const kept = [];
+  let inNewsSection = false;
+  for (const line of text.split("\n")) {
+    const heading = SECTION_HEADING_PATTERN.exec(line.trim());
+    if (heading) {
+      inNewsSection = NEWS_SECTION_HEADING_PATTERN.test(heading[1].trim());
+    }
+    if (!inNewsSection) {
+      kept.push(line);
+    }
+  }
+  return kept.join("\n");
+}
+
 export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
   const text = normalizeText(markdown);
   const failures = [];
@@ -127,6 +198,13 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
   }
   if (!/(QQQ 固定观察|QQQ 与美股风险温度)/u.test(text)) {
     failures.push("market.qqq");
+  }
+  // Task 4 - report.no_personal_content (see PERSONAL_CONTENT_FIELDS above).
+  // The leaked field names ride along in the failure code so an operator reads
+  // WHICH field came back, not just that something did.
+  const personalLeaks = findPersonalContentLeaks(text);
+  if (personalLeaks.length > 0) {
+    failures.push(`report.no_personal_content:${personalLeaks.join("、")}`);
   }
 
   // Phase 4 Task 6 - new-format-only gates (see isNewFormatReport above for

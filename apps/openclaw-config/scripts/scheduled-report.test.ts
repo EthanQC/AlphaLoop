@@ -187,9 +187,12 @@ describe("Phase 4 Task 7: clustered news section (### 多源新闻（事件聚�
 
     // facts.numeric_match: build the SAME daily_facts the real prepareReport
     // pipeline would persist from this fixture's snapshot/quote, and confirm
-    // the rendered narrative's numbers (净资产/现金/暴露%/剩余预算/QQQ 价与
-    // 涨跌%) agree with them within tolerance - proving the two independent
-    // computations (render vs. facts) never drifted apart for this fixture.
+    // the rendered narrative's numbers agree with them within tolerance -
+    // proving the two independent computations (render vs. facts) never
+    // drifted apart for this fixture. Task 4 (2026-07-28) took the paper.*
+    // numbers (净资产/现金/暴露%/剩余预算) out of the PUBLIC body, so what this
+    // still covers here is the QQQ pair; the paper.* patterns keep their
+    // coverage in report-quality.test.ts against LEAKY_PERSONAL_REPORT.
     const factsArray = buildDailyFacts({
       snapshot: data.officialPaperSnapshot,
       qqqQuote: data.qqqQuote,
@@ -320,6 +323,63 @@ process.exit(1);
         process.env.LONGBRIDGE_READ_RETRY_ATTEMPTS = originalAttempts;
       }
     }
+  });
+});
+
+// Task 4 (2026-07-28 spec-drift plan) - 2026-07-12 requirements §3.1: the
+// PUBLIC daily/weekly report is "不含任何个人持仓与策略内容". renderCoreSummary
+// used to put 净资产/现金/持仓/剩余预算/模拟盘暴露 straight into the body every
+// reader of /daily/<date> sees. With one member nothing leaked; with two, B
+// would read A's account. The data is not deleted - it moves to the per-owner
+// personal page, which is why the renderers below are still exported and still
+// render it in full.
+describe("Task 4: the public daily/weekly body carries no personal holdings or account data", () => {
+  for (const kind of ["daily", "weekly"] as const) {
+    it(`keeps 净资产/现金/持仓/剩余预算/模拟盘暴露 out of the public ${kind} body`, () => {
+      const window = scheduledReport.resolveReportWindow(kind, "2026-07-14");
+      const markdown = kind === "daily"
+        ? scheduledReport.renderDailyReport(window, buildFixtureData())
+        : scheduledReport.renderWeeklyReport(window, buildFixtureData());
+
+      expect(markdown).not.toContain("净资产");
+      expect(markdown).not.toContain("现金");
+      expect(markdown).not.toContain("购买力");
+      expect(markdown).not.toContain("模拟盘暴露");
+      expect(markdown).not.toMatch(/剩余[^\n]*预算/u);
+      // "持仓" as a data label ("当前持仓 QQQ.US …", "官方持仓 2 个") and the
+      // per-position bullet renderOfficialPaperSnapshot emits.
+      expect(markdown).not.toMatch(/持仓\s*[：:]?\s*[0-9A-Z]/u);
+      expect(markdown).not.toContain("QQQ.US（纳指 100 交易型开放式指数基金）");
+
+      const result = validateReportMarkdown(markdown, { kind });
+      expect(result.failures.some((failure) => failure.startsWith("report.no_personal_content"))).toBe(false);
+      expect(result).toEqual({ ok: true, failures: [] });
+    });
+  }
+
+  it("still ships the public-value sections (行情/新闻/宏观/QQQ 基准)", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(window, buildFixtureData());
+
+    expect(markdown).toContain("### 多源新闻（事件聚类）");
+    expect(markdown).toContain("### 宏观日历");
+    expect(markdown).toContain("## 4. QQQ 固定观察");
+    expect(markdown).toContain("最新价：721.34");
+    // The removal is disclosed rather than silent - the reader is told why the
+    // account block is absent, not left to assume the data was unavailable.
+    expect(markdown).toContain("账户与仓位明细不进入公共报告");
+  });
+
+  it("still renders the account snapshot in full for the per-owner personal page (moved, not lost)", () => {
+    const data = buildFixtureData();
+
+    const personal = scheduledReport.renderOfficialPaperSnapshot(data.officialPaperSnapshot);
+
+    expect(personal).toContain("净资产：100,000.00");
+    expect(personal).toContain("现金：20,000.00");
+    expect(personal).toContain("QQQ.US（纳指 100 交易型开放式指数基金）");
+    expect(scheduledReport.summarizeOfficialAccount(data.officialPaperSnapshot)).toContain("净资产 100,000.00");
+    expect(scheduledReport.summarizeOfficialPositions(data.officialPaperSnapshot.positions)).toContain("QQQ.US");
   });
 });
 

@@ -22,7 +22,7 @@ import {
 } from "./report-data.mjs";
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
-import { assertReportQuality, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
+import { assertReportQuality, findPersonalContentLeaks, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 // Phase 4 Task 7: news-search budgets/limits (Global Constraints - spec
@@ -127,7 +127,13 @@ async function prepareReport(reportKind, info) {
 async function deliverReport(reportKind, info, alreadyPrepared) {
   let markdown = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
   let regeneratedDuringDelivery = false;
-  if (!isPreparedReportMarkdownComplete(markdown)) {
+  // Task 4: a prepared file that still carries the owner's account/holdings was
+  // written by the pre-§3.1 renderer, i.e. it is STALE - exactly what the
+  // completeness check already regenerates for. Re-rendering it is the honest
+  // fix; letting assertReportQuality below throw on it would instead halt the
+  // whole scheduled job over a file we know how to rebuild correctly.
+  const preparedWithPersonalContent = findPersonalContentLeaks(markdown).length > 0;
+  if (!isPreparedReportMarkdownComplete(markdown) || preparedWithPersonalContent) {
     const prepared = await prepareReport(reportKind, info);
     markdown = prepared.markdown;
     alreadyPrepared = true;
@@ -302,7 +308,7 @@ export function renderDailyReport(info, data) {
     "",
     "## 5. 官方模拟盘",
     "",
-    renderOfficialPaperSnapshot(data.officialPaperSnapshot),
+    renderPublicAccountScopeNotice(),
     "",
     renderExecutionDigest(data.executionRows),
     "",
@@ -355,7 +361,7 @@ export function renderWeeklyReport(info, data) {
     "",
     "## 4. 模拟盘与执行复盘",
     "",
-    renderOfficialPaperSnapshot(data.officialPaperSnapshot),
+    renderPublicAccountScopeNotice(),
     "",
     renderExecutionDigest(data.executionRows),
     "",
@@ -372,18 +378,20 @@ export function renderWeeklyReport(info, data) {
   ].join("\n");
 }
 
+// Task 4 (2026-07-28 spec-drift plan): the "- 模拟盘：当前持仓 …；净资产 …，现金
+// …；模拟盘暴露 …，剩余自由发挥预算约 …" bullet that used to sit here is GONE
+// from the public body - 2026-07-12 requirements §3.1 ("公共日报不含任何个人持仓
+// 与策略内容"). It is not deleted, it moves to the per-owner personal page
+// (summarizeOfficialPositions/summarizeOfficialAccount/summarizePaperBudget are
+// exported for exactly that). report-quality.mjs's report.no_personal_content
+// gate fails any public report that grows it back.
 function renderCoreSummary(data, counts) {
-  const officialPositions = data.officialPaperSnapshot.positions;
-  const officialSummary = summarizeOfficialPositions(officialPositions);
-  const accountSummary = summarizeOfficialAccount(data.officialPaperSnapshot);
   const qqqSummary = summarizeQqqMove(data.qqqQuote);
   const newsSignal = summarizeNewsSignals(data.marketNews);
   const macroSignal = summarizeMacroSignal(data.macroEvents);
-  const paperBudget = summarizePaperBudget(data.officialPaperSnapshot, data.qqqQuote);
   return [
     `- 市场信号：${qqqSummary}；新闻主线：${newsSignal.summary}。`,
     `- 宏观信号：${macroSignal}。`,
-    `- 模拟盘：当前持仓 ${officialSummary}；${accountSummary}；${paperBudget}。`,
     `- 操作含义：${newsSignal.action}；新增模拟盘仓位仍必须通过总仓 10% 预算检查。`,
     `- 执行边界：${counts.period}没有自动提交实盘订单；交易/执行报告 ${counts.tradeCount} 条，其中拒绝或未执行 ${counts.rejectedCount} 条；期权自动化保持禁用。`
   ];
@@ -419,7 +427,10 @@ function renderNextTracking(data, label) {
     `- QQQ：${label}先看 ${formatOptionalNumber(low)} - ${formatOptionalNumber(high)} 区间是否被放量突破；最新价 ${formatOptionalNumber(last)}，盘后 ${formatOptionalNumber(post)}。`,
     `- 新闻：复核 ${newsThemes}；只有当新闻能落到收入、利润、指引、订单或监管约束时，才升级为个股基本面事件。`,
     `- 宏观：${nextMacro ? `${nextMacro.date} ${nextMacro.time || ""} ${nextMacro.title}` : "未来窗口没有高重要性宏观事件"}；关注是否改变利率、通胀或制造业景气预期。`,
-    `- 仓位：${summarizePaperBudget(data.officialPaperSnapshot, data.qqqQuote)}；任何新增模拟盘动作仍需通过人工复核和 10% 总仓上限。`
+    // Task 4: the owner's exposure/remaining-budget numbers used to be spelled
+    // out here. The RULE they express is public and stays; the numbers are
+    // personal and live on the personal page now.
+    "- 仓位纪律：任何新增模拟盘动作仍需通过人工复核和 10% 总仓上限；本人账户明细不进入公共报告。"
   ].join("\n");
 }
 
@@ -435,7 +446,24 @@ function renderDataSourceSummary(data) {
     ...(data.newsSearchDegraded ? [`- 新闻检索降级：agent 检索不可用（L1-only 模式）；原因：${data.newsSearchReason ?? "原因未知"}；本次仅使用 L1 确定性采集结果，事件聚类不含 L2/L3 补充证据。`] : []),
     `- 宏观与行情：美国二星/三星宏观事件窗口从 ${data.sourceEvidence.fetchedAt.slice(0, 10)} 起向后 ${Number(process.env.REPORT_MACRO_LOOKAHEAD_DAYS ?? 14)} 天；${formatQuoteTimestamp(data.qqqQuote)}。`,
     ...(data.macroWarnings?.length ? [`- 宏观日历降级：${data.macroWarnings.join("；")}。`] : []),
-    `- 审计状态：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；账户资产 ${data.sourceEvidence.assetRows} 行；官方持仓 ${data.sourceEvidence.officialPositions} 个；宏观事件 ${data.sourceEvidence.macroEventsCount} 条。`
+    // Task 4: 账户资产行数/官方持仓数 used to be spelled out here too. A count
+    // is still owner data (it tells every reader how many positions the owner
+    // holds), so the public audit line keeps only the source-health facts;
+    // the counts stay in report-delivery-state.json's sourceEvidence, which is
+    // runtime state, not a published document.
+    `- 审计状态：账户模式 ${translateAccountMode(data.sourceEvidence.accountMode)}；令牌 ${translateSessionStatus(data.sourceEvidence.longbridgeSessionStatus)}；可用区域 ${formatRegions(data.sourceEvidence.longbridgeOkRegions)}；宏观事件 ${data.sourceEvidence.macroEventsCount} 条。`
+  ].join("\n");
+}
+
+// Task 4: the honest replacement for the account block the public report used
+// to print. The data is not missing and not degraded - it is deliberately
+// out of scope for a document every member can read, and the reader is told
+// so rather than left to guess (Global Constraints: unavailable data is
+// disclosed with its reason).
+function renderPublicAccountScopeNotice() {
+  return [
+    "- 账户与仓位明细不进入公共报告：公共日报/周报只发布行情、新闻、宏观与 QQQ 基准。",
+    "- 本人的账户快照与策略对照只对本人可见，不在这里呈现。"
   ].join("\n");
 }
 
@@ -711,14 +739,19 @@ function formatRegions(regions) {
     : "未返回";
 }
 
-function summarizeOfficialPositions(rows) {
+// Task 4: exported (with renderOfficialPaperSnapshot below and the already-
+// exported summarizePaperBudget) because the owner's account is no longer
+// rendered into the PUBLIC body - these are the seam the per-owner personal
+// page renders it from instead, so the account view exists in one place rather
+// than being re-implemented next to the page that shows it.
+export function summarizeOfficialPositions(rows) {
   if (!rows.length) {
     return "空仓";
   }
   return rows.map((row) => `${row.symbol} ${formatNumber(row.quantity, 4)} 份`).join("、");
 }
 
-function summarizeOfficialAccount(snapshot) {
+export function summarizeOfficialAccount(snapshot) {
   if (snapshot.degraded) {
     return `官方模拟盘读取降级：${snapshot.degradedReason ?? "原因未返回"}；本报告不据此提出新增仓位`;
   }
@@ -1305,7 +1338,11 @@ function mapL2ResultToArticle(item) {
   };
 }
 
-function renderOfficialPaperSnapshot(snapshot) {
+// Task 4: no longer called by renderDailyReport/renderWeeklyReport - the
+// public body carries renderPublicAccountScopeNotice() in its place. Exported
+// for the per-owner personal page (and the test that proves the account data
+// still renders in full, i.e. that this was a relocation, not a deletion).
+export function renderOfficialPaperSnapshot(snapshot) {
   if (snapshot.degraded) {
     return [
       `- 来源：${translateDataSource(snapshot.source)}；账户模式：${translateAccountMode(snapshot.accountMode)}；抓取时间：${formatReportDateTime(snapshot.fetchedAt)}`,

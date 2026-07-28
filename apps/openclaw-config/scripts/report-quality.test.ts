@@ -293,7 +293,7 @@ const GOOD_NEW_FORMAT_REPORT = [
   "",
   "## 1. 今日结论",
   "",
-  "- 模拟盘：净资产 122,000.00 美元，现金 100,000.00；模拟盘暴露 5.00%，剩余自由发挥预算约 6,900.00 美元。",
+  "- 市场信号：QQQ 最新价 721.34，较前收上涨 4.22（0.59%）。",
   "",
   "## 2. 信息收集与分类",
   "",
@@ -313,6 +313,21 @@ const GOOD_NEW_FORMAT_REPORT = [
   "",
   "- 最新价：721.34；前收：717.12；区间涨跌：4.22 / 0.59%"
 ].join("\n");
+
+// Task 4 (2026-07-28 spec-drift plan): the account/holdings bullet
+// GOOD_NEW_FORMAT_REPORT used to carry inside "## 1. 今日结论". Spec §3.1 keeps
+// it OUT of the public body now (report.no_personal_content), so the "good"
+// fixture above no longer has it - but the facts.numeric_match gate's own
+// patterns (paper.netAssets/totalCash/exposurePct/remainingBudget) only ever
+// fire when those phrases ARE present, so the numeric tests below keep
+// exercising them against this deliberately-leaky variant, which doubles as
+// the bad sample for the new privacy gate.
+const PERSONAL_ACCOUNT_LINE =
+  "- 模拟盘：净资产 122,000.00 美元，现金 100,000.00；模拟盘暴露 5.00%，剩余自由发挥预算约 6,900.00 美元。";
+const LEAKY_PERSONAL_REPORT = GOOD_NEW_FORMAT_REPORT.replace(
+  "## 2. 信息收集与分类",
+  `${PERSONAL_ACCOUNT_LINE}\n\n## 2. 信息收集与分类`
+);
 
 // Phase 4 Task 7 (T6 gap fixed): added `paper.totalCash` here matching the
 // fixture's "现金 100,000.00" - report-quality.mjs's NUMERIC_MATCH_PATTERNS
@@ -660,7 +675,7 @@ describe("validateReportUrls - threshold + disclosure (news.url_reachability)", 
 
 describe("Phase 4 Task 6 - validateNarrativeNumbers (facts.numeric_match)", () => {
   it("fails with both values when a narrative number mismatches its fact beyond tolerance", () => {
-    const markdown = GOOD_NEW_FORMAT_REPORT.replace("净资产 122,000.00 美元", "净资产 122,959.91 美元");
+    const markdown = LEAKY_PERSONAL_REPORT.replace("净资产 122,000.00 美元", "净资产 122,959.91 美元");
 
     const result = validateNarrativeNumbers(markdown, GOOD_SAMPLE_FACTS);
 
@@ -669,7 +684,7 @@ describe("Phase 4 Task 6 - validateNarrativeNumbers (facts.numeric_match)", () =
   });
 
   it("fails when a narrative number has no corresponding fact key at all (fabricated number)", () => {
-    const result = validateNarrativeNumbers(GOOD_NEW_FORMAT_REPORT, {});
+    const result = validateNarrativeNumbers(LEAKY_PERSONAL_REPORT, {});
 
     expect(result.ok).toBe(false);
     expect(result.failures.some((failure) => failure.startsWith("facts.numeric_match:paper.netAssets:missing_fact"))).toBe(true);
@@ -690,6 +705,82 @@ describe("Phase 4 Task 6 - validateNarrativeNumbers (facts.numeric_match)", () =
 
     expect(result.ok).toBe(false);
     expect(result.failures.some((failure) => failure.startsWith("facts.numeric_match:qqq.price"))).toBe(true);
+  });
+});
+
+// Task 4 (2026-07-28 spec-drift plan) - report.no_personal_content. Spec §3.1:
+// the PUBLIC daily/weekly report must carry "不含任何个人持仓与策略内容".
+// Today the deployment has one member, so nothing has leaked yet; the moment a
+// second member exists, B opening /daily/<date> would read A's account. The
+// gate is the regression guard that keeps those fields from coming back.
+describe("Task 4 - report.no_personal_content", () => {
+  it("fails a public report whose 今日结论 still carries the owner's account and holdings", () => {
+    const result = validateReportMarkdown(LEAKY_PERSONAL_REPORT, { kind: "daily" });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("report.no_personal_content:净资产、现金、模拟盘暴露、剩余预算");
+  });
+
+  it("names every leaked field when a full 官方模拟盘 account/positions block is re-added", () => {
+    const markdown = [
+      GOOD_NEW_FORMAT_REPORT,
+      "",
+      "## 5. 官方模拟盘",
+      "",
+      "- 净资产：122,000.00 美元；现金：100,000.00；购买力：50,000.00",
+      "- 当前持仓 QQQ.US 20.0000 份、NVDA.US 10.0000 份",
+      "- QQQ.US（纳指 100 交易型开放式指数基金）：20.0000 交易型开放式指数基金，可用 20.0000，成本 600.000，币种 美元"
+    ].join("\n");
+
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("report.no_personal_content:净资产、现金、购买力、持仓、持仓明细");
+  });
+
+  it("passes a public report that carries none of them", () => {
+    const result = validateReportMarkdown(GOOD_NEW_FORMAT_REPORT, { kind: "daily" });
+
+    expect(result.failures.some((failure) => failure.startsWith("report.no_personal_content"))).toBe(false);
+    expect(result).toEqual({ ok: true, failures: [] });
+  });
+
+  it("judges a legacy-format report too - a privacy leak is not a formatting era", () => {
+    const legacyLeak = [
+      "# OpenClaw 日报 2026-06-14",
+      "",
+      "## 1. 今日结论",
+      "",
+      "- 模拟盘：净资产 122,000.00 美元。",
+      "",
+      "### 多源新闻（中文摘要与来源）",
+      "",
+      "- 2026-06-14 12:04 QQQ.US：纳指新闻更新；媒体：Longbridge；渠道：Longbridge；链接：https://longbridge.com/news/1。"
+    ].join("\n");
+
+    const result = validateReportMarkdown(legacyLeak, { kind: "daily" });
+
+    expect(result.failures).toContain("report.no_personal_content:净资产");
+  });
+
+  it("never fires on an external news headline that merely mentions 现金/持仓 (no delivery-halting false positive)", () => {
+    const markdown = GOOD_NEW_FORMAT_REPORT
+      .replace(
+        "美联储维持利率不变，市场解读为中性",
+        "某基金二季度持仓 300 万股并披露现金 12 亿美元"
+      )
+      // Renderer-authored prose OUTSIDE the news section that quotes the same
+      // headline: natural language keeps words between the noun and the
+      // number, which is exactly what the gate's adjacency requirement uses to
+      // tell a rendered `label：value` pair apart from a quoted headline.
+      .replace(
+        "## 2. 信息收集与分类",
+        "- 主线：某基金持仓比例升至 12%，现金储备升至 3,800 亿美元。\n\n## 2. 信息收集与分类"
+      );
+
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+
+    expect(result.failures.some((failure) => failure.startsWith("report.no_personal_content"))).toBe(false);
   });
 });
 
