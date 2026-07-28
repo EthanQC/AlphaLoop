@@ -43,6 +43,15 @@ const TEST_ENV = {
 export default defineConfig({
   test: {
     maxWorkers: 6,
+    // G1 (2026-07-28): ~60 files under apps/openclaw-config/scripts - the
+    // production .mjs scripts and the tests that drive them - import
+    // packages/shared-types/dist/index.js BY PATH, and dist is gitignored.
+    // `pnpm test` did not build, so any run after a src edit measured the
+    // PREVIOUS build. This setup builds the workspace before a single test file
+    // is loaded and refuses to start the run otherwise; it hangs off the config
+    // rather than off the `test` script so that `vitest run <one-file>`, watch
+    // mode and IDE runners are covered too. See test/global-setup.ts.
+    globalSetup: ["./test/global-setup.ts"],
     projects: [
       {
         test: {
@@ -65,7 +74,7 @@ export default defineConfig({
           name: "main",
           environment: "node",
           env: TEST_ENV,
-          include: ["packages/**/*.test.ts", "apps/**/*.test.ts"],
+          include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "test/**/*.test.ts"],
           exclude: ["**/node_modules/**", ...SERIAL_TEST_GLOBS]
         }
       }
