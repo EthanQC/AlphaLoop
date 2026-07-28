@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -570,6 +570,85 @@ rl.on("line", (line) => {
     expect(result.sent).toBe(false);
     expect(result.reason).toMatch(/Send failed/);
     // ... and it really did go through the legacy user-plugin channel.
+    expect(result.target).toBe("feishu-user-plugin-bot-post");
+  });
+
+  // 2026-07-28 (spec drift A4). This channel posts to ONE fixed chat -
+  // resolveFeishuUserPluginBotChatId(), the shared 炒股这一块 group - and cannot
+  // address a second target. It ignored payload.openId entirely, so with app
+  // credentials absent every member's PERSONAL page card went to that shared
+  // group and came back recorded as delivered. Silent misdelivery reported as
+  // success is the one outcome that must be impossible: owner-scoped content
+  // never reaches a shared chat, and if it cannot be addressed the caller is
+  // told so.
+  it("refuses an owner-scoped report on the shared-chat channel instead of leaking it there", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-owner-scoped-"));
+    const scriptPath = join(tempDir, "fake-plugin.mjs");
+    const spawnMarkerPath = join(tempDir, "plugin-was-spawned.log");
+    // Any spawn at all is a failure here: the refusal must happen before the
+    // channel is touched, so the marker file must never come into existence.
+    writeFileSync(
+      scriptPath,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(spawnMarkerPath)}, "spawned", "utf8");\n${FAKE_PLUGIN_SCRIPT}`,
+      "utf8"
+    );
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: "# 我的个人页 · 日报 2026-07-28\n\n## 1. 今日结论\n\n- 我的持仓：QQQ 1 份。",
+      openId: "ou_owner_specific",
+      reportKind: "personal-daily",
+      reportDate: "2026-07-28"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(existsSync(spawnMarkerPath)).toBe(false);
+    expect(result.target).toBe("feishu-user-plugin-bot-post");
+    // The reason has to name the real problem - the channel cannot address one
+    // member - so an operator fixes the credentials instead of hunting a
+    // transport error that never happened.
+    expect(result.reason).toMatch(/ou_owner_specific/);
+    expect(result.reason).toMatch(/FEISHU_APP_ID/);
+    expect(result.deliveries.every((entry) => !entry.sent)).toBe(true);
+  });
+
+  // A public report is what this channel's one chat is FOR, so it still ships.
+  it("still delivers a group-audience report on that channel, which is the group", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-group-audience-"));
+    const scriptPath = join(tempDir, "fake-plugin.mjs");
+    writeFileSync(scriptPath, FAKE_PLUGIN_SCRIPT, "utf8");
+
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    delete process.env.FEISHU_APP_ID;
+    delete process.env.FEISHU_APP_SECRET;
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+    delete process.env.FEISHU_USER_PLUGIN_DISABLED;
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: "# OpenClaw 日报 2026-07-28\n\n## 1. 今日结论\n\n- 市场信号：QQQ 走平。",
+      audience: "group",
+      reportKind: "daily",
+      reportDate: "2026-07-28"
+    });
+
+    expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-user-plugin-bot-post");
   });
 });

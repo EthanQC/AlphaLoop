@@ -593,6 +593,13 @@ async function postFeishuAppMessage(
   }
 }
 
+// Unreachable today: allowReportFallbackDelivery() is a constant `false`, so
+// nothing calls this. If it is ever re-enabled it needs the same owner-scoped
+// guard deliverReportViaUserPlugin now carries (spec drift A4) - it posts to
+// FEISHU_WEBHOOK_URL or the global app target and likewise cannot address one
+// member's DM, so an `openId` payload would leak here exactly the same way. No
+// guard is added now because a code path with no reachable call site cannot be
+// tested, and an untested guard is a guess.
 async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryError?: string): Promise<ReportDeliveryResult> {
   const chunks = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
   const deliveries: ReportDeliveryEntry[] = [];
@@ -898,7 +905,37 @@ async function tryDeliverReportViaFallback(
   }
 }
 
+/**
+ * The legacy feishu-user-plugin MCP channel. It posts to ONE fixed chat -
+ * resolveFeishuUserPluginBotChatId(), the shared 炒股这一块 group - and has no
+ * way to address a second target.
+ *
+ * 2026-07-28 (spec drift A4). It also ignored `payload.openId` entirely, so
+ * whenever app credentials were absent every member's OWN personal page card
+ * went to that shared group and came back recorded as delivered: each member's
+ * private positions published to everyone, and a run log showing a clean
+ * delivery. An owner-scoped payload is refused here instead - honoring `openId`
+ * is not an option on a channel with one hard-wired chat id, and a refusal an
+ * operator can read beats a leak nobody can see.
+ *
+ * `audience: "group"` needs no special handling: this channel's one chat IS the
+ * group, which is why a public report still ships through it.
+ */
 async function deliverReportViaUserPlugin(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
+  const ownerOpenId = payload.openId?.trim();
+  if (ownerOpenId) {
+    return {
+      sent: false,
+      target: "feishu-user-plugin-bot-post",
+      reason: [
+        `Owner-scoped report refused on the legacy feishu-user-plugin channel: it can only post to the shared bot chat (${resolveFeishuUserPluginBotChatIdForDiagnostics()}),`,
+        `so delivering this report would publish ${ownerOpenId}'s private page to everyone in that chat.`,
+        "Configure FEISHU_APP_ID/FEISHU_APP_SECRET (or an OpenClaw Feishu app account) so per-owner DMs can be addressed."
+      ].join(" "),
+      deliveries: []
+    };
+  }
+
   const deliveries: ReportDeliveryEntry[] = [];
   const summaryResult = await sendFeishuUserPluginBotPost({
     title: `${payload.title} 摘要`,
@@ -1431,6 +1468,17 @@ const defaultCardTransport: CardTransport = {
     return transport.updateCard(messageId, cardJson);
   }
 };
+
+// The chat id for an error message only: resolveFeishuUserPluginBotChatId
+// throws when nothing is configured, and a refusal explaining WHERE the report
+// would have leaked must not itself blow up over a missing chat id.
+function resolveFeishuUserPluginBotChatIdForDiagnostics(): string {
+  try {
+    return resolveFeishuUserPluginBotChatId();
+  } catch {
+    return "unknown shared chat";
+  }
+}
 
 function resolveFeishuUserPluginBotChatId(): string {
   const explicitBotChatId = process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID?.trim();
