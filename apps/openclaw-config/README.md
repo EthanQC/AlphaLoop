@@ -13,7 +13,8 @@
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
-- `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里清掉。
+- `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没加载时干脆不动，见下面「谁拥有哪个标签」）。
+- `scripts/launchd-agent-archive.mjs`：上面那条规则的唯一实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它。
 - `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 - `scripts/install-cloudflared-tunnel.mjs`：给**还没有 connector 的机器**安装用户级 cloudflared 隧道（token 模式）。mini 上已经跑着系统级的 `com.cloudflare.cloudflared`，所以这条脚本在那里会拒绝执行，见下面「公网入口」。
@@ -68,7 +69,7 @@ pnpm official-paper:pnl
 | --- | --- | --- |
 | `system` | `/Library/LaunchDaemons`，开机即起、不需要图形登录 | `install-system-daemons.sh`（**sudo**） |
 | `user` | `~/Library/LaunchAgents`，需要用户登录会话 | `install-launchd.sh`（`pnpm launchd:install-backup-alerts`） |
-| `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉（`install-system-daemons.sh` 移进备份目录，两个 node 安装器直接删） | — |
+| `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉，并**统一移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（三个脚本共用同一个归档目录，谁都不删除） | — |
 | `external` | 由 `openclaw` CLI 自己拥有，本仓库不碰 | — |
 
 当前只有 `com.alphaloop.rsshub` 是 `user`：它整个任务体就是 `docker start rsshub`，而它依赖的容器运行时（`homebrew.mxcl.colima`）本身就是用户级 LaunchAgent，socket 和 context 都在用户家目录下。系统 daemon 会赶在那个 socket 存在之前启动然后报 "Cannot connect to the Docker daemon"——把它提升到系统域只会让新闻源更不可靠。
@@ -102,12 +103,19 @@ pnpm launchd:install-user
 
 历史包袱提醒：ac741d8 之前 `launchd:install-user` 和 `openclaw:cron:install` 各自会安装 plist，那时的文档要求"三条都跑一遍"。现在它们只剩退役逻辑，照旧文档跑会把运行中的服务全部下线而什么都装不上。
 
-两条顺序约束，其余标签与顺序无关：
+只剩一条顺序约束：
 
 - `install-launchd.sh` 必须排在 `install-system-daemons.sh` **之前**。它结尾的 `openclaw gateway install` 会重新创建用户级 `ai.openclaw.gateway`，而只有后跑的 `install-system-daemons.sh` 才会把它 bootout 掉；反过来跑，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
-- `install-user-schedules.mjs`（`launchd:install-user`）最好排在 `install-system-daemons.sh` **之后**。两者都会清掉系统域标签的用户级副本，但前者是 `rmSync` 直接删、后者是移进备份目录。先跑 `install-system-daemons.sh`，那 8 个 plist 就先被移走存档，剩给前者删的只有 `com.openclaw.trading.event-bus` / `catchup` / `maintenance.*` 这类早已废弃的标签和 5 个历史报告 plist。这不是正确性约束（两种顺序的最终状态一样），是可回退性约束。
 
-`install-system-daemons.sh` 的执行顺序本身也是先退役后安装：先把系统域/retired 标签的用户级副本 bootout 并移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`，再 `bootstrap system` 新 daemon。所以重复执行安全，中途中断也不会留下两个实例同时写同一个交易数据库。
+以前这里还有第二条：「`launchd:install-user` 最好排在 daemon 安装之后，因为前者 `rmSync` 直接删、后者移进备份目录」。那条约束**是靠文档执行的，而文档执行不了**——第 5 轮 D1 实测到的正是它失效的样子：`install-system-daemons.sh` 因为某个 daemon 起不来而有意保留了它的用户级 plist、退出码 1，紧接着的 `pnpm launchd:install-user` 把这份 plist 无备份删掉、退出码 0。`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 三个标签在本仓库里没有任何模板（`apps/openclaw-config/launchd/` 只有 platform-app / market-alerts / daily-backup / rsshub 四个模板加两个历史 plist），删掉就再也生成不出来，而 mini 上这三份 plist 现在都还在。
+
+现在这条约束由代码保证，不再由顺序保证：两个 node 安装器和 shell 安装器共用 `scripts/launchd-agent-archive.mjs` 的同一条规则——
+
+1. **谁都不删除。** 退役 = 移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`，三个脚本用同一个归档目录。归档目录建不出来（mini 上它是早期 sudo 运行留下的 `root staff`）时，plist 原地保留并报错退出，不会退化成删除。
+2. **接管者没起来就不动它。** 对 system/retired 标签，node 安装器先问 `launchctl print system/<接管它的 daemon>`；没加载就说明这份用户级副本正是机器现在跑的那份，于是原地不动、打印 `keptLaunchAgent` 并以退出码 1 结束。
+3. **shell 安装器按服务逐个交接。** 停旧 → 起新 → `launchctl print` 确认 → 才归档；起不来就把刚停掉的 agent 立刻 `bootstrap gui/<uid>` 回去。所以单个服务的停机窗口是「一次 bootout + settle」（默认 2 秒，本机实测最坏 2.1 秒），其余服务不受影响，任何服务都不会同时跑两份。
+
+（这也修正了旧版这里写的「中途中断也不会留下两个实例」之外那半句：第 4 轮的 Phase A/B/C 注释曾声称「随时中断都安全，机器任何时刻要么跑旧的要么跑新的」。实测不是——Phase A 一次性停掉全部 9 个标签，Phase B 才带着 settle 逐个拉起，最后一个标签整段时间既没有旧的也没有新的。用会给每次调用打时间戳的 launchctl stub 分别跑旧版和新版：旧版最坏单服务窗口 17.1 秒（official-paper.poll），新版 2.1 秒。另测在第 1.5 / 4 / 9 秒 SIGTERM 打断新版：每次都恰好只有 1 个标签处于交接中间态，其余标签要么跑着旧的、要么跑着新的，且没有残留临时目录。）
 
 `PRINT_CONFIG_ONLY=1` 那次干跑不写任何文件、不建任何目录（包括临时目录）、不调 launchctl，只把这次解析出来的 `target_user` / `target_home` / `repo_root` / `pnpm_bin` / `gateway_port` / `proxy_labels` 打出来。同样在真正动手之前退出的还有 root 检查：不带 sudo 跑会直接被拦下并打印正确命令，不会写到一半才 "Permission denied"。
 
@@ -153,7 +161,17 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 - 两个域都没有 → warn `launchd-jobs.<name>.not_loaded`，并点名**该域对应的**安装命令（system → `sudo zsh .../install-system-daemons.sh`，user → `pnpm launchd:install-backup-alerts`）。
 - 加载在错误的域、或两个域同时加载 → **error** `launchd-jobs.<name>.wrong_domain`。这正是 ownership 清单要防的"一个标签两个 owner"（两个 broker-executor 抢同一个交易数据库），任何开发机都不会误入这个状态。
 
-另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health`）和 rsshub 的 `GET /healthz`（`rsshub-health`，404 时回退 `/`）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
+### 回环探针的严重级取决于 launchd 怎么说（第 5 轮 D2）
+
+另外还会单独探测 platform-app 的 `GET /health`、broker-executor 的 `GET /health`、rsshub 的 `GET /healthz`（404 时回退 `/`）。这三个探针「连不上」的严重级**不是探针的属性，是机器的属性**：
+
+- launchd **没有**持有这个标签 → warn。开发机没装这个服务，连不上是常态。
+- launchd **正持有**这个标签 → **error**。装过了、此刻本该在跑，回环连接却被拒，只能是进程起来又崩了或正在崩溃重启循环。
+- 连上了但状态码/响应体不对 → error（不变）。
+
+这条是补上第 8 步「过不了才怪」的窟窿。实测：把 platform-app 做成崩溃重启循环、在 launchd 刚把它拉起来的瞬间采样（`state = running`、`last exit code = 1`、`runs = 918`），`/health` 连接被拒，改之前 `analyzeOpenClawRuntimeSnapshot` 返回 `ok=true`、doctor 退出 0、零条 error；broker-executor、gateway 各自单独测同样如此。
+
+同一批还补了常驻服务的崩溃重启循环判定：`state = running` + 上次退出非零时，`runs ≥ 20` 报 `launchd-jobs.<name>.crash_looping`（error），低于阈值仍是原来的 `restarted_after_failure`（warn，"崩过一次但现在好着"）。20 这个阈值是**选的不是测出来的**：常驻 daemon 只有死掉才会累加 `runs`，而 mini 上那四个常驻服务只读实测是 platform-app 2、broker-executor 2、cron-runner 10、gateway 10，其中打印了 `last exit code` 的两个都是 0、另外两个上次是被信号杀死所以根本没这一行——也就是说不管阈值取多少它们都进不了这个分支。真正的判据是探针，这个阈值只是兜住「采样恰好落在两次崩溃之间的存活窗口」。
 
 ### platform-app（Phase 3 多成员 Web 平台）
 
@@ -210,7 +228,7 @@ zsh -lc 'docker start rsshub 2>/dev/null || docker run -d --name rsshub -p 127.0
 
 `pnpm openclaw:runtime:doctor` 覆盖两个新闻引擎检查项：
 
-- `rsshub-health`：GET `${RSSHUB_BASE_URL 或默认值}/healthz`（404 时回退 `/`）——容器不可达只是 warn（点名上面的 P10 命令和 `pnpm launchd:install-backup-alerts`），返回非 200 状态码算 error。
+- `rsshub-health`：GET `${RSSHUB_BASE_URL 或默认值}/healthz`（404 时回退 `/`）——容器不可达时，`com.alphaloop.rsshub` 没装是 warn（点名上面的 P10 命令和 `pnpm launchd:install-backup-alerts`），已装则是 error（那个 agent 的全部职责就是 `docker start rsshub`）；返回非 200 状态码一律 error。见上面「回环探针的严重级取决于 launchd 怎么说」。
 - `news-engine-health`：`news_events` 表最新一条 `last_published_at` 距今超过 48 小时且表内已有数据（非全新库）→ warn「新闻引擎超过 48 小时无新事件」；全新库（0 条事件）不报告。
 
 ### 日报/周报/个股分析调度：已迁移到 OpenClaw cron（2026-07-14）

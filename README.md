@@ -25,6 +25,8 @@
 
 ## 常用命令
 
+`pnpm test` 对仓库里真实的 `runtime/`（含 `trading.sqlite` 和长桥限流账本）是只读的：`test/runtime-write-guard.ts` 在每个用例前后、`test/global-setup.ts` 在整轮前后各比对一次该目录，任何写入都会让对应用例失败（见 5df98b9）。
+
 ```bash
 pnpm install
 pnpm build
@@ -108,21 +110,32 @@ pnpm launchd:install-backup-alerts
 #    先干跑一次，确认这次会为哪个用户安装（不写任何文件、不建目录、不调 launchctl）：
 PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
 #    确认输出里的 target_user / target_home 是部署机操作者本人后，再真正安装。
-#    可重跑：先 bootout 旧实例、把用户级副本移进备份目录，再 bootstrap，不会留下两份。
-#    退出码 1 不代表整批失败：它会逐个装完再汇总，打印
+#    它按【服务】逐个交接，不是先整体停机再整体启动：对每个标签依次
+#    ①停掉该服务的用户级副本 → ②bootstrap 它的 daemon → ③用 launchctl print 确认真的加载了
+#    → ④确认后才把该标签的用户级 plist【移进】备份目录（永远是移动，不是删除）。
+#    第 ②③ 步失败时，它会把刚停掉的那个用户级 agent 立刻 bootstrap 回去
+#    （不是等下次登录），plist 原样留在 ~/Library/LaunchAgents，然后继续装其余的。
+#    因此单个服务的停机窗口 = 一次 bootout + settle（默认 2 秒；本机实测最坏 2.1 秒），
+#    其余服务全程不受影响，任何服务都不会同时跑两份。
+#    可重跑；退出码 1 不代表整批失败：它逐个装完再汇总，打印
 #    "FAILED - N of M daemons did not come up" 加上还有几个是 loaded 的。
 #    照它给的原因修掉之后原样再跑一遍即可，不需要先手工清理。
 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
 
 # 4. 收尾清理旧标签。这条脚本从 2026-07-28 起【只退役、不再安装任何 plist】。
-#    排在第 3 步之后是有原因的：它用 rmSync 直接删除 plist（不备份），而第 3 步
-#    是移进备份目录。等第 3 步先把那 8 个标签移走，这一步能删到的就只剩
-#    event-bus / catchup / maintenance 这类早已废弃的标签和 5 个历史报告 plist——
-#    都是不需要留退路的。反过来先跑这条，那 8 个 plist 会被无备份地删掉。
+#    它同样不删除任何东西：退役 = 移进 ~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/。
+#    而且对第 3 步管的那 8+1 个标签，它会先问 `launchctl print system/<label>`：
+#    接管它的 daemon 没加载 → 这份用户级副本【就是机器现在跑的那份】，原地不动、
+#    只打印 keptLaunchAgent 并以退出码 1 结束。所以它已经不可能删掉第 3 步有意保留的退路
+#    （2026-07-28 之前它会：rmSync、无备份，其中 cron-runner / official-paper.poll / .pnl
+#    三个标签在仓库里没有任何模板，删掉就再也生成不出来）。
+#    先跑这条也是安全的，只是会以退出码 1 告诉你「daemon 还没装」。
 pnpm launchd:install-user
 
 # 5. 注册 5 个报告类 openclaw cron 任务（需要第 3 步的 gateway 已经在跑）
 #    可重跑：每个任务都先 `cron rm` 掉同名旧任务再 add，不会注册两份。
+#    它的退役半边和第 4 步同规则（同样只移动、同样按 daemon 是否加载决定动不动）；
+#    若有标签被保留，5 个 cron 任务照常装完，最后以退出码 1 提示这台机器只迁移了一半。
 pnpm openclaw:cron:install
 
 # 6. 部署 control agent 人设，否则飞书机器人会以无人设的 vanilla Codex 应答（整份覆盖写，可重跑）
@@ -136,7 +149,18 @@ node apps/openclaw-config/scripts/render-openclaw-config.mjs
 #    "The container name /rsshub is already in use" 非零退出，看起来像部署失败。
 zsh -lc 'docker start rsshub 2>/dev/null || docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub'
 
-# 8. 验收：不应再出现任何 launchd-jobs.* 发现项。
+# 8. 验收：以【退出码】为准（0 = 通过；1 = 有 error 级发现项）。
+#    这一步在 2026-07-29 之前是一道过不了才怪的门：实测把一个常驻 daemon 做成崩溃重启循环
+#    （launchd 刚拉起来所以 state = running、last exit code = 1、runs = 918），
+#    它的 /health 连接被拒，doctor 仍然 ok=true、退出 0、零条 error——platform-app、
+#    broker-executor、gateway 三个服务各自单独测都是这个结果。现在它会在这些情况上失败：
+#      · <label> 已被 launchd 持有，但它的回环探针连不上
+#        （platform-app-health / broker-executor-health / rsshub-health 的 unreachable
+#         从 warn 升为 error；标签根本没装的开发机仍然只是 warn）；
+#      · 常驻服务处于崩溃重启循环（state = running + 上次退出非零 + runs ≥ 20
+#        → launchd-jobs.<name>.crash_looping，error）；
+#      · 标签装在错误的域、周期任务上次运行失败、备份/模拟盘产物过期、人设文件缺失
+#        （这些是第 3、4 轮就有的检查项，未变）。
 #    这一步对交易库是只读的（3d19dfc 之后）。doctor 的三个读库检查项
 #    （news-engine-health / alerts-poller-health / official-paper-health）改走
 #    `new DatabaseSync(path, { readOnly: true })`，不再调 openTradingDatabase，
@@ -157,7 +181,7 @@ pnpm openclaw:runtime:doctor
 | --- | --- | --- | --- |
 | `pnpm launchd:install-backup-alerts` | 否 | `~/Library/LaunchAgents` | 当前登录用户 |
 | `sudo zsh .../install-system-daemons.sh` | **是** | `/Library/LaunchDaemons` | plist 里的 `UserName`，默认取 `SUDO_USER`（即敲 sudo 的那个人），**不是 root** |
-| `pnpm launchd:install-user` | 否 | 什么都不装（只退役） | — |
+| `pnpm launchd:install-user` | 否 | 什么都不装（只退役，且只移动不删除） | — |
 | `pnpm openclaw:cron:install` | 否 | `openclaw cron`（不写 plist） | 当前登录用户的 gateway 会话 |
 
 `package.json` 里另有一条 `pnpm launchd:install-system`，跑的就是同一个 `install-system-daemons.sh`（`install-user-schedules.mjs` 的输出也提这个名字）。它同样需要 root，而 `sudo pnpm` 未必能在 root 的 PATH 里找到 pnpm，所以上面统一写成 `sudo zsh <脚本路径>`；不加 sudo 直接跑会被脚本拦下并打印这条正确命令。
@@ -166,7 +190,15 @@ pnpm openclaw:runtime:doctor
 
 **不要**再按旧文档单独跑 `pnpm launchd:install-user` 或 `pnpm launchd:install-backup-alerts` 当作"完整安装"：前者现在只退役、不安装，后者只安装 rsshub 一个用户级任务。只跑这两条的机器，8 个无人值守服务会被全部下线且一个都装不回来（`com.alphaloop.rsshub` 是唯一还会在跑的 AlphaLoop 任务）。
 
-迁移一台还在跑旧布局的机器——按上面 0→8 跑一遍即可，不需要额外的手工清理。第 3 步会把每个系统域标签的用户级副本 bootout 并**移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（移动不是删除，出问题可以取回）；第 4 步删除的是它管不到的那些废弃标签（那一步是真删除，见上面注释）。迁移前 doctor 会对这 6 个标签报 `wrong_domain` error，迁移后应当全部消失。
+迁移一台还在跑旧布局的机器——按上面 0→8 跑一遍即可，不需要额外的手工清理。整条链路上**没有任何一步会删除 plist**：第 3、4、5 步一律是移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`。要回退某个服务到旧的用户级副本：
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/<label>.plist
+```
+
+归档失败（比如 `~/Library/LaunchAgents.disabled` 被早期 sudo 运行建成了 root 所有——mini 上现在就是这样）时，脚本保留 plist 原地不动并以退出码 1 报出来，绝不会因为归档不了就改成删除。修法：`sudo chown -R "$(id -un)":staff ~/Library/LaunchAgents.disabled`。
+
+迁移前 doctor 会对这 6 个标签报 `wrong_domain` error，迁移后应当全部消失。
 
 **第 0 步对迁移是必须的，不是可选项。** 迁移逻辑本身就住在新代码里：mini 上那份 `install-system-daemons.sh` 是 7 月 16 日的旧版（6111 字节），既没有 `install-launchd-ownership.txt` 可读，`TARGET_USER` 又写死成一个它上面并不存在的用户。跳过第 0 步直接从第 1 步开始，第 3 步会在解析 `TARGET_UID` 时当场退出，什么都装不上。
 
@@ -190,7 +222,7 @@ L1 多源采集（RSSHub 中文源 + Finnhub + 既有 Yahoo/Google/Longbridge）
 
 - 环境变量（可选，见 `.env.local.example`）：`FINNHUB_API_KEY`（Finnhub company-news 鉴权，未设置时该源整体跳过）、`RSSHUB_BASE_URL`（本机 RSSHub 地址，默认 `http://127.0.0.1:1200`）。
 - RSSHub 容器点火命令见「部署机安装顺序」第 7 步（`docker start … || docker run …`，必须走 login shell）；建好之后由 `com.alphaloop.rsshub` launchd 任务负责重启后 `docker start`。
-- `pnpm openclaw:runtime:doctor` 覆盖 `rsshub-health`（容器 `/healthz` 探活，不可达 warn、非 200 error）和 `news-engine-health`（`news_events` 超过 48 小时无新事件且非全新库 → warn）两个检查项。
+- `pnpm openclaw:runtime:doctor` 覆盖 `rsshub-health`（容器 `/healthz` 探活；`com.alphaloop.rsshub` 已加载时不可达算 error，没装才是 warn，非 200 一律 error）和 `news-engine-health`（`news_events` 超过 48 小时无新事件且非全新库 → warn）两个检查项。
 
 ## 本地接口
 
