@@ -101,8 +101,11 @@ function sendHtml(res: ServerResponse, status: number, body: string): void {
 /** `YYYY-MM-DD` for a given instant, in Asia/Shanghai (Beijing has no DST,
  * so a fixed IANA zone is exact year-round). Built from formatToParts (not
  * a locale's default separator/order) so the output shape doesn't depend on
- * ICU version/locale quirks. */
-function formatBeijingDate(date: Date): string {
+ * ICU version/locale quirks. Exported for routes/personal.ts, which applies
+ * the identical date-based freshness rule to the personal page it hangs off
+ * these reading pages - one implementation, so the two surfaces can never
+ * disagree about whether the same date is 最新 or 延迟. */
+export function formatBeijingDate(date: Date): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -413,7 +416,10 @@ function extractFirstParagraph(md: string): string {
   return collected.join(" ").trim() || "（无摘要内容）";
 }
 
-const REPORT_BODY_STYLE = trustedHtml(`<style>
+/** Shared by routes/personal.ts, which renders the same markdown-derived
+ * `.report-body` block - exported rather than copied so the two pages'
+ * typography stays one definition. */
+export const REPORT_BODY_STYLE = trustedHtml(`<style>
 .report-body h1{font-size:20px;margin:18px 0 10px}
 .report-body h2{font-size:16px;margin:20px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--line)}
 .report-body h3{font-size:14px;margin:14px 0 6px}
@@ -427,6 +433,29 @@ const REPORT_BODY_STYLE = trustedHtml(`<style>
 .report-body code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 .report-body a{color:var(--accent);text-decoration:underline}
 </style>`);
+
+/**
+ * Entry point to the reader's OWN personal page (Task 6, 2026-07-28), shown
+ * only on the two report kinds that generate one (`personal_pages.kind` is
+ * CHECK'd to daily/weekly - 个股分析/模拟盘快照 have no personal page at all,
+ * so linking to `/stock-analysis/<date>/me` would just be a guaranteed 404).
+ * The href carries no owner: routes/personal.ts resolves the owner from the
+ * session, and refuses an `?owner=` parameter outright.
+ */
+function renderPersonalPageEntry(entry: ReportIndexEntry): Html {
+  if (entry.type !== "daily" && entry.type !== "weekly") {
+    return trustedHtml("");
+  }
+  return html`<div class="bento" style="margin-top:10px">
+    <section class="card w2 dt-w4">
+      <h2>我的个人页</h2>
+      <p style="font-size:13px;color:var(--sub)">
+        持仓、策略对照、提醒回顾与待办都在你自己的个人页里，公共${TYPE_LABELS[entry.type]}不含任何个人内容。
+      </p>
+      <a class="btn primary" href="/${entry.type}/${entry.date}/me">我的个人页 →</a>
+    </section>
+  </div>`;
+}
 
 function renderReadingBody(entry: ReportIndexEntry, rawMd: string, rendered: MarkdownRenderResult): Html {
   const legacyNote = entry.legacy
@@ -470,6 +499,7 @@ function renderReadingBody(entry: ReportIndexEntry, rawMd: string, rendered: Mar
 
   return html`${entry.legacy ? renderLegacyBanner() : trustedHtml("")}
     <div class="bento">${summarySection}</div>
+    ${renderPersonalPageEntry(entry)}
     <div class="bento" style="margin-top:10px">
       <section class="card w2 dt-w4">
         ${tocSection}

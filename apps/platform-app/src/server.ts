@@ -13,6 +13,7 @@ import { handleMemberCardRoute } from "./routes/member-card.js";
 import { handleNewsRoute } from "./routes/news.js";
 import { handlePaperRoute } from "./routes/paper.js";
 import { handleProposalRoute } from "./routes/proposal.js";
+import { handlePersonalRoute } from "./routes/personal.js";
 import { handleReportsRoute } from "./routes/reports.js";
 import { handleResearchRoute } from "./routes/research.js";
 import { handleReviewRoute, type FeishuReviewNotifier } from "./routes/review.js";
@@ -202,6 +203,15 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         nonce
       )
     ) {
+      return;
+    }
+
+    // Owner-only personal pages (`GET /daily/<date>/me`, `/weekly/<date>/me`,
+    // Task 6) dispatch BEFORE handleReportsRoute purely for readability - the
+    // two never compete for a path (reports.ts only claims two-segment
+    // reading paths, this module only three-segment `.../me` ones), so the
+    // order is not load-bearing.
+    if (handlePersonalRoute(req, res, url, { db: deps.db, ...(deps.now ? { now: deps.now } : {}) }, nonce)) {
       return;
     }
 

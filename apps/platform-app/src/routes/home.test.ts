@@ -325,6 +325,29 @@ describe("home route (GET /)", () => {
     expect(body).not.toContain("暂无日报");
   });
 
+  // Task 6 (2026-07-28): the daily card is the home page's entry point to the
+  // viewer's own personal page (owner-only route, no owner id in the URL -
+  // it always resolves to whoever is logged in).
+  it("puts a 我的个人页 entry on the daily card, linking to /daily/<date>/me with no owner id in the URL", async () => {
+    const { token } = seedMemberWithToken();
+    writeDailyReport(repoRoot, "2026-07-14.md", "# 今日日报标题\n\n内容。\n");
+
+    const response = await authed("/", token);
+    const body = await response.text();
+
+    expect(body).toContain("我的个人页");
+    expect(body).toContain('href="/daily/2026-07-14/me"');
+    expect(body).not.toContain("/me?owner=");
+  });
+
+  it("omits the 我的个人页 entry when there is no daily report to hang it on", async () => {
+    const { token } = seedMemberWithToken();
+    const response = await authed("/", token);
+    const body = await response.text();
+    expect(body).toContain("暂无日报");
+    expect(body).not.toContain("我的个人页");
+  });
+
   describe("circuit breaker banner (Phase 6 Task 6)", () => {
     it("omits the banner entirely when the viewer is not paused", async () => {
       const { token } = seedMemberWithToken();

@@ -401,5 +401,33 @@ describe("reports routes", () => {
       });
       expect(response.status).toBe(405);
     });
+
+    // Task 6 (2026-07-28): the daily/weekly reading pages are where a member
+    // finds their own personal page - the public body no longer carries any
+    // personal holdings/strategy content (Task 4), so the entry point to it
+    // has to be here.
+    it("renders a 我的个人页 entry linking to /<type>/<date>/me on the daily and weekly reading pages", async () => {
+      writeReport(repoRoot, "daily", "2026-07-14.md", "# 今日日报\n\n内容。\n");
+      writeReport(repoRoot, "weekly", "2026-05-25.md", "# 周报 05-25\n\n周报内容。\n");
+
+      const daily = await authed("/daily/2026-07-14");
+      const dailyBody = await daily.text();
+      expect(dailyBody).toContain("我的个人页");
+      expect(dailyBody).toContain('href="/daily/2026-07-14/me"');
+
+      const weekly = await authed("/weekly/2026-05-25");
+      const weeklyBody = await weekly.text();
+      expect(weeklyBody).toContain("我的个人页");
+      expect(weeklyBody).toContain('href="/weekly/2026-05-25/me"');
+    });
+
+    it("does NOT offer a 我的个人页 entry on report types that have no personal page (个股分析/模拟盘快照)", async () => {
+      writeReport(repoRoot, "stock-analysis", "2026-06-19.md", "# 个股分析 06-19\n\n分析内容。\n");
+
+      const stock = await authed("/stock-analysis/2026-06-19");
+      const body = await stock.text();
+      expect(body).not.toContain("我的个人页");
+      expect(body).not.toContain("/me\"");
+    });
   });
 });

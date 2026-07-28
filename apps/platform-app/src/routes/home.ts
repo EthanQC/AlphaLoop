@@ -353,11 +353,22 @@ function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
 
   const legacyPill = entry.legacy ? html`<span class="pill warn">历史存档</span>` : trustedHtml("");
 
+  // 我的个人页 (Task 6, 2026-07-28): the daily card is the home page's entry
+  // point to the viewer's OWN personal page. The href carries no owner id -
+  // routes/personal.ts resolves the owner from the session and refuses an
+  // `?owner=` parameter - and it is only offered for daily/weekly reports,
+  // the only two kinds `personal_pages` holds.
+  const personalLink =
+    entry.type === "daily" || entry.type === "weekly"
+      ? html`<a class="btn" href="/${entry.type}/${entry.date}/me">我的个人页 →</a>`
+      : trustedHtml("");
+
   return html`<section class="card dt-w2 report">
     <h2>今日日报卡 ${legacyPill}</h2>
     <h3>${entry.title}</h3>
     <div class="report-links">
       <a class="btn primary" href="/${entry.type}/${entry.date}">阅读全文</a>
+      ${personalLink}
     </div>
   </section>`;
 }
