@@ -84,6 +84,65 @@ const REQUIRED_ARTIFACTS = [
  */
 export const BUILD_STAMP_ENV = "ALPHALOOP_TEST_WORKSPACE_BUILD";
 
+/**
+ * J1 (2026-07-29, round-6): a violation detected in the TEARDOWN below has to
+ * fail the process itself, because throwing is not enough.
+ *
+ * Measured on vitest 4.1.7 (this repo's pinned version), minimal config, one
+ * passing test, a globalSetup whose teardown throws:
+ *
+ *     Test Files  1 passed (1)
+ *          Tests  1 passed (1)
+ *     error during close Error: TEARDOWN-THREW ...
+ *     $? = 0
+ *
+ * The reason is in vitest's own `Vitest.close()`
+ * (dist/chunks/cli-api.C6CiCDM3.js:13919-13940): teardown rejections are
+ * collected into `teardownErrors`, handed to `this.logger.error("error during
+ * close", ...)`, and `process.exitCode` is never touched. So the backstop that
+ * exists to protect the deploy machine's live Longbridge rate-limit ledger
+ * printed the violation and then blessed the run - and "error during close"
+ * reads like a cleanup nit rather than a failure.
+ *
+ * This does three things instead of one, because the swallow was itself the
+ * result of trusting a single library-version-specific behavior:
+ *   1. prints the violation to stderr under an unmissable banner, on our own
+ *      terms rather than as vitest's close-time footnote;
+ *   2. sets `process.exitCode` - safe as the primary mechanism because no
+ *      branch anywhere in vitest 4.1.7 ever assigns `process.exitCode = 0`
+ *      (grepped: every write in dist/ is `= 1`, `= 130` or `= 128 + signal`),
+ *      so nothing downstream can undo it;
+ *   3. registers a last-word `exit` listener, so that a future vitest which
+ *      DOES reset the code before exiting still cannot make this green.
+ * Then it throws, so vitest also reports it and a future vitest that honors
+ * teardown throws needs no further change here.
+ *
+ * Deliberately NOT used by the setup-phase failures below. Those were measured
+ * on the same version and already exit 1 (vitest routes a globalSetup throw
+ * through its "Unhandled Error" path, which does set the code); routing them
+ * through this would additionally set `process.exitCode` inside vitest WORKER
+ * processes, because test/build-freshness.test.ts and
+ * test/runtime-write-guard.test.ts call the exported helpers and `setup()`
+ * itself from inside a worker, and a worker exiting non-zero of its own accord
+ * is reported as a crashed pool rather than as the failed assertion it is.
+ * test/runtime-write-guard.test.ts pins BOTH halves of that split by injection.
+ */
+export function failRunFromTeardown(message: string): never {
+  const banner = "=".repeat(72);
+  process.stderr.write(
+    `\n${banner}\nRUN FAILED: RUNTIME WRITE GUARD\n${banner}\n\n${message}\n\n` +
+      `(test/global-setup.ts forced a non-zero exit here: vitest 4.1.7 logs a teardown throw as `+
+      `"error during close" and would otherwise exit 0.)\n${banner}\n\n`
+  );
+  process.exitCode = 1;
+  process.on("exit", () => {
+    if (process.exitCode === undefined || process.exitCode === null || process.exitCode === 0) {
+      process.exitCode = 1;
+    }
+  });
+  throw new Error(message);
+}
+
 function runTsc(args: string[]): string {
   try {
     return execFileSync(process.execPath, [TSC, ...args], {
@@ -185,7 +244,9 @@ export default async function setup(): Promise<() => void> {
   return () => {
     const changes = diffRuntimeEntries(before, snapshotRuntimeEntries());
     if (hasRuntimeChanges(changes)) {
-      throw new Error(describeRuntimeChanges(changes, "this test run"));
+      // Not a bare `throw`: vitest 4.1.7 swallows one here and exits 0, which
+      // made this whole backstop decorative. See failRunFromTeardown.
+      failRunFromTeardown(describeRuntimeChanges(changes, "this test run"));
     }
   };
 }

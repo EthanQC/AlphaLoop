@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import vitestConfig from "../vitest.config.js";
+import { failRunFromTeardown } from "./global-setup.js";
 import {
   RUNTIME_GUARD_ROOT,
   describeRuntimeChanges,
@@ -165,6 +166,103 @@ describe("H1: the detector notices every kind of change", () => {
     );
     expect(message).toContain("longbridge-rate-limit-quote.json");
     expect(message).toContain("rateLimitDir");
+  });
+});
+
+describe("J1: a detected violation fails the RUN, not just the log", () => {
+  /**
+   * The round-6 finding: the whole-run backstop DETECTED an import-time write,
+   * threw, and the process still exited 0. Measured on this exact fixture,
+   * 2026-07-29, by swapping `failRunFromTeardown(...)` back to `throw new
+   * Error(...)` in test/global-setup.ts:
+   *
+   *   Test Files  1 passed (1)
+   *   error during close Error: this test run wrote into the repository's ...
+   *   $? = 0
+   *
+   * With the fix in place the same fixture exits 1. That difference is the only
+   * thing standing between a stray test and the deploy machine's live
+   * Longbridge rate-limit ledger, so it gets a test rather than a comment.
+   */
+  it("goes red when the write happens at IMPORT time, which only the backstop can see", { timeout: 120_000 }, () => {
+    const guardedRoot = tempDir("runtime-guard-import-");
+    const result = spawnSync(
+      process.execPath,
+      [VITEST_BIN, "run", "--config", "test/fixtures/runtime-guard-import-time.config.ts"],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { ...process.env, ALPHALOOP_RUNTIME_GUARD_ROOT: guardedRoot, CI: "true" }
+      }
+    );
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    expect(
+      result.status,
+      `the run must FAIL. Vitest 4.1.7 logs a globalSetup teardown throw as "error during close" and ` +
+        `exits 0, so test/global-setup.ts forces the code itself; if that stopped working the guard is ` +
+        `decorative again. Output:\n${output}`
+    ).not.toBe(0);
+    expect(output).toContain("RUN FAILED: RUNTIME WRITE GUARD");
+    expect(output).toContain("wrote into the repository's real runtime directory");
+    expect(output).toContain("created: import-time.json");
+    // The test itself passes: that is what makes this window invisible to the
+    // per-test guard, and why a green summary must not mean a green run.
+    expect(output).toMatch(/Tests\s+1 passed/u);
+  });
+
+  it("still goes red when the refusal comes from the SETUP phase", { timeout: 120_000 }, () => {
+    // The four build-freshness refusals in test/global-setup.ts are plain
+    // throws, on the measured basis that vitest honors a setup-phase throw.
+    // This pins that assumption instead of trusting it, which is the mistake
+    // the teardown half made.
+    const result = spawnSync(
+      process.execPath,
+      [VITEST_BIN, "run", "--config", "test/fixtures/global-setup-throw.config.ts"],
+      { cwd: ROOT, encoding: "utf8", env: { ...process.env, CI: "true" } }
+    );
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    expect(
+      result.status,
+      `a globalSetup that throws during SETUP must fail the run - test/global-setup.ts leaves its four ` +
+        `stale-build refusals as bare throws on exactly this basis. Output:\n${output}`
+    ).not.toBe(0);
+    expect(output).toContain("SETUP PHASE REFUSED THE RUN");
+  });
+
+  it("forces a non-zero exit code even if nothing re-reads the throw", () => {
+    // Unit-level, in-process: the exported helper must set process.exitCode
+    // BEFORE it throws, since the throw is the half vitest discards.
+    const previous = process.exitCode;
+    // Only the listeners THIS call adds get removed again - blowing away every
+    // "exit" listener would take vitest's own worker teardown with it.
+    const listenersBefore = new Set(process.listeners("exit"));
+    // Captured rather than let through: a RUN FAILED banner printed during a
+    // green run is how a banner stops being read.
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      process.exitCode = 0;
+      expect(() => failRunFromTeardown("injected violation")).toThrow(/injected violation/u);
+      expect(process.exitCode).toBe(1);
+      // The banner is the half vitest cannot discard, so it carries the message.
+      const banner = written.join("");
+      expect(banner).toContain("RUN FAILED: RUNTIME WRITE GUARD");
+      expect(banner).toContain("injected violation");
+    } finally {
+      process.stderr.write = realWrite;
+      process.exitCode = previous;
+      for (const listener of process.listeners("exit")) {
+        if (!listenersBefore.has(listener)) {
+          process.removeListener("exit", listener);
+        }
+      }
+    }
   });
 });
 
