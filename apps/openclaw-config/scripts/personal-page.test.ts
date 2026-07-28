@@ -20,6 +20,7 @@ import {
   getSchemaVersion,
   openTradingDatabase
 } from "../../../packages/shared-types/dist/index.js";
+import type { ExecutionResultStatus } from "../../../packages/shared-types/dist/index.js";
 
 import { normalizeOfficialPaperSnapshot } from "./report-data.mjs";
 
@@ -32,6 +33,10 @@ const scheduledReport = await import("./scheduled-report.mjs");
 // same two functions the broker-executor success path calls, so a change to
 // what that writer records breaks these tests instead of hiding behind them.
 const brokerExecutor = await import("../../broker-executor/src/server.ts");
+// The same status->{stage, localStatus} mapper that success path runs, so a
+// seeded row's lifecycle stage is derived from a raw broker status rather than
+// typed in here (M15).
+const brokerStatusMap = await import("../../broker-executor/src/broker-status-map.ts");
 const reconcileModule = await import("./reconcile-official-paper-orders.mjs");
 
 // The three renderers Task 4 exported as the seam for this page (see their doc
@@ -63,6 +68,13 @@ interface FillInput {
   proposalId?: string;
   /** Omit the structured facts, leaving only the prose body - the shape of a row written before R5. */
   legacyMetadataOnly?: boolean;
+  /**
+   * The RAW broker status the row came back with. The lifecycle stage and local
+   * status are then derived from it by the real mapper, exactly as
+   * broker-executor does - never typed in here - so a seeded row can only ever
+   * carry a {status, stage} pair the mapper actually produces.
+   */
+  brokerStatus?: string;
 }
 
 /**
@@ -84,17 +96,28 @@ function seedExecutionReport(db: DatabaseSync, input: FillInput): void {
     quantity: input.quantity,
     conviction: "normal" as const,
     notionalUsd: input.quantity * (input.price ?? 0),
-    ownerId: input.ownerId ?? undefined,
+    // OrderTicket declares `ownerId?: string`; under exactOptionalPropertyTypes
+    // neither an explicit `undefined` nor a `null` is the same as absent, and
+    // an ownerless ticket is the shape the pre-C1 rows actually have.
+    ...(input.ownerId === null ? {} : { ownerId: input.ownerId }),
     proposalId: input.proposalId ?? input.id
   };
+  // The stage/localStatus pair is DERIVED from the raw broker status by the
+  // same mapper the broker-executor success path uses, so these rows can only
+  // carry combinations production can produce. "unknown" is a legitimate
+  // mapper output (any status the table does not recognize) that the shared
+  // ExecutionResultStatus type has no member for - see the same cast and the
+  // same explanation in packages/shared-types/src/database.test.ts.
+  const brokerStatus = input.brokerStatus ?? "Filled";
+  const mapping = brokerStatusMap.mapBrokerStatusToStage(brokerStatus);
   const result = {
     ticketId,
     environment: "paper" as const,
-    status: "submitted" as const,
+    status: mapping.localStatus as ExecutionResultStatus,
     provider: "longbridge-paper" as const,
     externalOrderId: `ext_${input.id}`,
-    brokerStatus: "Filled",
-    brokerOrderStage: "filled" as const,
+    brokerStatus,
+    brokerOrderStage: mapping.stage,
     ...(input.price === undefined ? {} : { limitPrice: input.price, fillPrice: input.price }),
     reasons: ["长桥官方模拟盘已接受该订单。"]
   };
@@ -844,6 +867,131 @@ describe("C2: the weekly personal page reviews this week's trades against the ow
     expect(lines[2]).toContain("MSFT.US");
     expect(lines[2]).toContain("一致性：无对照（");
     expect(lines[2]).toMatch(/原因[：:]/u);
+  });
+
+  // ==========================================================================
+  // M15 (2026-07-28 round-4 verifier): F4 gave the execution verdict five
+  // tests, and all five call summarizeExecutionRow(row).status directly. The
+  // place a MEMBER reads that verdict is personal-page.mjs's renderConsistency
+  // Line - 「  - 状态：${summary.status}」 - and nothing asserted on that line,
+  // so the whole wiring (row -> selectExecutionReports -> summarizeExecution
+  // Row -> the rendered markdown) was unverified end to end. These assert the
+  // rendered TEXT of a real page, for rows whose lifecycle stage came out of
+  // the real broker-status mapper.
+  // ==========================================================================
+  describe("the 状态 line a member actually reads (M15)", () => {
+    function weeklyBodyFor(db: DatabaseSync, ownerId: string): string {
+      const weekly = personalPage.renderPersonalPage({
+        db,
+        ownerId,
+        kind: "weekly",
+        date: "2026-07-28",
+        now: "2026-07-28T12:05:00.000Z",
+        helpers
+      });
+      return weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+    }
+
+    it("prints 券商已确认成交 for a filled row - the only verdict allowed to claim a fill", () => {
+      const db = makeDb();
+      seedOwnerWithFills(db);
+
+      const body = weeklyBodyFor(db, "member_c2");
+
+      // The rendered line, indentation and all - not a helper's return value.
+      expect(body).toContain("  - 状态：券商已确认成交。");
+      // Three fills, three 状态 lines: the section renders one per row rather
+      // than one for the section.
+      expect(body.match(/^ {2}- 状态：/gmu) ?? []).toHaveLength(3);
+    });
+
+    it("never claims a fill for a live-but-unfilled order: 'New' renders 尚未观察到成交", () => {
+      const db = makeDb();
+      seedMember(db, "member_m15", "小状态");
+      seedExecutionReport(db, {
+        id: "er_m15_new",
+        ownerId: "member_m15",
+        symbol: "AAPL.US",
+        side: "buy",
+        quantity: 10,
+        price: 200,
+        createdAt: "2026-07-24T14:00:00.000Z",
+        // mapBrokerStatusToStage("New") -> {stage:"submitted", localStatus:"submitted"}
+        brokerStatus: "New"
+      });
+
+      const body = weeklyBodyFor(db, "member_m15");
+
+      expect(body).toContain("  - 状态：订单已提交至券商并存活，尚未观察到成交。");
+      expect(body).not.toContain("券商已确认成交");
+    });
+
+    it("says the status is unrecognized - naming it - instead of guessing, for a status the mapper does not know", () => {
+      const db = makeDb();
+      seedMember(db, "member_m15u", "小未知");
+      seedExecutionReport(db, {
+        id: "er_m15_unknown",
+        ownerId: "member_m15u",
+        symbol: "AAPL.US",
+        side: "buy",
+        quantity: 10,
+        price: 200,
+        createdAt: "2026-07-24T14:00:00.000Z",
+        // Anything outside broker-status-map's table maps to
+        // {stage:"unknown_broker_status", localStatus:"unknown"} - the real
+        // shape a new Longbridge status would arrive in.
+        brokerStatus: "SomeNewLongbridgeStatus"
+      });
+
+      const body = weeklyBodyFor(db, "member_m15u");
+
+      expect(body).toContain("  - 状态：券商状态「SomeNewLongbridgeStatus」不在本系统的状态映射表内，无法判定是否成交。");
+      expect(body).not.toContain("券商已确认成交");
+    });
+
+    // M14: the verdict tables are plain object literals and their keys come
+    // from row metadata, i.e. from DATA. Before the fix,
+    // EXECUTION_STAGE_VERDICTS["toString"] resolved through the prototype to
+    // Function.prototype.toString - truthy - and this line rendered
+    // 「  - 状态：function toString() { [native code] }」 on a member's page.
+    //
+    // This row's metadata is deliberately NOT a producer shape: no writer in
+    // this repo emits lifecycleStage "toString". That is the point - it is the
+    // garbage-input case, and the assertion is that the page degrades to the
+    // documented "unrecognized status" sentence like any other unknown value.
+    it("does not resolve a prototype key into a verdict (M14): lifecycleStage 'toString' degrades, it does not print a function", () => {
+      const db = makeDb();
+      seedMember(db, "member_m14", "小原型");
+      db.prepare(`
+        INSERT INTO execution_reports (id, category, title, body, metadata, created_at, owner_id)
+        VALUES (?, 'trade', ?, ?, ?, ?, ?)
+      `).run(
+        "er_m14_proto",
+        "AAPL.US 执行报告",
+        "标的：AAPL.US\n方向：买入\n数量：10",
+        JSON.stringify({
+          ticketId: "ticket_prop_er_m14_proto",
+          proposalId: "er_m14_proto",
+          environment: "paper",
+          assetClass: "stock",
+          symbol: "AAPL.US",
+          side: "buy",
+          quantity: 10,
+          lifecycleStage: "toString",
+          localStatus: "hasOwnProperty",
+          brokerStatus: "constructor"
+        }),
+        "2026-07-24T14:00:00.000Z",
+        "member_m14"
+      );
+
+      const body = weeklyBodyFor(db, "member_m14");
+
+      expect(body).not.toContain("native code");
+      expect(body).not.toContain("function toString");
+      expect(body).not.toContain("[object Object]");
+      expect(body).toContain("  - 状态：券商状态「constructor」不在本系统的状态映射表内，无法判定是否成交。");
+    });
   });
 
   it("judges a neutral thesis as 无对照 rather than forcing it into 一致 or 冲突", () => {

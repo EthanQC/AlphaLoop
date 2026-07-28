@@ -1134,11 +1134,33 @@ const EXECUTION_LOCAL_STATUS_VERDICTS = {
   rejected: "该订单被拒绝，未成交。"
 };
 
+/**
+ * M14 (2026-07-28 round-4 verifier): own-property lookup, and a string or
+ * nothing.
+ *
+ * Both verdict tables above are plain object literals and both keys come from
+ * a row's metadata JSON - i.e. from data, not from code. A plain `table[key]`
+ * therefore resolves INHERITED keys: measured, `metadata.lifecycleStage =
+ * "toString"` made the verdict `Function.prototype.toString`, which is truthy,
+ * so classifyExecutionStatus returned a function and personal-page.mjs
+ * interpolated 「  - 状态：function toString() { [native code] }」 onto a
+ * member's page. `constructor`, `valueOf` and `hasOwnProperty` behave the same
+ * way. Unknown keys must fall through to the "we cannot judge this" branches
+ * below, exactly like any other unrecognized status.
+ */
+function lookupVerdict(table, key) {
+  if (typeof key !== "string" || !Object.hasOwn(table, key)) {
+    return undefined;
+  }
+  const verdict = table[key];
+  return typeof verdict === "string" ? verdict : undefined;
+}
+
 function classifyExecutionStatus(row, text) {
   const outcome = readExecutionOutcome(row);
 
   if (outcome.stage) {
-    const verdict = EXECUTION_STAGE_VERDICTS[outcome.stage];
+    const verdict = lookupVerdict(EXECUTION_STAGE_VERDICTS, outcome.stage);
     if (verdict) {
       return verdict;
     }
@@ -1149,7 +1171,7 @@ function classifyExecutionStatus(row, text) {
       : "本记录的券商状态无法识别，无法判定是否成交。";
   }
 
-  const localVerdict = outcome.localStatus ? EXECUTION_LOCAL_STATUS_VERDICTS[outcome.localStatus] : undefined;
+  const localVerdict = lookupVerdict(EXECUTION_LOCAL_STATUS_VERDICTS, outcome.localStatus);
   if (localVerdict) {
     return localVerdict;
   }
