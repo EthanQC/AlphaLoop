@@ -492,6 +492,14 @@ describe("C4: a single member's card failure does not force a full-run retry", (
 // idempotency would have silently never fired and every case here would still
 // have passed. This drives the real writer and the real reader against a real
 // JSON file on disk - a temp one; the production runtime file is never touched.
+//
+// G2 (2026-07-28 round-4 verifier): the window fed to the writer used to be
+// hand-written here, which is the very fixture dishonesty R7 was supposed to
+// end - the writer keys off `info.kind`/`info.label`, so a test that supplies
+// those itself can never discover that the producer stopped supplying them.
+// It now comes from resolveReportWindow, the same function the CLI calls at
+// startup (`windowInfo = resolveReportWindow(kind, dateArg)`) and hands to
+// deliverReport -> updateState -> writeDeliveryStateEntry.
 describe("R7: the idempotency record survives a real round-trip through the state file", () => {
   function stateFile(): string {
     const dir = mkdtempSync(join(tmpdir(), "alphaloop-report-state-"));
@@ -499,14 +507,19 @@ describe("R7: the idempotency record survives a real round-trip through the stat
     return join(dir, "report-delivery-state.json");
   }
 
-  const window = {
-    kind: "daily" as const,
-    label: DATE,
-    startLabel: "2026-07-27",
-    endLabel: DATE,
-    start: new Date("2026-07-27T20:00:00+08:00"),
-    end: new Date("2026-07-28T20:00:00+08:00")
-  };
+  const window = scheduledReport.resolveReportWindow("daily", DATE);
+  const weeklyWindow = scheduledReport.resolveReportWindow("weekly", DATE);
+
+  it("takes the window from the producer, so the key under test is the key production writes", () => {
+    // Not a restatement of resolveReportWindow's body: the two fields the state
+    // key is built from must be present and usable, whatever else the producer
+    // decides a window carries.
+    expect(window.kind).toBe("daily");
+    expect(window.label).toBe(DATE);
+    expect(weeklyWindow.kind).toBe("weekly");
+    expect(window.start instanceof Date && Number.isFinite(window.start.getTime())).toBe(true);
+    expect(window.end instanceof Date && Number.isFinite(window.end.getTime())).toBe(true);
+  });
 
   it("re-running after a persisted run sends nothing a second time, and the third run agrees", async () => {
     const db = makeDb();
@@ -594,10 +607,13 @@ describe("R7: the idempotency record survives a real round-trip through the stat
 
     // Same date, other kind: the key differs, so nothing is suppressed. This is
     // the assertion that fails if writer and reader ever stop agreeing on the
-    // `kind:label` key.
+    // `kind:label` key. Both windows come from the producer, so a producer that
+    // stopped distinguishing the two kinds would collapse the keys and fail here.
     expect(
       scheduledReport.readDeliveredPersonalCards(scheduledReport.readDeliveryState(path), "weekly", DATE)
     ).toEqual([]);
+    const both = scheduledReport.writeDeliveryStateEntry(path, weeklyWindow, { personalCards: firstResult });
+    expect(Object.keys(both).sort()).toEqual([`daily:${DATE}`, `weekly:${DATE}`]);
     expect(
       scheduledReport
         .readDeliveredPersonalCards(scheduledReport.readDeliveryState(path), "daily", DATE)
