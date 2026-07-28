@@ -847,3 +847,47 @@ describe("F4: a reconciled fill is not reported to its owner as a failure", () =
     expect(summary.status).toBe("订单已提交至券商并存活，尚未观察到成交。");
   });
 });
+
+describe("F5: the reconciled report carries the price the writer already had", () => {
+  it("stores limitPrice structurally and prints it as 限价 - never as a fill price", async () => {
+    const db = makeDb();
+    const row = await reconcileOneFilledOrder(db, { symbol: "AAPL.US", side: "sell", quantity: 10, limitPrice: 210 });
+
+    const metadata = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+    expect(metadata.limitPrice).toBe(210);
+    expect(metadata.fillPrice).toBeUndefined();
+    expect(String(row.body)).toContain("限价：210.00");
+    expect(String(row.body)).not.toContain("成交价");
+
+    const facts = scheduledReport.extractExecutionFacts(row);
+    expect(facts.price).toBe("210");
+    expect(facts.priceKind).toBe("限价");
+    expect(facts.sources.price).toBe("metadata");
+
+    // What the owner's weekly page actually prints for this fill.
+    expect(scheduledReport.summarizeExecutionRow(row, facts).summary)
+      .toBe("标的 AAPL.US；方向 卖出；数量 10；限价 210。");
+  });
+
+  it("omits the price entirely when the broker order carried none, rather than printing a zero", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "MSFT.US", side: "buy", quantity: 3 });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+    insertLifecycleRow(db, {
+      id: "row_f5_nopx", ticketId, externalOrderId: null,
+      symbol: "MSFT.US", side: "buy", quantity: 3,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+    await runReconcile(db, [
+      { order_id: "EXT_NOPX", symbol: "MSFT.US", side: "Buy", quantity: 3, status: "Filled", created_at: "2026-07-15T14:02:00.000Z" }
+    ]);
+
+    const row = db.prepare(`SELECT * FROM execution_reports WHERE category = 'trade'`).get() as Record<string, unknown>;
+    expect(String(row.body)).not.toContain("限价");
+    expect(JSON.parse(String(row.metadata)).limitPrice).toBeUndefined();
+    expect(scheduledReport.extractExecutionFacts(row).price).toBeNull();
+  });
+});

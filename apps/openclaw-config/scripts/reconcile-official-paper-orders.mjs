@@ -438,6 +438,18 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
 
   const reportId = createId("report");
   const notionalUsd = typeof limitPrice === "number" ? limitPrice * quantity : undefined;
+  // F5 (2026-07-28 round 3): the price was received, used for notionalUsd, and
+  // then thrown away - neither the body nor the metadata carried it, so
+  // scheduled-report.mjs's extractExecutionFacts found no price and a
+  // reconciled fill rendered as 「方向 卖出；数量 10。」 next to a broker-executor
+  // fill that showed its own. It is carried through now, labelled 限价 and
+  // stored under `limitPrice`, because that is what it IS: `order.price` off
+  // the broker's day-order list is the LIMIT the order was placed at, not the
+  // price it filled at. extractExecutionFacts keys 「成交价」 off `fillPrice`
+  // and 「限价」 off `limitPrice`, so a limit price can never be shown to the
+  // owner as if the trade had executed there. This file does not compute a
+  // fill price at all and must not invent one.
+  const hasLimitPrice = typeof limitPrice === "number" && Number.isFinite(limitPrice);
   // FIX 2: only a 'filled' stage may claim 成交 - a merely-live order
   // (submitted/pending) is alive at the broker but NOT filled yet, and the
   // report must say so instead of hard-coding a fill claim.
@@ -464,6 +476,7 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
       `外部订单号：${externalOrderId}`,
       `券商状态：${brokerStatusRaw}`,
       `生命周期阶段：${stage}`,
+      ...(hasLimitPrice ? [`限价：${limitPrice.toFixed(2)}`] : []),
       "",
       "原因：",
       "- reconcile 在券商当日订单列表中发现该工单已成交/存活，此前 broker-executor 因 CLI 调用失败或超时误判为提交未确认并标记提案失败。",
@@ -477,6 +490,7 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
       symbol,
       side,
       quantity,
+      ...(hasLimitPrice ? { limitPrice } : {}),
       ...(notionalUsd !== undefined ? { notionalUsd } : {}),
       externalOrderId,
       brokerStatus: brokerStatusRaw,
