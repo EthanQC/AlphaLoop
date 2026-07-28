@@ -662,6 +662,9 @@ function checkLaunchdJobs(snapshot) {
 // is a fault for a KeepAlive daemon and the ordinary steady state for a
 // scheduled one, so a single uniform assertion would either miss the first
 // or false-alarm on the second, every five minutes, forever.
+// See the crash_looping branch below for where this number comes from.
+const RESIDENT_CRASH_LOOP_RUNS = 20;
+
 function checkLaunchdJobRuntime(job, row) {
   const contract = LAUNCHD_SERVICE_HEALTH[job.label];
   if (!contract) {
@@ -703,11 +706,38 @@ function checkLaunchdJobRuntime(job, row) {
           + `"已加载"不等于"在工作"。${logs}排查后可用 ${kickstart} 重启，或重跑 ${install}。`
       ));
     } else if (failedExit) {
-      findings.push(warn(
-        `launchd-jobs.${job.slug}.restarted_after_failure`,
-        `launchd 任务 ${job.label} 现在在运行，但它上一次退出是失败的（${where.replace(/^，/u, "")}）——KeepAlive 把它拉起来了，`
-          + `说明它至少崩过一次。${logs}`
-      ));
+      // Round-5 finding D2, second half. `state = running` + a failed last exit
+      // is BOTH "it crashed once last month and has been up since" and "it is
+      // crash-looping and I sampled it 200ms after the latest relaunch". The
+      // loopback probes above are the primary discriminator (a looping service
+      // refuses connections almost all of the time, since launchd throttles
+      // KeepAlive relaunches to ~10s apart). `runs` is the backstop for a
+      // sample that lands inside an up-window.
+      //
+      // The threshold is CHOSEN, not derived: a resident daemon accumulates a
+      // run only by dying. Read-only on the mini while writing this, the four
+      // resident services report runs = 2 (platform-app), 2 (broker-executor),
+      // 10 (cron-runner) and 10 (gateway); the two that print a `last exit
+      // code` line at all print 0, and the other two were last killed by a
+      // signal so they print none - i.e. none of them would reach this branch
+      // regardless of the threshold. 20 therefore sits clear of the highest
+      // healthy value observed on the real target while catching the 918 of
+      // the reported case by two orders of magnitude.
+      const runs = toFiniteNumber(row.runs);
+      if (runs !== null && runs >= RESIDENT_CRASH_LOOP_RUNS) {
+        findings.push(error(
+          `launchd-jobs.${job.slug}.crash_looping`,
+          `launchd 任务 ${job.label} 在反复崩溃重启（${where.replace(/^，/u, "")}）——它是常驻服务，正常情况下 runs 应该停在个位数，`
+            + `而现在已经重启 ${runs} 次且最近一次退出仍是失败。此刻 state = running 只是 launchd 刚把它拉起来的瞬间，不代表它可用。`
+            + `${logs}`
+        ));
+      } else {
+        findings.push(warn(
+          `launchd-jobs.${job.slug}.restarted_after_failure`,
+          `launchd 任务 ${job.label} 现在在运行，但它上一次退出是失败的（${where.replace(/^，/u, "")}）——KeepAlive 把它拉起来了，`
+            + `说明它至少崩过一次。${logs}`
+        ));
+      }
     }
   } else if (failedExit) {
     findings.push(error(
@@ -759,6 +789,40 @@ function isLaunchdJobLoaded(snapshot, label) {
   return Array.isArray(row?.loadedDomains) && row.loadedDomains.length > 0;
 }
 
+// Round-5 finding D2 - the reason the acceptance gate could not fail.
+//
+// MEASURED, against this module's own analyzeOpenClawRuntimeSnapshot: a
+// resident daemon that is crash-looping, sampled just after launchd relaunched
+// it (state = running, last exit code = 1, runs = 918) with its /health
+// refusing ECONNREFUSED, produced `ok: true`, doctor exit 0, and not one error
+// finding - separately for platform-app and for broker-executor. Runbook step 8
+// tells the operator to trust that answer.
+//
+// Two independent causes, both fixed here:
+//
+//   1. The severity of "the health endpoint did not answer" was a property of
+//      the CHECK ("a dev machine legitimately does not run this service"), when
+//      it is a property of the MACHINE. On a box where launchd is holding the
+//      label - i.e. an installer ran and the daemon is supposed to be up right
+//      now - a refused loopback connection is not ambiguous, it is the service
+//      being dead. Only when launchd holds the label NOWHERE is "unreachable"
+//      the ordinary dev-machine state, and only then is it a warn.
+//   2. `state = running` + a failed last exit was reported as
+//      `restarted_after_failure`, a warn, which is exactly the sample a crash
+//      loop hands you: launchd relaunches, the doctor looks, the process is
+//      briefly alive, the previous exit is still recorded as a failure.
+//
+// This helper answers question 1 for every loopback probe, so the four of them
+// cannot drift apart again.
+function probeSeverityFor(snapshot, label) {
+  return isLaunchdJobLoaded(snapshot, label) ? error : warn;
+}
+
+// Appended to an unreachable-probe message when launchd IS holding the label:
+// says why this is being called a failure rather than a dev-machine warning.
+const LOADED_BUT_UNREACHABLE_SUFFIX = "（launchd 当前持有这个标签，也就是说这台机器上它本应正在运行——"
+  + "『已加载但探针不通』说明进程起来了又崩、或崩溃重启循环中，不是开发机没装服务。）";
+
 function describeDomains(domains) {
   return domains.map((domain) => (domain === "system" ? "系统域" : "用户域")).join("、");
 }
@@ -805,10 +869,17 @@ async function checkPlatformAppHealth(snapshot) {
   try {
     response = await fetchImpl(url, { signal: controller.signal });
   } catch (fetchError) {
-    return [warn(
+    // Round-5 finding D2: error when launchd is holding com.alphaloop.platform-app
+    // (the daemon is supposed to be serving this port right now), warn when it
+    // is loaded nowhere (an ordinary dev machine).
+    const severity = probeSeverityFor(snapshot, "com.alphaloop.platform-app");
+    return [severity(
       "platform-app-health.unreachable",
-      `platform-app 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上尚未起服务是正常的——本地手动起服务请跑 pnpm platform:dev；`
-        + `需要常驻运行请跑 ${LAUNCHD_INSTALL_COMMAND.system} 安装 com.alphaloop.platform-app（它是系统域 daemon，pnpm launchd:install-backup-alerts 装不上它）。`
+      `platform-app 健康检查不可达（${url}）：${describeError(fetchError)}。`
+        + (severity === error
+          ? `${LOADED_BUT_UNREACHABLE_SUFFIX}请看 logs/platform-app.err.log，并用 sudo launchctl kickstart -k system/com.alphaloop.platform-app 重启。`
+          : `开发机上尚未起服务是正常的——本地手动起服务请跑 pnpm platform:dev；`
+            + `需要常驻运行请跑 ${LAUNCHD_INSTALL_COMMAND.system} 安装 com.alphaloop.platform-app（它是系统域 daemon，pnpm launchd:install-backup-alerts 装不上它）。`)
     )];
   } finally {
     clearTimeout(timeout);
@@ -875,11 +946,15 @@ async function checkBrokerExecutorHealth(snapshot) {
   try {
     response = await fetchImpl(url, { signal: controller.signal });
   } catch (fetchError) {
-    return [warn(
+    const severity = probeSeverityFor(snapshot, "com.openclaw.system.trading.broker-executor");
+    return [severity(
       "broker-executor-health.unreachable",
-      `broker-executor 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上没起这个服务是正常的；`
-        + `部署机器上请跑 ${LAUNCHD_INSTALL_COMMAND.system} 安装 com.openclaw.system.trading.broker-executor（系统域 daemon），`
-        + `并确认 BROKER_EXECUTOR_SHARED_SECRET 已配置——缺这个环境变量时进程会在绑定端口前就退出，而 launchd 里仍然显示"已加载"。`
+      `broker-executor 健康检查不可达（${url}）：${describeError(fetchError)}。`
+        + (severity === error
+          ? `${LOADED_BUT_UNREACHABLE_SUFFIX}最常见的原因是缺 BROKER_EXECUTOR_SHARED_SECRET——缺它时进程会在绑定端口前就退出，`
+            + `而 launchd 里仍然显示「已加载」。请看 ~/.openclaw/system-logs/broker-executor.system.err.log。`
+          : `开发机上没起这个服务是正常的；部署机器上请跑 ${LAUNCHD_INSTALL_COMMAND.system} `
+            + `安装 com.openclaw.system.trading.broker-executor（系统域 daemon），并确认 BROKER_EXECUTOR_SHARED_SECRET 已配置。`)
     )];
   } finally {
     clearTimeout(timeout);
@@ -1176,10 +1251,20 @@ async function checkRsshubHealth(snapshot) {
       attempt = await fetchWithTimeout("/");
     }
   } catch (fetchError) {
-    return [warn(
+    // com.alphaloop.rsshub is the one user-domain label here. Loaded means the
+    // agent ran `docker start rsshub` at login: the container should be
+    // answering on 1200, and "it is not" is the failure that agent exists to
+    // prevent (measured on the mini: last exit code = 1, i.e. `docker start`
+    // failed and nothing noticed).
+    const severity = probeSeverityFor(snapshot, "com.alphaloop.rsshub");
+    return [severity(
       "rsshub-health.unreachable",
-      `RSSHub 健康检查不可达（${baseUrl}）：${describeError(fetchError)}。如果这台机器还没有创建过 rsshub 容器，请先完成 P10 点火：`
-        + `${RSSHUB_P10_CONTAINER_COMMAND}；如果容器已经创建过、只是这次重启后没跟着起，请跑 pnpm launchd:install-backup-alerts 安装 com.alphaloop.rsshub 任务（负责 docker start rsshub）。`
+      `RSSHub 健康检查不可达（${baseUrl}）：${describeError(fetchError)}。`
+        + (severity === error
+          ? `${LOADED_BUT_UNREACHABLE_SUFFIX}com.alphaloop.rsshub 只负责 docker start，不会创建容器；`
+            + `请看 logs/rsshub.err.log，容器不存在时用 ${RSSHUB_P10_CONTAINER_COMMAND} 重建（必须走 login shell）。`
+          : `如果这台机器还没有创建过 rsshub 容器，请先完成 P10 点火：${RSSHUB_P10_CONTAINER_COMMAND}；`
+            + `如果容器已经创建过、只是这次重启后没跟着起，请跑 pnpm launchd:install-backup-alerts 安装 com.alphaloop.rsshub 任务（负责 docker start rsshub）。`)
     )];
   }
 
