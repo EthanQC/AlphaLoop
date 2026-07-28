@@ -106,13 +106,22 @@ export interface ReportDeliveryPayload {
   pdfPath?: string;
   maxSectionChars?: number;
   /**
-   * WHO may read this report. Set it on every report; see `ReportScope`.
+   * WHO may read this report. REQUIRED in effect, though the type cannot say
+   * so: `deliverReportToFeishu` refuses any payload that reaches it without a
+   * visibility declaration, on every channel, before a target is chosen.
    *
-   * When present it decides routing outright. When absent the delivery layer
-   * falls back to reading `openId`/`audience` (see `classifyReportScope`),
-   * which is how the callers written before this field still work - but an
-   * undeclared payload is treated as "not proven safe for a shared surface"
-   * and is refused by any channel that only has one shared chat.
+   * Optional here only because two older signals still count as declarations -
+   * `openId` (owner-private to that member) and `audience: "group"`
+   * (circle-public), which is how scheduled-report.mjs's two call sites work
+   * unchanged. Anything with none of the three is `undeliverable`.
+   *
+   * Why a runtime refusal and not a required field: every producer is a plain
+   * .mjs script under apps/openclaw-config, which has no package.json and no
+   * tsconfig and is not part of `pnpm typecheck` (that runs over
+   * shared-types + platform-app + broker-executor + longbridge-cli only). A
+   * required property there would be a promise nothing checks. This guard is
+   * the only thing that actually holds, so it lives at the call boundary and
+   * fails closed.
    */
   scope?: ReportScope;
   /**
@@ -345,9 +354,12 @@ export async function sendNotification(payload: NotificationPayload): Promise<No
  */
 export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
   // Before any channel is chosen: a payload that declares owner-private
-  // content with no reachable owner is undeliverable on ALL of them, and the
-  // honest answer is a refusal with the producer's own reason - not a card
-  // sent to whoever the deployment's default target happens to be.
+  // content with no reachable owner - or declares NOTHING AT ALL (2026-07-28
+  // R3) - is undeliverable on ALL of them, and the honest answer is a refusal
+  // with the producer's own reason, not a card sent to whoever the
+  // deployment's default target happens to be. `scope` is narrowed to
+  // DeliverableReportScope from here down, so the channels below cannot
+  // reintroduce a per-channel opinion about an undeclared report.
   const scope = classifyReportScope(payload);
   if (scope.kind === "undeliverable") {
     return { sent: false, target: "none", reason: scope.reason, deliveries: [] };
@@ -676,7 +688,7 @@ async function postFeishuAppMessage(
 // site is unreachable, the behavior itself is covered.
 async function deliverReportViaFallback(
   payload: ReportDeliveryPayload,
-  scope: ReportScopeDecision,
+  scope: DeliverableReportScope,
   primaryError?: string
 ): Promise<ReportDeliveryResult> {
   const refusal = refuseNonPublicOnSharedChatChannel(
@@ -763,7 +775,7 @@ async function deliverReportViaFallback(
 // two, which have no card transport of their own.
 async function deliverReportViaAppCredentials(
   payload: ReportDeliveryPayload,
-  scope: ReportScopeDecision
+  scope: DeliverableReportScope
 ): Promise<ReportDeliveryResult> {
   const resolved = resolveReportDeliveryTarget(scope);
   if (!resolved) {
@@ -907,16 +919,30 @@ function resolveReportDeepLink(payload: ReportDeliveryPayload): ReportDeepLink {
 }
 
 /**
- * What `classifyReportScope` decided. `undeclared` is deliberately a state of
- * its own rather than being folded into either of the real ones: "the producer
- * did not say" is not the same claim as "the producer said this is public",
- * and only one of them may be published to a shared chat.
+ * What `classifyReportScope` decided.
+ *
+ * There is no `undeclared` member any more (2026-07-28 R3). It used to be a
+ * state of its own that each channel then had to have an opinion about, and the
+ * two channels disagreed: the shared-chat ones refused it, the app-credential
+ * one delivered it to whatever the global target was. 个股分析 fell exactly into
+ * that gap - it declared nothing, so it was DM'd to the operator on one channel
+ * and dropped on the other, and neither outcome was anybody's intent. "The
+ * producer did not say" is now simply `undeliverable`: one answer, identical on
+ * every channel, with a reason that names what to declare.
  */
 type ReportScopeDecision =
   | { kind: "circle-public" }
   | { kind: "owner-private"; ownerOpenId: string }
-  | { kind: "undeclared" }
   | { kind: "undeliverable"; reason: string };
+
+/**
+ * A scope a channel is allowed to see. `deliverReportToFeishu` returns on
+ * `undeliverable` BEFORE picking a channel, so every function below it takes
+ * this narrowed type - which makes "an undeclared or undeliverable report
+ * reached a transport" a compile error inside this package rather than a rule
+ * each channel has to remember.
+ */
+type DeliverableReportScope = Exclude<ReportScopeDecision, { kind: "undeliverable" }>;
 
 /**
  * Read the producer's declaration off the payload (see `ReportScope`).
@@ -930,8 +956,11 @@ type ReportScopeDecision =
  *      cards) works unchanged.
  *   3. `audience: "group"` with no `scope` - an explicit statement about the
  *      shared surface, read as circle-public.
- *   4. anything else - `undeclared`. NOT public: see the shared-chat channels,
- *      which refuse it.
+ *   4. anything else - UNDELIVERABLE, on every channel (2026-07-28 R3). Not
+ *      "assume private", not "send it to the default target": a producer that
+ *      said nothing has not been read, so there is no honest recipient to pick,
+ *      and picking one silently is precisely how 个股分析 spent two rounds being
+ *      DM'd to the operator instead of published to the circle.
  */
 function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecision {
   const routingOpenId = payload.openId?.trim() ?? "";
@@ -980,7 +1009,16 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
   if (payload.audience === "group") {
     return { kind: "circle-public" };
   }
-  return { kind: "undeclared" };
+  return {
+    kind: "undeliverable",
+    reason: [
+      `报告「${payload.title}」没有声明可见范围，因此不投递：payload 上既没有 scope，`,
+      '也没有 openId 或 audience:"group" 这两个旧信号，无法判断这份内容可以给谁看。',
+      "请在生产方补上 scope：公共报告用 {visibility:\"circle-public\"}，",
+      "归属某位成员用 {visibility:\"owner-private\", ownerOpenId}，",
+      "知道归属但找不到收件人用 {visibility:\"owner-unresolved\", reason}。"
+    ].join("")
+  };
 }
 
 /**
@@ -996,7 +1034,7 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
  * already-exercised decision rather than a fresh untested guess.
  */
 function refuseNonPublicOnSharedChatChannel(
-  scope: ReportScopeDecision,
+  scope: DeliverableReportScope,
   target: NotificationDeliveryTarget,
   chatDescription: string
 ): ReportDeliveryResult | null {
@@ -1004,19 +1042,13 @@ function refuseNonPublicOnSharedChatChannel(
     return null;
   }
 
-  const why = scope.kind === "owner-private"
-    ? `这份报告归属成员 ${scope.ownerOpenId}，投递出去等于把 TA 的私有内容公开给该会话里的所有人。`
-    : "这份报告没有声明可见范围（scope），无法证明它可以公开；未经声明的内容一律不进共享会话。";
-
   return {
     sent: false,
     target,
     reason: [
       `Refused on the shared-chat channel (${chatDescription}): it can only post to that one chat and cannot address a single member.`,
-      why,
-      scope.kind === "owner-private"
-        ? "Configure FEISHU_APP_ID/FEISHU_APP_SECRET (or an OpenClaw Feishu app account) so per-owner DMs can be addressed."
-        : 'Declare `scope: {visibility: "circle-public"}` on the payload if it really is a public report.'
+      `这份报告归属成员 ${scope.ownerOpenId}，投递出去等于把 TA 的私有内容公开给该会话里的所有人。`,
+      "Configure FEISHU_APP_ID/FEISHU_APP_SECRET (or an OpenClaw Feishu app account) so per-owner DMs can be addressed."
     ].join(" "),
     deliveries: []
   };
@@ -1039,16 +1071,18 @@ interface ResolvedReportTarget {
  *   3. `circle-public` with no group configured - the card still ships, to
  *      whatever the global target is, and the caller is told (groupFallback)
  *      so the run log shows a public report that did not reach the group.
- *   4. `undeclared` - the deployment's global notify/ops target, exactly as
- *      before this field existed. This is NOT a safety claim: it is where an
- *      undeclared report has always gone, and it is precisely why the
- *      shared-chat channels refuse the same payload rather than copying this
- *      leniency.
+ *
+ * There is no fourth case. Until 2026-07-28 R3 an undeclared payload fell
+ * through to the global notify/ops target here, and that branch is what sent
+ * 个股分析 - a 公共资产 - to the operator's DM while FEISHU_GROUP_CHAT_ID sat
+ * configured and unused, reporting a clean delivery. Undeclared is now refused
+ * upstream, so the only two things that reach this function are the two the
+ * type admits.
  *
  * Wrapped in try/catch because resolveFeishuAppTarget touches sqlite and the
  * filesystem, and report delivery must degrade rather than throw.
  */
-function resolveReportDeliveryTarget(scope: ReportScopeDecision): ResolvedReportTarget | null {
+function resolveReportDeliveryTarget(scope: DeliverableReportScope): ResolvedReportTarget | null {
   if (scope.kind === "owner-private") {
     return {
       target: {
@@ -1059,32 +1093,27 @@ function resolveReportDeliveryTarget(scope: ReportScopeDecision): ResolvedReport
     };
   }
 
-  if (scope.kind === "circle-public") {
-    const groupChatId = process.env.FEISHU_GROUP_CHAT_ID?.trim();
-    if (groupChatId) {
-      return {
-        target: {
-          targetType: "chat_id",
-          targetId: groupChatId,
-          source: "env:FEISHU_GROUP_CHAT_ID"
-        }
-      };
-    }
-
-    const fallback = tryResolveGlobalFeishuTarget();
-    if (!fallback) {
-      return null;
-    }
-
+  const groupChatId = process.env.FEISHU_GROUP_CHAT_ID?.trim();
+  if (groupChatId) {
     return {
-      target: fallback,
-      groupFallback: true,
-      groupFallbackReason: `未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标（${fallback.targetType === "chat_id" ? "会话" : "单聊"}，来源 ${fallback.source}），群里本次没有收到发布卡。`
+      target: {
+        targetType: "chat_id",
+        targetId: groupChatId,
+        source: "env:FEISHU_GROUP_CHAT_ID"
+      }
     };
   }
 
-  const target = tryResolveGlobalFeishuTarget();
-  return target ? { target } : null;
+  const fallback = tryResolveGlobalFeishuTarget();
+  if (!fallback) {
+    return null;
+  }
+
+  return {
+    target: fallback,
+    groupFallback: true,
+    groupFallbackReason: `未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标（${fallback.targetType === "chat_id" ? "会话" : "单聊"}，来源 ${fallback.source}），群里本次没有收到发布卡。`
+  };
 }
 
 function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
@@ -1099,7 +1128,7 @@ function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
 // non-2xx webhook), and deliverReportToFeishu must not.
 async function tryDeliverReportViaFallback(
   payload: ReportDeliveryPayload,
-  scope: ReportScopeDecision,
+  scope: DeliverableReportScope,
   primaryError?: string
 ): Promise<ReportDeliveryResult> {
   try {
@@ -1126,12 +1155,16 @@ async function tryDeliverReportViaFallback(
  * "dm"` and no `openId`, so it was published to the shared group and recorded
  * `sent: true`. Inferring privacy from a routing field can only ever catch the
  * payloads that happen to carry that field, which is why the question is now
- * answered by the producer's own `scope` declaration - and why an UNDECLARED
- * payload is refused too rather than assumed publishable.
+ * answered by the producer's own `scope` declaration.
+ *
+ * An undeclared payload never reaches this function at all any more (R3):
+ * `deliverReportToFeishu` refuses it before choosing a channel, so this guard
+ * is left with exactly one job - keeping owner-private content out of the one
+ * shared chat this channel can post to.
  */
 async function deliverReportViaUserPlugin(
   payload: ReportDeliveryPayload,
-  scope: ReportScopeDecision
+  scope: DeliverableReportScope
 ): Promise<ReportDeliveryResult> {
   const refusal = refuseNonPublicOnSharedChatChannel(
     scope,

@@ -744,12 +744,15 @@ rl.on("line", (line) => {
     expect(result.deliveries.every((entry) => !entry.sent)).toBe(true);
   });
 
-  // 2026-07-28 (R2). The openId-shaped guard above catches only payloads that
-  // happen to carry an openId. The 模拟盘收支变化 report is just as
-  // owner-private and carried NONE - `audience: "dm"` and nothing else - so it
-  // walked through and was published here. An UNDECLARED payload is refused for
-  // the same reason a declared-private one is: nothing about it proves it may
-  // be shown to everyone in a shared chat.
+  // 2026-07-28 (R2, then R3). The openId-shaped guard above catches only
+  // payloads that happen to carry an openId. The 模拟盘收支变化 report is just
+  // as owner-private and carried NONE - `audience: "dm"` and nothing else - so
+  // it walked through and was published here. An UNDECLARED payload is refused
+  // for the same reason a declared-private one is: nothing about it proves it
+  // may be shown to everyone in a shared chat. R3 moved that refusal upstream
+  // of channel selection (see "refuses an undeclared payload before choosing a
+  // channel"), so this now pins the outcome from the channel's side - the
+  // plugin is never spawned no matter which channel would have been picked.
   it("refuses a payload that declares no scope at all, rather than assuming it is publishable", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "notifications-undeclared-"));
     const scriptPath = join(tempDir, "fake-plugin.mjs");
@@ -992,6 +995,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
       markdown: REPORT_MARKDOWN,
+      scope: { visibility: "circle-public" },
       reportKind: "daily",
       reportDate: "2026-07-26"
     });
@@ -1039,6 +1043,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
       markdown: REPORT_MARKDOWN,
+      scope: { visibility: "circle-public" },
       reportKind: "daily",
       reportDate: "2026-07-26"
     });
@@ -1079,7 +1084,8 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
 
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
-      markdown: REPORT_MARKDOWN
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "circle-public" }
     });
 
     expect(result.sent).toBe(false);
@@ -1097,7 +1103,8 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
 
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
-      markdown: REPORT_MARKDOWN
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "circle-public" }
     });
 
     expect(result.sent).toBe(false);
@@ -1233,6 +1240,40 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(calls).toHaveLength(0);
   });
 
+  // 2026-07-28 (R3). Until now "undeclared" meant two different things
+  // depending on which channel picked it up: the shared-chat channels refused
+  // it, while THIS one - the only one production uses - fell through to
+  // tryResolveGlobalFeishuTarget() and DM'd it to the operator. That gap is
+  // where 个股分析 lived: a 公共资产 delivered to one person's DM with
+  // FEISHU_GROUP_CHAT_ID sitting configured and unused, reported as sent.
+  // A producer that declares nothing now gets one answer everywhere.
+  it("refuses an undeclared payload before choosing a channel, even with every target configured", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    process.env.FEISHU_NOTIFY_CHAT_ID = "oc_ops_chat";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 个股分析 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      reportKind: "stock-analysis",
+      reportDate: "2026-07-28"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.deliveries).toEqual([]);
+    // Not even a tenant-token fetch: the refusal is upstream of every channel,
+    // so there is nothing to half-deliver and nothing to record as delivered.
+    expect(calls).toHaveLength(0);
+    // The reason names the payload and the three declarations that fix it, so
+    // an operator reading the run log knows which producer to change.
+    expect(result.reason).toContain("OpenClaw 个股分析 2026-07-28");
+    expect(result.reason).toContain("circle-public");
+    expect(result.reason).toContain("owner-private");
+    expect(result.reason).toContain("owner-unresolved");
+  });
+
   it("refuses a payload whose scope and openId name different owners instead of picking one", async () => {
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
     const calls = stubFetch(okFeishu());
@@ -1289,6 +1330,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
       markdown: `# OpenClaw 日报 2026-07-26\n\n${longSection}`,
+      scope: { visibility: "circle-public" },
       maxSectionChars: 100
     });
 
@@ -1449,13 +1491,30 @@ describe("deliverOperationalAlertToFeishu (operational alerts are not reports)",
 
   // The regression itself, pinned from the Feishu side: routing an alert
   // through the report path silently throws the body away.
+  //
+  // Two failures now, in the order an alert would hit them. An alert payload
+  // carries no visibility declaration (alerts are addressed to the operator,
+  // not to a member), so since 2026-07-28 R3 the report path refuses it before
+  // any channel is chosen - the first assertion. Force a declaration on and the
+  // ORIGINAL damage is still there: the body is summarized into a card and
+  // every load-bearing line disappears.
   it("is the reason an alert must NOT go through the report path (which drops the body)", async () => {
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
     const calls = stubFetch(okFeishu);
 
-    await deliverReportToFeishu({
+    const undeclared = await deliverReportToFeishu({
       title: "OpenClaw 自动报告失败告警：daily",
       markdown: ALERT_MARKDOWN
+    });
+
+    expect(undeclared.sent).toBe(false);
+    expect(undeclared.reason).toContain("没有声明可见范围");
+    expect(outboundMessages(calls)).toHaveLength(0);
+
+    await deliverReportToFeishu({
+      title: "OpenClaw 自动报告失败告警：daily",
+      markdown: ALERT_MARKDOWN,
+      scope: { visibility: "circle-public" }
     });
 
     const sends = outboundMessages(calls);
