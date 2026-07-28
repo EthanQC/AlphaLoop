@@ -695,3 +695,104 @@ describe("C1: selectExecutionReports is owner-scoped", () => {
     expect(scheduledReport.countUnattributedExecutionReports(db, window)).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// F4 (2026-07-28 round 3): classifyExecutionStatus decided whether a trade
+// happened by regexing the body. The reconcile writer's own end-to-end case is
+// pinned in reconcile-official-paper-orders.test.ts, against a row that writer
+// really produced. These cover the OTHER writer's row shape and the two
+// fallbacks.
+//
+// The broker-executor rows here get their metadata from the REAL exported
+// buildExecutionReportMetadata - that function, not this test, decides that the
+// stage nests at metadata.result.brokerOrderStage, which is the contract
+// classifyExecutionStatus now depends on. The stage/localStatus VALUES come out
+// of the shared broker-status-map module rather than being typed in here, so
+// this file cannot invent a status vocabulary the rest of the system does not
+// use.
+// ---------------------------------------------------------------------------
+const brokerExecutor = await import("../../broker-executor/src/server.ts");
+const { mapBrokerStatusToStage } = await import("./broker-status-map.mjs");
+
+function brokerExecutorRow(brokerStatus: string, symbol = "NVDA.US") {
+  const { stage, localStatus } = mapBrokerStatusToStage(brokerStatus);
+  const ticket = {
+    id: "ticket_prop_p_f4",
+    source: "proposals-cli",
+    submittedAt: "2026-07-14T10:00:00.000Z",
+    environment: "paper" as const,
+    assetClass: "stock" as const,
+    symbol,
+    side: "buy" as const,
+    quantity: 4,
+    conviction: "normal" as const,
+    notionalUsd: 400,
+    ownerId: "member_one",
+    proposalId: "p_f4"
+  };
+  const result = {
+    ticketId: ticket.id,
+    environment: "paper" as const,
+    status: localStatus,
+    provider: "longbridge-paper" as const,
+    externalOrderId: "ext_f4",
+    brokerStatus,
+    brokerOrderStage: stage,
+    limitPrice: 100,
+    reasons: [`长桥券商状态为 ${brokerStatus}；本地状态为 ${localStatus}。`]
+  };
+  return {
+    category: "trade",
+    title: `${symbol} 执行报告`,
+    body: brokerExecutor.buildExecutionReportBody(ticket, result),
+    // Stored as a JSON string, which is what selectExecutionReports' raw
+    // SELECT hands the renderer - not the parsed object the repository returns.
+    metadata: JSON.stringify(brokerExecutor.buildExecutionReportMetadata(ticket, "p_f4", result))
+  };
+}
+
+describe("F4: execution status is classified from the row's structured outcome", () => {
+  it("reads broker-executor's nested metadata.result.brokerOrderStage", () => {
+    expect(scheduledReport.summarizeExecutionRow(brokerExecutorRow("Filled")).status)
+      .toBe("券商已确认成交。");
+    expect(scheduledReport.summarizeExecutionRow(brokerExecutorRow("New")).status)
+      .toBe("订单已提交至券商并存活，尚未观察到成交。");
+    expect(scheduledReport.summarizeExecutionRow(brokerExecutorRow("Rejected")).status)
+      .toBe("券商拒绝该订单，未成交。");
+    expect(scheduledReport.summarizeExecutionRow(brokerExecutorRow("Canceled")).status)
+      .toBe("订单已撤销，未成交。");
+    // 'accepted' is the local status for BOTH filled and cancelled, so a
+    // partial fill must not be rounded up into a 成交 claim either.
+    expect(scheduledReport.summarizeExecutionRow(brokerExecutorRow("PartialFilled")).status)
+      .toContain("尚未确认为全部成交");
+  });
+
+  it("names an unmapped broker status instead of guessing whether it traded", () => {
+    const row = brokerExecutorRow("SomeBrandNewBrokerStatus");
+    expect(JSON.parse(row.metadata).result.brokerOrderStage).toBe("unknown_broker_status");
+    expect(scheduledReport.summarizeExecutionRow(row).status)
+      .toBe("券商状态「SomeBrandNewBrokerStatus」不在本系统的状态映射表内，无法判定是否成交。");
+  });
+
+  it("still reads the prose for a row that carries no structured outcome at all", () => {
+    // Pre-metadata history: body only. This is the ONLY path the English
+    // failure regexes are still reachable from.
+    const legacy = { category: "trade", title: "AAPL execution", body: "Status: failed - API error", metadata: "{}" };
+    expect(scheduledReport.summarizeExecutionRow(legacy).status).toBe("写入或回查失败，未确认为新成交。");
+
+    const daily = { category: "daily", title: "日报", body: "已入库。", metadata: "" };
+    expect(scheduledReport.summarizeExecutionRow(daily).status).toBe("报告记录已入库。");
+  });
+
+  it("a Chinese success narrative that merely contains the word 'failed' is never read as a failure", () => {
+    // The exact sentence reconcile-official-paper-orders.mjs writes into every
+    // body. Structured stage wins; the prose is not consulted.
+    const row = {
+      category: "trade",
+      title: "AAPL.US 执行报告",
+      body: "状态：对账已确认成交（此前误判为提交未确认）\n- 已将提案状态由 failed 更正为 executed，并补记一条交易执行报告。",
+      metadata: JSON.stringify({ symbol: "AAPL.US", side: "sell", quantity: 10, lifecycleStage: "filled", localStatus: "accepted", brokerStatus: "Filled" })
+    };
+    expect(scheduledReport.summarizeExecutionRow(row).status).toBe("券商已确认成交。");
+  });
+});

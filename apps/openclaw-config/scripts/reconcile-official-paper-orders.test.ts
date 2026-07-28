@@ -773,3 +773,77 @@ describe("finding #2 regression: an existing non-null ticket_id is never overwri
     expect(allRows(db)).toHaveLength(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// F4/F5 (2026-07-28 round 3). These do NOT assert against a hand-written row
+// shape: they run the REAL reconcileOfficialPaperOrders against a real temp
+// sqlite db, read the row it actually wrote back out of the table, and hand
+// that row to the REAL scheduled-report.mjs functions the owner's weekly
+// personal page renders through. A row shape invented here to match the reader
+// would prove nothing - that is exactly the fixture dishonesty that let F4 ship
+// under a green suite.
+//
+// F4: classifyExecutionStatus tested the row's PROSE with
+// /failed|API error|token empty|not valid JSON|Unexpected token/iu. Every body
+// this writer emits ends with the constant line 「- 已将提案状态由 failed 更正为
+// executed，并补记一条交易执行报告。」, so the English word `failed` inside that
+// Chinese success sentence matched and the owner was told
+// 「写入或回查失败，未确认为新成交。」 about a confirmed fill, 100% of the time.
+// F5: the writer received limitPrice, spent it on notionalUsd, and stored it
+// nowhere - so the same fill rendered with no price at all.
+// ---------------------------------------------------------------------------
+const scheduledReport = await import("./scheduled-report.mjs");
+
+async function reconcileOneFilledOrder(
+  db: DatabaseSync,
+  over: { symbol: string; side: "buy" | "sell"; quantity: number; limitPrice: number; status?: string }
+) {
+  seedMember(db, "member_1");
+  const proposal = seedProposal(db, { ownerId: "member_1", ...over });
+  const ticketId = `ticket_prop_${proposal.id}`;
+  new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）：模拟超时。");
+  insertLifecycleRow(db, {
+    id: "row_f4", ticketId, externalOrderId: null,
+    symbol: over.symbol, side: over.side, quantity: over.quantity, limitPrice: over.limitPrice,
+    lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+    submittedAt: "2026-07-15T14:00:00.000Z"
+  });
+  await runReconcile(db, [
+    brokerOrder({
+      order_id: "EXT_F4",
+      symbol: over.symbol,
+      side: over.side === "sell" ? "Sell" : "Buy",
+      quantity: over.quantity,
+      price: over.limitPrice,
+      status: over.status ?? "Filled",
+      created_at: "2026-07-15T14:02:00.000Z"
+    })
+  ]);
+  const row = db.prepare(`SELECT * FROM execution_reports WHERE category = 'trade'`).get() as Record<string, unknown>;
+  expect(row).toBeTruthy();
+  return row;
+}
+
+describe("F4: a reconciled fill is not reported to its owner as a failure", () => {
+  it("classifies the REAL writer's row from its structured stage, not from the word 'failed' in its Chinese prose", async () => {
+    const db = makeDb();
+    const row = await reconcileOneFilledOrder(db, { symbol: "AAPL.US", side: "sell", quantity: 10, limitPrice: 210 });
+
+    // The trigger string is still in the body - the fix is that it is no
+    // longer what decides the verdict. If this assertion ever fails the test
+    // below stops proving anything, so it is pinned deliberately.
+    expect(String(row.body)).toContain("已将提案状态由 failed 更正为 executed");
+
+    const summary = scheduledReport.summarizeExecutionRow(row);
+    expect(summary.status).toBe("券商已确认成交。");
+    expect(summary.status).not.toContain("失败");
+  });
+
+  it("a merely-live (submitted) reconciled order is not upgraded to a 成交 claim either", async () => {
+    const db = makeDb();
+    const row = await reconcileOneFilledOrder(db, { symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 180, status: "New" });
+
+    const summary = scheduledReport.summarizeExecutionRow(row);
+    expect(summary.status).toBe("订单已提交至券商并存活，尚未观察到成交。");
+  });
+});

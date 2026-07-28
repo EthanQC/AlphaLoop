@@ -1058,7 +1058,112 @@ export function summarizeExecutionRow(row, facts = extractExecutionFacts(row)) {
   };
 }
 
+function firstText(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim() !== "") {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * F4 (2026-07-28 round 3): the row's own STRUCTURED outcome.
+ *
+ * classifyExecutionStatus used to answer "did this trade happen?" by running
+ * /failed|API error|token empty|not valid JSON|Unexpected token/iu over the
+ * body. reconcile-official-paper-orders.mjs - one of exactly two writers of
+ * execution_reports (`grep -rn "reports.save(" apps` finds this one and
+ * broker-executor/src/server.ts's success path, nothing else) - ends EVERY
+ * body it writes with the constant line
+ * 「- 已将提案状态由 failed 更正为 executed，并补记一条交易执行报告。」. The English
+ * word `failed` inside that Chinese success sentence matched the regex, so
+ * 100% of reconciled fills were reported to their own owner as
+ * 「写入或回查失败，未确认为新成交。」 - the opposite of what the same row's body
+ * says. Reproduced end to end by running the real reconcileOfficialPaperOrders
+ * against a temp sqlite db and feeding the row it wrote to this function.
+ *
+ * Both writers already record the outcome as DATA, so read the data:
+ *   - reconcile-official-paper-orders.mjs's reconcileStuckFailedProposal puts
+ *     lifecycleStage / localStatus / brokerStatus at the top level of
+ *     `metadata`;
+ *   - broker-executor's buildExecutionReportMetadata nests the whole
+ *     ExecutionResult under `metadata.result`, so the same three facts are at
+ *     metadata.result.brokerOrderStage / .status / .brokerStatus.
+ * Both shapes were confirmed by running the producers, not by reading them.
+ *
+ * `stage` is null only for a row carrying no structured outcome at all
+ * (pre-metadata history); only then may the caller fall back to prose.
+ */
+function readExecutionOutcome(row) {
+  const metadata = parseExecutionMetadata(row?.metadata);
+  const result = metadata.result && typeof metadata.result === "object" ? metadata.result : {};
+  return {
+    stage: firstText(metadata.lifecycleStage, result.brokerOrderStage),
+    localStatus: firstText(metadata.localStatus, result.status),
+    brokerStatus: firstText(metadata.brokerStatus, result.brokerStatus)
+  };
+}
+
+// F4: one verdict per member of OfficialPaperOrderLifecycleStage
+// (packages/shared-types/src/domain.ts) except the two "we do not know" ones,
+// which are handled separately below so the raw broker status can be named.
+// Only 'filled' is ever allowed to claim 成交.
+const EXECUTION_STAGE_VERDICTS = {
+  filled: "券商已确认成交。",
+  submitted: "订单已提交至券商并存活，尚未观察到成交。",
+  accepted: "订单已被券商受理，尚未观察到成交。",
+  pending: "订单在券商侧仍在进行中（部分成交或撤单请求在途），尚未确认为全部成交。",
+  submitting: "仍在向券商提交，尚未拿到回执。",
+  cancelled: "订单已撤销，未成交。",
+  rejected: "券商拒绝该订单，未成交。",
+  failed: "提交失败，未确认为新成交。",
+  submit_unconfirmed: "提交结果未确认，未确认为新成交。"
+};
+
+// F4: second-tier structured signal. ExecutionResult.brokerOrderStage is
+// optional on the type, so a result that carries only `status` still gets a
+// data-derived verdict instead of falling through to prose. 'accepted' here
+// deliberately does NOT claim 成交: the local status 'accepted' is what
+// broker-status-map.mjs returns for BOTH 'filled' AND 'cancelled', so on its
+// own it cannot distinguish a fill from a cancellation.
+const EXECUTION_LOCAL_STATUS_VERDICTS = {
+  accepted: "执行方已接受该订单；本记录没有券商生命周期阶段，无法据此断言是否成交。",
+  submitted: "订单已提交，尚未观察到成交。",
+  pending: "订单仍在进行中，尚未观察到成交。",
+  rejected: "该订单被拒绝，未成交。"
+};
+
 function classifyExecutionStatus(row, text) {
+  const outcome = readExecutionOutcome(row);
+
+  if (outcome.stage) {
+    const verdict = EXECUTION_STAGE_VERDICTS[outcome.stage];
+    if (verdict) {
+      return verdict;
+    }
+    // 'unknown_broker_status' / 'unknown', or a stage value this table does
+    // not know: say so, naming the broker status, rather than guessing.
+    return outcome.brokerStatus
+      ? `券商状态「${outcome.brokerStatus}」不在本系统的状态映射表内，无法判定是否成交。`
+      : "本记录的券商状态无法识别，无法判定是否成交。";
+  }
+
+  const localVerdict = outcome.localStatus ? EXECUTION_LOCAL_STATUS_VERDICTS[outcome.localStatus] : undefined;
+  if (localVerdict) {
+    return localVerdict;
+  }
+
+  // ---- prose fallback: rows with NO structured outcome only ---------------
+  // Reachable only for pre-metadata history. Both live writers always record a
+  // stage, so neither writer's rows can reach these regexes - which is the
+  // whole point: `failed` inside 「由 failed 更正为 executed」 can no longer be
+  // read as a failure. The other four patterns were audited the same way and
+  // no producer in this repo emits 'API error', 'token empty' or 'Unexpected
+  // token' into an execution_reports body at all; 'not valid JSON' exists only
+  // in _openclaw-gateway.mjs's own thrown error, which never reaches this
+  // table. They stay because for a legacy English row they are the only signal
+  // there is.
   if (/Option trading is disabled|Option strategy .* not allowed|期权/iu.test(text)) {
     return "期权相关请求已拦截，未执行。";
   }
