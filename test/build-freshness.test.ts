@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { BUILD_STAMP_ENV, missingArtifacts, staleProjects } from "./global-setup.js";
+import { BUILD_STAMP_ENV, missingArtifacts, staleProjects, unlistedProjects } from "./global-setup.js";
 
 /**
  * G1's own guard. `test/global-setup.ts` explains WHY the suite must never run
@@ -74,6 +74,16 @@ describe("G1: the suite cannot run against a stale dist", () => {
 
   it("still compiles clean: no project's output lags its sources", () => {
     expect(staleProjects()).toEqual([]);
+  });
+
+  it("checks every project tsc builds, not just the four it was told about (H4)", () => {
+    // staleProjects only filters BUILT_PROJECTS, so a fifth reference added to
+    // the root tsconfig would be built and then verified by nobody - which the
+    // header of global-setup.ts claimed could not happen.
+    expect(
+      unlistedProjects(),
+      "these projects are in the build graph but absent from BUILT_PROJECTS, so their freshness is unchecked"
+    ).toEqual([]);
   });
 
   it("exposes every value shared-types' CURRENT source exports on the dist module under test", () => {

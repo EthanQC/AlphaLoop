@@ -44,10 +44,16 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const TSC = createRequire(import.meta.url).resolve("typescript/bin/tsc");
 
 /**
- * The four `composite` projects the root tsconfig references, in the exact
- * spelling `tsc -b --dry` reports them. Kept explicit so that ADDING a project
- * to the root tsconfig without teaching this file about it fails the run
- * instead of silently going unbuilt and unverified.
+ * The `composite` projects the root tsconfig references, in the exact spelling
+ * `tsc -b --dry` reports them. Kept explicit so that ADDING a project to the
+ * root tsconfig without teaching this file about it fails the run instead of
+ * silently going unverified.
+ *
+ * H4 (2026-07-28, round-5): that second sentence was not true when it was
+ * written. `staleProjects` only ever filtered THIS list, so a fifth project
+ * would have been built by `tsc -b` and then checked by nobody - the report
+ * would simply not mention it and nothing would complain.
+ * `unlistedProjects` below is what makes the claim true.
  */
 const BUILT_PROJECTS = [
   "packages/shared-types/tsconfig.json",
@@ -112,6 +118,23 @@ export function staleProjects(): string[] {
   return BUILT_PROJECTS.filter((project) => !report.includes(`'${join(ROOT, project)}' is up to date`));
 }
 
+/**
+ * Projects `tsc -b` builds that BUILT_PROJECTS does not name (H4).
+ *
+ * `tsc -b --dry` reports one line per project in the build graph
+ * (`Project '<abs path>/tsconfig.json' is up to date`), so the graph can be
+ * compared against the list rather than only sampled through it. Without this,
+ * adding a fifth reference to the root tsconfig would leave it built but never
+ * checked for staleness, and both this file's header and
+ * test/build-freshness.test.ts would go on reporting green about four.
+ */
+export function unlistedProjects(): string[] {
+  const report = runTsc(["-b", "--dry"]);
+  const listed = new Set(BUILT_PROJECTS.map((project) => join(ROOT, project)));
+  const seen = [...report.matchAll(/Project '([^']+)'/gu)].map((match) => match[1] as string);
+  return [...new Set(seen)].filter((project) => !listed.has(project)).sort();
+}
+
 export default async function setup(): Promise<() => void> {
   const startedAt = Date.now();
   runTsc(["-b"]);
@@ -133,6 +156,14 @@ export default async function setup(): Promise<() => void> {
     throw new Error(
       `after building, tsc still does not consider these projects up to date: ${stale.join(", ")}. ` +
         `Refusing to run the suite against output that does not match its sources.`
+    );
+  }
+
+  const unlisted = unlistedProjects();
+  if (unlisted.length > 0) {
+    throw new Error(
+      `tsc -b builds these projects, but BUILT_PROJECTS in test/global-setup.ts does not name them, so ` +
+        `nothing checks whether their output matches their sources: ${unlisted.join(", ")}. Add them to that list.`
     );
   }
 
