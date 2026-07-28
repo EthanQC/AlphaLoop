@@ -599,10 +599,17 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
   // It matters because it was the disguise: for four rounds a case named
   // "a WORKING fallback channel" passed here on the strength of this fixture
   // while the real defaultCardTransport, on the deploy target's credential
-  // shape, refused an empty target outright and sent nothing. The real
-  // transport's answer to `{}` is now pinned where it can be measured rather
-  // than authored - packages/shared-types/src/notifications.test.ts,
-  // "directHttpCardTransport empty target = the deployment's operator".
+  // shape, refused an empty target outright and sent nothing.
+  //
+  // 2026-07-29 (J3): the last sentence used to promise that the real
+  // transport's answer to `{}` was "pinned ... [as] directHttpCardTransport
+  // empty target = the deployment's operator". No such case exists, and since
+  // 41a7a34 the claim is backwards: `{}` is a HARD REFUSAL in BOTH transports
+  // ("needs a chatId or openId (or `operator: true` ...)"), and asking for the
+  // operator means passing `{ operator: true }` - which is what the poller
+  // passes. What IS pinned, in packages/shared-types/src/notifications.test.ts,
+  // is the describe block "directHttpCardTransport operator target
+  // (2026-07-28 R5)".
   function cardTransport(sink: Array<{ target: unknown; cardJson: any }>) {
     return {
       sendCard: async (target: unknown, cardJson: any) => {
@@ -826,10 +833,15 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
     });
 
     // Scope: the POLLER's decision - with no member to address, it must still
-    // make exactly one send, to the operator target (`{}`), and record
-    // escalation_sent when that send reports success. Whether a real transport
-    // can carry `{}` anywhere is a different question, answered by
+    // make exactly one send, to the operator target (`{ operator: true }`), and
+    // record escalation_sent when that send reports success. Whether a real
+    // transport can carry that anywhere is a different question, answered by
     // notifications.test.ts (see the cardTransport fixture note above).
+    //
+    // 2026-07-29 (J3): this said the operator target was `{}`, directly above
+    // an assertion reading `toEqual({ operator: true })`. Since 41a7a34 `{}` is
+    // refused by both transports, so the note taught exactly the belief the
+    // commit was written to remove.
     it("zero reachable members: the escalation is addressed to the operator target and, if that send succeeds, records escalation_sent", async () => {
       const { db, dbPath } = makeDb();
       seedMemberNoFeishu(db, "member_1");

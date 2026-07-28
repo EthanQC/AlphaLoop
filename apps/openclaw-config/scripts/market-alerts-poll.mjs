@@ -214,14 +214,15 @@
 //   the 3rd+ consecutive failure (honoring the identical 12h throttle), sends
 //   the escalation card straight to the `{operator: true}` target - which also
 //   needs no members table (see sendOperatorCard's own comment below for how
-//   each transport resolves an empty target; note that the direct HTTP one
+//   each transport resolves the operator form - an EMPTY target `{}` is
+//   refused outright by both since 41a7a34; note that the direct HTTP one
 //   does consult the notification_targets row, so "no db needed" here means
 //   no db handle of OUR OWN - notifications.ts opens and closes its own, and
 //   degrades to a named refusal if it cannot).
 //
 //   Fix 3 - for `reason === "send_failed"` the delivery escalation card says
-//   the likely cause is Feishu auth expiry - but the member send AND the `{}`
-//   fallback both go through the same Feishu channel, so the escalation card
+//   the likely cause is Feishu auth expiry - but the member send AND the
+//   `{operator: true}` fallback both go through the same Feishu channel, so the escalation card
 //   itself fails to send too. The outage is by construction unreportable
 //   through Feishu - only a marker in run_log that nothing external reads.
 //   Fixed by a LOUD out-of-band artifact, runtime/market-alerts/
@@ -616,10 +617,21 @@ async function escalateWithoutDb(dbPath, { now, error, openError, transport }) {
       ]
     };
     // No db handle exists at all here, so this bypasses sendOperatorCard
-    // (which needs one for MemberRepository) and sends straight to the `{}`
-    // fallback target - resolveFeishuUserPluginBotChatId() via
-    // sendInteractiveCard's default transport, same as sendOperatorCard's
-    // own fallback tier (see that function's doc comment).
+    // (which needs one for MemberRepository) and addresses the operator
+    // directly with `{ operator: true }`, the same way sendOperatorCard's own
+    // fallback tier does (see that function's doc comment).
+    //
+    // 2026-07-29 (J3): this comment used to describe the pre-41a7a34 shape -
+    // "sends straight to the `{}` fallback target - resolveFeishuUserPluginBotChatId()
+    // via sendInteractiveCard's default transport". Two things about that are
+    // now false. `{}` is a HARD REFUSAL in both transports
+    // (resolveDirectCardTarget and legacyMcpCardTransport each return
+    // "needs a chatId or openId (or `operator: true` ...)"), and
+    // resolveFeishuUserPluginBotChatId() is only the LEGACY transport's answer
+    // for the operator - a credentialed deployment gets directHttpCardTransport,
+    // which resolves the operator via resolveFeishuAppTarget(). The line below
+    // has passed `{ operator: true }` since 41a7a34; the note was missed while
+    // its twin at sendOperatorCard was corrected.
     try {
       const send = await sendInteractiveCard(card, { operator: true }, transport);
       if (send.ok) {
