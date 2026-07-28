@@ -8,11 +8,11 @@
 // see market-alerts-seam.test.ts for the writer (setTargets) <-> reader
 // (isSymbolWatched) cross-module seam test, per this task's "writer-side
 // and reader-side must be tested against each other" instruction.
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { parseConclusionBox } from "./conclusion-box.mjs";
@@ -1224,5 +1224,174 @@ describe("stock-analysis Feishu delivery payload (spec drift A3)", () => {
         process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
       }
     }
+  });
+});
+
+// 2026-07-28 (spec drift R3/F7). 个股分析 was the only report producer that
+// declared no `scope`, so the delivery layer classified it "undeclared" and
+// both channels got it wrong - measured, on this exact payload, before the fix:
+//
+//   app credentials + FEISHU_GROUP_CHAT_ID=oc_public_group
+//     -> {sent:true, target:"feishu-app-open-id"}, receive_id ou_global_member.
+//        The 公共资产 (§1.2/§1.4) went to the operator's DM and the group never
+//        saw it, with groupFallback UNSET so nothing in the run log said so.
+//   legacy shared-chat channel
+//     -> {sent:false, reason:"...未经声明的内容一律不进共享会话"}, plugin never
+//        spawned. R2 made undeclared fail closed, so on a deployment with no
+//        FEISHU_APP_ID/SECRET the batch silently stopped being delivered.
+//
+// These drive the REAL producer through the REAL delivery layer (the built
+// dist the .mjs scripts import) on both channels, because the payload's own
+// shape is what the previous test pair asserted and that is exactly what could
+// be true while delivery still landed in the wrong chat.
+describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
+  const envKeys = [
+    "LARK_APP_ID",
+    "LARK_APP_SECRET",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ACCOUNT_ID",
+    "FEISHU_GROUP_CHAT_ID",
+    "FEISHU_NOTIFY_OPEN_ID",
+    "FEISHU_NOTIFY_CHAT_ID",
+    "FEISHU_WEBHOOK_URL",
+    "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "FEISHU_USER_PLUGIN_COMMAND",
+    "FEISHU_USER_PLUGIN_ARGS",
+    "FEISHU_USER_PLUGIN_DISABLED",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "PLATFORM_PUBLIC_BASE_URL",
+    "HOME"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+  const savedCwd = process.cwd();
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      if (key !== "HOME") {
+        delete process.env[key];
+      }
+    }
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (process.cwd() !== savedCwd) {
+      process.chdir(savedCwd);
+    }
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+  });
+
+  /** The payload runAnalysis itself hands deliverReportToFeishu. */
+  function realBatchPayload(): Record<string, unknown> {
+    return stockAnalysis.buildStockAnalysisDeliveryPayload({
+      label: "2026-07-28",
+      markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83；阻力位 312.51。",
+      markdownPath: "/tmp/reports/2026-07-28.md",
+      pdfPath: undefined
+    }) as Record<string, unknown>;
+  }
+
+  /** Isolates both sqlite/credential sources resolveFeishuAppTarget can reach
+   * (cwd-derived notification_targets, $HOME-derived ~/.openclaw) into a temp
+   * dir, so nothing here can read or write runtime/trading.sqlite. */
+  function isolateHome(): string {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-stock-analysis-delivery-"));
+    tempDirs.push(dir);
+    process.env.HOME = dir;
+    process.chdir(dir);
+    return dir;
+  }
+
+  it("declares itself 圈子公开, per §1.2「个股分析是公共资产，谁都能看」", () => {
+    expect(realBatchPayload().scope).toEqual({ visibility: "circle-public" });
+    expect(realBatchPayload().audience).toBe("group");
+    // Not owner-scoped in any form: a batch covers the union of every member's
+    // target list, so there is no member it could belong to.
+    expect(realBatchPayload().openId).toBeUndefined();
+  });
+
+  it("lands in the circle's group chat on the app-credential channel, not the operator's DM", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    isolateHome();
+    process.env.FEISHU_APP_ID = "cli_trading_copilot";
+    process.env.FEISHU_APP_SECRET = "app-secret-x";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    // The DM target the undeclared payload used to be delivered to. It stays
+    // configured on purpose: the assertion is that the group wins over it.
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+
+    const sends: Array<{ url: string; receiveId: string }> = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes("tenant_access_token")) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: "t-token", expire: 7200 }), { status: 200 });
+      }
+      const body = JSON.parse(String(init?.body)) as { receive_id: string };
+      sends.push({ url: href, receiveId: body.receive_id });
+      return new Response(JSON.stringify({ code: 0, msg: "success", data: { message_id: "om_batch" } }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await notifications.deliverReportToFeishu(realBatchPayload());
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-chat-id");
+    expect(result.groupFallback).toBeFalsy();
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=chat_id");
+    expect(sends[0]!.receiveId).toBe("oc_public_group");
+  });
+
+  it("is published again on the legacy shared-chat channel instead of being refused as undeclared", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    const dir = isolateHome();
+    const markerPath = join(dir, "plugin-was-spawned.log");
+    const scriptPath = join(dir, "fake-plugin.mjs");
+    writeFileSync(
+      scriptPath,
+      [
+        `import { writeFileSync } from "node:fs";`,
+        `writeFileSync(${JSON.stringify(markerPath)}, "spawned", "utf8");`,
+        `import { createInterface } from "node:readline";`,
+        `const rl = createInterface({ input: process.stdin, terminal: false });`,
+        `rl.on("line", (line) => {`,
+        `  const trimmed = line.trim();`,
+        `  if (!trimmed) return;`,
+        `  let message;`,
+        `  try { message = JSON.parse(trimmed); } catch { return; }`,
+        `  if (message.id === undefined) return;`,
+        `  const result = message.method === "initialize"`,
+        `    ? {}`,
+        `    : { content: [{ type: "text", text: "Message sent (bot): om_batch_summary" }] };`,
+        `  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");`,
+        `});`,
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    // App credentials must be genuinely unresolvable, or the machine running
+    // the suite decides which channel this exercises.
+    process.env.LARK_APP_ID = "test_app_id";
+    process.env.LARK_APP_SECRET = "test_app_secret";
+    process.env.FEISHU_ACCOUNT_ID = "__no_such_account__";
+    process.env.FEISHU_USER_PLUGIN_BOT_CHAT_ID = "oc_shared_group_chat";
+    process.env.FEISHU_USER_PLUGIN_COMMAND = process.execPath;
+    process.env.FEISHU_USER_PLUGIN_ARGS = JSON.stringify([scriptPath]);
+
+    const result = await notifications.deliverReportToFeishu(realBatchPayload());
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-user-plugin-bot-post");
+    expect(existsSync(markerPath)).toBe(true);
+    expect(result.reason).toBeUndefined();
   });
 });

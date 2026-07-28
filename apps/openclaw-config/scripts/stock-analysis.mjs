@@ -339,14 +339,25 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
  * `stock-analysis` + the batch date is exactly the /stock-analysis/<date>
  * reading page the platform router serves (deep-links.ts).
  *
- * Audience is left at the default (单聊/DM): the batch card is not a 公共通知
- * like the daily/weekly publication card, and it carries no per-owner `openId`
- * because a batch covers the shared target list rather than one member.
+ * 2026-07-28 (spec drift R3/F7). This was the ONE report producer that declared
+ * no `scope`, and the comment here used to justify it: "audience is left at the
+ * default (单聊/DM)". That was wrong on the requirements and wrong in effect.
+ * §1.2「个股分析是公共资产，谁都能看」and §1.4「日报/周报/个股分析是公共的」
+ * make the batch a 公共资产, and an undeclared payload was measured landing in
+ * the operator's DM even with FEISHU_GROUP_CHAT_ID configured, while the legacy
+ * shared-chat channel refused it outright (R2 made undeclared fail closed) - so
+ * on a deployment without app credentials the batch stopped being sent at all.
+ * A batch covering the union of every member's target list is exactly what
+ * `circle-public` means; nothing in it belongs to one member.
+ *
+ * `audience: "group"` says the same thing about the CHANNEL (§4 群: 公共报告
+ * 发布卡). `scope` is what decides routing - audience is set alongside it so
+ * the two cannot drift apart, not because delivery needs both.
  *
  * Extracted as a named function so the payload - the thing that actually
- * decides whether the reader can reach the report - has a direct test, instead
- * of being an object literal buried in a path that needs live Longbridge data
- * to reach.
+ * decides who receives this and whether they can reach the report - has a
+ * direct test, instead of being an object literal buried in a path that needs
+ * live Longbridge data to reach.
  */
 export function buildStockAnalysisDeliveryPayload({ label, markdown, markdownPath, pdfPath }) {
   return {
@@ -354,6 +365,8 @@ export function buildStockAnalysisDeliveryPayload({ label, markdown, markdownPat
     markdown,
     markdownPath,
     pdfPath,
+    scope: { visibility: "circle-public" },
+    audience: "group",
     reportKind: "stock-analysis",
     reportDate: label
   };
