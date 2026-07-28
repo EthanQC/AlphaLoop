@@ -51,24 +51,78 @@ pnpm platform:start
 - 个股分析：用户指定标的后，每三天 21:00 发送一次批量分析，PDF + 摘要卡片。
 - 官方模拟盘：美股常规交易时段每小时轮询；美股开盘后 30 分钟发送收支变化表。
 
-安装本地调度——一台正式部署机通常三条都要跑（详见 `apps/openclaw-config/README.md` 的「Launchd」章节）：
+## 部署机安装顺序（2026-07-28 起）
+
+无人值守的 8 个服务在 ac741d8 之后全部住在 `/Library/LaunchDaemons`（系统域，开机即起，不需要有人登录图形界面）；只有 `com.alphaloop.rsshub` 仍是用户级 LaunchAgent，因为它依赖用户级的 colima/docker socket。谁拥有哪个标签，唯一事实来源是 `apps/openclaw-config/scripts/install-launchd-ownership.txt`。
+
+**顺序是有意义的，但整段可以任意次数重跑**（每一步都先退役再安装，重复执行不会产生第二份实例）：
 
 ```bash
-# 日报/周报/个股分析——2026-07-14 起唯一 owner 是 OpenClaw cron 通道
-pnpm openclaw:cron:install
+# 0. 前置：daemon 直接跑 dist 产物，必须先装依赖并构建
+pnpm install
+pnpm build
 
-# 官方模拟盘每小时轮询 + 开盘后收支变化表
+# 1. 安装用户级任务（当前只有 com.alphaloop.rsshub），并顺带 `openclaw gateway install`。
+#    必须排在第 2 步之前：这一步会创建用户级 ai.openclaw.gateway，第 2 步会把它 bootout；
+#    顺序反了，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
+pnpm launchd:install-backup-alerts
+
+# 2. 安装 8 个无人值守服务到 /Library/LaunchDaemons。【需要 sudo】
+#    先干跑一次，确认这次会为哪个用户安装（不写任何文件、不建目录、不调 launchctl）：
+PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
+#    确认输出里的 target_user / target_home 是部署机操作者本人后，再真正安装：
+sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
+
+# 3. 收尾清理旧标签。这条脚本从 2026-07-28 起【只退役、不再安装任何 plist】。
+#    排在第 2 步之后是有原因的：它用 rmSync 直接删除 plist（不备份），而第 2 步
+#    是移进备份目录。等第 2 步先把那 8 个标签移走，这一步能删到的就只剩
+#    event-bus / catchup / maintenance 这类早已废弃的标签和 5 个历史报告 plist——
+#    都是不需要留退路的。反过来先跑这条，那 8 个 plist 会被无备份地删掉。
 pnpm launchd:install-user
 
-# 每日交易数据库备份 + 市场提醒（market-alerts）轮询器 + platform-app 常驻服务
-pnpm launchd:install-backup-alerts
+# 4. 注册 5 个报告类 openclaw cron 任务（需要第 2 步的 gateway 已经在跑）
+pnpm openclaw:cron:install
+
+# 5. 部署 control agent 人设，否则飞书机器人会以无人设的 vanilla Codex 应答
+node apps/openclaw-config/scripts/render-openclaw-config.mjs
+
+# 6. 一次性：创建 rsshub 容器（之后由 com.alphaloop.rsshub 负责重启后 docker start）
+docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub
+
+# 7. 验收：不应再出现任何 launchd-jobs.* 发现项
+pnpm openclaw:runtime:doctor
 ```
 
-只跑其中一条会漏装其余任务——例如只跑 `launchd:install-user` 的机器没有日报/周报/个股分析，也没有每日备份或盘中提醒器（`openclaw:runtime:doctor` 的 `launchd-jobs.*.not_loaded` 提示就是在检测这种情况）。这三条命令彼此不会冲突，可以任意顺序、任意次数重跑。
+哪些要 sudo、装给谁：
 
-`launchd:install-backup-alerts`（Phase 3 起）额外安装 `com.alphaloop.platform-app`——一个常驻 `KeepAlive` launchd 服务（不是周期任务），启动 `pnpm --filter @apps/platform-app start`；`openclaw:runtime:doctor` 同样会检测它是否已加载，以及它的 `/health` 是否可达。
+| 命令 | 需要 sudo | 装到哪 | 服务以谁的身份运行 |
+| --- | --- | --- | --- |
+| `pnpm launchd:install-backup-alerts` | 否 | `~/Library/LaunchAgents` | 当前登录用户 |
+| `sudo zsh .../install-system-daemons.sh` | **是** | `/Library/LaunchDaemons` | plist 里的 `UserName`，默认取 `SUDO_USER`（即敲 sudo 的那个人），**不是 root** |
+| `pnpm launchd:install-user` | 否 | 什么都不装（只退役） | — |
+| `pnpm openclaw:cron:install` | 否 | `openclaw cron`（不写 plist） | 当前登录用户的 gateway 会话 |
 
-`launchd:install-backup-alerts`（Phase 4 起）还额外安装 `com.alphaloop.rsshub`——`RunAtLoad=true`/`KeepAlive=false`，每次重启只跑一次 `docker start rsshub`；rsshub 容器本体不由这个任务创建，需要先在部署机上手动跑一次 P10 点火命令 `docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub`（详见 `apps/openclaw-config/README.md` 的「新闻引擎」章节）。
+`package.json` 里另有一条 `pnpm launchd:install-system`，跑的就是同一个 `install-system-daemons.sh`（`install-user-schedules.mjs` 的输出也提这个名字）。它同样需要 root，而 `sudo pnpm` 未必能在 root 的 PATH 里找到 pnpm，所以上面统一写成 `sudo zsh <脚本路径>`；不加 sudo 直接跑会被脚本拦下并打印这条正确命令。
+
+`install-system-daemons.sh` 的 `TARGET_USER` 默认值：有 `SUDO_USER` 就用它，否则用 `id -un`；解析成 `root` 会直接拒绝安装（repo 检出、`~/.openclaw` 凭据、node 都在操作者家目录里，让 daemon 跑成 root 是错的）。装给别人用 `TARGET_USER=<用户名> sudo -E zsh ...`。
+
+**不要**再按旧文档单独跑 `pnpm launchd:install-user` 或 `pnpm launchd:install-backup-alerts` 当作"完整安装"：前者现在只退役、不安装，后者只安装 rsshub 一个用户级任务。只跑这两条的机器，8 个无人值守服务会被全部下线且一个都装不回来（`com.alphaloop.rsshub` 是唯一还会在跑的 AlphaLoop 任务）。
+
+迁移一台还在跑旧布局的机器——按上面 0→7 跑一遍即可，不需要额外的手工清理。第 2 步会把每个系统域标签的用户级副本 bootout 并**移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（移动不是删除，出问题可以取回）；第 3 步删除的是它管不到的那些废弃标签（那一步是真删除，见上面注释）。迁移前 doctor 会对这 6 个标签报 `wrong_domain` error，迁移后应当全部消失。
+
+2026-07-28 只读实测的 mini 现状（尚未迁移）：`~/Library/LaunchAgents` 里有 `com.alphaloop.daily-backup` / `market-alerts` / `platform-app` / `rsshub`、`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 七个用户级 agent（`launchctl list` 全部在列，platform-app 上次退出码 -15、rsshub 为 1），`/Library/LaunchDaemons` 里只有 `ai.openclaw.system.gateway` 和 `com.openclaw.system.trading.broker-executor` 两个 daemon；用户级 `ai.openclaw.gateway` 当前不存在。也就是说 8 个系统域标签里有 6 个还在错误的域上。
+
+## 调度任务清单
+
+- `com.alphaloop.platform-app`（系统域，`KeepAlive`）——`pnpm --filter @apps/platform-app start`，日志 `logs/platform-app.log`。
+- `com.alphaloop.market-alerts`（系统域，每 300 秒）——盘中提醒轮询。
+- `com.alphaloop.daily-backup`（系统域，每天 05:30）——交易数据库备份。
+- `com.openclaw.trading.cron-runner`（系统域，`KeepAlive`）——执行 openclaw cron 派发的日报/周报/个股分析。
+- `com.openclaw.trading.official-paper.poll` / `.pnl`（系统域，每小时 :30 / :00）——官方模拟盘轮询与收支变化表。
+- `ai.openclaw.system.gateway` / `com.openclaw.system.trading.broker-executor`（系统域，`KeepAlive`）。
+- `com.alphaloop.rsshub`（**用户域**，`RunAtLoad=true`/`KeepAlive=false`）——每次重启跑一次 `docker start rsshub`；容器本体不由它创建，见上面第 6 步。
+
+`pnpm openclaw:runtime:doctor` 会按上面这张表逐个探测：系统域用 `launchctl print system/<label>`，用户域用 `launchctl list`——两个域分开问，因为 `launchctl list` 只回答调用者自己的 `gui/$UID` 域，系统 daemon 在它的输出里根本不出现。装错域（例如迁移只做了一半，服务还留在 `~/Library/LaunchAgents`）报 `launchd-jobs.<name>.wrong_domain`，是 error 不是 warn。
 
 ## 新闻引擎（Phase 4）
 

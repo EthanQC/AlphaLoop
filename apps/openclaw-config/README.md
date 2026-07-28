@@ -11,8 +11,10 @@
 - `scripts/official-paper-monitor.mjs`：长桥官方模拟盘盘中轮询和开盘后收支变化表。
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
-- `scripts/install-user-schedules.mjs`：安装用户级 launchd 调度（日报/周报/个股分析/官方模拟盘轮询）。
-- `scripts/install-launchd.sh`：安装每日数据库备份 + 市场提醒（market-alerts）轮询器 + platform-app 常驻服务 + rsshub 容器启动这四个 launchd 任务（`com.alphaloop.daily-backup` / `com.alphaloop.market-alerts` / `com.alphaloop.platform-app` / `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
+- `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
+- `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
+- `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里清掉。
+- `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 
 ## Feishu
@@ -55,29 +57,89 @@ pnpm official-paper:pnl
 
 ## Launchd
 
-`launchd:install-user` 和 `launchd:install-backup-alerts` 安装的是两组完全不重叠的 launchd 任务，都只在各自文档里出现过一次——正式部署机上两条命令通常都要跑一遍；只跑其中一条会漏装另一半（例如只跑 `launchd:install-user` 的机器盘中就没有官方模拟盘轮询，也没有每日备份/提醒器轮询）。这里没有把两者合并成一条命令：它们面向的部署场景不完全相同（例如只需要官方模拟盘轮询的轻量机器，未必需要 `install-launchd.sh` 顺带执行的 `openclaw gateway install`），合并会让 `launchd:install-user` 悄悄多做事，也会让不想装 gateway 的场景失去单独跳过的办法。
+完整部署顺序见仓库根 `README.md` 的「部署机安装顺序」，这里只补充"为什么"。
+
+### 谁拥有哪个标签
+
+`scripts/install-launchd-ownership.txt` 是唯一事实来源，五个消费者都读它（4 个安装脚本 `install-system-daemons.sh` / `install-launchd.sh` / `install-user-schedules.mjs` / `install-openclaw-cron.mjs`，加上 `openclaw-runtime-doctor-core.mjs`），所以一个标签不可能有两个 owner：
+
+| scope | 含义 | 安装者 |
+| --- | --- | --- |
+| `system` | `/Library/LaunchDaemons`，开机即起、不需要图形登录 | `install-system-daemons.sh`（**sudo**） |
+| `user` | `~/Library/LaunchAgents`，需要用户登录会话 | `install-launchd.sh`（`pnpm launchd:install-backup-alerts`） |
+| `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉（`install-system-daemons.sh` 移进备份目录，两个 node 安装器直接删） | — |
+| `external` | 由 `openclaw` CLI 自己拥有，本仓库不碰 | — |
+
+当前只有 `com.alphaloop.rsshub` 是 `user`：它整个任务体就是 `docker start rsshub`，而它依赖的容器运行时（`homebrew.mxcl.colima`）本身就是用户级 LaunchAgent，socket 和 context 都在用户家目录下。系统 daemon 会赶在那个 socket 存在之前启动然后报 "Cannot connect to the Docker daemon"——把它提升到系统域只会让新闻源更不可靠。
+
+### 三个安装脚本各自做什么（2026-07-28 之后）
 
 ```bash
-# 官方模拟盘每小时轮询 + 开盘后收支变化表
-pnpm launchd:install-user
-
-# 每日交易数据库备份 + 市场提醒（market-alerts）轮询器
+# 1) 只安装 scope=user 的模板（当前 = com.alphaloop.rsshub），外加 openclaw gateway install
 pnpm launchd:install-backup-alerts
+
+# 2) 安装全部 8 个 scope=system 的 daemon；先干跑确认装给谁，再 sudo 真装
+PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
+sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
+
+# 3) 只退役、不安装任何 plist
+pnpm launchd:install-user
 ```
 
-`launchd:install-user` 安装后只会保留：
+历史包袱提醒：ac741d8 之前 `launchd:install-user` 和 `openclaw:cron:install` 各自会安装 plist，那时的文档要求"三条都跑一遍"。现在它们只剩退役逻辑，照旧文档跑会把运行中的服务全部下线而什么都装不上。
 
-- 美股盘中官方模拟盘每小时轮询。
-- 美股开盘后 30 分钟官方模拟盘收支变化表。
+两条顺序约束，其余标签与顺序无关：
 
-`launchd:install-backup-alerts` 安装后额外保留：
+- `install-launchd.sh` 必须排在 `install-system-daemons.sh` **之前**。它结尾的 `openclaw gateway install` 会重新创建用户级 `ai.openclaw.gateway`，而只有后跑的 `install-system-daemons.sh` 才会把它 bootout 掉；反过来跑，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
+- `install-user-schedules.mjs`（`launchd:install-user`）最好排在 `install-system-daemons.sh` **之后**。两者都会清掉系统域标签的用户级副本，但前者是 `rmSync` 直接删、后者是移进备份目录。先跑 `install-system-daemons.sh`，那 8 个 plist 就先被移走存档，剩给前者删的只有 `com.openclaw.trading.event-bus` / `catchup` / `maintenance.*` 这类早已废弃的标签和 5 个历史报告 plist。这不是正确性约束（两种顺序的最终状态一样），是可回退性约束。
 
-- 每日交易数据库备份（`com.alphaloop.daily-backup`）。
-- 市场提醒轮询器（`com.alphaloop.market-alerts`）。
-- platform-app 常驻服务（`com.alphaloop.platform-app`，Phase 3 起）——`KeepAlive`（不是周期任务），启动 `pnpm --filter @apps/platform-app start`，日志写到 `logs/platform-app.log` / `.err.log`。
-- rsshub 容器启动包装（`com.alphaloop.rsshub`，Phase 4 起）——`RunAtLoad=true`/`KeepAlive=false`，只跑 `docker start rsshub`（容器本体不由这个任务创建，见下方「新闻引擎」章节），日志写到 `logs/rsshub.log` / `.err.log`。
+`install-system-daemons.sh` 的执行顺序本身也是先退役后安装：先把系统域/retired 标签的用户级副本 bootout 并移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`，再 `bootstrap system` 新 daemon。所以重复执行安全，中途中断也不会留下两个实例同时写同一个交易数据库。
 
-`pnpm openclaw:runtime:doctor` 会检测这四个任务是否都已通过 `launchctl list` 加载，缺失时给出对应的安装命令提示；另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health` 检查项）和 rsshub 的 `GET /healthz`（`rsshub-health` 检查项，404 时回退 `/`）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
+`PRINT_CONFIG_ONLY=1` 那次干跑不写任何文件、不建任何目录（包括临时目录）、不调 launchctl，只把这次解析出来的 `target_user` / `target_home` / `repo_root` / `pnpm_bin` / `gateway_port` / `proxy_labels` 打出来。同样在真正动手之前退出的还有 root 检查：不带 sudo 跑会直接被拦下并打印正确命令，不会写到一半才 "Permission denied"。
+
+### 各服务的出网路径（proxy）
+
+`install-system-daemons.sh` 按标签逐个决定要不要往 plist 里写 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`（含小写别名）和 `NO_PROXY`，默认只有两个服务写：
+
+- `ai.openclaw.system.gateway`、`com.openclaw.system.trading.broker-executor` —— proxy。它们在 ac741d8 之前就一直带着 proxy 在跑，保持不变。
+- 其余 6 个（platform-app / market-alerts / daily-backup / cron-runner / official-paper poll+pnl）—— 直连。它们从用户级 LaunchAgent 迁过来，原模板只 export 了 `PATH`，从来没有任何 proxy 变量；ac741d8 让它们无声地继承了 proxy，这里把行为改回去。
+
+判断依据（2026-07-28 在 mini 上只读实测）。关键事实是：**TUN 和 7897 是同一个 mihomo 进程、同一份配置提供的**——`verge-mihomo`（pid 1411，由 clash-verge 特权 helper 拉起）读的那份 `clash-verge.yaml` 里同时有 `tun.enable: true` + `fake-ip-range: 198.18.0.1/16`（对应 `netstat -rn` 里持有 `1/8, 2/7, 4/6, 8/5 …` 切分默认路由的 `utun1024`）和 `mixed-port: 7897`。两者同生同死，于是只剩两种情形：
+
+- **mihomo 在跑**：TUN 已经在网络层接管出网，env 变量不增加任何可达性。`curl --noproxy '*'` 与 `curl -x http://127.0.0.1:7897` 对 `news.google.com`(302)、`query1.finance.yahoo.com`(429)、`finnhub.io`(200)、`open.feishu.cn`(404)、`openapi.longportapp.com`(404) 返回完全相同的状态码。
+- **mihomo 没跑**：7897 拒绝连接，TUN 路由同时也不在。带 env 变量的 daemon 每一个出网请求都会在 connect 阶段失败；不带的至少还能连上本来就没被墙的目标。
+
+launchd 不保证 `RunAtLoad` 的 daemon 和 mihomo 绑上 7897 之间的先后，所以"开机时抢在 mihomo 前面"是真实存在的窗口。也就是说这 6 个服务加上 proxy 变量，好的时候没用，坏的时候把局部故障放大成全面故障。
+
+从代码看这 6 个到底连什么：`daily-backup` 根本不出网（`backup-trading-data.mjs` 只做本地 sqlite 拷贝）；`market-alerts` 和 `official-paper` poll/pnl 走本地 Longbridge CLI（`openapi.longportapp.com`）和飞书（`open.feishu.cn`），上面的 curl 已证明两者直连可达；`platform-app` 只监听本地端口；`cron-runner` 通过 `127.0.0.1` 连 gateway（`NO_PROXY` 本来就排除了它），真正发往 Anthropic 的流量是 gateway 进程出去的，不是 cron-runner。这一组里唯一被墙的目标是 `cron-runner` 派发的 `stock-analysis.mjs` 要取的 `news.google.com`（还有 `finnhub.io`）——而它走的正是 TUN 默认路由，恰好就是 7897 存在的那个前提。
+
+保留 proxy 的那两个：`gateway` 是唯一目标确定被墙的服务（`api.anthropic.com`），而且这是当前 mini 上已验证在跑的配置（`/Library/LaunchDaemons/ai.openclaw.system.gateway.plist` 今天就带着这 8 个 key）。`broker-executor` 的目标是 Longbridge，按上面的逻辑其实也可以改直连，但它是下单链路，这次改动没有在 mini 上实跑验证过，所以**有意不动**。
+
+没有透明代理的部署机可以显式给某个服务加回来：
+
+```bash
+OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runner" \
+  sudo -E zsh apps/openclaw-config/scripts/install-system-daemons.sh
+```
+
+安装结束时脚本会逐行打印每个 daemon 的 `egress=proxy(...)` / `egress=direct`，可以当场核对。
+
+### doctor 的 launchd 检查
+
+`pnpm openclaw:runtime:doctor` 按 ownership 清单逐个探测，**分域询问**：
+
+- `system` 域用 `launchctl print system/<label>`（存在返回 0 并打印 `state = ...`，不存在退出 113）。
+- `user` 域用 `launchctl list`。
+
+必须分开问，因为 `launchctl list` 只回答调用者自己的 `gui/$UID` 域——一个加载中且正在运行的系统 daemon 在它的输出里根本不出现。旧版 doctor 只读 `launchctl list`，所以 ac741d8 之后它对 6 个已正确安装的服务永远报 `not_loaded`，还给出一条装不上它们的修复命令。
+
+三种结果：
+
+- 在应属的域里加载 → 不报告（`state` 仍会出现在 snapshot 里供人工核对）。
+- 两个域都没有 → warn `launchd-jobs.<name>.not_loaded`，并点名**该域对应的**安装命令（system → `sudo zsh .../install-system-daemons.sh`，user → `pnpm launchd:install-backup-alerts`）。
+- 加载在错误的域、或两个域同时加载 → **error** `launchd-jobs.<name>.wrong_domain`。这正是 ownership 清单要防的"一个标签两个 owner"（两个 broker-executor 抢同一个交易数据库），任何开发机都不会误入这个状态。
+
+另外还会单独探测 platform-app 的 `GET /health`（`platform-app-health`）和 rsshub 的 `GET /healthz`（`rsshub-health`，404 时回退 `/`）——开发机没起服务只是 warn，起了但状态码/响应体不对才算 error。
 
 ### platform-app（Phase 3 多成员 Web 平台）
 
@@ -87,7 +149,9 @@ pnpm launchd:install-backup-alerts
 pnpm platform:dev    # tsx watch 本地开发
 pnpm platform:start  # node dist/index.js，launchd 常驻用的就是这条
 
-pnpm launchd:install-backup-alerts   # 顺带安装 com.alphaloop.platform-app
+# 常驻服务 com.alphaloop.platform-app 从 ac741d8 起是系统域 daemon，
+# 由这条（需要 sudo）安装，launchd:install-backup-alerts 装不上它
+sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
 ```
 
 成员管理（`scripts/members.mjs`，单行 JSON 输出、错误非零退出）：
@@ -138,6 +202,10 @@ docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub
 pnpm openclaw:cron:install
 ```
 
-该命令会：①先 retire 这 5 个 launchd 任务对应的旧 plist（如果存在）；②把等价的 5 个任务注册进 `openclaw cron`；③安装 `com.openclaw.trading.cron-runner` launchd 服务，由它监听 `openclaw cron` 的 run 记录并实际执行这些脚本。详见 `docs/superpowers/specs/2026-06-14-openclaw-report-quality-cron-design.md`。
+该命令会：①先 retire 这 5 个 launchd 任务对应的旧 plist（如果存在）；②同样 retire 系统域已经拥有的那些标签的用户级副本；③把等价的 5 个任务注册进 `openclaw cron`。详见 `docs/superpowers/specs/2026-06-14-openclaw-report-quality-cron-design.md`。
 
-**历史教训（2026-07-14 存量代码审计）**：这 5 个标签曾经在 `install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 里各自硬编码一份——先跑 `openclaw:cron:install`（retire 这 5 个 plist、装 cron 等价物），后跑 `launchd:install-user`（原样重装这 5 个 plist）会让它们同时复活：两个通道各自成功，日报/周报/选股每次都双份生成、双份投递飞书。现在两边共享 `scripts/openclaw-report-launchd-jobs.mjs` 里的同一份标签清单：`install-user-schedules.mjs` 不再安装这 5 个任务，且防御性地把它们也 retire 一遍（如果 `openclaw:cron:install` 还没跑过，这一步是 no-op）。**部署顺序**：`openclaw:cron:install` 和 `launchd:install-user` 谁先谁后都安全，且可以任意重跑——不会再互相打架。
+真正执行这些任务的 `com.openclaw.trading.cron-runner` **不再由这条命令安装**——ac741d8 起它是系统域 daemon，归 `sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh`。所以正确顺序是先装 daemon（gateway 起来了，`openclaw cron add` 才连得上），再跑 `openclaw:cron:install`。
+
+**历史教训（2026-07-14 存量代码审计）**：这 5 个标签曾经在 `install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 里各自硬编码一份——先跑 `openclaw:cron:install`（retire 这 5 个 plist、装 cron 等价物），后跑 `launchd:install-user`（原样重装这 5 个 plist）会让它们同时复活：两个通道各自成功，日报/周报/选股每次都双份生成、双份投递飞书。现在两边共享 `scripts/openclaw-report-launchd-jobs.mjs` 里的同一份标签清单，且都只 retire 不安装，所以这两条谁先谁后都安全、可以任意重跑。
+
+**2026-07-28 补充**：同一类"两个 owner"隐患现在由 `install-launchd-ownership.txt` 统一防守——4 个安装脚本和 doctor 都读它，doctor 会把"标签加载在错误的域"直接报成 error（`launchd-jobs.<name>.wrong_domain`）。
