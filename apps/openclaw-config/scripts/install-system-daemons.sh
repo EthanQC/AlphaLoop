@@ -144,7 +144,14 @@ OPENCLAW_LOG_DIR="${TARGET_HOME}/.openclaw/logs"
 REPO_LOG_DIR="${REPO_ROOT}/logs"
 RUNTIME_LAUNCHD_DIR="${REPO_ROOT}/runtime/launchd"
 AGENTS_DIR="${TARGET_HOME}/Library/LaunchAgents"
-BACKUP_DIR="${TARGET_HOME}/Library/LaunchAgents.disabled/openclaw-system-backup-$(date +%Y%m%d%H%M%S)"
+# Finding M7: BACKUP_DIR is only a NAME here. It used to be `mkdir -p`'d
+# unconditionally alongside the log directories below, which meant every run
+# after the migration - when there is by definition nothing left to retire -
+# left one more empty `openclaw-system-backup-<ts>` directory behind forever.
+# ensure_backup_dir() below creates it the first time something is actually
+# moved into it, and nothing creates it otherwise.
+BACKUP_PARENT="${TARGET_HOME}/Library/LaunchAgents.disabled"
+BACKUP_DIR="${BACKUP_PARENT}/openclaw-system-backup-$(date +%Y%m%d%H%M%S)"
 # TMP_DIR is deliberately NOT created here: the PRINT_CONFIG_ONLY preflight and
 # the "needs root" refusal below both exit before it, and both promise to leave
 # nothing behind. `mktemp -d` on this line would have made that promise false.
@@ -227,13 +234,33 @@ fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/install-system-daemons.XXXXXX")"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-mkdir -p "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${BACKUP_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
+mkdir -p "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
 # Only root can hand these to another user; when the operator runs this
 # unprivileged (or under the test harness) the directories are already theirs.
 if [ "$(id -u)" -eq 0 ]; then
   chown -R "${TARGET_USER}:${TARGET_GID}" \
-    "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${BACKUP_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
+    "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
+  # Not -R: AGENTS_DIR also holds the operator's own personal-OpenClaw agents,
+  # and this script has no business rewriting the ownership of plists it did
+  # not create. Only the directory itself, which the mkdir above may have just
+  # created as root inside a home directory that is not root's.
+  chown "${TARGET_USER}:${TARGET_GID}" "${AGENTS_DIR}"
 fi
+
+# Finding M7: `mkdir -p` under sudo creates BOTH the backup directory and its
+# parent as root:wheel inside the operator's own home - on the mini
+# ~/Library/LaunchAgents.disabled ended up `drwxr-xr-x root staff` inside a
+# `drwx------ qingchang` home, so the operator could not clean up their own
+# archived agents. The parent is chowned here alongside the directory itself.
+ensure_backup_dir() {
+  if [ -d "${BACKUP_DIR}" ]; then
+    return 0
+  fi
+  mkdir -p "${BACKUP_DIR}"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "${TARGET_USER}:${TARGET_GID}" "${BACKUP_PARENT}" "${BACKUP_DIR}"
+  fi
+}
 
 manifest_labels() {
   awk -v want="$1" '/^[[:space:]]*#/ { next } $1 == want { print $2 }' "${OWNERSHIP_FILE}"
@@ -456,7 +483,54 @@ if [ "${EXPECTED_SYSTEM_LABELS}" != "${ACTUAL_SYSTEM_LABELS}" ]; then
   exit 1
 fi
 
+# Labels this script used to install and must now actively destroy. A variable
+# rather than an inline list in the loop below so the collision guard can read
+# it - and, like LAUNCHCTL / SYSTEM_DIR / OWNERSHIP_FILE above, overridable so
+# the suite can drive that guard. A collision cannot be reached through the
+# manifest (the drift check below already refuses when the manifest and the
+# rendered set disagree), so the only real-world way in is a future edit that
+# renames a write_plist call onto one of these labels AND updates the manifest
+# to match - which is exactly the case the guard exists for, and exactly the
+# case no test can construct without this seam.
+OBSOLETE_SYSTEM_LABELS="${OBSOLETE_SYSTEM_LABELS:-com.openclaw.system.trading.event-bus
+com.openclaw.system.trading.event-ingestor
+com.openclaw.system.trading.live-advisor
+com.openclaw.system.trading.options-shadow
+com.openclaw.system.trading.paper-trader}"
+
+# Finding C3, first half: the retire loop below runs `launchctl disable
+# system/<label>` and `rm -f "${SYSTEM_DIR}/<label>.plist"`. launchd's
+# disabled-services database survives reboots AND plist reinstalls, and
+# bootstrap/kickstart on a disabled label fail - so if a daemon rendered above
+# were ever renamed onto one of these five labels, this script would delete the
+# plist it had just installed, disable the label, and then fail to bootstrap it
+# on this run and on every re-run forever. Refuse before touching anything.
+while IFS= read -r obsolete_label; do
+  [ -n "${obsolete_label}" ] || continue
+  if printf "%s\n" "${EXPECTED_SYSTEM_LABELS}" | grep -qxF "${obsolete_label}"; then
+    echo "install-system-daemons: ${obsolete_label} is BOTH rendered as a daemon above and listed as obsolete." >&2
+    echo "install-system-daemons: the retire step would delete the plist this run just installed and leave the" >&2
+    echo "install-system-daemons: label in launchd's disabled database, which survives reboots and reinstalls." >&2
+    echo "install-system-daemons: rename the daemon, or drop it from OBSOLETE_SYSTEM_LABELS." >&2
+    exit 1
+  fi
+done <<EOF
+${OBSOLETE_SYSTEM_LABELS}
+EOF
+
 mkdir -p "${SYSTEM_DIR}"
+
+# Destroy the obsolete labels BEFORE installing the current ones: `rm -f
+# "${SYSTEM_DIR}/<label>.plist"` below can then never delete a plist this run
+# wrote, even if the guard above is ever weakened.
+while IFS= read -r obsolete_label; do
+  [ -n "${obsolete_label}" ] || continue
+  "${LAUNCHCTL}" bootout "system/${obsolete_label}" >/dev/null 2>&1 || true
+  "${LAUNCHCTL}" disable "system/${obsolete_label}" >/dev/null 2>&1 || true
+  rm -f "${SYSTEM_DIR}/${obsolete_label}.plist"
+done <<EOF
+${OBSOLETE_SYSTEM_LABELS}
+EOF
 
 for plist in "${TMP_DIR}"/*.plist; do
   if [ "$(id -u)" -eq 0 ]; then
@@ -466,43 +540,86 @@ for plist in "${TMP_DIR}"/*.plist; do
   fi
 done
 
-for retired_label in \
-  com.openclaw.system.trading.event-bus \
-  com.openclaw.system.trading.event-ingestor \
-  com.openclaw.system.trading.live-advisor \
-  com.openclaw.system.trading.options-shadow \
-  com.openclaw.system.trading.paper-trader; do
-  "${LAUNCHCTL}" bootout "system/${retired_label}" >/dev/null 2>&1 || true
-  "${LAUNCHCTL}" disable "system/${retired_label}" >/dev/null 2>&1 || true
-  rm -f "${SYSTEM_DIR}/${retired_label}.plist"
-done
+# ---------------------------------------------------------------------------
+# Finding C2: the three phases below used to be two, in the wrong order, with
+# no error handling.
+#
+# The old shape was: MOVE every user-level LaunchAgent into a backup directory,
+# then bootstrap the daemons in a `set -e` loop whose bootstrap/enable/kickstart
+# calls were unguarded. One failed bootstrap - the third label of eight, say -
+# aborted the script with the six user agents already gone from
+# ~/Library/LaunchAgents and only two daemons loaded. The machine was then
+# running NEITHER the old copy nor the new one, and re-running produced the
+# same abort at the same label, so it could not converge either.
+#
+# The split below separates the two things "retire" used to mean:
+#
+#   Phase A  STOP the running user agents (`launchctl bootout gui/<uid>/...`).
+#            Reversible: the plist stays on disk, so the agent comes back at
+#            the next login and can be bootstrapped by hand right now. This
+#            still happens before any daemon starts, which is what keeps two
+#            broker-executors from ever writing the trading database at once.
+#   Phase B  Bring each daemon up, INDEPENDENTLY. One label failing no longer
+#            stops the other seven from being installed and started.
+#   Phase C  Only now move a user plist out of the way - and only that label's,
+#            and only once its replacement daemon is verified loaded. A daemon
+#            that did not come up leaves its old agent on disk, so the machine
+#            keeps running the old copy of that one service instead of nothing.
+#
+# The result is safe to interrupt anywhere: at every point the machine is
+# either running the old copy or the new one, and re-running the script from
+# the top converges (every step is idempotent, and Phase B enables and boots
+# out before it bootstraps).
+# ---------------------------------------------------------------------------
 
-# Retire the user-level copy of every label this script now owns, plus the
-# labels nobody may own, BEFORE bootstrapping the daemons - otherwise a
-# leftover LaunchAgent and the new LaunchDaemon would both be live for the
-# window in between, which for broker-executor / cron-runner means two
-# processes writing the same trading database.
+# Which daemon must be verified loaded before a given user-level plist may be
+# archived. For the eight system labels the daemon has the same label. These
+# two rows are the only places where the old user-level name and the daemon
+# that replaces it differ.
+supersedes() {
+  case "$1" in
+    com.openclaw.trading.broker-executor) printf "%s" "com.openclaw.system.trading.broker-executor" ;;
+    ai.openclaw.gateway) printf "%s" "ai.openclaw.system.gateway" ;;
+    *) printf "%s" "$1" ;;
+  esac
+}
+
+LOADED_LABELS=""
+FAILED_LABELS=""
+FAILURE_DETAIL=""
+KEPT_AGENTS=""
+
+label_is_loaded() {
+  printf "%s\n" "${LOADED_LABELS}" | grep -qxF "$1"
+}
+
+record_failure() {
+  FAILED_LABELS="${FAILED_LABELS}$1
+"
+  FAILURE_DETAIL="${FAILURE_DETAIL}  ${1}
+      $2
+"
+}
+
+# --- Phase A: stop the user-level copies, leave their plists on disk --------
+# `|| true` is correct HERE and only here: bootout of a label that is not
+# loaded (the common case on a second run, and on any machine with no GUI
+# session at all) exits non-zero, and "not loaded" is precisely the state this
+# loop wants. Unlike the bootstrap loop below, there is no outcome to report -
+# the desired end state and the error state are the same state.
 while IFS= read -r label; do
   [ -n "${label}" ] || continue
   "${LAUNCHCTL}" bootout "gui/${TARGET_UID}/${label}" >/dev/null 2>&1 || true
-  agent_plist="${AGENTS_DIR}/${label}.plist"
-  if [ -f "${agent_plist}" ]; then
-    mv "${agent_plist}" "${BACKUP_DIR}/"
-    echo "Retired user LaunchAgent ${label} -> ${BACKUP_DIR}"
+  if "${LAUNCHCTL}" print "gui/${TARGET_UID}/${label}" >/dev/null 2>&1; then
+    echo "install-system-daemons: warning: gui/${TARGET_UID}/${label} is STILL loaded after bootout." >&2
+    echo "install-system-daemons: warning: it may race the daemon of the same name; stop it by hand." >&2
   fi
 done <<EOF
 $(manifest_labels system; manifest_labels retired)
+ai.openclaw.gateway
 EOF
 
-# ai.openclaw.gateway is installed by the `openclaw` CLI, not by this repo
-# (see install-launchd-ownership.txt's "external" rows). Booting it out here
-# is unchanged pre-existing behaviour: ai.openclaw.system.gateway supersedes
-# it and they would otherwise fight over the same port.
-"${LAUNCHCTL}" bootout "gui/${TARGET_UID}/ai.openclaw.gateway" >/dev/null 2>&1 || true
-if [ -f "${AGENTS_DIR}/ai.openclaw.gateway.plist" ]; then
-  mv "${AGENTS_DIR}/ai.openclaw.gateway.plist" "${BACKUP_DIR}/"
-fi
-
+# --- Phase B: bring up each daemon independently ---------------------------
 while IFS= read -r system_label; do
   [ -n "${system_label}" ] || continue
   system_plist="${SYSTEM_DIR}/${system_label}.plist"
@@ -514,22 +631,111 @@ while IFS= read -r system_label; do
     sleep 0.25
   done
   sleep "${BOOTSTRAP_SETTLE_SECONDS}"
-  "${LAUNCHCTL}" bootstrap system "${system_plist}"
-  "${LAUNCHCTL}" enable "system/${system_label}"
-  "${LAUNCHCTL}" kickstart -k "system/${system_label}"
+
+  # Finding C3, second half: `enable` comes FIRST, before bootstrap and
+  # kickstart, because both of those fail outright on a label that is in
+  # launchd's disabled database - and that database survives reboots and plist
+  # reinstalls, so nothing else in a re-run clears it. With the old
+  # bootstrap -> enable -> kickstart order, any label that was ever disabled
+  # (an operator debugging with `sudo launchctl disable`, or the retire loop
+  # above after a rename) aborted the run before reaching the `enable` that
+  # would have unwedged it, so every subsequent run failed identically.
+  # Non-fatal on its own: on a label that was never disabled some macOS
+  # versions still return non-zero, and bootstrap is the real test.
+  enable_output=""
+  if ! enable_output="$("${LAUNCHCTL}" enable "system/${system_label}" 2>&1)"; then
+    echo "install-system-daemons: warning: launchctl enable system/${system_label} failed: ${enable_output}" >&2
+  fi
+
+  # FATAL FOR THIS LABEL, not for the run: record it and keep going, so the
+  # other seven daemons still get installed and started.
+  bootstrap_output=""
+  if ! bootstrap_output="$("${LAUNCHCTL}" bootstrap system "${system_plist}" 2>&1)"; then
+    record_failure "${system_label}" "launchctl bootstrap system ${system_plist}: ${bootstrap_output}"
+    continue
+  fi
+
+  # Reportable, not fatal: the plists all carry RunAtLoad=true, so a successful
+  # bootstrap has already started the job. `kickstart -k` only forces a restart
+  # of an instance that may be mid-run; the load check below is what decides.
+  kickstart_output=""
+  if ! kickstart_output="$("${LAUNCHCTL}" kickstart -k "system/${system_label}" 2>&1)"; then
+    echo "install-system-daemons: warning: launchctl kickstart -k system/${system_label} failed: ${kickstart_output}" >&2
+    echo "install-system-daemons: warning: bootstrap succeeded and RunAtLoad started it; checking the job table." >&2
+  fi
+
+  # The load check, not bootstrap's exit code, is what marks a label up. This
+  # is the claim Phase C is allowed to act on ("its replacement is running"),
+  # so it is answered by asking launchd, not by assuming.
+  if ! "${LAUNCHCTL}" print "system/${system_label}" >/dev/null 2>&1; then
+    record_failure "${system_label}" "bootstrap reported success but launchctl print system/${system_label} cannot find the job"
+    continue
+  fi
+
+  LOADED_LABELS="${LOADED_LABELS}${system_label}
+"
 done <<EOF
 ${EXPECTED_SYSTEM_LABELS}
+EOF
+
+# --- Phase C: archive each user plist whose replacement is verified up ------
+while IFS= read -r label; do
+  [ -n "${label}" ] || continue
+  agent_plist="${AGENTS_DIR}/${label}.plist"
+  [ -f "${agent_plist}" ] || continue
+  replacement="$(supersedes "${label}")"
+  if ! label_is_loaded "${replacement}"; then
+    KEPT_AGENTS="${KEPT_AGENTS}  ${label} (replacement system/${replacement} is not loaded)
+"
+    continue
+  fi
+  ensure_backup_dir
+  mv "${agent_plist}" "${BACKUP_DIR}/"
+  echo "Retired user LaunchAgent ${label} -> ${BACKUP_DIR}"
+done <<EOF
+$(manifest_labels system; manifest_labels retired)
+ai.openclaw.gateway
 EOF
 
 echo "Installed system daemons under ${SYSTEM_DIR} (running as ${TARGET_USER}):"
 while IFS= read -r installed_label; do
   [ -n "${installed_label}" ] || continue
-  if daemon_uses_proxy "${installed_label}"; then
-    echo "  ${installed_label}  egress=proxy(${OPENCLAW_PROXY_URL})"
+  if label_is_loaded "${installed_label}"; then
+    state="loaded"
   else
-    echo "  ${installed_label}  egress=direct"
+    state="NOT LOADED"
+  fi
+  if daemon_uses_proxy "${installed_label}"; then
+    echo "  ${installed_label}  egress=proxy(${OPENCLAW_PROXY_URL})  ${state}"
+  else
+    echo "  ${installed_label}  egress=direct  ${state}"
   fi
 done <<EOF
 ${EXPECTED_SYSTEM_LABELS}
 EOF
-echo "Backed up user launch agents under ${BACKUP_DIR}"
+
+if [ -d "${BACKUP_DIR}" ]; then
+  echo "Backed up user launch agents under ${BACKUP_DIR}"
+fi
+
+if [ -n "${FAILED_LABELS}" ]; then
+  failed_count="$(printf "%s" "${FAILED_LABELS}" | grep -c . || true)"
+  total_count="$(printf "%s" "${EXPECTED_SYSTEM_LABELS}" | grep -c . || true)"
+  loaded_count="$(printf "%s" "${LOADED_LABELS}" | grep -c . || true)"
+  echo "" >&2
+  echo "install-system-daemons: FAILED - ${failed_count} of ${total_count} daemons did not come up:" >&2
+  printf "%s" "${FAILURE_DETAIL}" >&2
+  echo "install-system-daemons: ${loaded_count} of ${total_count} ARE loaded; the machine is not idle." >&2
+  if [ -n "${KEPT_AGENTS}" ]; then
+    echo "install-system-daemons: these user LaunchAgents were deliberately LEFT in ${AGENTS_DIR}," >&2
+    echo "install-system-daemons: so the old copy of each still starts at the next login:" >&2
+    printf "%s" "${KEPT_AGENTS}" >&2
+    echo "install-system-daemons: to start one right now without waiting for a login:" >&2
+    echo "install-system-daemons:   launchctl bootstrap gui/${TARGET_UID} ${AGENTS_DIR}/<label>.plist" >&2
+  fi
+  echo "install-system-daemons: nothing about this run blocks a re-run - fix the cause and run again:" >&2
+  echo "install-system-daemons:   sudo zsh $0" >&2
+  echo "install-system-daemons: every step is idempotent, and each daemon is enabled and booted out" >&2
+  echo "install-system-daemons: before it is bootstrapped, so a re-run converges rather than repeating." >&2
+  exit 1
+fi

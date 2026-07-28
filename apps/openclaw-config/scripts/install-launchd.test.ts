@@ -58,15 +58,71 @@ function writeStub(path: string, logPath: string): void {
   chmodSync(path, 0o755);
 }
 
-// install-system-daemons.sh polls `launchctl print system/<label>` after a
-// bootout and only proceeds once the label is GONE. A stub that reported
-// success for `print` would claim the job is still loaded forever; exiting 1
-// is the honest simulation of "not loaded", which is the post-bootout state.
-function writeLaunchctlStub(path: string, logPath: string): void {
+interface LaunchctlStubOptions {
+  /** Directory holding the stub's job table and disabled database. */
+  stateDir: string;
+  /** Label whose `bootstrap` fails, to inject the partial failure of C2. */
+  failBootstrapLabel?: string;
+  /** Labels seeded into the disabled database, to inject the wedge of C3. */
+  disabledLabels?: string[];
+}
+
+/**
+ * launchctl stub as a STATE MACHINE over a job table on disk.
+ *
+ * Round 4: the installer no longer trusts `bootstrap`'s exit code - it asks
+ * launchd whether the label actually loaded (`launchctl print system/<label>`)
+ * and decides on that answer whether the old user-level LaunchAgent may be
+ * archived. The previous stub answered every `print` with exit 1, i.e. "no job
+ * is ever loaded, before or after bootstrap", which no real launchctl does; it
+ * modelled only the post-bootout half of the contract because that was the
+ * only half the installer used to read.
+ *
+ * The four behaviours modelled here are the four the installer depends on, and
+ * each matches launchctl(1):
+ *   print      exits 0 iff the target was bootstrapped and not since booted out
+ *   bootout    fails when the target is not loaded (the ordinary second-run case)
+ *   bootstrap  fails on a missing plist, and fails on a label sitting in the
+ *              disabled database - the wedge finding C3 is about
+ *   enable     removes the label from the disabled database
+ */
+function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStubOptions): void {
+  const loadedDir = join(options.stateDir, "loaded");
+  const disabledDir = join(options.stateDir, "disabled");
+  mkdirSync(loadedDir, { recursive: true });
+  mkdirSync(disabledDir, { recursive: true });
+  for (const label of options.disabledLabels ?? []) {
+    writeFileSync(join(disabledDir, `system_${label}`), "");
+  }
+
+  const failLine = options.failBootstrapLabel
+    ? `    if [ "$lbl" = "${options.failBootstrapLabel}" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi`
+    : "    :";
+
   const contents = [
     "#!/bin/sh",
     `echo "$@" >> "${logPath}"`,
-    'if [ "$1" = "print" ]; then exit 1; fi',
+    `S="${options.stateDir}"`,
+    'key() { printf "%s" "$1" | tr / _; }',
+    'case "$1" in',
+    '  print)',
+    '    [ -f "$S/loaded/$(key "$2")" ] && exit 0',
+    "    exit 113 ;;",
+    '  enable) rm -f "$S/disabled/$(key "$2")"; exit 0 ;;',
+    '  disable) touch "$S/disabled/$(key "$2")"; exit 0 ;;',
+    "  bootout)",
+    '    [ -f "$S/loaded/$(key "$2")" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
+    '    rm -f "$S/loaded/$(key "$2")"; exit 0 ;;',
+    "  bootstrap)",
+    '    lbl="$(basename "$3" .plist)"',
+    '    [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }',
+    '    if [ -f "$S/disabled/$(key "system/$lbl")" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi',
+    failLine,
+    '    touch "$S/loaded/$(key "system/$lbl")"; exit 0 ;;',
+    "  kickstart)",
+    '    [ -f "$S/loaded/$(key "$3")" ] || { echo "Could not find service" >&2; exit 113; }',
+    "    exit 0 ;;",
+    "esac",
     "exit 0"
   ].join("\n");
   writeFileSync(path, `${contents}\n`);
@@ -109,21 +165,24 @@ interface FakeMachine {
   stubBinDir: string;
   launchctlLog: string;
   openclawLog: string;
+  /** The stub launchd's job table, so tests can ask what is actually loaded. */
+  stateDir: string;
   env: NodeJS.ProcessEnv;
 }
 
-function makeFakeMachine(prefix: string): FakeMachine {
+function makeFakeMachine(prefix: string, stub: Omit<LaunchctlStubOptions, "stateDir"> = {}): FakeMachine {
   const home = makeTempDir(prefix);
   const systemDir = join(makeTempDir(`${prefix}sys-`), "LaunchDaemons");
   const stubBinDir = join(home, ".local", "bin");
   const nodeBinDir = join(home, ".local", "node-v24", "bin");
+  const stateDir = join(home, "launchd-state");
   mkdirSync(stubBinDir, { recursive: true });
   mkdirSync(nodeBinDir, { recursive: true });
   mkdirSync(systemDir, { recursive: true });
 
   const launchctlLog = join(home, "launchctl-calls.log");
   const openclawLog = join(home, "openclaw-calls.log");
-  writeLaunchctlStub(join(stubBinDir, "launchctl"), launchctlLog);
+  writeLaunchctlStub(join(stubBinDir, "launchctl"), launchctlLog, { ...stub, stateDir });
   writeOpenClawStub(join(stubBinDir, "openclaw"), openclawLog);
   // install-system-daemons.sh resolves PNPM_BIN under the TARGET user's own
   // node install and refuses to install when it cannot find one, so the fake
@@ -138,6 +197,7 @@ function makeFakeMachine(prefix: string): FakeMachine {
     stubBinDir,
     launchctlLog,
     openclawLog,
+    stateDir,
     env: {
       ...process.env,
       HOME: home,
@@ -178,6 +238,42 @@ function launchAgentLabels(machine: FakeMachine): string[] {
 
 function launchDaemonLabels(machine: FakeMachine): string[] {
   return plistLabelsIn(machine.systemDir);
+}
+
+/**
+ * What the stub launchd is actually RUNNING, as opposed to which plist files
+ * exist on disk. The distinction is the whole point of C2: the old installer
+ * left eight plists in /Library/LaunchDaemons while only two of them were
+ * loaded, so `launchDaemonLabels` alone reported a healthy machine.
+ */
+function loadedSystemLabels(machine: FakeMachine): string[] {
+  const loadedDir = join(machine.stateDir, "loaded");
+  if (!existsSync(loadedDir)) {
+    return [];
+  }
+  return readdirSync(loadedDir)
+    .filter((name) => name.startsWith("system_"))
+    .map((name) => name.slice("system_".length))
+    .sort();
+}
+
+function backupDirs(machine: FakeMachine): string[] {
+  const parent = join(machine.home, "Library", "LaunchAgents.disabled");
+  return existsSync(parent) ? readdirSync(parent).sort() : [];
+}
+
+/** Runs the installer expecting a non-zero exit, and returns what it printed. */
+function runSystemDaemonsExpectingFailure(machine: FakeMachine): { status: number; output: string } {
+  try {
+    const stdout = execFileSync("bash", [systemDaemonsScript], { env: machine.env, encoding: "utf8", stdio: "pipe" });
+    throw new Error(`expected a non-zero exit, got success:\n${stdout}`);
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string };
+    if (typeof failure.status !== "number") {
+      throw error;
+    }
+    return { status: failure.status, output: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+  }
 }
 
 afterEach(() => {
@@ -587,6 +683,175 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       // ...and opting one in does not opt everything else in.
       expect(hasProxyEnv(join(machine.systemDir, "ai.openclaw.system.gateway.plist"))).toBe(false);
       expect(hasProxyEnv(join(machine.systemDir, "com.alphaloop.daily-backup.plist"))).toBe(false);
+    });
+  });
+
+  // Round-4 findings C2/C3. This installer is about to be run with sudo on the
+  // machine that also hosts the operator's personal 185-agent OpenClaw, and
+  // both defects turned a single failed launchctl call into a machine running
+  // NEITHER the old copy nor the new one, un-recoverable by re-running.
+  //
+  // Measured against the pre-fix script with the same stub used below
+  // (bootstrap fails on com.alphaloop.market-alerts, the third label of eight
+  // in sorted order): the run exited 5, ~/Library/LaunchAgents was empty of
+  // every AlphaLoop label because the retire loop had already MOVED all seven,
+  // and only two daemons were loaded.
+  describe("a partial failure is survivable (round-4 findings C2/C3)", () => {
+    const MIGRATED_AGENTS = [
+      "com.alphaloop.daily-backup",
+      "com.alphaloop.market-alerts",
+      "com.alphaloop.platform-app",
+      "com.openclaw.trading.cron-runner",
+      "com.openclaw.trading.official-paper.pnl",
+      "com.openclaw.trading.official-paper.poll",
+      "com.openclaw.trading.broker-executor"
+    ];
+
+    it("keeps the other seven daemons up when one cannot bootstrap, instead of aborting the loop", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-c2-", { failBootstrapLabel: "com.alphaloop.market-alerts" });
+      seedLegacyUserAgents(machine, MIGRATED_AGENTS);
+
+      const { status } = runSystemDaemonsExpectingFailure(machine);
+
+      // Non-zero, because something really did fail - `|| true` would have
+      // turned "broken" into "silently broken".
+      expect(status).not.toBe(0);
+      // ...but the other seven are LOADED, not merely present as plist files.
+      expect(loadedSystemLabels(machine)).toEqual(SYSTEM_LABELS.filter((l) => l !== "com.alphaloop.market-alerts").sort());
+      expect(launchDaemonLabels(machine).sort()).toEqual([...SYSTEM_LABELS].sort());
+    });
+
+    it("leaves the failed label's user LaunchAgent on disk, so that service keeps running the old copy", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-c2-keep-", { failBootstrapLabel: "com.alphaloop.market-alerts" });
+      seedLegacyUserAgents(machine, MIGRATED_AGENTS);
+      seedLegacyUserAgents(machine, ["com.qingverse.openclaw.auto-update"]);
+
+      runSystemDaemonsExpectingFailure(machine);
+
+      // The one label whose replacement is down keeps its agent - launchd
+      // re-bootstraps it at the next login, so the machine is not left with
+      // nothing running that service. Every label whose daemon IS up is
+      // archived as usual: this is per-label, not all-or-nothing.
+      expect(launchAgentLabels(machine)).toEqual([
+        "com.alphaloop.market-alerts",
+        "com.qingverse.openclaw.auto-update"
+      ]);
+    });
+
+    it("tells the operator which label failed, why, and that a re-run is safe", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-c2-report-", { failBootstrapLabel: "com.alphaloop.platform-app" });
+      seedLegacyUserAgents(machine, MIGRATED_AGENTS);
+
+      const { output } = runSystemDaemonsExpectingFailure(machine);
+
+      expect(output).toContain("com.alphaloop.platform-app");
+      expect(output).toContain("Bootstrap failed: 5: Input/output error");
+      // Names how many are up, so "it failed" is never read as "nothing runs".
+      expect(output).toMatch(/7 of 8 ARE loaded/u);
+      expect(output).toContain("were deliberately LEFT in");
+      expect(output).toMatch(/nothing about this run blocks a re-run/u);
+      // The failure summary must not claim the label came up.
+      expect(output).toMatch(/com\.alphaloop\.platform-app {2}egress=direct {2}NOT LOADED/u);
+    });
+
+    it("converges when the operator fixes the cause and re-runs", () => {
+      const failing = makeFakeMachine("alphaloop-daemons-c2-converge-", { failBootstrapLabel: "com.alphaloop.market-alerts" });
+      seedLegacyUserAgents(failing, MIGRATED_AGENTS);
+      runSystemDaemonsExpectingFailure(failing);
+      // The state a re-run has to converge FROM: seven daemons up, one down,
+      // one agent still on disk. An installer that aborted the loop would
+      // leave a different, much emptier machine here.
+      expect(loadedSystemLabels(failing)).toHaveLength(SYSTEM_LABELS.length - 1);
+      expect(launchAgentLabels(failing)).toEqual(["com.alphaloop.market-alerts"]);
+
+      // "Fix the cause" = the same machine, same job table, same half-migrated
+      // ~/Library/LaunchAgents, with a launchctl that no longer fails. Nothing
+      // else is reset, which is the point: the previous run must not have left
+      // state that blocks this one.
+      writeLaunchctlStub(join(failing.stubBinDir, "launchctl"), failing.launchctlLog, { stateDir: failing.stateDir });
+
+      const stdout = runSystemDaemons(failing);
+      expect(stdout).toContain("com.alphaloop.market-alerts");
+      expect(loadedSystemLabels(failing)).toEqual([...SYSTEM_LABELS].sort());
+      expect(launchAgentLabels(failing)).toEqual([]);
+    });
+
+    it("clears a label out of launchd's disabled database BEFORE bootstrapping it", () => {
+      // launchd's disabled-services database survives reboots AND plist
+      // reinstalls, and bootstrap/kickstart on a disabled label fail. With the
+      // old bootstrap -> enable -> kickstart order the run aborted before ever
+      // reaching the `enable` that would have cleared it, so every re-run
+      // failed identically forever. This script creates that state itself: it
+      // runs `launchctl disable system/<label>` on every obsolete label.
+      const machine = makeFakeMachine("alphaloop-daemons-c3-", { disabledLabels: ["com.alphaloop.daily-backup"] });
+      seedLegacyUserAgents(machine, MIGRATED_AGENTS);
+
+      const stdout = runSystemDaemons(machine);
+
+      expect(loadedSystemLabels(machine)).toEqual([...SYSTEM_LABELS].sort());
+      expect(stdout).toContain("com.alphaloop.daily-backup  egress=direct  loaded");
+
+      // The ordering itself, not just the outcome: enable must precede
+      // bootstrap for the label, or the disabled entry is still there when
+      // bootstrap runs.
+      const calls = readFileSync(machine.launchctlLog, "utf8").split(/\n/u);
+      const enableAt = calls.findIndex((line) => line === "enable system/com.alphaloop.daily-backup");
+      const bootstrapAt = calls.findIndex((line) => line.startsWith("bootstrap system ") && line.endsWith("com.alphaloop.daily-backup.plist"));
+      expect(enableAt).toBeGreaterThan(-1);
+      expect(bootstrapAt).toBeGreaterThan(-1);
+      expect(enableAt).toBeLessThan(bootstrapAt);
+    });
+
+    it("refuses up front when a rendered daemon collides with a label the retire step destroys", () => {
+      // The retire step runs `launchctl disable system/<label>` and `rm -f
+      // <SYSTEM_DIR>/<label>.plist` on every obsolete label. A future rename
+      // onto one of those labels would delete the plist this run just wrote
+      // and leave the label disabled - wedged on this run and every re-run.
+      // A collision is unreachable through the manifest (the drift check
+      // refuses first), so the obsolete list is overridden here the same way
+      // SYSTEM_DIR and LAUNCHCTL are; the guard under test is the script's.
+      const machine = makeFakeMachine("alphaloop-daemons-c3-collision-");
+      const { status, output } = runSystemDaemonsExpectingFailure({
+        ...machine,
+        env: { ...machine.env, OBSOLETE_SYSTEM_LABELS: "com.alphaloop.market-alerts" }
+      });
+
+      expect(status).not.toBe(0);
+      expect(output).toMatch(/com\.alphaloop\.market-alerts is BOTH rendered as a daemon above and listed as obsolete/u);
+      // Refused BEFORE writing or loading anything.
+      expect(launchDaemonLabels(machine)).toEqual([]);
+      expect(loadedSystemLabels(machine)).toEqual([]);
+    });
+  });
+
+  // Round-4 finding M7.
+  describe("backup directory hygiene (round-4 finding M7)", () => {
+    it("creates no backup directory at all on a machine with nothing to retire", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-m7-empty-");
+      runSystemDaemons(machine);
+      // BACKUP_DIR used to be `mkdir -p`'d unconditionally, before knowing
+      // whether anything would be archived - so every run after the migration
+      // left one more empty openclaw-system-backup-<ts> behind forever.
+      expect(backupDirs(machine)).toEqual([]);
+      expect(runSystemDaemons(machine)).toContain("Installed system daemons");
+      expect(backupDirs(machine)).toEqual([]);
+    });
+
+    it("creates exactly one, non-empty, on the migration run and none on the runs after it", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-m7-migrate-");
+      seedLegacyUserAgents(machine, ["com.alphaloop.market-alerts", "com.openclaw.trading.broker-executor"]);
+
+      runSystemDaemons(machine);
+      const dirs = backupDirs(machine);
+      expect(dirs).toHaveLength(1);
+      expect(readdirSync(join(machine.home, "Library", "LaunchAgents.disabled", String(dirs[0]))).sort()).toEqual([
+        "com.alphaloop.market-alerts.plist",
+        "com.openclaw.trading.broker-executor.plist"
+      ]);
+
+      runSystemDaemons(machine);
+      runSystemDaemons(machine);
+      expect(backupDirs(machine)).toEqual(dirs);
     });
   });
 
