@@ -366,6 +366,30 @@ function describeNetAssetsChange(scope, window) {
   if (!scope.baseline) {
     return `不可计算（原因：窗口起点 ${window.startLabel} 20:00 之前没有同口径的账户快照可比）`;
   }
+  // C3 (2026-07-28 review, fabrication): loadSnapshotScope picks `latest` at
+  // fetched_at <= window.end and `baseline` at fetched_at <= window.start. When
+  // NO snapshot lands inside the window - Monday, a holiday, any day the
+  // collector did not run - both queries resolve to THE SAME ROW, and the
+  // arithmetic below then produced 「±0.00（±0.00%）；起点 X → 最新 X」: a claim
+  // that the account was flat, computed from a single data point. A computed 0
+  // that actually means "no data" is a fabrication.
+  //
+  // Compared on ROW ID rather than on value, deliberately: two DISTINCT
+  // snapshots that happen to carry identical net assets describe an account
+  // that really was flat, and that zero is honest and still reported.
+  //
+  // Both queries always select `id` (a PRIMARY KEY, so never null), but note
+  // the failure direction if that ever stopped holding: indistinguishable ids
+  // make the check DISCLOSE rather than compute, which is the safe way to be
+  // wrong here.
+  if (String(scope.baseline.id) === String(scope.latest.id)) {
+    return [
+      "不可计算（原因：窗口内没有采到新的账户快照——",
+      `起止两端读到的是同一条记录（采集于 ${formatDateTime(scope.latest.fetched_at)}，`,
+      `早于窗口起点 ${window.startLabel} 20:00）；`,
+      "这不等于账户持平，只代表这段区间没有可比的数据）"
+    ].join("");
+  }
   const baseNet = toNumberOrNull(scope.baseline.net_assets);
   if (baseNet === null) {
     return "不可计算（原因：窗口起点的快照没有净资产字段）";

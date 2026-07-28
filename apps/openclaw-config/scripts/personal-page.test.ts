@@ -949,3 +949,135 @@ describe("C2: the weekly personal page reviews this week's trades against the ow
     expect(body).toMatch(/原因|说明/u);
   });
 });
+
+// ---------------------------------------------------------------------------
+// C3 (2026-07-28 adversarial review, fabrication): loadSnapshotScope queried
+// `latest` with fetched_at <= window.end and `baseline` with fetched_at <=
+// window.start. When NO snapshot falls inside the window - every Monday, every
+// holiday, every day the collector did not run - both queries return the SAME
+// ROW, and describeNetAssetsChange never compared ids, so the page rendered
+// 「区间净值变动：±0.00（±0.00%）；起点 X → 最新 X」: a claim that the account was
+// FLAT, made from no data at all. Every other branch in this module writes
+// 「不可计算（原因：…）」 instead.
+// ---------------------------------------------------------------------------
+describe("C3: no snapshot inside the window is disclosed, never rendered as ±0.00", () => {
+  it("refuses to call the account flat when the only snapshot predates the window (the Monday/holiday case)", () => {
+    const db = makeDb();
+    seedMember(db, "member_c3", "小周一");
+    // One snapshot, taken BEFORE the daily window starts (2026-07-27 20:00 CST
+    // = 2026-07-27T12:00Z). Nothing inside the window at all.
+    seedSnapshot(db, {
+      id: "snap_c3_stale",
+      ownerId: "member_c3",
+      fetchedAt: "2026-07-24T09:00:00.000Z",
+      netAssets: 123456.78,
+      totalCash: 20000,
+      positions: [{ symbol: "QQQ.US", name: "Invesco QQQ", quantity: 5, costPrice: 600 }]
+    });
+
+    const page = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c3",
+      kind: "daily",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    expect(page.markdown).toContain("区间净值变动：不可计算");
+    expect(page.markdown).toMatch(/区间净值变动：不可计算（原因：/u);
+    // The exact fabrication the review found.
+    expect(page.markdown).not.toContain("±0.00");
+    expect(page.markdown).not.toMatch(/起点\s*123,456\.78\s*→\s*最新\s*123,456\.78/u);
+    // The stale snapshot is still USED for the holdings view - it is the newest
+    // account state we have - so the reason has to say what is missing.
+    expect(page.markdown).toContain("123,456.78");
+  });
+
+  it("does the same on the shared (owner_id IS NULL) scope", () => {
+    const db = makeDb();
+    seedMember(db, "member_c3s", "小共享");
+    seedSnapshot(db, {
+      id: "snap_c3_shared",
+      ownerId: null,
+      fetchedAt: "2026-07-20T09:00:00.000Z",
+      netAssets: 50000,
+      totalCash: 10000,
+      positions: [{ symbol: "QQQ.US", name: "Invesco QQQ", quantity: 5, costPrice: 400 }]
+    });
+
+    const page = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c3s",
+      kind: "daily",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    expect(page.markdown).toContain("区间净值变动：不可计算");
+    expect(page.markdown).not.toContain("±0.00");
+  });
+
+  it("STILL reports a genuinely flat window as ±0.00 - the fix compares row ids, not values", () => {
+    const db = makeDb();
+    seedMember(db, "member_c3f", "小持平");
+    // Two DISTINCT snapshots: one at/just before the window start, one inside
+    // it, with identical net assets. That account really was flat, and saying
+    // so is honest - suppressing it would be the opposite error.
+    seedSnapshot(db, {
+      id: "snap_c3f_base",
+      ownerId: "member_c3f",
+      fetchedAt: "2026-07-27T09:00:00.000Z",
+      netAssets: 90000,
+      totalCash: 10000,
+      positions: [{ symbol: "QQQ.US", name: "Invesco QQQ", quantity: 5, costPrice: 600 }]
+    });
+    seedSnapshot(db, {
+      id: "snap_c3f_latest",
+      ownerId: "member_c3f",
+      fetchedAt: "2026-07-28T09:00:00.000Z",
+      netAssets: 90000,
+      totalCash: 10000,
+      positions: [{ symbol: "QQQ.US", name: "Invesco QQQ", quantity: 5, costPrice: 600 }]
+    });
+
+    const page = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c3f",
+      kind: "daily",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    expect(page.markdown).toContain("区间净值变动：±0.00（±0.00%）");
+    expect(page.markdown).not.toContain("区间净值变动：不可计算");
+  });
+
+  it("names the stale snapshot's own timestamp in the reason, so the gap is auditable", () => {
+    const db = makeDb();
+    seedMember(db, "member_c3t", "小时间");
+    seedSnapshot(db, {
+      id: "snap_c3t",
+      ownerId: "member_c3t",
+      fetchedAt: "2026-07-24T09:00:00.000Z",
+      netAssets: 100000,
+      totalCash: 20000,
+      positions: [{ symbol: "QQQ.US", name: "Invesco QQQ", quantity: 5, costPrice: 600 }]
+    });
+
+    const page = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c3t",
+      kind: "daily",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    // 2026-07-24T09:00Z = 2026-07-24 17:00 Beijing time.
+    expect(page.markdown).toMatch(/区间净值变动：不可计算（原因：[^）]*2026-07-24 17:00/u);
+    expect(page.markdown).toMatch(/区间净值变动：不可计算（原因：[^）]*2026-07-27/u);
+  });
+});
