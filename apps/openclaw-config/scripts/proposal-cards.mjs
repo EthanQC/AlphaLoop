@@ -26,6 +26,7 @@
 import {
   MemberRepository,
   ProposalRepository,
+  buildDeepLink,
   sendInteractiveCard
 } from "../../../packages/shared-types/dist/index.js";
 import { getZonedParts } from "./trading-schedule.mjs";
@@ -99,6 +100,18 @@ function buildDescriptiveLines(proposal, disciplineReport) {
   ];
 }
 
+/**
+ * The card's link to the proposal's own platform page, or `undefined` when
+ * this deployment has no PLATFORM_PUBLIC_BASE_URL configured. Never a bare
+ * path: a path with no origin is not openable from a Feishu card (see
+ * deep-links.ts). Both card variants carry it - the reader of a decided
+ * proposal wants the full discipline report just as much as the approver did.
+ */
+function buildProposalUrl(proposal) {
+  const href = buildDeepLink("proposal", proposal.id);
+  return href ? { text: "查看提案详情", href } : undefined;
+}
+
 function buildTitle(proposal) {
   const sideLabel = SIDE_LABEL[proposal.side] ?? proposal.side;
   const symbol = formatDisplaySymbol(proposal.symbol);
@@ -118,6 +131,7 @@ function buildTitle(proposal) {
  */
 export function composeProposalCard(proposal, disciplineReport) {
   const token = proposal.approvalToken;
+  const url = buildProposalUrl(proposal);
   return {
     title: buildTitle(proposal),
     lines: [
@@ -128,7 +142,8 @@ export function composeProposalCard(proposal, disciplineReport) {
       { text: "批准", value: `批准 ${token}`, style: "primary" },
       { text: "减半批准", value: `减半批准 ${token}` },
       { text: "拒绝", value: `拒绝 ${token}`, style: "danger" }
-    ]
+    ],
+    ...(url ? { url } : {})
   };
 }
 
@@ -151,12 +166,14 @@ export function composeProposalCard(proposal, disciplineReport) {
 export function composeDecisionUpdate(proposal) {
   const decisionLabel = DECISION_LABEL[proposal.status] ?? proposal.status;
   const displayName = proposal.decidedByDisplayName ?? proposal.decidedBy ?? "未知";
+  const url = buildProposalUrl(proposal);
   return {
     title: buildTitle(proposal),
     lines: [
       ...buildDescriptiveLines(proposal, proposal.disciplineReport),
       `决策: ${decisionLabel} · 时间: ${formatShanghaiDateTime(proposal.decidedAt)} · 操作人: ${displayName}`
-    ]
+    ],
+    ...(url ? { url } : {})
   };
 }
 

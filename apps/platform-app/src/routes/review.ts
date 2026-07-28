@@ -60,7 +60,7 @@ import { MonthlyReviewRepository, methodNotAllowed, sendJson, type Member } from
 
 import { guardAsyncWrite } from "./async-guard.js";
 import {
-  composeReviewConfirmCardLines,
+  composeReviewConfirmCardBody,
   createFeishuReviewNotifier,
   type FeishuReviewNotifier,
   type FeishuReviewNotifyResult
@@ -111,7 +111,7 @@ async function notifyFeishuReviewConfirmed(
     const result = await notifier({
       ownerId,
       title: `${review.period} 月度复盘已确认`,
-      lines: composeReviewConfirmCardLines({
+      ...composeReviewConfirmCardBody({
         id: review.id,
         period: review.period,
         confirmedAt: review.confirmedAt ?? null,

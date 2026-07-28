@@ -27,12 +27,15 @@
 // catches anything unexpected).
 import {
   MemberRepository,
+  buildDeepLink,
   sendInteractiveCard
 } from "../../../packages/shared-types/dist/index.js";
 
 // Same disclaimer line the confirm cards carried before this notifier became
 // real - kept verbatim (plan Global Constraint: "改进建议 only，变更须本人确认").
 const CARD_DISCLAIMER = "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。";
+// Shown in place of the platform link when no public base url is configured.
+const NO_LINK_LINE = "完整复盘请在平台复盘页查看。";
 
 function asRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -128,9 +131,28 @@ export function composeReviewConfirmCardLines(review) {
     lines.push(`一句话教训：${oneLineLesson}`);
   }
 
-  lines.push(`复盘详情：/review/${review.id}（平台站内路径）`);
+  if (!buildDeepLink("review", review.id)) {
+    // No public base url on this deployment - say so plainly instead of
+    // printing the bare "/review/<id>" path this line used to carry, which is
+    // not openable from inside Feishu (see deep-links.ts).
+    lines.push(NO_LINK_LINE);
+  }
   lines.push(CARD_DISCLAIMER);
   return lines;
+}
+
+/**
+ * The card body (lines + the platform `url` button when this deployment has a
+ * public base url). Spread straight into the notifier's argument object:
+ * `notifier({ownerId, title, ...composeReviewConfirmCardBody(review)})`.
+ *
+ * @param {{id: string, period: string, confirmedAt?: string|null, result?: unknown}} review
+ * @returns {{lines: string[], url?: {text: string, href: string}}}
+ */
+export function composeReviewConfirmCardBody(review) {
+  const lines = composeReviewConfirmCardLines(review);
+  const href = buildDeepLink("review", review.id);
+  return href ? { lines, url: { text: "查看复盘详情", href } } : { lines };
 }
 
 /**
@@ -145,11 +167,11 @@ export function composeReviewConfirmCardLines(review) {
  * market-alerts-cards.mjs delivers through today.
  *
  * @param {{db: import('node:sqlite').DatabaseSync, transport?: import('../../../packages/shared-types/dist/index.js').CardTransport}} deps
- * @returns {(args: {ownerId: string, title: string, lines: string[]}) => Promise<{ok: boolean, messageId?: string, reason?: string}>}
+ * @returns {(args: {ownerId: string, title: string, lines: string[], url?: {text: string, href: string}}) => Promise<{ok: boolean, messageId?: string, reason?: string}>}
  */
 export function createFeishuReviewNotifier({ db, transport }) {
   const members = new MemberRepository(db);
-  return async function feishuReviewNotifier({ ownerId, title, lines }) {
+  return async function feishuReviewNotifier({ ownerId, title, lines, url }) {
     const member = members.getById(ownerId);
     if (!member) {
       return { ok: false, reason: `成员不存在：${ownerId}，无法投递飞书复盘通知。` };
@@ -158,9 +180,10 @@ export function createFeishuReviewNotifier({ db, transport }) {
       return { ok: false, reason: `成员 ${ownerId} 未配置 feishu_open_id，跳过飞书复盘通知。` };
     }
 
+    const card = { title, lines, ...(url ? { url } : {}) };
     const sent = transport
-      ? await sendInteractiveCard({ title, lines }, { openId: member.feishuOpenId }, transport)
-      : await sendInteractiveCard({ title, lines }, { openId: member.feishuOpenId });
+      ? await sendInteractiveCard(card, { openId: member.feishuOpenId }, transport)
+      : await sendInteractiveCard(card, { openId: member.feishuOpenId });
     if (!sent.ok) {
       return { ok: false, reason: sent.error ?? "飞书卡片发送失败。" };
     }

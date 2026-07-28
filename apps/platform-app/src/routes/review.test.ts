@@ -437,7 +437,12 @@ describe("monthly review reading page + confirm endpoint", () => {
       // Restart the suite's server with an injected fake notifier - the same
       // deps seam index.ts fills with createFeishuReviewNotifier({db}).
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      const calls: Array<{ ownerId: string; title: string; lines: string[] }> = [];
+      const calls: Array<{ ownerId: string; title: string; lines: string[]; url?: { text: string; href: string } }> =
+        [];
+      // The route must ship the platform deep link, not a bare path - so this
+      // end-to-end wiring test runs with a configured public base url.
+      const originalBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+      process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
       server = createPlatformServer({
         db,
         repoRoot,
@@ -463,12 +468,20 @@ describe("monthly review reading page + confirm endpoint", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]?.ownerId).toBe(memberA.id);
       expect(calls[0]?.title).toBe("2026-07 月度复盘已确认");
-      // Headline metrics straight from fullResultFixture + the link line -
-      // composeReviewConfirmCardLines' own suite covers every line/degrade
-      // variant; this pins the route wires the real composer end to end.
+      // Headline metrics straight from fullResultFixture + the deep-link
+      // button - composeReviewConfirmCardBody's own suite covers every
+      // line/degrade variant; this pins the route wires the real composer
+      // (body AND url) end to end.
       expect(calls[0]?.lines).toContain("本人论点命中率：67%（8/12）");
       expect(calls[0]?.lines).toContain("纪律遵守率：80%（8/10）");
-      expect(calls[0]?.lines).toContain(`复盘详情：/review/${id}（平台站内路径）`);
+      expect(calls[0]?.url).toEqual({ text: "查看复盘详情", href: `https://reports.qingverse.com/review/${id}` });
+      expect(calls[0]?.lines.join("\n")).not.toContain("/review/");
+
+      if (originalBaseUrl === undefined) {
+        delete process.env.PLATFORM_PUBLIC_BASE_URL;
+      } else {
+        process.env.PLATFORM_PUBLIC_BASE_URL = originalBaseUrl;
+      }
     });
 
     it("a form submission (reading page's own confirm button): 303-redirects to /review/<id>", async () => {

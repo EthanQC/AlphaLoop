@@ -405,7 +405,7 @@ describe("confirm", () => {
     expect(result.notify.reason).toContain("feishu_open_id");
   });
 
-  it("the confirm card carries the 月度复盘确认摘要 body: headline-metric lines + the /review/<id> link line", async () => {
+  it("the confirm card carries the 月度复盘确认摘要 body: headline-metric lines + the platform review link", async () => {
     const { db, options } = makeDb();
     seedMember(db, OWNER_A);
     const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
@@ -416,14 +416,23 @@ describe("confirm", () => {
       { ...options, memorydBackend: fakeMemorydBackend().backend, feishuNotifier }
     );
 
-    const notifierArgs = feishuNotifier.mock.calls[0]?.[0] as unknown as { title: string; lines: string[] };
+    const notifierArgs = feishuNotifier.mock.calls[0]?.[0] as unknown as {
+      title: string;
+      lines: string[];
+      url?: { text: string; href: string };
+    };
     expect(notifierArgs.title).toBe(`${PERIOD} 月度复盘已确认`);
     expect(notifierArgs.lines[0]).toBe(`复盘周期：${PERIOD}`);
     // A fresh empty-data fixture: every metric degrades honestly rather than
-    // fabricating a number (composeReviewConfirmCardLines' own suite covers
+    // fabricating a number (composeReviewConfirmCardBody's own suite covers
     // the populated variants line by line).
     expect(notifierArgs.lines).toContain("本人论点命中率：样本不足");
-    expect(notifierArgs.lines).toContain(`复盘详情：/review/${generated.review.id}（平台站内路径）`);
+    // No PLATFORM_PUBLIC_BASE_URL in the test environment: an honest pointer,
+    // never the bare "/review/<id>" path (see feishu-review-notifier's suite
+    // for the configured-base-url variant that ships a real `url` button).
+    expect(notifierArgs.lines).toContain("完整复盘请在平台复盘页查看。");
+    expect(notifierArgs.url).toBeUndefined();
+    expect(notifierArgs.lines.join("\n")).not.toContain("/review/");
     expect(notifierArgs.lines.join("\n")).not.toContain("NaN");
   });
 
@@ -463,7 +472,8 @@ describe("notify-test", () => {
     expect(result.reviewId).toBe(generated.review.id);
     expect(result.feishuOpenId).toBeNull();
     expect(result.card.title).toBe(`${PERIOD} 月度复盘已确认`);
-    expect(result.card.lines).toContain(`复盘详情：/review/${generated.review.id}（平台站内路径）`);
+    expect(result.card.lines).toContain("完整复盘请在平台复盘页查看。");
+    expect(JSON.stringify(result.card)).not.toContain("/review/");
     expect(feishuNotifier).not.toHaveBeenCalled(); // dry-run NEVER sends
     expect(auditRows(db, "notify-test")).toHaveLength(0); // and never audits
   });

@@ -64,6 +64,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   MemberRepository,
   ResearchTaskRepository,
+  buildDeepLink,
   sendInteractiveCard,
   type InteractiveCard,
   type JsonValue,
@@ -250,29 +251,38 @@ export function createDefaultMemoryReader(
   };
 }
 
-/** Real Feishu DM notifier: one line of conclusion + a confidence badge
+/** The result DM's card: one line of conclusion + a confidence badge
  * (CONFIDENCE_LABELS 高/中/低 - the SAME mapping reports/conclusion-box.ts
- * already uses for every other confidence field in this app), plus the
- * `/research/<id>` path as plain text (NOT a clickable `url` button: this
- * loopback-only service has no public base URL configured yet - P10's
- * Cloudflare Access domain - so a clickable link would silently 404/refuse
- * from inside the Feishu app; honestly-a-path-to-copy beats a broken button,
- * matching routes/research.ts's own "研究执行 P8 上线" honesty precedent for
- * an unshipped capability). `notifyOwner` below only ever calls this once a
- * `feishuOpenId` is already confirmed present, so no missing-openId guard is
- * needed here. */
+ * already uses for every other confidence field in this app), plus a `url`
+ * button straight at this task's own platform page.
+ *
+ * The button is dropped - and NOT replaced by the bare `/research/<id>` path
+ * this used to print - when the deployment has no PLATFORM_PUBLIC_BASE_URL
+ * configured: a path with no origin cannot be opened from inside Feishu, so
+ * it is replaced by an honest pointer at the platform (see deep-links.ts's
+ * "never a bare path" rule). PURE - exported so its copy is testable without
+ * a transport. */
+export function composeResearchResultCard(task: ResearchTask): InteractiveCard {
+  const confidenceLabel = task.confidence ? CONFIDENCE_LABELS[task.confidence] : "—";
+  const conclusion = task.resultJson?.conclusion ?? "研判已完成，详情见站内研判页。";
+  const href = buildDeepLink("research", task.id);
+  return {
+    title: task.title ?? "研究完成",
+    lines: [conclusion, `置信度：${confidenceLabel}`, ...(href ? [] : ["完整研判请在平台研判页查看。"])],
+    ...(href ? { url: { text: "查看研判详情", href } } : {})
+  };
+}
+
+/** Real Feishu DM notifier around composeResearchResultCard. `notifyOwner`
+ * below only ever calls this once a `feishuOpenId` is already confirmed
+ * present, so no missing-openId guard is needed here. */
 export function createDefaultNotifier(): ResearchNotifier {
   return async (task: ResearchTask, member: Member): Promise<void> => {
     const openId = member.feishuOpenId;
     if (!openId) {
       return;
     }
-    const confidenceLabel = task.confidence ? CONFIDENCE_LABELS[task.confidence] : "—";
-    const conclusion = task.resultJson?.conclusion ?? "研判已完成，详情见站内研判页。";
-    const card: InteractiveCard = {
-      title: task.title ?? "研究完成",
-      lines: [conclusion, `置信度：${confidenceLabel}`, `研判页：/research/${task.id}`]
-    };
+    const card = composeResearchResultCard(task);
     // sendInteractiveCard NEVER throws (notifications.ts): a delivery failure
     // (expired/bad openId, MCP transport error, network failure) surfaces as
     // `{ok:false, error}`, not an exception - so notifyOwner's own try/catch

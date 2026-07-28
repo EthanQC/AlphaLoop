@@ -17,7 +17,11 @@ import {
   type Member
 } from "../../../packages/shared-types/dist/index.js";
 
-import { composeReviewConfirmCardLines, createFeishuReviewNotifier } from "./feishu-review-notifier.mjs";
+import {
+  composeReviewConfirmCardBody,
+  composeReviewConfirmCardLines,
+  createFeishuReviewNotifier
+} from "./feishu-review-notifier.mjs";
 
 const OWNER = "member_a";
 const OPEN_ID = "ou_member_a_open_id";
@@ -107,7 +111,9 @@ describe("composeReviewConfirmCardLines (.mjs face)", () => {
       "纪律遵守率：80%（8/10）",
       "提醒误报率：50%（触发 4 / 误报 2）",
       "一句话教训：本月遵守率偏低，需复核高频违反的规则。",
-      "复盘详情：/review/monthly_review_1（平台站内路径）",
+      // No PLATFORM_PUBLIC_BASE_URL in this environment - an honest pointer,
+      // never the old bare "/review/<id>" path (see the deep-link suite below).
+      "完整复盘请在平台复盘页查看。",
       "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。"
     ]);
   });
@@ -119,7 +125,7 @@ describe("composeReviewConfirmCardLines (.mjs face)", () => {
       expect(lines).toContain("决策收益：样本不足");
       expect(lines).toContain("纪律遵守率：暂无数据");
       expect(lines).toContain("提醒质量：本月无提醒触发");
-      expect(lines).toContain("复盘详情：/review/monthly_review_2（平台站内路径）");
+      expect(lines.join("\n")).not.toContain("/review/");
       const joined = lines.join("\n");
       expect(joined).not.toContain("NaN");
       expect(joined).not.toContain("undefined");
@@ -209,5 +215,62 @@ describe("createFeishuReviewNotifier (.mjs face)", () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toContain("transport exploded (fake)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Platform deep link (Task 3, 2026-07-28 spec-drift plan)
+// ---------------------------------------------------------------------------
+
+describe("composeReviewConfirmCardBody platform deep link (.mjs face)", () => {
+  const BASE_URL_ENV = "PLATFORM_PUBLIC_BASE_URL";
+  const originalBaseUrl = process.env[BASE_URL_ENV];
+
+  afterEach(() => {
+    if (originalBaseUrl === undefined) {
+      delete process.env[BASE_URL_ENV];
+    } else {
+      process.env[BASE_URL_ENV] = originalBaseUrl;
+    }
+  });
+
+  it("turns the review page into an absolute /review/<id> button", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+
+    const body = composeReviewConfirmCardBody({ id: "monthly_review_1", period: "2026-07", result: RESULT_FIXTURE });
+
+    expect(body.url).toEqual({
+      text: "查看复盘详情",
+      href: "https://reports.qingverse.com/review/monthly_review_1"
+    });
+    expect(body.lines).not.toContain("完整复盘请在平台复盘页查看。");
+  });
+
+  it("degrades to an honest line with no button and no bare path when no public base url is configured", () => {
+    delete process.env[BASE_URL_ENV];
+
+    const body = composeReviewConfirmCardBody({ id: "monthly_review_1", period: "2026-07", result: RESULT_FIXTURE });
+
+    expect(body.url).toBeUndefined();
+    expect(body.lines.join("\n")).not.toContain("/review/");
+    expect(body.lines.at(-2)).toBe("完整复盘请在平台复盘页查看。");
+  });
+
+  it("ships the link as a real card button through the notifier", async () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const db = makeDb();
+    seedMember(db, { feishuOpenId: OPEN_ID });
+    const { transport, calls } = fakeTransport();
+    const notifier = createFeishuReviewNotifier({ db, transport });
+
+    const body = composeReviewConfirmCardBody({ id: "monthly_review_1", period: "2026-07", result: RESULT_FIXTURE });
+    const result = await notifier({ ownerId: OWNER, title: "2026-07 月度复盘已确认", ...body });
+
+    expect(result.ok).toBe(true);
+    const payload = calls[0]?.cardJson as {
+      body: { elements: Array<{ tag: string; actions?: Array<{ tag: string; url?: string }> }> };
+    };
+    const action = payload.body.elements.find((element) => element.tag === "action");
+    expect(action?.actions?.[0]?.url).toBe("https://reports.qingverse.com/review/monthly_review_1");
   });
 });

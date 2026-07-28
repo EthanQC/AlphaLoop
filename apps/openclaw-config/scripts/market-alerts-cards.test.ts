@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -71,9 +71,9 @@ describe("composeAlertCards", () => {
     expect(batches[0].ownerId).toBe("member_1");
     expect(batches[0].openId).toBe("ou_member_1");
     expect(batches[0].card.title).toBe("盘中提醒 2 条");
-    // 2 fire lines + the fixed footer line.
-    expect(batches[0].card.lines).toHaveLength(3);
-    expect(batches[0].card.lines.at(-1)).toBe("详情见今日日报（站点上线后将直达）");
+    // One line per fire - no trailing footer line any more (the platform link
+    // is a `url` button now, see the deep-link suite below).
+    expect(batches[0].card.lines).toHaveLength(2);
     expect(batches[0].eventIds).toEqual(["event_1", "event_2"]);
     expect(batches[0].card.buttons).toBeUndefined();
   });
@@ -89,7 +89,7 @@ describe("composeAlertCards", () => {
     expect(batches).toHaveLength(2);
     expect(batches.map((b) => b.ownerId).sort()).toEqual(["member_1", "member_2"]);
     for (const batch of batches) {
-      expect(batch.card.lines).toHaveLength(2); // 1 fire line + footer
+      expect(batch.card.lines).toHaveLength(1); // 1 fire line, nothing else
     }
   });
 
@@ -379,7 +379,7 @@ describe("deliverAlertCards", () => {
     return {
       ownerId: "member_1",
       openId: "ou_member_1",
-      card: { title: "盘中提醒 1 条", lines: ["22:10 NVDA 日内 -4.3%（阈值 ±4%）", "详情见今日日报（站点上线后将直达）"] },
+      card: { title: "盘中提醒 1 条", lines: ["22:10 NVDA 日内 -4.3%（阈值 ±4%）"] },
       eventIds
     };
   }
@@ -627,5 +627,108 @@ describe("deliverAlertCards", () => {
       // @ts-expect-error - deliberately passing the old (bare array) signature.
       deliverAlertCards(db, [makeBatch([eventId])], fakeTransport)
     ).rejects.toThrow(/batches/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Platform deep link (Task 3, 2026-07-28 spec-drift plan)
+// ---------------------------------------------------------------------------
+
+describe("composeAlertCards platform deep link", () => {
+  const BASE_URL_ENV = "PLATFORM_PUBLIC_BASE_URL";
+  const originalBaseUrl = process.env[BASE_URL_ENV];
+
+  afterEach(() => {
+    if (originalBaseUrl === undefined) {
+      delete process.env[BASE_URL_ENV];
+    } else {
+      process.env[BASE_URL_ENV] = originalBaseUrl;
+    }
+  });
+
+  it("links a single-symbol card straight at that symbol's platform page", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const fires = [
+      makeFire({ eventId: "event_1", symbol: "NVDA.US", ruleType: "daily_move" }),
+      makeFire({ eventId: "event_2", ruleId: "rule_2", symbol: "NVDA.US", ruleType: "spike_5m", threshold: 0.025 })
+    ];
+
+    const { batches } = composeAlertCards(fires, memberById, {});
+
+    expect(batches[0].card.url).toEqual({
+      text: "查看 NVDA 标的页",
+      href: "https://reports.qingverse.com/stock/NVDA.US"
+    });
+  });
+
+  it("ignores the portfolio-exposure sentinel when deciding the single symbol", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const fires = [
+      makeFire({ eventId: "event_1", symbol: "NVDA.US" }),
+      makeFire({ eventId: "event_2", ruleId: "rule_2", symbol: "*", ruleType: "exposure", value: 0.104, threshold: 0.1 })
+    ];
+
+    const { batches } = composeAlertCards(fires, memberById, {});
+
+    expect(batches[0].card.url?.href).toBe("https://reports.qingverse.com/stock/NVDA.US");
+  });
+
+  it("renders no button when one card mixes several symbols (no single right destination)", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const fires = [
+      makeFire({ eventId: "event_1", symbol: "NVDA.US" }),
+      makeFire({ eventId: "event_2", ruleId: "rule_2", symbol: "TSLA.US" })
+    ];
+
+    const { batches } = composeAlertCards(fires, memberById, {});
+
+    expect(batches[0].card.url).toBeUndefined();
+    expect(JSON.stringify(batches[0].card)).not.toContain("/stock/");
+  });
+
+  it("renders no button and no bare path when this deployment has no public base url", () => {
+    delete process.env[BASE_URL_ENV];
+    const fires = [makeFire({ eventId: "event_1", symbol: "NVDA.US" })];
+
+    const { batches } = composeAlertCards(fires, memberById, {});
+
+    expect(batches[0].card.url).toBeUndefined();
+    expect(JSON.stringify(batches[0].card)).not.toContain("/stock/");
+  });
+});
+
+// The footer this card used to end with promised a platform that has since
+// shipped ("详情见今日日报（...）", the 站点上线后 + 将直达 wording spelled out in
+// PLACEHOLDER below - assembled from two halves so this guard does not trip
+// over its own source). Scans the whole source tree, not just this module, so
+// no other card quietly reintroduces a "coming soon" line.
+describe("no shipped-code placeholder promising a future site", () => {
+  const PLACEHOLDER = ["站点上线后", "将直达"].join("");
+  const REPO_ROOT = resolve(import.meta.dirname, "../../..");
+  const SCANNED_ROOTS = ["apps", "packages"];
+  const SKIPPED_DIRS = new Set(["node_modules", "dist", ".git", "coverage"]);
+  const SCANNED_EXTENSIONS = [".ts", ".tsx", ".mjs", ".js", ".json"];
+
+  function collectSourceFiles(dir: string, found: string[] = []): string[] {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (!SKIPPED_DIRS.has(entry.name)) {
+          collectSourceFiles(join(dir, entry.name), found);
+        }
+        continue;
+      }
+      if (SCANNED_EXTENSIONS.some((extension) => entry.name.endsWith(extension))) {
+        found.push(join(dir, entry.name));
+      }
+    }
+    return found;
+  }
+
+  it("is gone from every source file under apps/ and packages/", () => {
+    const offenders = SCANNED_ROOTS.flatMap((root) => collectSourceFiles(join(REPO_ROOT, root))).filter((file) =>
+      readFileSync(file, "utf8").includes(PLACEHOLDER)
+    );
+
+    expect(offenders).toEqual([]);
   });
 });

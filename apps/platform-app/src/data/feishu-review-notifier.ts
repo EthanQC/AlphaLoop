@@ -29,7 +29,7 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 
-import { MemberRepository, sendInteractiveCard, type CardTransport } from "@packages/shared-types";
+import { MemberRepository, buildDeepLink, sendInteractiveCard, type CardTransport } from "@packages/shared-types";
 
 export interface FeishuReviewNotifyResult {
   ok: boolean;
@@ -41,6 +41,9 @@ export type FeishuReviewNotifier = (args: {
   ownerId: string;
   title: string;
   lines: string[];
+  /** The platform deep-link button, absent when this deployment has no public
+   * base url - see composeReviewConfirmCardBody. */
+  url?: { text: string; href: string };
 }) => Promise<FeishuReviewNotifyResult>;
 
 /** What composeReviewConfirmCardLines needs from a review row - structural,
@@ -58,6 +61,8 @@ export interface ReviewCardSource {
 // Same disclaimer line the confirm cards carried before this notifier became
 // real - kept verbatim (plan Global Constraint: "改进建议 only，变更须本人确认").
 const CARD_DISCLAIMER = "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。";
+// Shown in place of the platform link when no public base url is configured.
+const NO_LINK_LINE = "完整复盘请在平台复盘页查看。";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -130,7 +135,8 @@ function alertQualityLine(result: Record<string, unknown> | null): string {
  * headline-metric line per review section (each degrading to an honest
  * 样本不足/暂无数据 when the review row lacks that number - never NaN, never a
  * fabricated value), the one-line lesson when present, a link line to the
- * platform's own review page path, and the standing disclaimer. PURE - no
+ * platform's own review page (as a `url` button - see
+ * composeReviewConfirmCardBody), and the standing disclaimer. PURE - no
  * IO. Identical output, line for line, to the .mjs sibling's
  * composeReviewConfirmCardLines.
  */
@@ -150,9 +156,28 @@ export function composeReviewConfirmCardLines(review: ReviewCardSource): string[
     lines.push(`一句话教训：${oneLineLesson}`);
   }
 
-  lines.push(`复盘详情：/review/${review.id}（平台站内路径）`);
+  if (!buildDeepLink("review", review.id)) {
+    // No public base url on this deployment - say so plainly instead of
+    // printing the bare "/review/<id>" path this line used to carry, which is
+    // not openable from inside Feishu (see deep-links.ts).
+    lines.push(NO_LINK_LINE);
+  }
   lines.push(CARD_DISCLAIMER);
   return lines;
+}
+
+/**
+ * The card body (lines + the platform `url` button when this deployment has a
+ * public base url). Spread straight into the notifier's argument object:
+ * `notifier({ownerId, title, ...composeReviewConfirmCardBody(review)})`.
+ */
+export function composeReviewConfirmCardBody(review: ReviewCardSource): {
+  lines: string[];
+  url?: { text: string; href: string };
+} {
+  const lines = composeReviewConfirmCardLines(review);
+  const href = buildDeepLink("review", review.id);
+  return href ? { lines, url: { text: "查看复盘详情", href } } : { lines };
 }
 
 export interface FeishuReviewNotifierDeps {
@@ -172,7 +197,7 @@ export interface FeishuReviewNotifierDeps {
  */
 export function createFeishuReviewNotifier(deps: FeishuReviewNotifierDeps): FeishuReviewNotifier {
   const members = new MemberRepository(deps.db);
-  return async function feishuReviewNotifier({ ownerId, title, lines }): Promise<FeishuReviewNotifyResult> {
+  return async function feishuReviewNotifier({ ownerId, title, lines, url }): Promise<FeishuReviewNotifyResult> {
     const member = members.getById(ownerId);
     if (!member) {
       return { ok: false, reason: `成员不存在：${ownerId}，无法投递飞书复盘通知。` };
@@ -181,9 +206,10 @@ export function createFeishuReviewNotifier(deps: FeishuReviewNotifierDeps): Feis
       return { ok: false, reason: `成员 ${ownerId} 未配置 feishu_open_id，跳过飞书复盘通知。` };
     }
 
+    const card = { title, lines, ...(url ? { url } : {}) };
     const sent = deps.transport
-      ? await sendInteractiveCard({ title, lines }, { openId: member.feishuOpenId }, deps.transport)
-      : await sendInteractiveCard({ title, lines }, { openId: member.feishuOpenId });
+      ? await sendInteractiveCard(card, { openId: member.feishuOpenId }, deps.transport)
+      : await sendInteractiveCard(card, { openId: member.feishuOpenId });
     if (!sent.ok) {
       return { ok: false, reason: sent.error ?? "飞书卡片发送失败。" };
     }

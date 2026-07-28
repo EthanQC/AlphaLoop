@@ -58,7 +58,7 @@
 // non-finite quantity/price, degrades gracefully (see composeAlertLine)
 // instead of ever printing NaN - per the task brief, omit the affected
 // clause rather than guess.
-import { sendInteractiveCard } from "../../../packages/shared-types/dist/index.js";
+import { buildDeepLink, sendInteractiveCard } from "../../../packages/shared-types/dist/index.js";
 import { EXPOSURE_SYMBOL } from "./market-alerts-engine.mjs";
 import { updateEventMessageId } from "./market-alerts-store.mjs";
 import { getZonedParts } from "./trading-schedule.mjs";
@@ -69,7 +69,35 @@ const RULE_TYPE_LABEL = {
   spike_5m: "5分钟"
 };
 
-const FOOTER_LINE = "详情见今日日报（站点上线后将直达）";
+/**
+ * The card's platform link, or `undefined` when there is no single right
+ * destination for it. Replaces the old footer line, which promised a site
+ * that has since shipped ("详情见今日日报（…）").
+ *
+ * A card carries every fire of one owner in one poll cycle, so it only maps
+ * onto ONE platform page when every fire in it is about the same symbol -
+ * with two symbols in the card, picking either one's page would send the
+ * reader somewhere the card never promised. The portfolio-exposure sentinel
+ * is not a symbol at all and is ignored when deciding that, since
+ * `/stock/*` is not a page.
+ *
+ * Returns `undefined` (never a bare path) when this deployment has no
+ * PLATFORM_PUBLIC_BASE_URL configured - see deep-links.ts.
+ */
+function buildCardUrl(ownerFires) {
+  const symbols = new Set(ownerFires.map((fire) => fire.symbol).filter((symbol) => symbol !== EXPOSURE_SYMBOL));
+  if (symbols.size !== 1) {
+    return undefined;
+  }
+
+  const [symbol] = symbols;
+  const href = buildDeepLink("stock", symbol);
+  if (!href) {
+    return undefined;
+  }
+
+  return { text: `查看 ${formatDisplaySymbol(symbol)} 标的页`, href };
+}
 
 /**
  * Group fires by owner and render one InteractiveCard per owner for this
@@ -120,13 +148,15 @@ export function composeAlertCards(fires, memberById, positions) {
     }
 
     const lines = ownerFires.map((fire) => composeAlertLine(fire, positions ?? {}));
+    const url = buildCardUrl(ownerFires);
 
     batches.push({
       ownerId,
       openId,
       card: {
         title: `盘中提醒 ${ownerFires.length} 条`,
-        lines: [...lines, FOOTER_LINE]
+        lines,
+        ...(url ? { url } : {})
       },
       eventIds: ownerFires.map((fire) => fire.eventId)
     });

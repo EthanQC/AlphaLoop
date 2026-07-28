@@ -244,3 +244,58 @@ describe("deliverProposalCard", () => {
     expect(new ProposalRepository(db).getById(proposal.id)?.cardMessageId).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Platform deep link (Task 3, 2026-07-28 spec-drift plan)
+// ---------------------------------------------------------------------------
+
+describe("proposal card platform deep link", () => {
+  const BASE_URL_ENV = "PLATFORM_PUBLIC_BASE_URL";
+  const originalBaseUrl = process.env[BASE_URL_ENV];
+
+  afterEach(() => {
+    if (originalBaseUrl === undefined) {
+      delete process.env[BASE_URL_ENV];
+    } else {
+      process.env[BASE_URL_ENV] = originalBaseUrl;
+    }
+  });
+
+  it("puts an absolute /proposal/<id> link on the approval card", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const db = makeDb();
+    seedMember(db);
+    const proposal = fullProposal(db);
+
+    const card = composeProposalCard(proposal, DISCIPLINE_REPORT);
+
+    expect(card.url).toEqual({
+      text: "查看提案详情",
+      href: `https://reports.qingverse.com/proposal/${proposal.id}`
+    });
+  });
+
+  it("keeps the link on the post-decision re-render", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+    const db = makeDb();
+    seedMember(db);
+    const proposal = fullProposal(db);
+    const decided = { ...proposal, status: "approved", decidedAt: "2026-07-16T02:00:00.000Z", decidedBy: "member_1" };
+
+    const card = composeDecisionUpdate(decided);
+
+    expect(card.url?.href).toBe(`https://reports.qingverse.com/proposal/${proposal.id}`);
+  });
+
+  it("renders no button and no bare path when this deployment has no public base url", () => {
+    delete process.env[BASE_URL_ENV];
+    const db = makeDb();
+    seedMember(db);
+    const proposal = fullProposal(db);
+
+    const card = composeProposalCard(proposal, DISCIPLINE_REPORT);
+
+    expect(card.url).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain("/proposal/");
+  });
+});

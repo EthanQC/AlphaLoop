@@ -56,7 +56,7 @@ import {
 
 import { computeComplianceStats, loadLatestPriceForSymbol } from "../../platform-app/dist/data/strategy.js";
 
-import { composeReviewConfirmCardLines, createFeishuReviewNotifier } from "./feishu-review-notifier.mjs";
+import { composeReviewConfirmCardBody, createFeishuReviewNotifier } from "./feishu-review-notifier.mjs";
 import { createMemorydBackend, mirrorRecord } from "./memoryd-mirror.mjs";
 import { buildMonthlyReview } from "./review-engine.mjs";
 import { compareReviewMetrics, recomputeReviewMetrics } from "./review-verifier.mjs";
@@ -194,7 +194,7 @@ async function notifyFeishuReviewConfirmed(notifier, { ownerId, review }) {
     const result = await notifier({
       ownerId,
       title: `${review.period} 月度复盘已确认`,
-      lines: composeReviewConfirmCardLines({
+      ...composeReviewConfirmCardBody({
         id: review.id,
         period: review.period,
         confirmedAt: review.confirmedAt ?? null,
@@ -389,7 +389,7 @@ export async function runNotifyTest(flags, options = {}) {
     const card = review
       ? {
           title: `${review.period} 月度复盘已确认`,
-          lines: composeReviewConfirmCardLines({
+          ...composeReviewConfirmCardBody({
             id: review.id,
             period: review.period,
             confirmedAt: review.confirmedAt ?? null,

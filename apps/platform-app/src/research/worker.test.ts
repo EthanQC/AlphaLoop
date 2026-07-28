@@ -10,9 +10,16 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MemberRepository, ResearchTaskRepository, migrate, type Member } from "@packages/shared-types";
+import {
+  MemberRepository,
+  ResearchTaskRepository,
+  migrate,
+  type Member,
+  type ResearchTask
+} from "@packages/shared-types";
 
 import {
+  composeResearchResultCard,
   createResearchWorker,
   type ResearchBackend,
   type ResearchMemoryReader,
@@ -397,5 +404,66 @@ describe("createResearchWorker (Phase 8 Task 3, 2026-07-16 plan)", () => {
         vi.useRealTimers();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Result-card platform deep link (Task 3, 2026-07-28 spec-drift plan)
+// ---------------------------------------------------------------------------
+
+describe("composeResearchResultCard", () => {
+  const BASE_URL_ENV = "PLATFORM_PUBLIC_BASE_URL";
+  const originalBaseUrl = process.env[BASE_URL_ENV];
+
+  function doneTask(): ResearchTask {
+    return {
+      id: "research_1",
+      ownerId: "member_a",
+      question: "NVDA 还能追吗？",
+      status: "done",
+      steps: [],
+      budgetSpent: 0,
+      visibility: "private",
+      createdAt: "2026-07-28T00:00:00.000Z",
+      title: "NVDA 追高研判",
+      confidence: "medium",
+      resultJson: {
+        conclusion: "估值已透支，等回调。",
+        confidence: "medium",
+        keyPoints: [],
+        dataTable: [],
+        comparison: { theses: [], disciplines: [] },
+        evidence: [],
+        skipped: []
+      }
+    };
+  }
+
+  afterEach(() => {
+    if (originalBaseUrl === undefined) {
+      delete process.env[BASE_URL_ENV];
+    } else {
+      process.env[BASE_URL_ENV] = originalBaseUrl;
+    }
+  });
+
+  it("carries an absolute /research/<id> button instead of a bare path", () => {
+    process.env[BASE_URL_ENV] = "https://reports.qingverse.com";
+
+    const card = composeResearchResultCard(doneTask());
+
+    expect(card.title).toBe("NVDA 追高研判");
+    expect(card.lines).toEqual(["估值已透支，等回调。", "置信度：中"]);
+    expect(card.url).toEqual({ text: "查看研判详情", href: "https://reports.qingverse.com/research/research_1" });
+  });
+
+  it("renders no button and no bare path when this deployment has no public base url", () => {
+    delete process.env[BASE_URL_ENV];
+
+    const card = composeResearchResultCard(doneTask());
+
+    expect(card.url).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain("/research/");
+    expect(card.lines.at(-1)).toBe("完整研判请在平台研判页查看。");
   });
 });
