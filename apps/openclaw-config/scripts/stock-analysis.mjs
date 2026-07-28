@@ -324,8 +324,72 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, pdfPath, JSON.stringify(delivery));
 
-  writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols });
-  console.log(JSON.stringify({ delivered: delivery.sent, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
+  const { state, envelope } = buildStockAnalysisRunSummary({
+    delivery,
+    runId,
+    generatedAt,
+    deliveredSymbols,
+    failedSymbols,
+    markdownPath,
+    pdfPath
+  });
+  writeState(state);
+  console.log(JSON.stringify(envelope, null, 2));
+}
+
+/**
+ * What this run leaves behind for a human: the state file and the stdout JSON
+ * envelope.
+ *
+ * 2026-07-28 (R4, I13). `groupFallback` is the ONE signal that a 公共资产
+ * shipped but the circle's group chat never got it: with FEISHU_GROUP_CHAT_ID
+ * unset, the delivery layer sends the public card to the deployment's default
+ * target instead and says so (notifications.ts resolveReportDeliveryTarget).
+ * `delivery.sent` is TRUE on that path, so the success branch above logged a
+ * clean {delivered:true} and the fallback survived only inside the JSON blob in
+ * stock_analysis_runs.delivery - retrievable by querying sqlite, invisible to
+ * anyone reading the run. Its sibling did the opposite all along:
+ * scheduled-report.mjs writes both fields into the state file AND the stdout
+ * envelope, so 日报/周报 said it while 个股分析 did not. Both now report the
+ * same fact in the same two places.
+ *
+ * `groupFallback` is written unconditionally (false when the group DID get it),
+ * because an absent key cannot be told apart from an older build that never
+ * wrote one; the reason appears only when there is a reason.
+ *
+ * Exported for the same reason buildStockAnalysisDeliveryPayload below is:
+ * these two objects ARE the operator-visible output of a delivered run, and as
+ * object literals inside runAnalysis they could only be reached by a full live
+ * run (Longbridge CLI + gateway + network) - which is exactly why a missing
+ * field went unnoticed. One function feeds both sinks, so they cannot drift.
+ */
+export function buildStockAnalysisRunSummary({
+  delivery,
+  runId,
+  generatedAt,
+  deliveredSymbols,
+  failedSymbols,
+  markdownPath,
+  pdfPath
+}) {
+  const groupFallbackFields = {
+    groupFallback: delivery.groupFallback ?? false,
+    ...(delivery.groupFallbackReason ? { groupFallbackReason: delivery.groupFallbackReason } : {})
+  };
+
+  return {
+    state: { lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols, ...groupFallbackFields },
+    envelope: {
+      delivered: delivery.sent,
+      runId,
+      symbols: deliveredSymbols,
+      failedSymbols,
+      markdownPath,
+      pdfPath,
+      ...groupFallbackFields,
+      ...(delivery.sent ? {} : { deliveryReason: delivery.reason })
+    }
+  };
 }
 
 /**

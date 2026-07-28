@@ -1351,6 +1351,98 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
     expect(sends[0]!.receiveId).toBe("oc_public_group");
   });
 
+  // 2026-07-28 (R4, I13). On the fallback path `delivery.sent` is TRUE, so the
+  // producer took its success branch and logged {delivered:true, ...} with
+  // `groupFallback`/`groupFallbackReason` never read - the one signal that a
+  // 公共资产 went to one person's DM instead of the circle survived only inside
+  // the JSON blob in stock_analysis_runs.delivery. Its sibling
+  // (scheduled-report.mjs) wrote both into the state file and the envelope all
+  // along.
+  //
+  // The `delivery` fed to the producer's summarizer here is NOT hand-written:
+  // it is what the REAL delivery layer returns for the REAL batch payload on a
+  // deployment with no FEISHU_GROUP_CHAT_ID, so the field names and the reason
+  // text cannot drift from what production actually produces.
+  it("surfaces groupFallback in both the state file and the stdout envelope when the group never got the card", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    isolateHome();
+    process.env.FEISHU_APP_ID = "cli_trading_copilot";
+    process.env.FEISHU_APP_SECRET = "app-secret-x";
+    // No FEISHU_GROUP_CHAT_ID - the deployment shape that produces the fallback.
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+
+    const sends: string[] = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes("tenant_access_token")) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: "t-token", expire: 7200 }), { status: 200 });
+      }
+      sends.push((JSON.parse(String(init?.body)) as { receive_id: string }).receive_id);
+      return new Response(JSON.stringify({ code: 0, msg: "success", data: { message_id: "om_batch" } }), { status: 200 });
+    }) as typeof fetch;
+
+    const delivery = await notifications.deliverReportToFeishu(realBatchPayload());
+
+    // Preconditions, measured rather than assumed: the public card really did
+    // ship, really did go to one person, and the group really did not get it.
+    expect(delivery.sent).toBe(true);
+    expect(delivery.groupFallback).toBe(true);
+    expect(sends).toEqual(["ou_global_member"]);
+
+    const { state, envelope } = stockAnalysis.buildStockAnalysisRunSummary({
+      delivery,
+      runId: "stock_analysis_run_test",
+      generatedAt: "2026-07-28T12:00:00.000Z",
+      deliveredSymbols: ["AAPL.US"],
+      failedSymbols: [],
+      markdownPath: "/tmp/reports/2026-07-28.md",
+      pdfPath: undefined
+    });
+
+    // stdout envelope: "delivered" is still true, and now it no longer stands
+    // alone claiming an unqualified success.
+    expect(envelope.delivered).toBe(true);
+    expect(envelope.groupFallback).toBe(true);
+    expect(envelope.groupFallbackReason).toContain("FEISHU_GROUP_CHAT_ID");
+    // State file: the same two fields, same names as scheduled-report.mjs's.
+    expect(state.groupFallback).toBe(true);
+    expect(state.groupFallbackReason).toBe(delivery.groupFallbackReason);
+    expect(state.groupFallbackReason).toContain("群里本次没有收到发布卡");
+  });
+
+  it("records groupFallback:false with no reason when the card did reach the group", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    isolateHome();
+    process.env.FEISHU_APP_ID = "cli_trading_copilot";
+    process.env.FEISHU_APP_SECRET = "app-secret-x";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+
+    globalThis.fetch = (async (url: string | URL) => {
+      const body = String(url).includes("tenant_access_token")
+        ? { code: 0, tenant_access_token: "t-token", expire: 7200 }
+        : { code: 0, msg: "success", data: { message_id: "om_batch" } };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as typeof fetch;
+
+    const delivery = await notifications.deliverReportToFeishu(realBatchPayload());
+    const { state, envelope } = stockAnalysis.buildStockAnalysisRunSummary({
+      delivery,
+      runId: "stock_analysis_run_test",
+      generatedAt: "2026-07-28T12:00:00.000Z",
+      deliveredSymbols: ["AAPL.US"],
+      failedSymbols: [],
+      markdownPath: "/tmp/reports/2026-07-28.md",
+      pdfPath: undefined
+    });
+
+    // Written even on the good path: an absent key cannot be told apart from an
+    // older build that never wrote one.
+    expect(state.groupFallback).toBe(false);
+    expect(state).not.toHaveProperty("groupFallbackReason");
+    expect(envelope.groupFallback).toBe(false);
+    expect(envelope).not.toHaveProperty("groupFallbackReason");
+  });
+
   it("is published again on the legacy shared-chat channel instead of being refused as undeclared", async () => {
     const notifications = await import("../../../packages/shared-types/dist/index.js");
     const dir = isolateHome();
