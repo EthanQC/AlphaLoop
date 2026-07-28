@@ -49,10 +49,20 @@ const SECTION_TITLES = {
   holdings: "我的持仓速览",
   strategy: "我的策略对照",
   alerts: "我的提醒回顾",
-  todos: "我的待办"
+  todos: "我的待办",
+  // C2 (2026-07-28 review): §3.3's weekly-only section. The weekly page used to
+  // be byte-identical in structure to the daily one.
+  consistency: "本周我的交易 vs 策略一致性回顾"
 };
 
+// §3.2 fixes these four, in this order, for BOTH kinds. `consistency` is
+// appended for the weekly kind only (§3.3) - see SECTION_ORDER_BY_KIND.
 const SECTION_ORDER = ["holdings", "strategy", "alerts", "todos"];
+
+const SECTION_ORDER_BY_KIND = {
+  daily: SECTION_ORDER,
+  weekly: [...SECTION_ORDER, "consistency"]
+};
 
 const KIND_LABELS = { daily: "日报", weekly: "周报" };
 
@@ -139,12 +149,18 @@ export function renderPersonalPage({ db, ownerId, kind, date, now, helpers } = {
   const member = loadMember(db, ownerId);
   const alerts = loadAlertEvents(db, ownerId, window);
 
-  const sections = [
-    { key: "holdings", title: SECTION_TITLES.holdings, body: renderHoldings(db, ownerId, window, alerts, helpers) },
-    { key: "strategy", title: SECTION_TITLES.strategy, body: renderStrategy(db, ownerId, date) },
-    { key: "alerts", title: SECTION_TITLES.alerts, body: renderAlerts(alerts, window) },
-    { key: "todos", title: SECTION_TITLES.todos, body: renderTodos(db, ownerId) }
-  ];
+  const bodies = {
+    holdings: () => renderHoldings(db, ownerId, window, alerts, helpers),
+    strategy: () => renderStrategy(db, ownerId, date),
+    alerts: () => renderAlerts(alerts, window),
+    todos: () => renderTodos(db, ownerId),
+    consistency: () => renderTradeConsistency(db, ownerId, window, helpers)
+  };
+  const sections = SECTION_ORDER_BY_KIND[kind].map((key) => ({
+    key,
+    title: SECTION_TITLES[key],
+    body: bodies[key]()
+  }));
 
   const displayName = member?.displayName ?? "未知成员";
   const generatedAt = now ?? new Date().toISOString();
@@ -552,6 +568,194 @@ function renderTodos(db, ownerId) {
 }
 
 // ---------------------------------------------------------------------------
+// 5. 本周我的交易 vs 策略一致性回顾 (weekly only, spec §3.3)
+// ---------------------------------------------------------------------------
+// C2 (2026-07-28 review). Two defects met here:
+//
+//   - the weekly page used `kind` for nothing but the window length and the
+//     title, so it was structurally identical to the daily one and §3.3's
+//     「本周我的交易 vs 策略一致性回顾」 existed nowhere;
+//   - C1 had just taken the fill detail out of the PUBLIC daily/weekly body,
+//     where every member could read every other member's order flow. Removing
+//     it without rehoming it would have destroyed the content, so it lands
+//     here - on the page whose only reader is the member who placed the order.
+//
+// The verdict vocabulary is deliberately three-valued. 一致 / 冲突 are only
+// claimed when a DIRECTIONAL thesis on the same symbol makes the comparison
+// meaningful; everything else is 无对照 with the reason spelled out. A
+// two-valued verdict would have to guess, and a guess here reads as a judgment
+// of the member's discipline.
+function renderTradeConsistency(db, ownerId, window, helpers) {
+  const rows = helpers.selectExecutionReports(db, window, ownerId);
+  const unattributed = helpers.countUnattributedExecutionReports(db, window);
+  const disciplines = loadActiveDisciplineRules(db, ownerId);
+
+  // Unattributed rows are excluded by design (schema v17 left pre-per-member
+  // history with no owner rather than inventing one), but their EXISTENCE is
+  // disclosed: an empty section that silently dropped rows would read as "I
+  // traded nothing this week", which is a different claim from "nothing here
+  // is attributable to me".
+  const exclusionNotice = unattributed > 0
+    ? `- 说明：本窗口另有 ${unattributed} 条执行记录未按成员归属（owner_id 为空，早于按成员归属的账户），无法确认是否为本人下单，因此不计入本人对照，也不展开其内容。`
+    : null;
+
+  if (rows.length === 0) {
+    return [
+      `- 本周没有属于本人的执行记录：${window.startLabel} 20:00 - ${window.endLabel} 20:00 之间，execution_reports 里没有归属本人的成交或执行报告。`,
+      "- 说明：这不是「本周没有交易」的账户结论——只代表本窗口没有可归属到本人的执行记录，请勿据此判断仓位变化。",
+      ...(exclusionNotice ? [exclusionNotice] : [])
+    ].join("\n");
+  }
+
+  const theses = loadThesesBySymbol(db, ownerId);
+  const lines = rows.map((row) => renderConsistencyLine(row, theses, disciplines, helpers));
+
+  return [
+    `- 本周共有 ${rows.length} 条归属本人的执行记录，逐条与本人论点、纪律对照如下。`,
+    ...(exclusionNotice ? [exclusionNotice] : []),
+    ...lines,
+    renderDisciplineFootnote(disciplines)
+  ].join("\n");
+}
+
+function renderConsistencyLine(row, theses, disciplines, helpers) {
+  const summary = helpers.summarizeExecutionRow(row);
+  const text = `${row.title ?? ""}\n${row.body ?? ""}`;
+  const symbol = extractOwnedSymbol(text);
+  const side = extractOwnedSide(text);
+  const verdict = judgeConsistency(symbol, side, theses);
+  const ruleNote = describeSymbolDisciplines(symbol, disciplines);
+
+  return [
+    `- ${formatDateTime(row.created_at)} ${summary.heading}：${summary.summary}`,
+    `  - 一致性：${verdict.label}（${verdict.reason}）`,
+    `  - 状态：${summary.status}`,
+    `  - 纪律对照：${ruleNote}`
+  ].join("\n");
+}
+
+// The comparison itself. `theses` is a symbol -> thesis map of the owner's own
+// ACTIVE theses; a withdrawn/superseded thesis is not a live commitment, so it
+// is not used to convict a fill.
+function judgeConsistency(symbol, side, theses) {
+  if (!symbol) {
+    return {
+      label: "无对照",
+      reason: "原因：这条执行记录的正文里读不出标的，无法定位对应论点"
+    };
+  }
+  if (!side) {
+    return {
+      label: "无对照",
+      reason: `原因：这条执行记录的正文里读不出买卖方向，${symbol} 的论点方向无从比较`
+    };
+  }
+  const thesis = theses.get(symbol);
+  if (!thesis) {
+    return {
+      label: "无对照",
+      reason: `原因：本人名下没有 ${symbol} 的 status=active 论点，这笔${side}没有可对照的方向`
+    };
+  }
+  const directionLabel = DIRECTION_LABELS[thesis.direction] ?? thesis.direction;
+  if (thesis.direction === "neutral") {
+    return {
+      label: "无对照",
+      reason: `原因：${symbol} 的论点方向为${directionLabel}，买入或卖出都不构成一致或冲突`
+    };
+  }
+  const agrees = (thesis.direction === "bull" && side === "买入") || (thesis.direction === "bear" && side === "卖出");
+  return agrees
+    ? { label: "一致", reason: `${symbol} 论点为${directionLabel}，本次${side}与论点方向同向` }
+    : { label: "冲突", reason: `${symbol} 论点为${directionLabel}，本次${side}与论点方向相反，需要说明是减仓/止损还是论点已变` };
+}
+
+function loadThesesBySymbol(db, ownerId) {
+  const rows = db
+    .prepare(`
+      SELECT symbol, direction FROM theses
+      WHERE owner_id = ? AND status = 'active'
+      ORDER BY updated_at DESC, id ASC
+    `)
+    .all(ownerId);
+  const map = new Map();
+  for (const row of rows) {
+    const symbol = String(row.symbol).toUpperCase();
+    // First row wins: the ORDER BY puts the most recently updated thesis first,
+    // which is the one that represents the owner's current view.
+    if (!map.has(symbol)) {
+      map.set(symbol, { symbol, direction: String(row.direction) });
+    }
+  }
+  return map;
+}
+
+function loadActiveDisciplineRules(db, ownerId) {
+  return db
+    .prepare(`
+      SELECT rule_text, enforcement FROM discipline_rules
+      WHERE owner_id = ? AND enabled = 1 AND disabled_at IS NULL
+      ORDER BY created_at ASC
+    `)
+    .all(ownerId)
+    .map((row) => ({ text: String(row.rule_text), enforcement: String(row.enforcement) }));
+}
+
+// discipline_rules.rule_text is free-form Chinese written by the member. There
+// is no structured field to evaluate a fill against, so the page does NOT claim
+// to have checked the fill - it surfaces the rules that name the traded symbol
+// and says plainly that the judgment is the member's to make. Inventing a
+// pass/fail here would be the fabrication this section is supposed to avoid.
+function describeSymbolDisciplines(symbol, disciplines) {
+  if (disciplines.length === 0) {
+    return "本人尚未登记生效中的纪律条目，本条无纪律可对照";
+  }
+  if (!symbol) {
+    return `本人有 ${disciplines.length} 条生效纪律，但这条记录读不出标的，无法定位相关条目`;
+  }
+  const matched = disciplines.filter((rule) => rule.text.toUpperCase().includes(symbol));
+  if (matched.length === 0) {
+    return `本人 ${disciplines.length} 条生效纪律中没有点名 ${symbol} 的条目`;
+  }
+  return matched
+    .map((rule) => `${rule.text}（执行方式：${ENFORCEMENT_LABELS[rule.enforcement] ?? rule.enforcement}）`)
+    .join("；");
+}
+
+function renderDisciplineFootnote(disciplines) {
+  return disciplines.length === 0
+    ? "- 判定口径：一致/冲突只在本人存在同标的方向性论点时给出；纪律条目为空，本节没有纪律侧结论。"
+    : "- 判定口径：一致/冲突只在本人存在同标的方向性论点时给出；纪律条目是自然语言，本节只列出相关条目供本人对照，不做机器判定。";
+}
+
+// Symbol/side re-extracted here (rather than read off summarizeExecutionRow's
+// formatted heading) because the verdict must key on the RAW value, not on a
+// display string that may carry a fallback label like 「未标明标的」.
+function extractOwnedSymbol(text) {
+  const patterns = [
+    /\bSymbol:\s*([A-Z]{1,5}(?:\.US)?)/iu,
+    /\bfor\s+([A-Z]{1,5}(?:\.US)?)/iu,
+    /\border\s+(?:buy|sell)\s+([A-Z]{1,5}(?:\.US)?)/iu,
+    /\b([A-Z]{1,5}\.US)\b/u
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].toUpperCase();
+    }
+  }
+  return null;
+}
+
+function extractOwnedSide(text) {
+  const match = text.match(/\b(?:Side:\s*|order\s+)(buy|sell)\b/iu);
+  if (!match?.[1]) {
+    return null;
+  }
+  return match[1].toLowerCase() === "buy" ? "买入" : "卖出";
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -569,16 +773,23 @@ function parseSnapshot(raw) {
   }
 }
 
+// C2 added the last three: the owner-scoped execution read, the unattributed
+// count, and the fill formatter that used to feed the public digest. All six
+// come from scheduled-report.mjs through the same injection seam, for the
+// one-directional-dependency reason in this module's header.
+const REQUIRED_HELPERS = [
+  "renderOfficialPaperSnapshot",
+  "summarizeOfficialAccount",
+  "summarizeOfficialPositions",
+  "selectExecutionReports",
+  "countUnattributedExecutionReports",
+  "summarizeExecutionRow"
+];
+
 function assertHelpers(helpers) {
-  if (
-    !helpers ||
-    typeof helpers.renderOfficialPaperSnapshot !== "function" ||
-    typeof helpers.summarizeOfficialAccount !== "function" ||
-    typeof helpers.summarizeOfficialPositions !== "function"
-  ) {
-    throw new Error(
-      "personal-page requires helpers.{renderOfficialPaperSnapshot, summarizeOfficialAccount, summarizeOfficialPositions}."
-    );
+  const missing = helpers ? REQUIRED_HELPERS.filter((name) => typeof helpers[name] !== "function") : REQUIRED_HELPERS;
+  if (missing.length > 0) {
+    throw new Error(`personal-page requires helpers.{${missing.join(", ")}}.`);
   }
 }
 
@@ -660,4 +871,4 @@ function singleLine(value, maxChars = 160) {
   return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
 }
 
-export { SECTION_ORDER, SECTION_TITLES };
+export { SECTION_ORDER, SECTION_ORDER_BY_KIND, SECTION_TITLES };

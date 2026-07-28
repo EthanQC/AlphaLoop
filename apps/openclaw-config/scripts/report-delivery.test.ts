@@ -31,7 +31,12 @@ const scheduledReport = await import("./scheduled-report.mjs");
 const helpers = {
   renderOfficialPaperSnapshot: scheduledReport.renderOfficialPaperSnapshot,
   summarizeOfficialAccount: scheduledReport.summarizeOfficialAccount,
-  summarizeOfficialPositions: scheduledReport.summarizeOfficialPositions
+  summarizeOfficialPositions: scheduledReport.summarizeOfficialPositions,
+  // C1/C2: the owner-scoped execution read and the fill formatter §3.3's weekly
+  // 「本周我的交易 vs 策略一致性回顾」 section needs.
+  selectExecutionReports: scheduledReport.selectExecutionReports,
+  countUnattributedExecutionReports: scheduledReport.countUnattributedExecutionReports,
+  summarizeExecutionRow: scheduledReport.summarizeExecutionRow
 };
 
 const DATE = "2026-07-28";

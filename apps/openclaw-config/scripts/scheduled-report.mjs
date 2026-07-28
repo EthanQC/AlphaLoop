@@ -115,7 +115,13 @@ async function prepareReport(reportKind, info) {
     helpers: {
       renderOfficialPaperSnapshot,
       summarizeOfficialAccount,
-      summarizeOfficialPositions
+      summarizeOfficialPositions,
+      // C1/C2: the owner-scoped execution read and the fill formatter that used
+      // to feed the PUBLIC digest, injected for §3.3's weekly
+      // 「本周我的交易 vs 策略一致性回顾」 section.
+      selectExecutionReports,
+      countUnattributedExecutionReports,
+      summarizeExecutionRow
     }
   });
   if (personalPages.failures.length > 0) {

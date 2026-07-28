@@ -33,8 +33,45 @@ const scheduledReport = await import("./scheduled-report.mjs");
 const helpers = {
   renderOfficialPaperSnapshot: scheduledReport.renderOfficialPaperSnapshot,
   summarizeOfficialAccount: scheduledReport.summarizeOfficialAccount,
-  summarizeOfficialPositions: scheduledReport.summarizeOfficialPositions
+  summarizeOfficialPositions: scheduledReport.summarizeOfficialPositions,
+  // C1/C2: the owner-scoped execution read and the fill formatter that used to
+  // feed the PUBLIC digest. Injected through the same seam for the same reason.
+  selectExecutionReports: scheduledReport.selectExecutionReports,
+  countUnattributedExecutionReports: scheduledReport.countUnattributedExecutionReports,
+  summarizeExecutionRow: scheduledReport.summarizeExecutionRow
 };
+
+// One fill for `ownerId`, worded the way broker-executor's
+// buildExecutionReportBody words a real one, so the extraction the page reuses
+// (summarizeExecutionRow) is exercised on realistic text rather than on a
+// string shaped to match it.
+function seedExecutionReport(
+  db: DatabaseSync,
+  input: {
+    id: string;
+    ownerId: string | null;
+    symbol: string;
+    side: "buy" | "sell";
+    quantity: number;
+    price?: number;
+    createdAt: string;
+    category?: string;
+    extra?: string;
+  }
+): void {
+  const body = [
+    `Ticket: ${input.id}`,
+    `Symbol: ${input.symbol}`,
+    `Side: ${input.side}`,
+    `Quantity: ${input.quantity}`,
+    ...(input.price === undefined ? [] : [`Price: ${input.price}`]),
+    ...(input.extra ? [input.extra] : [])
+  ].join("\n");
+  db.prepare(`
+    INSERT INTO execution_reports (id, category, title, body, metadata, created_at, owner_id)
+    VALUES (?, ?, ?, ?, '{}', ?, ?)
+  `).run(input.id, input.category ?? "trade", `${input.symbol} 执行报告`, body, input.createdAt, input.ownerId);
+}
 
 const tempDirs: string[] = [];
 
@@ -603,12 +640,312 @@ describe("scheduled-report wiring", () => {
 // never be written into an ad-hoc table.
 describe("schema v16 personal_pages", () => {
   it("is on the migration chain a plain openTradingDatabase() produces", () => {
-    expect(SCHEMA_VERSION).toBe(16);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(16);
     const db = makeDb();
-    expect(getSchemaVersion(db)).toBe(16);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
     const columns = (db.prepare(`PRAGMA table_info(personal_pages)`).all() as Array<{ name: string }>).map(
       (column) => column.name
     );
     expect(columns).toEqual(["id", "owner_id", "kind", "date", "markdown", "created_at"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C2 (2026-07-28 adversarial review): the weekly personal page was
+// byte-identical in STRUCTURE to the daily one - renderPersonalPage used `kind`
+// only for the window length and the title. Spec §3.3 asks the weekly page for
+// 「本周我的交易 vs 策略一致性回顾」, and C1 just took the fill detail out of the
+// public body, so this is where it belongs.
+// ---------------------------------------------------------------------------
+describe("C2: the weekly personal page reviews this week's trades against the owner's strategy", () => {
+  function seedOwnerWithFills(db: DatabaseSync): void {
+    seedMember(db, "member_c2", "小周报");
+    // bull thesis on AAPL: a buy is 一致, a sell is 冲突.
+    seedThesis(db, {
+      id: "thesis_c2_aapl",
+      ownerId: "member_c2",
+      symbol: "AAPL.US",
+      direction: "bull",
+      targetHigh: 300,
+      invalidationPrice: 150
+    });
+    // No thesis at all on MSFT: the verdict must be 无对照 with a reason, not a
+    // guess in either direction.
+    seedExecutionReport(db, {
+      id: "er_c2_buy",
+      ownerId: "member_c2",
+      symbol: "AAPL.US",
+      side: "buy",
+      quantity: 40,
+      price: 210.5,
+      createdAt: "2026-07-24T14:00:00.000Z"
+    });
+    seedExecutionReport(db, {
+      id: "er_c2_sell",
+      ownerId: "member_c2",
+      symbol: "AAPL.US",
+      side: "sell",
+      quantity: 15,
+      price: 205.25,
+      createdAt: "2026-07-25T14:00:00.000Z"
+    });
+    seedExecutionReport(db, {
+      id: "er_c2_nothesis",
+      ownerId: "member_c2",
+      symbol: "MSFT.US",
+      side: "buy",
+      quantity: 5,
+      price: 480,
+      createdAt: "2026-07-26T14:00:00.000Z"
+    });
+  }
+
+  it("adds the §3.3 section to the WEEKLY page only - the daily page keeps the four §3.2 sections", () => {
+    const db = makeDb();
+    seedOwnerWithFills(db);
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const daily = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "daily",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    expect(weekly.sections.map((section: { key: string }) => section.key)).toEqual([
+      "holdings",
+      "strategy",
+      "alerts",
+      "todos",
+      "consistency"
+    ]);
+    expect(weekly.markdown).toContain("## 5. 本周我的交易 vs 策略一致性回顾");
+
+    expect(daily.sections.map((section: { key: string }) => section.key)).toEqual([
+      "holdings",
+      "strategy",
+      "alerts",
+      "todos"
+    ]);
+    expect(daily.markdown).not.toContain("本周我的交易 vs 策略一致性回顾");
+    // The two pages are no longer structurally identical, which is the defect.
+    expect(weekly.sections).not.toHaveLength(daily.sections.length);
+  });
+
+  it("carries the fill detail C1 removed from the public body: symbol, side, quantity, reference price", () => {
+    const db = makeDb();
+    seedOwnerWithFills(db);
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const section = weekly.sections.find((entry: { key: string }) => entry.key === "consistency");
+
+    expect(section?.body).toContain("AAPL.US");
+    expect(section?.body).toContain("买入");
+    expect(section?.body).toContain("卖出");
+    expect(section?.body).toContain("40");
+    expect(section?.body).toContain("210.5");
+  });
+
+  it("states a real verdict per fill: 一致 / 冲突 / 无对照, each with its reason", () => {
+    const db = makeDb();
+    seedOwnerWithFills(db);
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const body = weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+    // One block per fill: the entry line plus its indented 一致性/状态/纪律对照
+    // sub-lines. The section's own header/说明/判定口径 bullets do not start
+    // with a date, so they are excluded.
+    const lines = body.split(/\n(?=- )/u).filter((block) => /^- \d{4}-/u.test(block));
+
+    expect(lines).toHaveLength(3);
+    // buy under a bull thesis
+    expect(lines[0]).toContain("买入");
+    expect(lines[0]).toContain("一致性：一致（");
+    expect(lines[0]).toContain("看多");
+    // sell under the same bull thesis
+    expect(lines[1]).toContain("卖出");
+    expect(lines[1]).toContain("一致性：冲突（");
+    // no thesis for MSFT at all - disclosed, not guessed
+    expect(lines[2]).toContain("MSFT.US");
+    expect(lines[2]).toContain("一致性：无对照（");
+    expect(lines[2]).toMatch(/原因[：:]/u);
+  });
+
+  it("judges a neutral thesis as 无对照 rather than forcing it into 一致 or 冲突", () => {
+    const db = makeDb();
+    seedMember(db, "member_c2n", "小中性");
+    seedThesis(db, {
+      id: "thesis_c2n",
+      ownerId: "member_c2n",
+      symbol: "AAPL.US",
+      direction: "neutral",
+      targetHigh: 300,
+      invalidationPrice: 150
+    });
+    seedExecutionReport(db, {
+      id: "er_c2n",
+      ownerId: "member_c2n",
+      symbol: "AAPL.US",
+      side: "buy",
+      quantity: 10,
+      price: 200,
+      createdAt: "2026-07-24T14:00:00.000Z"
+    });
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2n",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const body = weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+    expect(body).toContain("一致性：无对照（");
+    expect(body).toContain("中性");
+    expect(body).not.toContain("一致性：一致（");
+    expect(body).not.toContain("一致性：冲突（");
+  });
+
+  it("lists the owner's discipline rules that name the traded symbol, and says when a rule is not machine-judgeable", () => {
+    const db = makeDb();
+    seedOwnerWithFills(db);
+    db.prepare(`
+      INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, linked_strategy, enabled, created_at, disabled_at)
+      VALUES ('rule_c2', 'member_c2', 'AAPL.US 单一标的不超过总仓 15%', 'hard', NULL, 1, '2026-07-01T00:00:00.000Z', NULL)
+    `).run();
+    db.prepare(`
+      INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, linked_strategy, enabled, created_at, disabled_at)
+      VALUES ('rule_c2_off', 'member_c2', 'MSFT.US 禁止追高', 'self', NULL, 0, '2026-07-01T00:00:00.000Z', '2026-07-02T00:00:00.000Z')
+    `).run();
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const body = weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+
+    expect(body).toContain("AAPL.US 单一标的不超过总仓 15%");
+    expect(body).toContain("硬约束");
+    // A free-text rule is NOT machine-evaluated, and the page says so instead
+    // of implying the fill was checked against it.
+    expect(body).toContain("不做机器判定");
+    // A disabled rule is not presented as if it were in force.
+    expect(body).not.toContain("MSFT.US 禁止追高");
+  });
+
+  it("never shows another member's fill, and excludes the window's rows from the owner's list", () => {
+    const db = makeDb();
+    seedOwnerWithFills(db);
+    seedMember(db, "member_other", "别人");
+    seedExecutionReport(db, {
+      id: "er_other",
+      ownerId: "member_other",
+      symbol: "TSLA.US",
+      side: "buy",
+      quantity: 999,
+      price: 250,
+      createdAt: "2026-07-24T15:00:00.000Z"
+    });
+    seedExecutionReport(db, {
+      id: "er_stale",
+      ownerId: "member_c2",
+      symbol: "GOOG.US",
+      side: "buy",
+      quantity: 7,
+      price: 190,
+      createdAt: "2026-06-01T15:00:00.000Z"
+    });
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+
+    expect(weekly.markdown).not.toContain("TSLA.US");
+    expect(weekly.markdown).not.toContain("999");
+    // Outside the seven-day window.
+    expect(weekly.markdown).not.toContain("GOOG.US");
+  });
+
+  it("discloses the unattributed legacy rows it excluded instead of letting them look like nothing happened", () => {
+    const db = makeDb();
+    seedMember(db, "member_c2u", "小无主");
+    seedExecutionReport(db, {
+      id: "er_legacy_1",
+      ownerId: null,
+      symbol: "QQQ.US",
+      side: "buy",
+      quantity: 3,
+      price: 700,
+      createdAt: "2026-07-24T15:00:00.000Z"
+    });
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2u",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const body = weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+
+    expect(body).toContain("本周没有属于本人的执行记录");
+    expect(body).toContain("1 条");
+    expect(body).toContain("未按成员归属");
+    // The disclosure names the count, never the excluded row's content.
+    expect(body).not.toContain("QQQ.US");
+  });
+
+  it("says the section is empty and WHY when the week has no execution rows at all", () => {
+    const db = makeDb();
+    seedMember(db, "member_c2e", "小空周");
+
+    const weekly = personalPage.renderPersonalPage({
+      db,
+      ownerId: "member_c2e",
+      kind: "weekly",
+      date: "2026-07-28",
+      now: "2026-07-28T12:05:00.000Z",
+      helpers
+    });
+    const body = weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+
+    expect(body.trim()).not.toBe("");
+    expect(body).toContain("本周没有属于本人的执行记录");
+    // Never "flat"/"no trades were made" as a conclusion about the ACCOUNT.
+    expect(body).toMatch(/原因|说明/u);
   });
 });
