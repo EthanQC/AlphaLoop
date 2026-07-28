@@ -165,6 +165,17 @@ const NO_SNAPSHOT_ROW: OfficialPaperAttribution = {
  * real member. Zero rows, a NULL `owner_id`, a non-member sentinel, or two
  * members on one date are all `unattributable` WITH A REASON - never resolved
  * to a best guess, and (see the callers) never readable by anyone.
+ *
+ * 2026-07-28 (spec drift R4/F9): this DATE-level rule is what decides the 403,
+ * so it is also what the card writer must ask before it names a recipient.
+ * official-paper-monitor.mjs mirrors it in `resolveOfficialPaperDateAttribution`
+ * (same reason filter, same `substr(fetched_at, 1, 10)` key, same
+ * multiple-owners / NULL / non-member-sentinel verdicts). The mirror is a second
+ * implementation, not a shared one - `reports.test.ts` "the card's scope and the
+ * page's attribution agree" runs BOTH against the same database, including the
+ * two-same-date-owners case that used to DM a card for a page that 403s
+ * everyone, so a change to either rule alone fails that test rather than
+ * silently splitting the two surfaces again.
  */
 function resolveOfficialPaperAttributions(db: DatabaseSync): Map<string, OfficialPaperAttribution> {
   const rows = db

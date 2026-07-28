@@ -532,6 +532,77 @@ describe("resolvePnlReportScope: the card's recipient is the page's owner (spec 
     expect(scope.visibility).toBe("owner-unresolved");
     expect(scope.reason).toContain("飞书 open_id");
   });
+
+  // 2026-07-28 (spec drift R4/F9). This function used to read ONE row - this
+  // run's - while routes/reports.ts decides the 403 from EVERY post_open_pnl row
+  // on the date. Two same-date rows with different owners therefore produced a
+  // card addressed to member_1 for a page that 403s member_1 too, and the doc
+  // above it claimed the two "cannot disagree".
+  it("refuses to name an owner when the same date carries two differently-owned post_open_pnl rows", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    // The reproduction: a __shared__ row at 14:00Z and member_1's row at 14:05Z.
+    officialPaperMonitor.saveSnapshot(
+      db,
+      buildSnapshot({ fetchedAt: "2026-07-01T14:00:00.000Z" }),
+      "post_open_pnl",
+      officialPaperMonitor.SHARED_OWNER_SENTINEL
+    );
+    const snapshotId = officialPaperMonitor.saveSnapshot(
+      db,
+      buildSnapshot({ fetchedAt: "2026-07-01T14:05:00.000Z" }),
+      "post_open_pnl",
+      "member_1"
+    );
+
+    const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+    expect(scope.visibility).toBe("owner-unresolved");
+    expect(scope.reason).toContain("2026-07-01");
+    expect(scope.reason).toContain("归属不同");
+    // The date-level rule the platform runs agrees, on the same rows.
+    expect(officialPaperMonitor.resolveOfficialPaperDateAttribution(db, "2026-07-01").kind).toBe("unattributable");
+  });
+
+  it("ignores rows on OTHER dates - a different day's owner does not make today ambiguous", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    officialPaperMonitor.saveSnapshot(
+      db,
+      buildSnapshot({ fetchedAt: "2026-06-30T14:00:00.000Z" }),
+      "post_open_pnl",
+      "member_2"
+    );
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl", "member_1");
+
+    expect(officialPaperMonitor.resolvePnlReportScope(db, snapshotId)).toEqual({
+      visibility: "owner-private",
+      ownerOpenId: "ou_member_1"
+    });
+  });
+
+  it("ignores same-date rows from other run kinds, exactly as the platform's query does", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    officialPaperMonitor.saveSnapshot(
+      db,
+      buildSnapshot({ fetchedAt: "2026-07-01T15:00:00.000Z" }),
+      "hourly_poll_per_member",
+      "member_2"
+    );
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl", "member_1");
+
+    expect(officialPaperMonitor.resolvePnlReportScope(db, snapshotId).visibility).toBe("owner-private");
+  });
+
+  it("refuses a snapshot whose reason the platform never attributes, rather than claiming an owner for it", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "manual");
+
+    const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+    expect(scope.visibility).toBe("owner-unresolved");
+    expect(scope.reason).toContain("post_open_pnl");
+  });
 });
 
 // The end-to-end version of the same defect, driven through the REAL producer

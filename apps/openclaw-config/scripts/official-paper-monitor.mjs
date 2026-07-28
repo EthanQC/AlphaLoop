@@ -149,7 +149,7 @@ async function sendPnlReport(db, forceRun = false) {
 
   assertOfficialPaperReportEnvironment();
   const snapshot = await fetchOfficialPaperSnapshot();
-  const snapshotId = saveSnapshot(db, snapshot, "post_open_pnl");
+  const snapshotId = saveSnapshot(db, snapshot, OFFICIAL_PAPER_REPORT_REASON);
   const previousDay = findComparisonSnapshot(db, snapshot.fetchedAt, "previous_day");
   const previousWeek = findComparisonSnapshot(db, snapshot.fetchedAt, "previous_week");
   const markdown = renderPnlReport(snapshot, previousDay, previousWeek);
@@ -159,6 +159,12 @@ async function sendPnlReport(db, forceRun = false) {
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
+  // Resolved from the persisted rows with the platform's own date-level rule
+  // (resolveOfficialPaperDateAttribution), never from re-running
+  // resolveSnapshotOwnerId: the card's recipient and the page's 403 gate answer
+  // the same question over the same rows, and the basis is printed below so a
+  // later run that changes the answer is visible in the run log.
+  const scope = resolvePnlReportScope(db, snapshotId);
   const delivery = await deliverReportToFeishu(buildPnlDeliveryPayload({
     current: snapshot,
     previousDay,
@@ -166,11 +172,7 @@ async function sendPnlReport(db, forceRun = false) {
     markdown,
     markdownPath,
     pdfPath,
-    // Read back the owner the row was ACTUALLY written with, rather than
-    // re-running resolveSnapshotOwnerId - the card's recipient and the page's
-    // 403 gate then answer to the same value by construction, even if the
-    // member table changes between the two calls.
-    scope: resolvePnlReportScope(db, snapshotId)
+    scope
   }));
   // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
   // already persisted by this point, so a Feishu delivery failure must not
@@ -185,41 +187,145 @@ async function sendPnlReport(db, forceRun = false) {
     process.exitCode = 1;
   }
 
-  console.log(JSON.stringify({ delivered: delivery.sent, snapshotId, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
+  console.log(JSON.stringify({
+    delivered: delivery.sent,
+    snapshotId,
+    markdownPath,
+    pdfPath,
+    // The exact basis the page will re-derive: report date, the rule's verdict
+    // over this date's rows, and the scope that verdict produced. A same-date
+    // rerun that flips this leaves a record of WHY the page closed on a date
+    // whose card already went out. The owner's open_id is deliberately NOT
+    // logged - the attribution question is answered by member id.
+    attribution: {
+      reportDate: label,
+      ...resolveOfficialPaperDateAttribution(db, label),
+      visibility: scope.visibility,
+      ...(scope.reason ? { scopeReason: scope.reason } : {})
+    },
+    ...(delivery.sent ? {} : { deliveryReason: delivery.reason })
+  }, null, 2));
+}
+
+/** The `reason` the platform keys its /official-paper attribution on
+ * (routes/reports.ts OFFICIAL_PAPER_REPORT_REASON). A snapshot written with any
+ * other reason produced no `<date>-post-open.md` and is invisible to that
+ * query, so it can never be the basis for a card either. */
+const OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl";
+
+/** `owner_id` values that are NOT a member. Mirrors routes/reports.ts's
+ * NON_MEMBER_OWNER_IDS exactly: this file's own "could not attribute" sentinel
+ * plus the v7 migration placeholder identity.ts refuses to resolve. */
+const NON_MEMBER_OWNER_IDS = new Set([SHARED_OWNER_SENTINEL, "__legacy_system__"]);
+
+/**
+ * Who the platform will say owns `/official-paper/<reportDate>` — computed here
+ * with the SAME rule, over the SAME rows, as routes/reports.ts
+ * resolveOfficialPaperAttributions (2026-07-28 spec drift R4/F9).
+ *
+ * That rule is date-scoped, not row-scoped: it groups EVERY `post_open_pnl` row
+ * whose `substr(fetched_at, 1, 10)` is this date and refuses to attribute the
+ * date at all when they do not all name one real member. Reading only this
+ * run's own row — which is what this file used to do — is a DIFFERENT question
+ * with a different answer: two same-date `post_open_pnl` rows with different
+ * owners (e.g. a `__shared__` row at 14:00Z and a `member_1` row at 14:05Z)
+ * gave the card `owner-private -> member_1` while the page 403s member_1 too.
+ *
+ * Returned shape matches the platform's: `{kind:"owner", ownerId}` or
+ * `{kind:"unattributable", reason}`. Kept exported so the agreement is testable
+ * against the real route rather than asserted in a comment
+ * (routes/reports.test.ts "card scope and page attribution agree").
+ */
+export function resolveOfficialPaperDateAttribution(db, reportDate) {
+  const rows = db.prepare(`
+    SELECT owner_id FROM official_paper_snapshots
+    WHERE reason = ? AND substr(fetched_at, 1, 10) = ?
+    GROUP BY owner_id
+  `).all(OFFICIAL_PAPER_REPORT_REASON, reportDate);
+
+  const owners = new Set(rows.map((row) => (
+    typeof row.owner_id === "string" && row.owner_id.length > 0 ? row.owner_id : null
+  )));
+
+  if (owners.size === 0) {
+    return {
+      kind: "unattributable",
+      reason: `${reportDate} 当天没有任何 post_open_pnl 快照记录，无法确认这份报告属于谁`
+    };
+  }
+  if (owners.size > 1) {
+    const listed = [...owners].map((owner) => owner ?? "（空归属）").join("、");
+    return {
+      kind: "unattributable",
+      reason: `${reportDate} 当天存在 ${owners.size} 份归属不同的 post_open_pnl 记录（${listed}），平台按同一规则判定为无法归属，页面对所有人关闭`
+    };
+  }
+  const [ownerId] = [...owners];
+  if (ownerId === null) {
+    return {
+      kind: "unattributable",
+      reason: `${reportDate} 当天的快照没有写入归属成员（owner_id 为空），无法确认这份账户数据属于谁`
+    };
+  }
+  if (NON_MEMBER_OWNER_IDS.has(ownerId)) {
+    return {
+      kind: "unattributable",
+      reason: `${reportDate} 当天的快照归属是占位值 ${ownerId}（写入时就不是恰好 1 位活跃成员，无法归属到某一个人），平台上的 /official-paper 页面对所有人关闭`
+    };
+  }
+  return { kind: "owner", ownerId };
 }
 
 /**
  * The `ReportScope` for a PnL card: WHO is allowed to read this account's
- * balances (2026-07-28 spec drift R2).
+ * balances (2026-07-28 spec drift R2, corrected R4/F9).
  *
- * The platform decides who may open /official-paper/<date> from
- * `official_paper_snapshots.owner_id` on that date's `post_open_pnl` row
- * (routes/reports.ts resolveOfficialPaperAttributions). This reads back the
- * SAME row this run just wrote, so the card and the page cannot disagree about
- * who owns the numbers.
+ * Both sides answer from `resolveOfficialPaperDateAttribution`'s rule over this
+ * snapshot's own report date, so the card's recipient and the page's 403 gate
+ * agree on the rows that exist WHEN THIS RUN ASKS. That is the whole guarantee,
+ * and it is not more than that: the page re-reads at request time, so a LATER
+ * same-date `post_open_pnl` row with a different owner (a second `pnl --force`
+ * run that day) can still close a page whose card was already delivered. That
+ * later run resolves the same conflict and refuses to send, and sendPnlReport
+ * prints the attribution basis it used (`attribution` in its JSON output), so
+ * the divergence shows up in the run log instead of being silent.
  *
- * Three honest outcomes, no fourth:
- *   - one real member with a Feishu open_id -> owner-private to that member.
- *   - the `__shared__` sentinel (0 or >1 active members, so the writer could
- *     not attribute the snapshot) -> owner-unresolved. The platform page is
- *     closed to EVERYONE in this state; a card that went anywhere would be
- *     handing one account's balances to whoever the default target is.
+ * Honest outcomes, no others:
+ *   - the date attributes to one real member with a Feishu open_id ->
+ *     owner-private to that member.
+ *   - the date is unattributable (no row, several owners, an empty owner, or a
+ *     non-member sentinel) -> owner-unresolved, carrying the platform's own
+ *     reason. The page is closed to EVERYONE in this state; a card that went
+ *     anywhere would be handing one account's balances to whoever the default
+ *     target is.
  *   - a real member who has not bound a Feishu account -> owner-unresolved.
  *     There is no DM to send to, and "no DM available" must never degrade into
  *     "send it to the group".
  */
 export function resolvePnlReportScope(db, snapshotId) {
-  const row = db.prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = ?").get(snapshotId);
-  const ownerId = typeof row?.owner_id === "string" ? row.owner_id.trim() : "";
-
-  if (ownerId === "" || ownerId === SHARED_OWNER_SENTINEL) {
+  const row = db
+    .prepare("SELECT fetched_at, reason FROM official_paper_snapshots WHERE id = ?")
+    .get(snapshotId);
+  if (!row) {
     return {
       visibility: "owner-unresolved",
-      reason: ownerId === SHARED_OWNER_SENTINEL
-        ? `本次快照的归属是 ${SHARED_OWNER_SENTINEL}（当前不是恰好 1 位活跃成员，无法归属到某一个人），平台上的 /official-paper 页面对所有人关闭`
-        : "本次快照没有写入归属成员（owner_id 为空），无法确认这份账户数据属于谁"
+      reason: `快照 ${snapshotId} 在 official_paper_snapshots 里不存在，无法确认这份账户数据属于谁`
     };
   }
+  if (row.reason !== OFFICIAL_PAPER_REPORT_REASON) {
+    // The platform only attributes post_open_pnl rows; a card built on any
+    // other reason would be claiming an owner for a page that has none.
+    return {
+      visibility: "owner-unresolved",
+      reason: `本次快照的 reason 是 ${String(row.reason)}，平台只按 ${OFFICIAL_PAPER_REPORT_REASON} 快照判定 /official-paper 的归属，两边无法对齐`
+    };
+  }
+
+  const attribution = resolveOfficialPaperDateAttribution(db, String(row.fetched_at).slice(0, 10));
+  if (attribution.kind !== "owner") {
+    return { visibility: "owner-unresolved", reason: attribution.reason };
+  }
+  const ownerId = attribution.ownerId;
 
   const member = new MemberRepository(db).getById(ownerId);
   if (!member) {

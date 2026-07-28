@@ -18,6 +18,12 @@ import {
 
 import { createPlatformServer } from "../server.js";
 
+/** The REAL card writer (apps/openclaw-config/scripts/official-paper-monitor.mjs).
+ * Imported so the R4/F9 cases below can run the writer's own snapshot writes and
+ * its own recipient resolution against this module's own route, instead of
+ * restating either side's rule in a fixture. */
+const officialPaperMonitor = await import("../../../openclaw-config/scripts/official-paper-monitor.mjs");
+
 function memoryDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON;");
@@ -655,6 +661,108 @@ describe("reports routes", () => {
       const body = await (await authed("/reports")).text();
       expect(body).not.toContain(`href="/official-paper/${DATE}"`);
       expect(body).toContain("归属无法确认");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 2026-07-28 (spec drift R4/F9). The card writer resolved its recipient from
+  // ONE row (the run's own snapshot); this page resolves the 403 from EVERY
+  // post_open_pnl row on the date. Two same-date rows with different owners
+  // therefore DM'd member_1 a card for a page that 403s member_1 - while the
+  // writer's doc claimed the two "cannot disagree about who owns the numbers".
+  //
+  // These cases run the REAL writer (official-paper-monitor.mjs: its own
+  // saveSnapshot writes the rows, its own resolvePnlReportScope decides the
+  // recipient) against the REAL route, on ONE database. No hand-written
+  // snapshot row and no restated rule: if either side's rule changes alone,
+  // this fails.
+  // -------------------------------------------------------------------------
+  describe("the card's scope and the page's attribution agree (spec drift R4/F9)", () => {
+    const DATE = "2026-06-17";
+
+    /** The writer's own snapshot shape, as `fetchOfficialPaperSnapshot` returns
+     * it - saveSnapshot derives every persisted column from this. */
+    function paperSnapshot(fetchedAt: string): Record<string, unknown> {
+      return {
+        fetchedAt,
+        primaryAsset: { net_assets: "122951.22", total_cash: "122220.08" },
+        positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 731.42 }],
+        quotes: [{ symbol: "QQQ.US", last: 731.42 }]
+      };
+    }
+
+    beforeEach(() => {
+      writeReport(repoRoot, "official-paper", `${DATE}-post-open.md`, PAPER_ACCOUNT_MARKDOWN);
+      // The card can only be addressed to a member with a Feishu binding.
+      new MemberRepository(db).upsert({ ...member, feishuOpenId: "ou_member_1" });
+    });
+
+    it("one owner on the date: the card is owner-private to that member and the page opens for exactly them", async () => {
+      const snapshotId = officialPaperMonitor.saveSnapshot(
+        db,
+        paperSnapshot(`${DATE}T13:40:00.000Z`),
+        "post_open_pnl",
+        member.id
+      );
+
+      expect(officialPaperMonitor.resolvePnlReportScope(db, snapshotId)).toEqual({
+        visibility: "owner-private",
+        ownerOpenId: "ou_member_1"
+      });
+      expect((await authed(`/official-paper/${DATE}`)).status).toBe(200);
+      expect((await authedAsOther(`/official-paper/${DATE}`)).status).toBe(403);
+    });
+
+    it("two owners on one date: the card is refused for the same reason the page 403s EVERYONE", async () => {
+      officialPaperMonitor.saveSnapshot(db, paperSnapshot(`${DATE}T13:40:00.000Z`), "post_open_pnl", "__shared__");
+      const snapshotId = officialPaperMonitor.saveSnapshot(
+        db,
+        paperSnapshot(`${DATE}T13:45:00.000Z`),
+        "post_open_pnl",
+        member.id
+      );
+
+      // Before the fix this was {visibility:"owner-private", ownerOpenId:"ou_member_1"}.
+      const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+      expect(scope.visibility).toBe("owner-unresolved");
+      expect(scope.reason).toContain(DATE);
+
+      for (const response of [await authed(`/official-paper/${DATE}`), await authedAsOther(`/official-paper/${DATE}`)]) {
+        expect(response.status).toBe(403);
+        expect(await response.text()).not.toContain("122951.22");
+      }
+    });
+
+    it("the writer's date rule returns the same verdict as the page for every attribution state", async () => {
+      const states = [
+        { date: "2026-06-18", ownerId: "member_1", expectOwner: "member_1", ownerCanRead: true },
+        { date: "2026-06-19", ownerId: "__shared__", expectOwner: null, ownerCanRead: false },
+        { date: "2026-06-20", ownerId: null, expectOwner: null, ownerCanRead: false },
+        { date: "2026-06-21", ownerId: "member_gone", expectOwner: "member_gone", ownerCanRead: false }
+      ] as const;
+
+      for (const state of states) {
+        writeReport(repoRoot, "official-paper", `${state.date}-post-open.md`, PAPER_ACCOUNT_MARKDOWN);
+        if (state.ownerId === null) {
+          // No current writer can produce this: saveSnapshot always stamps an
+          // owner (a member id or the sentinel). A NULL owner_id only exists on
+          // rows written before schema v4, so it is seeded directly.
+          seedPaperSnapshot(db, { fetchedAt: `${state.date}T13:40:00.000Z`, ownerId: null });
+        } else {
+          officialPaperMonitor.saveSnapshot(
+            db,
+            paperSnapshot(`${state.date}T13:40:00.000Z`),
+            "post_open_pnl",
+            state.ownerId
+          );
+        }
+
+        const attribution = officialPaperMonitor.resolveOfficialPaperDateAttribution(db, state.date);
+        expect(attribution.kind === "owner" ? attribution.ownerId : null).toBe(state.expectOwner);
+
+        expect((await authed(`/official-paper/${state.date}`)).status).toBe(state.ownerCanRead ? 200 : 403);
+        expect((await authedAsOther(`/official-paper/${state.date}`)).status).toBe(403);
+      }
     });
   });
 });
