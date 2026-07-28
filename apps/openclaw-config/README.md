@@ -16,6 +16,7 @@
 - `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里清掉。
 - `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
+- `scripts/install-cloudflared-tunnel.mjs`：给**还没有 connector 的机器**安装用户级 cloudflared 隧道（token 模式）。mini 上已经跑着系统级的 `com.cloudflare.cloudflared`，所以这条脚本在那里会拒绝执行，见下面「公网入口」。
 
 ## Feishu
 
@@ -71,6 +72,19 @@ pnpm official-paper:pnl
 | `external` | 由 `openclaw` CLI 自己拥有，本仓库不碰 | — |
 
 当前只有 `com.alphaloop.rsshub` 是 `user`：它整个任务体就是 `docker start rsshub`，而它依赖的容器运行时（`homebrew.mxcl.colima`）本身就是用户级 LaunchAgent，socket 和 context 都在用户家目录下。系统 daemon 会赶在那个 socket 存在之前启动然后报 "Cannot connect to the Docker daemon"——把它提升到系统域只会让新闻源更不可靠。
+
+### 公网入口：`com.cloudflare.cloudflared` 才是那一个
+
+清单里 2026-07-28 新增了一行 `external com.cloudflare.cloudflared`。原因是这个标签此前**根本不在**「唯一事实来源」里，而它恰恰是用户唯一依赖的公网入口。
+
+mini 上只读实测：`/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`（`root:wheel`，7 月 27 日），`launchctl print system/com.cloudflare.cloudflared` 报 `state = running`，命令行是 `/opt/homebrew/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run`（named tunnel，凭据在 `/etc/cloudflared/<uuid>.json`，0600 root），`https://reports.qingverse.com/health` 经 Cloudflare anycast 返回 200。
+
+而 `install-cloudflared-tunnel.mjs` 装的是 `com.alphaloop.cloudflared-tunnel`——**另一个标签**，用户级 LaunchAgent，token 模式。名字不同意味着 launchd 不会用新的替换旧的，而是两个 connector 一起跑。所以：
+
+- **系统 daemon 赢。** 它是 root 拥有、由 `cloudflared service install` 安装的第三方产物（scope `external`，本仓库任何脚本都不写它、不删它），而且它是系统域——开机不需要图形登录就能起来，正是这轮把 8 个标签搬去 `/Library/LaunchDaemons` 的同一个理由。用户级 LaunchAgent 在这条标准上是退步。
+- `install-cloudflared-tunnel.mjs` 现在会在 `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist` 存在时拒绝安装（消息里给出改 `/etc/cloudflared/config.yml` + `launchctl kickstart` 的正确做法），`--force` 才能越过。判断放在 `ensureCloudflaredInstalled()` 之前，所以拒绝时不会顺手 `brew install` 一个包。`--dry-run` 的 JSON 里多了 `systemDaemonPresent` / `wouldRefuse` 两个字段。
+- 它的自己那个标签**故意不写进清单**：装了系统 daemon 的机器上它永远不该被安装，而没有 connector 的新机器由操作者显式选路径。
+- doctor 不探测这两个标签中的任何一个（`external` 行不参与 `launchd-jobs.*`）。隧道健康只能手工确认：`curl -sS -o /dev/null -w '%{http_code}\n' https://reports.qingverse.com/health`。
 
 ### 三个安装脚本各自做什么（2026-07-28 之后）
 
@@ -181,13 +195,18 @@ L1 多源采集（RSSHub 中文源 + Finnhub + 既有 Yahoo/Google/Longbridge）
 - `FINNHUB_API_KEY`：Finnhub company-news API 鉴权（`X-Finnhub-Token` 请求头）；未设置时 Finnhub 源整体跳过（`sourceHealth.finnhub = 'skipped_no_key'`），不报错、不阻塞报告。
 - `RSSHUB_BASE_URL`：本机/自建 RSSHub 实例地址，供财联社电报、华尔街见闻快讯、格隆汇快讯三条中文源路由使用；未设置默认 `http://127.0.0.1:1200`。
 
-本机 RSSHub 容器**不由**任何 launchd 任务创建，只在 P10 首次点火时手动跑一次：
+本机 RSSHub 容器**不由**任何 launchd 任务创建，需要在部署时手动建一次（根 README「部署机安装顺序」第 7 步）：
 
 ```bash
-docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub
+zsh -lc 'docker start rsshub 2>/dev/null || docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub'
 ```
 
-容器创建后，`com.alphaloop.rsshub` launchd 任务（`launchd:install-backup-alerts` 一并安装）负责在每次机器重启后跑 `docker start rsshub`，确保容器继续常驻——它不创建、不重建容器，容器不存在时这一步会失败（`logs/rsshub.err.log` 里会看到 "No such container"），此时需要回去手动跑一遍上面的 `docker run` 命令。
+两个细节都是 2026-07-28 在 mini 上实测出来的：
+
+- **`zsh -lc` 不能省。** 非 login shell 里 `command -v docker` 什么都不返回（`zsh:1: command not found: docker`），login shell 里才是 `/opt/homebrew/bin/docker`。用 ssh 或脚本远程执行时默认拿到的正是前者。
+- **不要用裸 `docker run`。** 容器已存在时它以 "The container name /rsshub is already in use" 非零退出，把一次正常的重跑变成看起来像失败的部署。`docker start` 在容器已在运行时空转返回 0、容器停止时把它拉起来、容器不存在时返回 1，所以上面的 `||` 写法三种状态都对。
+
+容器创建后，`com.alphaloop.rsshub` launchd 任务（`launchd:install-backup-alerts` 一并安装）负责在每次机器重启后跑 `docker start rsshub`，确保容器继续常驻——它不创建、不重建容器，容器不存在时这一步会失败（`logs/rsshub.err.log` 里会看到 "No such container"），此时需要回去手动跑一遍上面那条命令。
 
 `pnpm openclaw:runtime:doctor` 覆盖两个新闻引擎检查项：
 
