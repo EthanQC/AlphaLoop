@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
@@ -266,6 +267,7 @@ describe("cache headers on every route the server dispatches", () => {
   let baseUrl: string;
   let db: DatabaseSync;
   let bearerToken: string;
+  let repoRoot: string;
 
   interface Observed {
     status: number;
@@ -290,7 +292,16 @@ describe("cache headers on every route the server dispatches", () => {
     new MemberRepository(db).upsert(member);
     bearerToken = new ApiTokenRepository(db).issue(member.id, "cache-headers-probe").token;
 
-    server = createPlatformServer({ db, repoRoot: process.cwd(), now: () => new Date("2026-07-28T12:00:00.000Z") });
+    // An EMPTY temp root, never the repo (defect G4-b, 2026-07-28). With
+    // `repoRoot: process.cwd()` the probes below that expect 404 were reading
+    // the real reports/ tree, so they turned red the day anyone generated a
+    // report for 2026-07-01 - reproduced by creating reports/daily/2026-07-01.md,
+    // reports/weekly/2026-07-01.md and reports/stock-analysis/2026-07-01.md,
+    // which flipped all three probes to 200. The cache headers this file is
+    // about do not depend on whether a report exists, so the probes should not
+    // either; /official-paper's 403 is decided before anything is scanned.
+    repoRoot = mkdtempSync(join(tmpdir(), "alphaloop-cache-headers-"));
+    server = createPlatformServer({ db, repoRoot, now: () => new Date("2026-07-28T12:00:00.000Z") });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => resolve());
     });
@@ -324,6 +335,7 @@ describe("cache headers on every route the server dispatches", () => {
   afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     db.close();
+    rmSync(repoRoot, { recursive: true, force: true });
   });
 
   it("probes every route module server.ts dispatches to, plus its inline branches and its fall-through", () => {
