@@ -104,6 +104,20 @@ DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh
 DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=3 zsh apps/openclaw-config/scripts/deploy.sh
 ```
 
+`DEPLOY_FROM_STEP` 只接受 0-8 的整数，写错（`9`、`99`、`abc`）会**在什么都还没做的时候**以退出码 2 停下。2026-07-29 之前它没有上界：`DEPLOY_FROM_STEP=9` 会把九步全部跳过、一次 launchctl 都不调、doctor 也不跑，然后退出 0 并打印「0-8 全部通过」——手滑一次就能凭空造出一次"成功部署"。现在结尾那句写的是**这次真正执行了哪几步**，跳过的步骤会单独列出来。
+
+它的退出码是分开的，别把它们混成一件事：
+
+| 退出码 | 含义 | 机器被改了吗 |
+| --- | --- | --- |
+| 0 | 本次要求执行的步骤全部退出 0（含第 8 步 doctor） | 是 |
+| 1 | 某一步失败，后面的步骤没有执行 | 半完成 |
+| 2 | 参数写错，或没确认 gateway 重启 | 否 |
+| 3 | **配置未就绪**（见下一节），在第 0 步之前就拒绝 | 否 |
+| 4 | 某一步的收据写不进账本——验收门看不见这次部署 | 半完成 |
+
+**第 0 步之前的配置预检。** 脚本会先看 `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL`（进程环境优先，其次 `.env.local`，解析规则和 daemon 用的 `loadLocalEnv` 一致）。缺任何一个就以退出码 3 停下，**一步都不跑**。原因是这两个变量正是 doctor 会报 error 的那两个：mini 上它们今天都没配，所以第 0-7 步可以全部成功而第 8 步照样退出 1——语义没错，但读日志的人会把它当成"部署回退了"。想先装服务、稍后补配置，就显式写 `DEPLOY_ALLOW_MISSING_CONFIG=yes`：第 0-7 步照跑，第 8 步仍然会红，红的是配置。
+
 **为什么必须是脚本而不是粘贴命令块。** 2026-07-29 之前这一节就是一段可以整体复制的命令序列——没有 `&&`、没有 `set -e`、没有任何守卫（这一点看那段文本本身就能确认）。第 5 轮实测到的后果：让第 0 步的 `git pull --ff-only` 因为一个改动过的 README 中止，第 1 到第 8 步照样全部跑完，跑的全是**旧 commit 的代码**，最后第 8 步还给了绿灯。同一个形状对每一步都成立：第 3 步退出 1 拦不住第 4 步去动它刚刚有意保留的退路。粘进交互式 shell 的命令块没法 fail-fast（`set -e` 会把操作者的 ssh 会话一起杀掉），所以 runbook 变成了这个脚本。
 
 **验收以第 8 步的退出码为准**（0 = 通过）。第 8 步现在也会因为「部署收据里有失败的步骤」而报错——也就是说，跑到一半失败的部署，不可能在下一次验收时装作没发生过。
@@ -180,13 +194,15 @@ pnpm openclaw:runtime:doctor
 
 这道门在 2026-07-29 之前拦不住"部署失败"本身——第 5 轮实测的五个 critical 全是同一个形状：某一步失败了、明明白白打印了、非零退出了，而这道门仍然 `ok=true` 退出 0。现在它会在下列情况上失败：
 
-- **部署收据里有失败的步骤**（`deploy-ledger.step_N_failed`，error）。`deploy.sh` 和 `install-system-daemons.sh` 会把每一步的退出码写进 `runtime/deploy/steps.jsonl`；修好那一步再重跑，成功的新收据会覆盖它。收据缺失或对应的是别的 commit 只报 warn——"没有证据"不等于"失败"。
-- **这台机器的检出不是你 push 的代码**（`deploy-checkout.behind_origin`，error）：直接比较 `HEAD` 和本地的 `origin/main` ref（不联网、不 fetch）。
+- **部署收据里有失败的步骤**（`deploy-ledger.step_N_failed`，error）。`deploy.sh` 和 `install-system-daemons.sh` 会把每一步的退出码写进 `runtime/deploy/steps.jsonl`；修好那一步再重跑，成功的新收据会覆盖它。**收据缺失**只报 warn——"没有证据"不等于"失败"。
+- **收据对应的是别的 commit**（`deploy-ledger.stale`，error，2026-07-29 从 warn 提上来）。之前把它当 warn 的理由是「检出旧不旧由 `deploy-checkout` 判」，那句话是错的：`deploy-checkout` 只在**落后 origin** 时报错。实测（真的本地 origin + 两个真 commit）：在 A 部署 → origin 前进到 B → 操作者手动 `git pull` 成功、但没有重跑 `deploy.sh` → 落后 0、只有一条 warn、门是绿的，而 dist 产物和八个 daemon 跑的全是 A。手动 pull 不会更新收据，也不会重启任何服务。
+- **收据写不进去**（`deploy-ledger.unwritable`，已部署的机器上是 error）。判据是「当前用户能不能往那个文件追加」，只问内核、不写任何东西。它堵的是这条路：账本被某次 sudo 跑变成 root 属主之后，新的失败记录写不进去，而上一次部署的九条 `exitCode: 0` 还躺在那儿——门读到的就是那九条绿灯。`deploy.sh`、`install-system-daemons.sh`、`install-openclaw-cron.mjs` 三个写入方现在也都会因为写失败而以退出码 4 停下。
+- **这台机器的检出不是你 push 的代码**（`deploy-checkout.behind_origin` / `deploy-checkout.never_fetched`，error）：用 `git ls-remote` 直接问 origin 的 main 现在在哪（只读：不更新 ref、不下载对象、不动工作区），再看这台机器上有没有那个 commit。之前只比 `HEAD` 和**本地那份** `origin/main` ref，而 mini 上实测：`HEAD` = 14b1202、本地 ref 也 = 14b1202、落后 0、工作区干净，真正的 `origin/main` 却是 a4e39c1。这条检查存在的意义就是回答「跑的不是你 push 的代码」，它却在一台五个 commit 没跟上、且从没 fetch 过的机器上答「没事」。问不到 origin（断网/凭据）时报 warn `deploy-checkout.remote_unverified`，并说明结论只基于本地 ref。
 - **某个标签一个域都没装**（`launchd-jobs.<name>.not_loaded`）。这在**已经部署过的机器**上是 error（判据：有部署收据、或者已有别的受管标签处于加载状态、或者磁盘上已经有受管标签的 plist）；在完全没有部署痕迹的开发机上仍然只是 warn。
-- **常驻服务在崩溃重启循环**（`crash_looping`，error）：`runs ≥ 20` 即成立，不再要求"上次退出码非零"。原因是 `runs` 只在服务死掉时增加、而且每次重新 bootstrap 都会清零（本机实测：同一个标签 bootout+bootstrap 之后 runs 从 3 回到 1），所以它累计不到部署次数上去。旧规则挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**（mini 上的 platform-app 现在就是这样：只有 `last terminating signal = Terminated: 15`），于是整个分支对这类死法不可达。信号本身也纳入判定，但 SIGTERM/SIGKILL 除外——那正是 `launchctl bootout` 和 `kickstart -k` 发的信号，也就是这套安装脚本每次都会对每个 daemon 做的事。
+- **常驻服务在崩溃重启循环**（`crash_looping`，error）：`runs ≥ 20` **且**距上一次装系统 daemon 不到 24 小时。不再要求"上次退出码非零"。原因是 `runs` 只在服务死掉时增加、而且每次重新 bootstrap 都会清零（本机实测：同一个标签 bootout+bootstrap 之后 runs 从 3 回到 1），所以它累计不到部署次数上去；但它在**两次安装之间**照样累加——mini 上今天 gateway 就是 `runs = 10` + `state = running` + 进程活了 10 天，只数次数的规则迟早会给一台正常机器挂上永久红灯，还说它「自上次安装以来死了 19 次」。次数够了而窗口不明（没有第 3 步的成功收据）或跨度远超一天时，报的是 warn `restarted_many_times`，并把缺的那一半事实直说。旧规则挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**（mini 上的 platform-app 现在就是这样：只有 `last terminating signal = Terminated: 15`），于是整个分支对这类死法不可达。信号本身也纳入判定，但 SIGTERM/SIGKILL 除外——那正是 `launchctl bootout` 和 `kickstart -k` 发的信号，也就是这套安装脚本每次都会对每个 daemon 做的事。
 - **`~/Library/LaunchAgents` 里还留着系统域标签的用户级 plist**（`launchd-plists.stray_user_copy`，error）。此刻它们没有加载，所以 launchd 任务表看不出问题；但下次登录时 launchd 会把它们全部 bootstrap 起来，同一个服务就有两份在抢同一个端口和同一份 `trading.sqlite`。通常是归档目录写不进去留下的。
-- **5 个报告类 openclaw cron 任务缺了任何一个**（`openclaw-cron.jobs_missing`，error）。这 5 条任务就是日报、周报和个股分析本身。读不到 cron 任务表时，已部署的机器算 error、开发机算 warn。
-- **报告投递去向没配好**（`notification-routing.*`）：`FEISHU_GROUP_CHAT_ID` 没配（公共卡改投私聊、或者根本发不出去）、`PLATFORM_PUBLIC_BASE_URL` 没配（卡片按钮点不进任何页面）、或者最近一次投递确实降级成了私聊。这三项只看"配没配"，不读也不打印具体值。
+- **5 个报告类 openclaw cron 任务缺了任何一个**（`openclaw-cron.jobs_missing`，error）。这 5 条任务就是日报、周报和个股分析本身。查询用的是 `openclaw cron list --json --agent control --all`：`--agent control` 是因为这五条都注册在 control 上，而这台 gateway 同时还在服务操作者个人的 186 个 agent，任务表是分页的（`{total, offset, limit, hasMore, nextOffset}`）而这个版本的 CLI 没有 `--limit`/`--offset`，缩小查询范围是唯一能防止我们这五行被别人的任务挤掉的办法；`--all` 是因为不带它就看不见 disabled 的任务，而 disabled 的任务不会被派发、却会被当成「缺失」。disabled 单独报 `openclaw-cron.jobs_disabled`（error）。真被截断（`hasMore=true`）时报 warn `openclaw-cron.list_truncated`——「这次没看全」不等于「它不存在」。2026-07-29 只读实测：total=5、hasMore=false、五条全在且 enabled。读不到 cron 任务表时，已部署的机器算 error、开发机算 warn。
+- **报告投递去向没配好**（`notification-routing.*`）：`FEISHU_GROUP_CHAT_ID` 没配（公共卡改投私聊、或者根本发不出去）、`PLATFORM_PUBLIC_BASE_URL` 没配（卡片按钮点不进任何页面）、或者最近一次投递根本没进圈子群（`last_delivery_missed_group`，error）。前两项只看"配没配"，不读也不打印具体值。最后那条读的是 `report-delivery-state.json` 里**最新一条**记录（按 `deliveredAt` 或 `deliveryFailedAt` 排）：J2 之后「没配群」的公共报告是被投递层**拒发**的（`sent:false` + `groupFallback`），而拒发那条分支以前既不写 `groupFallback` 也不带 `deliveredAt`，于是这条 error 级检查一次都触发不了——一个永远不会响的检查比没有更糟，因为它在清单里看起来像是覆盖。
 - **回环探针连不上一个 launchd 正持有的标签**（platform-app / broker-executor / rsshub 的 `unreachable` 从 warn 升为 error；标签根本没装的开发机仍然只是 warn）。
 - 标签装在错误的域、周期任务上次运行失败、备份/模拟盘产物过期、人设文件缺失（第 3、4 轮就有的检查项，未变）。
 

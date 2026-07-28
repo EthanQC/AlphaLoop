@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 
 import { loadLocalEnv, resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
 import { analyzeOpenClawRuntimeSnapshot, readLaunchdJobStates } from "./openclaw-runtime-doctor-core.mjs";
+import {
+  describeOpenClawCliFailure,
+  judgeReportDeliveryState,
+  parseOpenClawCronList
+} from "./openclaw-runtime-doctor-probes.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime", "openclaw-cron-runner");
@@ -172,25 +177,58 @@ function plistLabelsIn(dir) {
 /**
  * Round-6 finding S3b. Is this checkout the code that was pushed?
  *
- * `origin/main` is read from the local ref only - no fetch, no network. The
- * doctor observes; refreshing the remote ref would be changing the repository
- * it is reporting on, and a stale ref can only ever make this check quieter,
- * never noisier.
+ * Round-7 finding K7: it used to answer that question out of the LOCAL
+ * `origin/main` ref, with the note "the doctor observes; refreshing the remote
+ * ref would be changing the repository it is reporting on, and a stale ref can
+ * only ever make this check quieter, never noisier". The second half is true
+ * and is exactly the problem. MEASURED read-only on the deploy target
+ * (2026-07-29): HEAD = 14b1202, local origin/main ref = 14b1202, behind = 0,
+ * tree clean - while the real origin/main was a4e39c1, five commits ahead. The
+ * one check whose job is to answer 「跑的不是你 push 的代码」 answered "fine" on
+ * a machine that had never fetched them.
+ *
+ * So the remote tip is now read with `git ls-remote`, which asks origin
+ * directly and writes NOTHING - no ref update, no object fetch, no working-tree
+ * change. The observe-don't-mutate rule is kept; the blind spot is not. When
+ * the network or credentials say no, `remoteTip` stays null and the analyzer
+ * says so rather than treating silence as agreement.
  */
 function readGitCheckout() {
   const head = gitOutput(["rev-parse", "--short", "HEAD"]);
   if (!head) {
-    return { head: null, remoteHead: null, behind: null, ahead: null, dirtyFiles: [] };
+    return {
+      head: null,
+      remoteHead: null,
+      behind: null,
+      ahead: null,
+      remoteTip: null,
+      remoteTipError: null,
+      remoteTipKnownLocally: null,
+      dirtyFiles: []
+    };
   }
   const remoteHead = gitOutput(["rev-parse", "--short", "origin/main"]);
   const behindText = remoteHead ? gitOutput(["rev-list", "--count", "HEAD..origin/main"]) : null;
   const aheadText = remoteHead ? gitOutput(["rev-list", "--count", "origin/main..HEAD"]) : null;
   const dirty = gitOutput(["status", "--porcelain", "--untracked-files=no"]) ?? "";
+  const remote = readRemoteTip();
   return {
     head,
     remoteHead,
     behind: behindText === null ? null : Number(behindText),
     ahead: aheadText === null ? null : Number(aheadText),
+    // The true tip of origin/main right now, its short form, and whether this
+    // machine even has that commit. "Not known locally" is the strongest
+    // possible statement that this checkout is not it: the object is not here,
+    // so HEAD cannot contain it.
+    remoteTip: remote.tip,
+    remoteTipError: remote.error,
+    remoteTipKnownLocally: remote.known,
+    // Only computable when the commit is here; when it is not, "how far behind"
+    // is unanswerable and stays null rather than becoming a made-up number.
+    behindRemoteTip: remote.known
+      ? Number(gitOutput(["rev-list", "--count", `HEAD..${remote.tip}`]) ?? "0")
+      : null,
     // Everything after the status code, NOT `slice(3)`: gitOutput trims the
     // whole payload, which eats the leading space of `git status --porcelain`'s
     // first line only - so a fixed offset dropped one character from exactly
@@ -215,6 +253,58 @@ function gitOutput(args) {
   }
 }
 
+/** For git commands whose ANSWER is the exit code (`cat-file -e`, `merge-base --is-ancestor`). */
+function gitSucceeds(args) {
+  try {
+    execFileSync("git", ["-C", repoRoot, ...args], {
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 5000
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The tip of origin/main as origin reports it RIGHT NOW.
+ *
+ * `ls-remote` is a read: it prints what the remote has and updates no ref, no
+ * object store and no working tree. Bounded by a 15s timeout so an unreachable
+ * remote (or an ssh key that wants a passphrase) delays the gate instead of
+ * hanging it; a failure is returned as a reason, never as a silent "current".
+ */
+function readRemoteTip() {
+  let output;
+  try {
+    output = execFileSync("git", ["-C", repoRoot, "ls-remote", "origin", "refs/heads/main"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+      // BatchMode so a key with a passphrase, or an unknown host key, FAILS
+      // instead of prompting: ssh reads those from the terminal rather than
+      // stdin, so `stdio: ignore` alone would leave the gate sitting there
+      // until the timeout. An operator who has already set GIT_SSH_COMMAND
+      // keeps theirs. Measured on the deploy target (2026-07-29, read-only):
+      // `git ls-remote origin refs/heads/main` under BatchMode returns
+      // a4e39c1 there in well under a second.
+      env: {
+        ...process.env,
+        GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes -o ConnectTimeout=8"
+      }
+    });
+  } catch (error) {
+    const stderr = String(error?.stderr ?? "").trim().split(/\r?\n/u).filter(Boolean).at(-1);
+    return { tip: null, known: null, error: stderr || String(error?.message ?? error) };
+  }
+  const sha = String(output).trim().split(/\s+/u)[0] ?? "";
+  if (!/^[0-9a-f]{7,40}$/iu.test(sha)) {
+    return { tip: null, known: null, error: `git ls-remote origin refs/heads/main 没有给出 sha：${String(output).trim().slice(0, 120)}` };
+  }
+  const known = gitSucceeds(["cat-file", "-e", `${sha}^{commit}`]);
+  return { tip: gitOutput(["rev-parse", "--short", sha]) ?? sha.slice(0, 7), known, error: null };
+}
+
 /**
  * Round-6 finding S3g. The five report pipelines live in the openclaw cron
  * channel, so the only honest way to ask whether they exist is to ask that
@@ -228,15 +318,30 @@ function gitOutput(args) {
 function readOpenClawCronJobs() {
   let output;
   try {
-    output = execFileSync("openclaw", ["cron", "list", "--json"], {
+    // Round-7 finding K8. Two flags, both measured against the deploy target's
+    // own CLI (openclaw 2026.7.1-2) read-only on 2026-07-29:
+    //
+    //   --agent control  every managed job is registered on the `control` agent
+    //                    (see openclaw-cron-jobs.mjs), and this gateway also
+    //                    serves the operator's personal 186-agent fleet. The
+    //                    envelope is paged - {total, offset, limit, hasMore,
+    //                    nextOffset} - and this CLI version has no --limit or
+    //                    --offset, so scoping the QUERY is the only way to keep
+    //                    our five rows from being pushed off the page by
+    //                    somebody else's jobs.
+    //   --all            without it the list omits DISABLED jobs, and a
+    //                    disabled job would read here as a missing one. It is
+    //                    broken either way, but it is a different repair.
+    //
+    // Answer today: total=5, limit=5, hasMore=false, all five present, enabled.
+    output = execFileSync("openclaw", ["cron", "list", "--json", "--agent", "control", "--all"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 20_000
     });
   } catch (error) {
-    const stderr = String(error?.stderr ?? "").trim();
-    return { ok: false, error: stderr.split(/\r?\n/u)[0] || String(error?.message ?? error), names: [] };
+    return { ok: false, error: describeOpenClawCliFailure(error), names: [] };
   }
 
   let parsed;
@@ -246,14 +351,10 @@ function readOpenClawCronJobs() {
     return { ok: false, error: `openclaw cron list --json 的输出不是 JSON：${parseError.message}`, names: [] };
   }
 
-  const list = Array.isArray(parsed)
-    ? parsed
-    : Array.isArray(parsed?.jobs)
-      ? parsed.jobs
-      : Array.isArray(parsed?.data)
-        ? parsed.data
-        : [];
-  return { ok: true, names: list.map((job) => String(job?.name ?? job?.id ?? "")).filter(Boolean) };
+  // Envelope shapes, paging and the enabled/disabled split all live in
+  // openclaw-runtime-doctor-probes.mjs, where they can be tested without
+  // running a health check against this machine.
+  return parseOpenClawCronList(parsed);
 }
 
 /**
@@ -279,7 +380,8 @@ function readNotificationRouting() {
     lastDeliveryGroupFallback: false,
     lastDeliveryLabel: null,
     lastDeliveryAt: null,
-    lastDeliveryReason: null
+    lastDeliveryReason: null,
+    lastDeliverySent: null
   };
 
   const statePath = join(runtimeRoot, "report-delivery-state.json");
@@ -292,19 +394,10 @@ function readNotificationRouting() {
   } catch {
     return routing;
   }
-  const newest = Object.entries(state && typeof state === "object" ? state : {})
-    .filter(([, entry]) => entry && typeof entry === "object" && entry.deliveredAt)
-    .sort(([, left], [, right]) => String(right.deliveredAt).localeCompare(String(left.deliveredAt)))
-    .at(0);
-  if (!newest) {
-    return routing;
-  }
-  const [key, entry] = newest;
-  routing.lastDeliveryGroupFallback = entry.groupFallback === true;
-  routing.lastDeliveryLabel = key;
-  routing.lastDeliveryAt = String(entry.deliveredAt);
-  routing.lastDeliveryReason = entry.groupFallbackReason ? String(entry.groupFallbackReason) : null;
-  return routing;
+  // Round-7 finding K5: which entry is "the last delivery", and what it says,
+  // is judged in openclaw-runtime-doctor-probes.mjs - see its own note on why
+  // ranking by `deliveredAt` alone could never see a refused report.
+  return { ...routing, ...judgeReportDeliveryState(state) };
 }
 
 function tail(value) {

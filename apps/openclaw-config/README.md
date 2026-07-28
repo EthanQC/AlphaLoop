@@ -12,7 +12,7 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
-- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent。
+- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先查报告投递需要的两个变量（缺就退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）。
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
@@ -118,7 +118,7 @@ pnpm launchd:install-user
 2. **接管者没起来就不动它。** 对 system/retired 标签，node 安装器先问 `launchctl print system/<接管它的 daemon>`；没加载就说明这份用户级副本正是机器现在跑的那份，于是原地不动、打印 `keptLaunchAgent` 并以退出码 1 结束。
 3. **shell 安装器按服务逐个交接。** 停旧 → 起新 → **确认它真的在跑** → 才归档；起不来就把刚停掉的 agent 立刻 `bootstrap gui/<uid>` 回去。所以单个服务的停机窗口是「一次 bootout + settle」（默认 2 秒，本机实测最坏 2.1 秒），其余服务不受影响，任何服务都不会同时跑两份。
 
-   第三步在 2026-07-29 之前是 `launchctl print system/<label>` 的退出码，而那只能证明**注册过**。实测（真实安装脚本 + 沙箱 root + launchctl stub）：platform-app / broker-executor / market-alerts 三个 daemon bootstrap 成功、`print` 退出 0，但 job 报 `state = not running` + `last exit code = 1`——脚本把 8 个标签全部打印成 `loaded`、把每一份用户级 plist 都归档掉、退出 0。现在它调 `launchd-health.mjs`（doctor 的同一份 residency 契约）：常驻服务必须 `state = running`，周期任务的首次运行不能异常退出，`runs ≥ 20` 直接判崩溃重启循环。不满足 → 不归档、把旧 agent 立刻拉回来、以退出码 1 汇总，并把这次失败写进部署收据。
+   第三步在 2026-07-29 之前是 `launchctl print system/<label>` 的退出码，而那只能证明**注册过**。实测（真实安装脚本 + 沙箱 root + launchctl stub）：platform-app / broker-executor / market-alerts 三个 daemon bootstrap 成功、`print` 退出 0，但 job 报 `state = not running` + `last exit code = 1`——脚本把 8 个标签全部打印成 `loaded`、把每一份用户级 plist 都归档掉、退出 0。现在它调 `launchd-health.mjs`（doctor 的同一份 residency 契约）：常驻服务必须 `state = running`，周期任务的首次运行不能异常退出，`runs ≥ 20` 也不放行（安装脚本这一侧不区分崩溃重启循环和「攒了很多次重启」——刚 bootstrap 完的服务两者都不该出现）。不满足 → 不归档、把旧 agent 立刻拉回来、以退出码 1 汇总，并把这次失败写进部署收据。
 
    这**不能**证明服务在正常工作——launchd 知道的任何东西都证明不了。它证明的是"daemon 活过了 settle 窗口，且 launchd 没有记录到异常终止"。真正的工作证明是 doctor 的回环探针，所以第 8 步仍然是验收门。
 
@@ -163,9 +163,12 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 - 某一步最新的收据是非零退出 → **error**。
 - 某一步根本没有收据 → warn。「没有证据」不等于「失败」——照着 README 一条条手敲就是这个结果。
-- 某一步最近一次成功是在别的 commit 上跑的 → warn，代码换了要重跑。
+- 某一步最近一次成功是在别的 commit 上跑的 → **error**（2026-07-29 从 warn 提上来）。当时把它当 warn，写的理由是「检出旧不旧由 doctor 自己的 git 检查判」——而那条检查只在**落后 origin** 时报错。实测（真的本地 origin + 两个真 commit）：在 A 部署、origin 前进到 B、操作者手动 `git pull` 成功但没重跑 `deploy.sh`，于是落后 0、只剩这一条 warn、门是绿的，而 dist 和八个 daemon 跑的仍然是 A。
 
-记账永远不改变部署本身的退出码：写不进去时只会少一条收据，doctor 把它报成 warn，不会假装它成功过。
+**写不进账本本身就是一种失败。** 原来的说法是「记账永远不改变部署本身的退出码：写不进去时只会少一条收据，doctor 把它报成 warn，不会假装它成功过」。少一条收据的前提是这台机器上**没有**别的收据；实测（真脚本、真 doctor、真 writer）：干净部署留下九条 `exitCode: 0` → `chmod 444 steps.jsonl`（一次 sudo 跑就会留下这个属主）→ 再跑一次、第 1 步失败 → 失败记录写不进去、九条绿灯原样躺着、doctor `ok=true` 退出 0，零条 error。所以现在：
+
+- `deploy-ledger.mjs record` 写失败时退出 3（成功仍是 0），三个写入方——`deploy.sh`、`install-system-daemons.sh`、`install-openclaw-cron.mjs`——都会因此以退出码 **4** 停下，并说清楚「验收门看到的是上一次部署的收据」。步骤本身的退出码仍然不被记账覆盖，它在这之前就已经被记下来了。
+- doctor 有独立的一条 `deploy-ledger.unwritable`（已部署的机器上是 error），只问内核「当前用户能不能往这个路径追加」，不依赖那个失败的写入方还能报告什么，自己也不写任何东西。
 
 ### ⚠ 第 3 步会打断操作者自己的 agent
 
@@ -203,7 +206,7 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 同一批还补了常驻服务的崩溃重启循环判定。2026-07-29 又改了两处，都是因为原来的写法对**真实机器现在打印的形状**不可达：
 
-- **`runs ≥ 20` 单独成立**（`launchd-jobs.<name>.crash_looping`，error），不再要求"上次退出码非零"。原来整个分支挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**——mini 上的 platform-app 此刻就是这样（只有 `last terminating signal = Terminated: 15`）。阈值仍然是选的，但依据更硬了：本机实测 `runs` 是**按加载计数、不是按生命周期**（同一个标签 `bootout` + `bootstrap` 之后 runs 从 3 回到 1），所以它累计不到部署次数上去；一次健康安装留下的是 runs = 2（RunAtLoad 一次 + `kickstart -k` 一次），正好对上 mini 上 platform-app 和 broker-executor 的实测值。
+- **`runs ≥ 20` 且距上次安装不到 24 小时**（`launchd-jobs.<name>.crash_looping`，error），不再要求"上次退出码非零"。原来整个分支挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**——mini 上的 platform-app 此刻就是这样（只有 `last terminating signal = Terminated: 15`）。阈值仍然是选的，但依据更硬了：本机实测 `runs` 是**按加载计数、不是按生命周期**（同一个标签 `bootout` + `bootstrap` 之后 runs 从 3 回到 1），所以它累计不到部署次数上去；一次健康安装留下的是 runs = 2（RunAtLoad 一次 + `kickstart -k` 一次），正好对上 mini 上 platform-app 和 broker-executor 的实测值。2026-07-29 补上了缺的另一半：**次数不是循环，次数 + 窗口才是**。`runs` 在两次安装之间照样累加，mini 上 gateway 今天就是 `runs = 10` + `state = running` + 进程活了 10 天——一台几周不重装的机器迟早会靠偶尔的重启越过 20，然后被永久判成「自上次安装以来死了 19 次」。窗口取自账本里第 3 步最新的成功收据（那一步会把每个系统标签 bootout 再 bootstrap，也就是 `runs` 归零的时刻）；一天这个尺度是有意往「不误报」那边偏的——第 5 轮实测的那个崩溃重启样本 `runs` 已经到 918，起来就死的 KeepAlive 服务几分钟就能攒到 20，而一台只是活得久的机器永远攒不到。窗口不明或跨度更长时报的是 warn `restarted_many_times`，并明说缺的是哪一半事实。
 - **信号也算异常终止**，但 SIGTERM（15）和 SIGKILL（9）除外：那正是 `launchctl bootout` 和 `kickstart -k` 发的信号，也就是安装脚本每次都对每个 daemon 做的事；把它们算成崩溃，等于每次健康安装都报八条崩溃。`last exit reason`（比如 jetsam）也算异常。低于阈值的异常终止仍是 `restarted_after_failure`（warn）。
 
 ### platform-app（Phase 3 多成员 Web 平台）

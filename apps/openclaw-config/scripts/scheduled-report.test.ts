@@ -3,7 +3,7 @@
 // process.argv), which made the module impossible to `import` for testing
 // at all - see the isMainModule guard this task added. This is the first
 // direct test coverage the module has ever had.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -794,6 +794,32 @@ describe("F4: execution status is classified from the row's structured outcome",
 
     const daily = { category: "daily", title: "日报", body: "已入库。", metadata: "" };
     expect(scheduledReport.summarizeExecutionRow(daily).status).toBe("报告记录已入库。");
+  });
+
+  // Round-7 finding K5. THIS IS A SOURCE-LEVEL ASSERTION and says so: driving
+  // the refusal branch end to end needs a full report run plus a Feishu
+  // transport, which this suite does not have. What it does prove is the one
+  // thing that rotted - the comment above deliverReportToFeishu has claimed
+  // since J2 that the refusal 「arrives as `sent:false` + `groupFallback`, both
+  // recorded below」, and only the SUCCESS branch carried the field. The
+  // consequence was measurable elsewhere: the doctor's
+  // `notification-routing.last_delivery_missed_group` reads exactly this field
+  // off the newest state entry, so an error-severity check had become
+  // unreachable. The reader's half is covered for real in
+  // openclaw-runtime-doctor-probes.test.ts.
+  it("records groupFallback on the refusal path too, not only on the successful one", () => {
+    const source = readFileSync(
+      join(process.cwd(), "apps/openclaw-config/scripts/scheduled-report.mjs"),
+      "utf8"
+    );
+    const refusalBranch = source.slice(
+      source.indexOf("if (!result.sent) {"),
+      source.indexOf("const outcome = summarizeRunOutcome(")
+    );
+
+    expect(refusalBranch).toContain("deliveryFailedAt");
+    expect(refusalBranch).toContain("groupFallback: result.groupFallback ?? false");
+    expect(refusalBranch).toContain("result.groupFallbackReason");
   });
 
   // G5 (2026-07-28 round 4): a case here used to hand-write a reconcile row -

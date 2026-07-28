@@ -181,29 +181,51 @@ fi
 # failed" instead of only on whatever it can still observe minutes later. See
 # deploy-ledger.mjs's header for the five confirmed cases that motivated it.
 #
-# Bookkeeping never changes the outcome: every call here is `|| true`, and a
-# ledger that cannot be written is reported by the doctor as a missing receipt
-# rather than pretended away.
+# Round-7 finding K1: the write RESULT is not optional reading. This used to
+# end in `>/dev/null 2>&1 || true` with the note "bookkeeping never changes the
+# outcome … a ledger that cannot be written is reported by the doctor as a
+# missing receipt rather than pretended away". The second half was false
+# whenever an EARLIER deploy had already written receipts: the doctor then sees
+# not a gap but last time's `exitCode: 0` rows, and calls the machine deployed.
+#
+# So a receipt that could not be written is now printed here and turned into
+# exit code 4 (see on_exit) - distinct from 1, which means "the daemons did not
+# come up". The doctor closes the same hole from its own side with
+# `deploy-ledger.unwritable`.
 #
 # Not covered: the two refusals above (running as root, TARGET_USER does not
 # exist) exit before this point and leave no receipt. They also change nothing
 # on the machine, and `deploy.sh` records step 3's exit code itself whichever
 # way this script exits.
 INSTALL_RESULT_RECORDED=""
+LEDGER_WRITE_FAILED=""
 record_install_result() {
   [ -z "${PRINT_CONFIG_ONLY:-}" ] || return 0
   [ -z "${INSTALL_RESULT_RECORDED}" ] || return 0
   INSTALL_RESULT_RECORDED=1
   [ -x "${NODE_BIN}" ] || return 0
   [ -f "${DEPLOY_LEDGER}" ] || return 0
-  "${NODE_BIN}" "${DEPLOY_LEDGER}" record \
+  local ledger_output=""
+  local ledger_status=0
+  ledger_output="$("${NODE_BIN}" "${DEPLOY_LEDGER}" record \
     --runtime-root "${DEPLOY_RUNTIME_ROOT}" \
     --attempt "${DEPLOY_ATTEMPT_ID}" \
     --step 3 \
     --exit "$1" \
     --head "$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     --started-at "${INSTALL_STARTED_AT}" \
-    --detail "install-system-daemons.sh" >/dev/null 2>&1 || true
+    --detail "install-system-daemons.sh" 2>&1)" || ledger_status=$?
+  if [ "${ledger_status}" -ne 0 ]; then
+    LEDGER_WRITE_FAILED=1
+    echo "" >&2
+    echo "install-system-daemons: could NOT write this run's deploy receipt:" >&2
+    echo "install-system-daemons:   ${ledger_output:-deploy-ledger.mjs exited ${ledger_status} with no output}" >&2
+    echo "install-system-daemons: ledger: ${DEPLOY_RUNTIME_ROOT}/deploy/steps.jsonl" >&2
+    echo "install-system-daemons: so the acceptance gate will judge this machine on the PREVIOUS" >&2
+    echo "install-system-daemons: deploy's receipts, which are probably all exit code 0. Fix the" >&2
+    echo "install-system-daemons: file's ownership and re-run this script:" >&2
+    echo "install-system-daemons:   sudo chown -R \"${TARGET_USER}\":staff ${DEPLOY_RUNTIME_ROOT}/deploy" >&2
+  fi
   # Under sudo the ledger would end up root-owned inside the operator's own
   # repo, and the next unprivileged step could not append to it - the same
   # class of bug finding D3 fixed for the log directories.
@@ -225,6 +247,13 @@ on_exit() {
   local exit_status=$?
   record_install_result "${exit_status}"
   cleanup_tmp_dir
+  # Round-7 K1: an unrecorded run must not be able to end in 0. zsh honours an
+  # `exit` from inside an EXIT trap, so this is where "the install worked but
+  # nothing can prove it" becomes visible to whoever called this script -
+  # deploy.sh's step 3, or an operator running it by hand.
+  if [ -n "${LEDGER_WRITE_FAILED}" ] && [ "${exit_status}" -eq 0 ]; then
+    exit 4
+  fi
   return 0
 }
 

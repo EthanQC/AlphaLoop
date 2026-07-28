@@ -132,6 +132,32 @@ export const LAUNCHD_SERVICE_HEALTH = {
 // for platform-app and broker-executor, with 10 for gateway and cron-runner.
 export const RESIDENT_CRASH_LOOP_RUNS = 20;
 
+// Round-7 finding K6: a COUNT is not a loop. Everything the comment above says
+// is still true - `runs` really does reset on re-bootstrap, so it is scoped to
+// "since the last install" - but "since the last install" is not a bounded
+// window on a machine that is not reinstalled. Measured read-only on the deploy
+// target (2026-07-29): `launchctl print system/ai.openclaw.system.gateway`
+// reports runs = 10 with `state = running` and pid 21802, a process that had
+// been alive 10 days 6 hours at the time of the reading. A machine left alone
+// for a few more weeks crosses 20 through ordinary occasional restarts, and a
+// rule with no time dimension would then light a permanent red claiming it
+// "died 19 times since the last install" - true, and yet a lie about what is
+// happening now.
+//
+// So a crash loop needs both halves: the count AND a window it happened in. A
+// day is the window, and it is deliberately generous in the direction of not
+// crying wolf: the crash-looping sample round 5 measured had reached runs = 918
+// (a KeepAlive service that dies immediately is relaunched over and over within
+// minutes), so a real loop clears 20 long before a day is out, while a machine
+// that is simply old never does.
+//
+// The window is measured from the last SUCCESSFUL install receipt for runbook
+// step 3, which is the moment `runs` was last reset (that installer boots every
+// system label out and back in). When no such receipt exists the elapsed time
+// is unknown, and an unknown window cannot be called a loop - see the
+// `restarted_many_times` verdict, which says exactly that instead.
+export const RESIDENT_CRASH_LOOP_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 // Signals launchd ITSELF sends to stop a job: SIGTERM on bootout /
 // `kickstart -k`, and SIGKILL when the job is still alive after its
 // `exit timeout` seconds. install-system-daemons.sh sends both of those to
@@ -206,6 +232,25 @@ export function toFiniteNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/**
+ * Milliseconds between `installedAt` (epoch ms, or anything Date can parse)
+ * and `now`, or null when it is unknown or nonsense. A negative result - a
+ * receipt stamped in the future, i.e. clock skew - is null too: "we cannot
+ * time this" rather than a fabricated zero, which would read as "installed
+ * just now" and turn every such machine's restart count into a crash loop.
+ */
+export function elapsedSince(installedAt, now = Date.now()) {
+  if (installedAt === null || installedAt === undefined || installedAt === "") {
+    return null;
+  }
+  const at = typeof installedAt === "number" ? installedAt : Date.parse(String(installedAt));
+  if (!Number.isFinite(at)) {
+    return null;
+  }
+  const elapsed = Number(now) - at;
+  return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
+}
+
 /** `Segmentation fault: 11` -> 11; `Terminated: 15` -> 15; anything else -> null. */
 export function terminatingSignalNumber(value) {
   const match = String(value ?? "").match(/(-?\d+)\s*$/u);
@@ -273,7 +318,14 @@ export function describeLaunchdExit(row) {
 /**
  * The one judgement, shared by the installer and the doctor.
  *
- * @returns {{status: string, evidence: string, runs: number|null, probe: string|null}}
+ * @param {string} label
+ * @param {Record<string, unknown>|null|undefined} detail
+ * @param {{residency: string, probe: string}|undefined} [contract]
+ * @param {{installedAt?: string|number|null, now?: number}} [window]
+ * @returns {{
+ *   status: string, evidence: string, runs: number|null, probe: string|null,
+ *   state?: string, sinceInstallMs?: number|null
+ * }}
  *   status is one of:
  *     ok                        - launchd's own record shows nothing wrong
  *     not_loaded                - no record in this domain at all
@@ -282,14 +334,27 @@ export function describeLaunchdExit(row) {
  *                                 judge it (never silently "fine")
  *     state_unknown             - launchctl answered but printed no state line
  *     not_running               - resident daemon that is not running
- *     crash_looping             - resident daemon relaunched >= 20 times since
- *                                 it was loaded
+ *     crash_looping             - resident daemon relaunched >= 20 times
+ *                                 within RESIDENT_CRASH_LOOP_WINDOW_MS of the
+ *                                 install that reset the counter
+ *     restarted_many_times      - same count, but over an unknown or much
+ *                                 longer stretch: worth saying, not a loop
  *     restarted_after_failure   - resident daemon running now, last termination
  *                                 was abnormal
  *     last_run_failed           - periodic job whose last run terminated
  *                                 abnormally
+ *
+ * `installedAt` (epoch ms or an ISO string) is when `runs` was last reset -
+ * the newest successful step-3 receipt in the deploy ledger. Callers that do
+ * not know it pass nothing, and get `restarted_many_times` instead of a
+ * crash-loop claim they cannot support.
  */
-export function judgeLaunchdRuntime(label, detail, contract = LAUNCHD_SERVICE_HEALTH[label]) {
+export function judgeLaunchdRuntime(
+  label,
+  detail,
+  contract = LAUNCHD_SERVICE_HEALTH[label],
+  { installedAt = null, now = Date.now() } = {}
+) {
   const probe = contract?.probe ?? null;
   if (!contract) {
     return { status: "no_health_contract", evidence: "", runs: null, probe };
@@ -313,12 +378,26 @@ export function judgeLaunchdRuntime(label, detail, contract = LAUNCHD_SERVICE_HE
     }
     // Ordered before the termination test on purpose: `runs` counts deaths
     // since this label was loaded (measured - see RESIDENT_CRASH_LOOP_RUNS),
-    // so a service being relaunched 20 times is a crash loop whatever launchd
-    // says about the LAST death - including the signal deaths that print no
-    // exit code at all, which is the shape that used to make this branch
-    // unreachable.
+    // so a service being relaunched this often is worth reporting whatever
+    // launchd says about the LAST death - including the signal deaths that
+    // print no exit code at all, which is the shape that used to make this
+    // branch unreachable.
+    //
+    // Round-7 K6: the count alone does not distinguish "dying every ten
+    // seconds" from "restarted once a fortnight for two months", so the window
+    // decides which of the two verdicts this is, and an unknown window never
+    // becomes the louder one.
     if (runs !== null && runs >= RESIDENT_CRASH_LOOP_RUNS) {
-      return { status: "crash_looping", evidence, runs, probe, state };
+      const sinceInstallMs = elapsedSince(installedAt, now);
+      const withinWindow = sinceInstallMs !== null && sinceInstallMs <= RESIDENT_CRASH_LOOP_WINDOW_MS;
+      return {
+        status: withinWindow ? "crash_looping" : "restarted_many_times",
+        evidence,
+        runs,
+        probe,
+        state,
+        sinceInstallMs
+      };
     }
     if (termination.abnormal) {
       return { status: "restarted_after_failure", evidence, runs, probe, state };
@@ -345,6 +424,21 @@ export function isHandoverHealthy(verdict) {
   return verdict?.status === "ok";
 }
 
+/** `2 小时` / `3 天` - only ever called with a known elapsed time. */
+export function describeElapsedHours(elapsedMs) {
+  if (elapsedMs === null || elapsedMs === undefined) {
+    return "unknown time";
+  }
+  const hours = elapsedMs / (60 * 60 * 1000);
+  if (hours < 1) {
+    return `${Math.max(1, Math.round(elapsedMs / 60000))} minutes`;
+  }
+  if (hours < 48) {
+    return `${Math.round(hours)} hours`;
+  }
+  return `${Math.round(hours / 24)} days`;
+}
+
 /** One English line for the installer's failure report. */
 export function describeVerdictForInstaller(label, verdict) {
   const evidence = String(verdict?.evidence ?? "").replace(/^，/u, "").replace(/，/gu, ", ");
@@ -361,7 +455,10 @@ export function describeVerdictForInstaller(label, verdict) {
     case "not_running":
       return `${label}: bootstrapped but NOT RUNNING - it is a KeepAlive service, so this is dead on arrival${tail}`;
     case "crash_looping":
-      return `${label}: crash-looping - relaunched ${verdict.runs} times since it was loaded${tail}`;
+      return `${label}: crash-looping - relaunched ${verdict.runs} times in the ${describeElapsedHours(verdict.sinceInstallMs)} since it was installed${tail}`;
+    case "restarted_many_times":
+      return `${label}: relaunched ${verdict.runs} times since it was installed`
+        + `${verdict.sinceInstallMs === null ? " (when that was is unknown here)" : ` (${describeElapsedHours(verdict.sinceInstallMs)} ago)`}${tail}`;
     case "restarted_after_failure":
       return `${label}: died inside the settle window and was relaunched${tail}`;
     case "last_run_failed":

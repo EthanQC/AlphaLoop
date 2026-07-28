@@ -34,11 +34,11 @@
 // Deliberately NOT a lock or a state machine: it never prevents a step from
 // running, it only makes the outcome of every step something the gate has to
 // answer for. A machine with no ledger at all is not treated as a failed
-// deploy - see `judgeDeployAttempt`'s `deployed: false` branch and the
+// deploy - see `judgeDeployLedger`'s `deployed: false` branch and the
 // footprint detection in the doctor - because a dev box has never deployed
 // anything and must stay green.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -74,9 +74,24 @@ export function deployStepByNumber(step) {
 }
 
 /**
- * Appends one step receipt. Never throws for an ordinary I/O problem: a deploy
- * must not fail BECAUSE its bookkeeping failed, and the doctor's "this step
- * left no receipt" finding covers the resulting gap honestly.
+ * Appends one step receipt. Never throws for an ordinary I/O problem - but the
+ * result is not optional reading, and round 7 is why.
+ *
+ * The old contract said an unwritable ledger was harmless because "the doctor's
+ * 'this step left no receipt' finding covers the gap honestly". That reasoning
+ * only holds when the receipts are ABSENT. MEASURED (2026-07-29, real scripts,
+ * real doctor): a clean deploy, then `chmod 444 runtime/deploy/steps.jsonl`
+ * (exactly what one earlier sudo run leaves behind), then a deploy whose step 1
+ * fails - the failure receipt could not be appended, LAST deploy's nine
+ * `exitCode: 0` rows were still on disk, and the gate answered ok=true, exit 0
+ * on a machine that had just failed to deploy. The gap was not a blank; it was
+ * a row of green.
+ *
+ * So: the writer still never throws (a deploy must not die of bookkeeping), and
+ * EVERY caller now checks `written` and stops - see deploy.sh's record_step,
+ * install-system-daemons.sh's record_install_result and install-openclaw-cron.mjs.
+ * The doctor closes the same hole from the other side with
+ * `deploy-ledger.unwritable`, which needs no cooperation from the failed writer.
  *
  * @returns {{written: boolean, path: string, error?: string}}
  */
@@ -111,6 +126,44 @@ export function recordDeployStep({
   } catch (error) {
     return { written: false, path, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * Round-7 finding K1, the half that does not depend on a failed writer having
+ * been able to report anything: CAN a receipt be appended here at all?
+ *
+ * Read-only by construction - `access(W_OK)` asks the kernel, it does not
+ * create or touch anything, so this is safe to call from the doctor (which must
+ * never write under runtime/) and from a test suite.
+ *
+ * Judged against the deepest path that already exists, because that is what the
+ * next `mkdir -p` + append will actually hit: the ledger file itself if it is
+ * there, else the directory that would hold it, else the runtime root, else its
+ * parent. When none of them exists this machine has no runtime tree yet and
+ * there is nothing to judge - `writable: null`, and the doctor says nothing.
+ *
+ * @returns {{writable: boolean|null, path: string, checked: string|null, error?: string}}
+ */
+export function probeDeployLedgerWritable(runtimeRoot) {
+  const path = deployLedgerPath(runtimeRoot);
+  const candidates = [path, dirname(path), String(runtimeRoot ?? ""), dirname(String(runtimeRoot ?? ""))];
+  for (const candidate of candidates) {
+    if (!candidate || !existsSync(candidate)) {
+      continue;
+    }
+    try {
+      accessSync(candidate, constants.W_OK);
+      return { writable: true, path, checked: candidate };
+    } catch (error) {
+      return {
+        writable: false,
+        path,
+        checked: candidate,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+  return { writable: null, path, checked: null };
 }
 
 /** Every receipt on this machine, oldest first. Malformed lines are dropped. */
@@ -169,15 +222,33 @@ export function latestReceiptPerStep(entries) {
  *                                     call a failure. Someone may have run the
  *                                     step by hand before this file existed;
  *                                     "we have no evidence" is not "it failed".
- *   a receipt from another commit   -> also a reported gap, not a failure: the
- *                                     step did succeed, just against code that
- *                                     is no longer checked out. The doctor's
- *                                     own git check is what calls a stale
- *                                     checkout an error.
+ *   a receipt from another commit   -> ERROR, as of round 7 (finding K2). The
+ *                                     step did succeed - against code that is
+ *                                     no longer what is checked out here, which
+ *                                     is the definition of "the running system
+ *                                     is not the code you pushed". This used to
+ *                                     be a warn, justified by "the doctor's own
+ *                                     git check is what calls a stale checkout
+ *                                     an error"; that justification was false.
+ *                                     checkDeployCheckout only errors when the
+ *                                     checkout is BEHIND origin, and MEASURED
+ *                                     with a real local origin and two real
+ *                                     commits: deploy at A -> origin advances to
+ *                                     B -> the operator runs `git pull` by hand
+ *                                     and never re-runs deploy.sh -> behind = 0,
+ *                                     one warn, gate green - while dist and all
+ *                                     eight daemons were still running A.
+ *                                     A full deploy re-stamps every step at the
+ *                                     current head, so a green machine never
+ *                                     carries stale receipts.
  *
+ * @param {Array<Record<string, unknown>>} entries
+ * @param {{head?: string|null}} [options]
  * @returns {{
  *   deployed: boolean, attempt: string|null,
- *   failedSteps: object[], missingSteps: object[], staleSteps: object[]
+ *   failedSteps: Array<Record<string, any>>,
+ *   missingSteps: Array<Record<string, any>>,
+ *   staleSteps: Array<Record<string, any>>
  * }}
  */
 export function judgeDeployLedger(entries, { head = null } = {}) {
@@ -214,6 +285,24 @@ export function judgeDeployLedger(entries, { head = null } = {}) {
   };
 }
 
+/**
+ * When did the installer last reset every resident daemon's `runs` counter?
+ *
+ * Runbook step 3 (install-system-daemons.sh) boots every system label out and
+ * back in on every run, which is what makes `runs` scoped to "since the last
+ * install" (measured - see launchd-health.mjs's RESIDENT_CRASH_LOOP_RUNS). Its
+ * newest SUCCESSFUL receipt is therefore the start of the window a restart
+ * count is counted over, and without it a count has no window at all.
+ *
+ * @param {Array<Record<string, unknown>>} entries
+ * @returns {string|null} the receipt's finishedAt, or null when unknown.
+ */
+export function lastSuccessfulInstallAt(entries) {
+  const receipts = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => Number(entry?.step) === 3 && Number(entry?.exitCode) === 0 && entry?.finishedAt);
+  return receipts.length === 0 ? null : String(receipts.at(-1).finishedAt);
+}
+
 /** `20260729-014233-7f3a` - sortable, and unique enough for one machine. */
 export function newDeployAttemptId(now = new Date()) {
   const pad = (value) => String(value).padStart(2, "0");
@@ -245,9 +334,17 @@ function safeUsername() {
 //        --step 3 --exit 1 [--head <sha>] [--started-at <iso>] [--detail <text>]
 //   node deploy-ledger.mjs show --runtime-root <dir>
 //
-// `record` always exits 0, including when the write failed (it prints the
-// reason): the caller's own exit code is the deploy result, and must not be
-// overwritten by bookkeeping.
+// `record` exits 0 when the receipt landed and 3 when it could not be written
+// (with the reason on stderr). Round 7, finding K1: it used to always exit 0,
+// reasoning that "the caller's own exit code is the deploy result and must not
+// be overwritten by bookkeeping". The exit code it must not overwrite is the
+// STEP's, and it does not - deploy.sh has already captured that before it calls
+// this. What the old contract actually did was make a deploy that could not
+// record anything indistinguishable from one that recorded success, while last
+// deploy's green receipts stayed on disk for the gate to read.
+//
+// 3 rather than 1, so a shell caller can tell "the ledger is broken" from "the
+// step failed" without parsing text; 2 stays "you called this wrong".
 // ---------------------------------------------------------------------------
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
@@ -275,6 +372,7 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
     });
     if (!result.written) {
       console.error(`deploy-ledger: could not write ${result.path}: ${result.error}`);
+      process.exit(3);
     }
     process.exit(0);
   }

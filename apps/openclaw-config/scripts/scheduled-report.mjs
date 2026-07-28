@@ -297,6 +297,15 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
       deliveries,
       deliveryFailedAt: new Date().toISOString(),
       deliveryFailureReason: result.reason ?? "Report delivery was not sent.",
+      // Round-7 finding K5. The comment above deliverReportToFeishu has claimed
+      // since J2 that the refusal 「arrives as `sent:false` + `groupFallback`,
+      // both recorded below」 - and only the SUCCESS branch below carried
+      // `groupFallback`, so on the one path where it is now always true it was
+      // never written. The doctor's `notification-routing.last_delivery_missed_group`
+      // reads exactly this field, which is why an error-severity check had
+      // become unreachable.
+      groupFallback: result.groupFallback ?? false,
+      ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
       personalCards,
       regeneratedDuringDelivery,
       preparedInSameRun: alreadyPrepared

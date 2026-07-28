@@ -690,7 +690,23 @@ const SYSTEM_LABELS = doctor.REQUIRED_LAUNCHD_JOBS
   .filter((job) => job.domain === "system")
   .map((job) => job.label);
 
-async function analyzeLaunchdOnly(launchdJobs: unknown[]) {
+// Round-7 finding K6: a restart count is judged against the window since the
+// install that reset it, which the doctor reads from the ledger's newest
+// successful step-3 receipt. A machine installed an hour ago is the setting in
+// which `runs = 918` means a crash loop; the same count against a two-month-old
+// receipt, or against no receipt at all, does not - see "will not call a
+// restart count a loop when it has no window to have happened in".
+const installedAgo = (ms: number, nowMs = OUTSIDE_MARKET_HOURS.nowMs) => [{
+  attempt: "r7-window",
+  step: 3,
+  key: "install-system-daemons",
+  exitCode: 0,
+  finishedAt: new Date(nowMs - ms).toISOString()
+}];
+const HOUR_MS = 60 * 60 * 1000;
+const INSTALLED_AN_HOUR_AGO = installedAgo(HOUR_MS);
+
+async function analyzeLaunchdOnly(launchdJobs: unknown[], extra: Record<string, unknown> = {}) {
   return doctor.analyzeOpenClawRuntimeSnapshot({
     ...CONTROL_PERSONA_HEALTHY,
     ...HEALTHY_LISTENERS,
@@ -698,7 +714,9 @@ async function analyzeLaunchdOnly(launchdJobs: unknown[]) {
     ...RSSHUB_HEALTH_STUBBED_OK,
     ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
     ...OUTSIDE_MARKET_HOURS,
-    launchdJobs
+    deployLedger: INSTALLED_AN_HOUR_AGO,
+    launchdJobs,
+    ...extra
   });
 }
 
@@ -875,6 +893,49 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const platformApp = launchdFindings(report).find((f) => f.code === "launchd-jobs.platform-app.crash_looping");
     expect(platformApp?.severity).toBe("error");
     expect(platformApp?.message).toContain("918");
+  });
+
+  // Round-7 finding K6. The same 918 relaunches, with the two other windows
+  // this machine can be in. MEASURED on the deploy target (2026-07-29,
+  // read-only): the gateway is at runs = 10 with a process alive 10 days, so a
+  // count-only rule reaches 20 through ordinary restarts and then calls a
+  // perfectly healthy machine a crash loop forever.
+  it("will not call a restart count a loop when it has no window to have happened in", async () => {
+    const looping = (label: string) => label === "com.alphaloop.platform-app";
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: SYSTEM_LABELS,
+        textFor: (_domain, label) => (isResident(label)
+          ? MINI_RESIDENT_PRINT_RUNNING.replace("\truns = 10", looping(label) ? "\truns = 918" : "\truns = 2")
+          : MINI_RSSHUB_PRINT_OK)
+      })
+    );
+
+    // (a) no receipt at all: the reset moment is unknown, so the count cannot
+    //     be timed - a warn that says so, not an error that guesses.
+    const noLedger = await analyzeLaunchdOnly(jobs, { deployLedger: [] });
+    const unknownWindow = launchdFindings(noLedger).find((f) => f.code === "launchd-jobs.platform-app.restarted_many_times");
+    expect(unknownWindow?.severity).toBe("warn");
+    expect(unknownWindow?.message).toMatch(/没有「上次装系统 daemon 是什么时候」的收据/u);
+    expect(noLedger.findings.some((f) => f.code.endsWith(".crash_looping"))).toBe(false);
+
+    // (b) installed two months ago: 918 restarts spread over that is still
+    //     worth a word, and still not a loop.
+    const old = await analyzeLaunchdOnly(jobs, {
+      deployLedger: installedAgo(60 * 24 * HOUR_MS)
+    });
+    const longAgo = launchdFindings(old).find((f) => f.code === "launchd-jobs.platform-app.restarted_many_times");
+    expect(longAgo?.severity).toBe("warn");
+    expect(longAgo?.message).toMatch(/60 天/u);
+
+    // (c) installed an hour ago: same number, and now it IS a loop.
+    const fresh = await analyzeLaunchdOnly(jobs);
+    const loop = launchdFindings(fresh).find((f) => f.code === "launchd-jobs.platform-app.crash_looping");
+    expect(loop?.severity).toBe("error");
+    expect(loop?.message).toMatch(/1 小时/u);
+    expect(fresh.ok).toBe(false);
   });
 
   it("does not invent an exit code launchd never reported (a signal-killed job prints none)", async () => {
@@ -2331,6 +2392,9 @@ describe("round 6 - deploy-path checks", () => {
 
     it("reports a crash loop even though launchd printed no exit code", async () => {
       const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        // Round-7 K6: 918 relaunches an hour after the install that zeroed the
+        // counter. The window is what makes this a loop rather than a number.
+        deployLedger: installedAgo(HOUR_MS, Date.now()),
         launchdJobs: signalKilled({
           state: "running",
           lastExitCode: null,
@@ -2406,6 +2470,40 @@ describe("round 6 - deploy-path checks", () => {
       expect(analysis.findings.filter((f) => f.code.startsWith("openclaw-cron."))).toEqual([]);
     });
 
+    // Round-7 finding K8. This gateway also serves the operator's personal
+    // 186-agent fleet and the registry is paged; "not in the page I was handed"
+    // must not be reported as "not installed", because that is a red light on a
+    // machine where all five jobs exist.
+    it("does not call a truncated page a missing job", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        openclawCron: { ok: true, names: ["someone-elses-job"], total: 240, truncated: true }
+      }));
+
+      expect(analysis.findings.map((f) => f.code)).not.toContain("openclaw-cron.jobs_missing");
+      const finding = analysis.findings.find((f) => f.code === "openclaw-cron.list_truncated");
+      expect(finding?.severity).toBe("warn");
+      expect(finding?.message).toMatch(/这次没看全/u);
+      expect(analysis.ok).toBe(true);
+    });
+
+    // The other K8 half: `openclaw cron list` hides disabled jobs unless asked,
+    // so a job that exists and will never fire used to read as missing. Both
+    // are broken; the repair is different, so the message has to be.
+    it("reports a disabled job as disabled rather than missing", async () => {
+      const names = buildManagedOpenClawCronJobs(
+        fileURLToPath(new URL("../../..", import.meta.url))
+      ).map((job) => job.name);
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        openclawCron: { ok: true, names: names.slice(1), disabledNames: [names[0]] }
+      }));
+
+      expect(analysis.findings.map((f) => f.code)).not.toContain("openclaw-cron.jobs_missing");
+      const finding = analysis.findings.find((f) => f.code === "openclaw-cron.jobs_disabled");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/disabled 的任务不会被派发/u);
+      expect(analysis.ok).toBe(false);
+    });
+
     it("an unreadable cron registry is an error on a deployed machine and a warn on a dev box", async () => {
       const deployed = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
         openclawCron: { ok: false, error: "GatewayTransportError: connect ECONNREFUSED 127.0.0.1:18789", names: [] }
@@ -2454,15 +2552,45 @@ describe("round 6 - deploy-path checks", () => {
           publicBaseUrlConfigured: true,
           fallbackTargetConfigured: true,
           lastDeliveryGroupFallback: true,
+          lastDeliverySent: true,
           lastDeliveryLabel: "daily:2026-07-28",
           lastDeliveryAt: "2026-07-28T12:00:00.000Z",
           lastDeliveryReason: "未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标"
         }
       }));
 
-      const finding = analysis.findings.find((f) => f.code === "notification-routing.last_delivery_fell_back");
+      const finding = analysis.findings.find((f) => f.code === "notification-routing.last_delivery_missed_group");
       expect(finding?.severity).toBe("error");
       expect(finding?.message).toMatch(/daily:2026-07-28/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    // Round-7 finding K5. This is the shape the deploy target produces TODAY,
+    // and the shape the check could not see: after J2 a circle-public report
+    // with no group chat is refused, so `groupFallback: true` arrives with
+    // `sent: false` - an entry that carries `deliveryFailedAt` and never a
+    // `deliveredAt`. The CLI half of this (ranking by
+    // `deliveredAt ?? deliveryFailedAt`) is covered in the doctor CLI's own
+    // reading of report-delivery-state.json; this asserts the analyzer says the
+    // right thing about it.
+    it("reports the refusal shape too, and says the report never reached the group", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        notificationRouting: {
+          groupChatIdConfigured: false,
+          publicBaseUrlConfigured: true,
+          fallbackTargetConfigured: true,
+          lastDeliveryGroupFallback: true,
+          lastDeliverySent: false,
+          lastDeliveryLabel: "weekly:2026-07-26",
+          lastDeliveryAt: "2026-07-26T12:00:00.000Z",
+          lastDeliveryReason: "圈子公共报告没有配置群聊目标（FEISHU_GROUP_CHAT_ID）"
+        }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "notification-routing.last_delivery_missed_group");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/被投递层拒发/u);
+      expect(finding?.message).toMatch(/weekly:2026-07-26/u);
       expect(analysis.ok).toBe(false);
     });
 
@@ -2495,11 +2623,65 @@ describe("round 6 - deploy-path checks", () => {
 
     it("only warns about a dirty tree when the commit itself is current", async () => {
       const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
-        git: { head: "a4e39c1", remoteHead: "a4e39c1", behind: 0, dirtyFiles: ["README.md"] }
+        git: {
+          head: "a4e39c1",
+          remoteHead: "a4e39c1",
+          behind: 0,
+          dirtyFiles: ["README.md"],
+          remoteTip: "a4e39c1",
+          remoteTipKnownLocally: true,
+          behindRemoteTip: 0
+        }
       }));
 
       expect(analysis.findings.find((f) => f.code === "deploy-checkout.dirty")?.severity).toBe("warn");
       expect(analysis.ok).toBe(true);
+    });
+
+    // Round-7 finding K7. THE DEPLOY TARGET'S SHAPE TODAY, measured read-only
+    // on 2026-07-29: HEAD = 14b1202, the LOCAL origin/main ref = 14b1202,
+    // behind = 0, tree clean - and the real origin/main is a4e39c1, five
+    // commits ahead. Every input this check used to have said "fine".
+    it("fails the gate on a machine that never fetched the commits it is behind by", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        git: {
+          head: "14b1202",
+          remoteHead: "14b1202",
+          behind: 0,
+          ahead: 0,
+          dirtyFiles: [],
+          remoteTip: "a4e39c1",
+          remoteTipKnownLocally: false,
+          behindRemoteTip: null
+        }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-checkout.never_fetched");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/连这个 commit 都没有/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("says it could not reach origin instead of treating silence as agreement", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: INSTALLED_AN_HOUR_AGO,
+        git: {
+          head: "14b1202",
+          remoteHead: "14b1202",
+          behind: 0,
+          ahead: 0,
+          dirtyFiles: [],
+          remoteTip: null,
+          remoteTipError: "ssh: connect to host github.com port 22: Network is unreachable",
+          remoteTipKnownLocally: null,
+          behindRemoteTip: null
+        }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-checkout.remote_unverified");
+      expect(finding?.severity).toBe("warn");
+      expect(finding?.message).toMatch(/Network is unreachable/u);
+      expect(finding?.message).toMatch(/只基于本地那份 origin\/main 引用/u);
     });
   });
 
@@ -2538,6 +2720,28 @@ describe("round 6 - deploy-path checks", () => {
       }));
 
       expect(analysis.findings.filter((f) => f.code.startsWith("deploy-ledger."))).toEqual([]);
+    });
+
+    // Round 7: `deploy-ledger.incomplete` shipped in round 6 as part of the
+    // mechanism described as catching a half-finished deploy, and no test in
+    // the tree named it - which is a claim of coverage rather than coverage.
+    // It stays a WARN on purpose: an operator who ran the runbook by hand
+    // before this file existed leaves exactly this shape, and "we have no
+    // receipt" is not "the step failed".
+    it("reports steps with no receipt without calling them failures", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: [
+          { attempt: "a1", step: 3, key: "install-system-daemons", exitCode: 0, head: "a4e39c1", finishedAt: "2026-07-29T01:00:00Z" }
+        ],
+        gitHead: "a4e39c1"
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-ledger.incomplete");
+      expect(finding?.severity).toBe("warn");
+      // Every required step except the one that left a receipt.
+      expect(finding?.message).toMatch(/第 0 步/u);
+      expect(finding?.message).not.toMatch(/第 3 步/u);
+      expect(analysis.ok).toBe(true);
     });
   });
 });

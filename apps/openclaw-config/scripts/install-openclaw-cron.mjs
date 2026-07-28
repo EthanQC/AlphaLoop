@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
@@ -99,9 +99,13 @@ if (failed.length > 0) {
 }
 
 // The gate has to be able to see this outcome later, not only in this
-// terminal: see deploy-ledger.mjs's header. Bookkeeping never changes the
-// exit code.
-recordDeployStep({
+// terminal: see deploy-ledger.mjs's header.
+//
+// Round-7 finding K1: the return value used to be discarded. A receipt that
+// could not be written leaves the PREVIOUS deploy's step-5 row - `exitCode: 0` -
+// standing as the gate's most recent evidence about this step, so an
+// unrecordable run cannot be allowed to exit 0 either.
+const receipt = recordDeployStep({
   // DEPLOY_RUNTIME_ROOT is the same test seam install-system-daemons.sh and
   // deploy.sh use: the suite runs this real installer end to end, and a test
   // that appended to the repo's own runtime/ would be exactly the class of
@@ -114,6 +118,18 @@ recordDeployStep({
   startedAt,
   detail: `installed ${installed.length}/${jobs.length} openclaw cron jobs`
 });
+
+if (!receipt.written) {
+  console.error("");
+  console.error(`install-openclaw-cron: 这一步的收据没能写进 ${receipt.path}：${receipt.error}`);
+  console.error("install-openclaw-cron: 也就是说验收门看到的第 5 步记录还是【上一次部署】那条，多半是退出码 0。");
+  console.error("install-openclaw-cron: 先把这个文件修回可写（常见成因是某次 sudo 跑留下的 root 属主）再重跑：");
+  console.error(`install-openclaw-cron:   sudo chown -R "$(id -un)":staff ${dirname(receipt.path)}`);
+  // 4, not 1: "记不下来" 和 "cron 任务没装上" 是两件事，退出码不该把它们混成一件。
+  if (!process.exitCode) {
+    process.exitCode = 4;
+  }
+}
 
 function describeCliError(error) {
   const stderr = String(error?.stderr ?? "").trim();

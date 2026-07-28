@@ -146,13 +146,52 @@ describe("judging the shapes the deploy target actually prints", () => {
   });
 
   it("judges a resident daemon relaunched 20+ times as a crash loop whatever killed it", () => {
-    const verdict = judgeLaunchdRuntime("com.alphaloop.platform-app", {
-      state: "running",
-      runs: 918,
-      lastExitCode: null,
-      lastTerminatingSignal: null
+    const detail = { state: "running", runs: 918, lastExitCode: null, lastTerminatingSignal: null };
+    const now = Date.parse("2026-07-29T12:00:00.000Z");
+
+    // Round-7 finding K6: the count needs a window. An hour after the install
+    // that reset the counter, 918 relaunches is a loop and nothing else.
+    const looping = judgeLaunchdRuntime("com.alphaloop.platform-app", detail, undefined, {
+      installedAt: "2026-07-29T11:00:00.000Z",
+      now
     });
-    expect(verdict.status).toBe("crash_looping");
+    expect(looping.status).toBe("crash_looping");
+    expect(looping.sinceInstallMs).toBe(60 * 60 * 1000);
+  });
+
+  // The other side of K6, and the reason it was raised: `runs` accumulates
+  // BETWEEN installs. MEASURED read-only on the deploy target (2026-07-29):
+  // ai.openclaw.system.gateway is at runs = 10 with state = running and a
+  // process alive 10 days; cron-runner likewise. Left alone for a few more
+  // weeks that machine crosses 20 through ordinary restarts, and a count-only
+  // rule would then light a permanent red claiming it "died 19 times since the
+  // last install".
+  it("does not call the same count a loop when the window is unknown or long", () => {
+    const detail = { state: "running", runs: 918, lastExitCode: null, lastTerminatingSignal: null };
+    const now = Date.parse("2026-07-29T12:00:00.000Z");
+
+    const unknown = judgeLaunchdRuntime("com.alphaloop.platform-app", detail, undefined, { now });
+    expect(unknown.status).toBe("restarted_many_times");
+    expect(unknown.sinceInstallMs).toBeNull();
+
+    const longAgo = judgeLaunchdRuntime("com.alphaloop.platform-app", detail, undefined, {
+      installedAt: "2026-06-01T00:00:00.000Z",
+      now
+    });
+    expect(longAgo.status).toBe("restarted_many_times");
+
+    // A receipt stamped in the future is clock skew, not "installed just now":
+    // it must not become a zero-length window that turns every count into a
+    // loop.
+    const skewed = judgeLaunchdRuntime("com.alphaloop.platform-app", detail, undefined, {
+      installedAt: "2026-07-30T00:00:00.000Z",
+      now
+    });
+    expect(skewed.status).toBe("restarted_many_times");
+    expect(skewed.sinceInstallMs).toBeNull();
+
+    // Either way the installer refuses to hand over to a service in this state.
+    expect(isHandoverHealthy(unknown)).toBe(false);
   });
 
   it("keeps a periodic job's idle state healthy, and its failed run unhealthy", () => {

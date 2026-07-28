@@ -23,7 +23,7 @@
 // that only satisfies our string matching but not launchd's parser would be
 // worthless. This file already lives in vitest.config.ts's serial lane, which
 // is where subprocess-spawning suites belong.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -1399,6 +1399,39 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     expect(codesOf(analysis, "error")).toContain("deploy-ledger.step_5_failed");
   });
 
+  // Round-7 finding K1, the cron half: this installer called recordDeployStep
+  // and ignored its `{written:false, error}` return entirely.
+  it("K1: the cron installer says so, and exits 4, when its receipt cannot be written", () => {
+    const machine = makeFakeMachine("alphaloop-r7-cron-ledger-");
+    const ledgerDir = join(machine.home, "runtime", "deploy");
+    mkdirSync(ledgerDir, { recursive: true });
+    const ledgerPath = join(ledgerDir, "steps.jsonl");
+    writeFileSync(ledgerPath, `${JSON.stringify({ attempt: "yesterday", step: 5, exitCode: 0 })}\n`);
+    chmodSync(ledgerPath, 0o444);
+
+    let status = 0;
+    let output = "";
+    try {
+      output = execFileSync(process.execPath, [cronInstallScript], {
+        env: { ...machine.env, OPENCLAW_CRON_RETRY_BASE_MS: "1" },
+        encoding: "utf8",
+        stdio: "pipe"
+      });
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      status = failure.status ?? 0;
+      output = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
+    } finally {
+      chmodSync(ledgerPath, 0o644);
+    }
+
+    // The cron jobs themselves installed fine against the stub gateway - this
+    // 4 is only about the receipt, and that is the point of it not being 1.
+    expect(status).toBe(4);
+    expect(output).toMatch(/这一步的收据没能写进/u);
+    expect(output).toMatch(/验收门看到的第 5 步记录还是【上一次部署】那条/u);
+  });
+
   it("S3a: labels installed NOWHERE fail the gate on a machine that has deployed", async () => {
     const machine = makeFakeMachine("alphaloop-r6-nowhere-");
     // The footprint: plists on disk, nothing loaded. That is what a machine
@@ -1428,6 +1461,41 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     // A developer's laptop must still pass: this is the reason the old check
     // was a warn, and it is preserved rather than traded away.
     expect(analysis.ok).toBe(true);
+  });
+
+  // Round-7 finding K1, the sudo half. install-system-daemons.sh is the one
+  // step an operator legitimately runs by hand, and it is the step most likely
+  // to leave the ledger root-owned in the first place; its receipt call had the
+  // same `>/dev/null 2>&1 || true` shape as deploy.sh's.
+  it("K1: an install whose receipt cannot be written does not get to exit 0", () => {
+    const machine = makeFakeMachine("alphaloop-r7-daemon-ledger-");
+    const ledgerDir = join(machine.home, "runtime", "deploy");
+    mkdirSync(ledgerDir, { recursive: true });
+    const ledgerPath = join(ledgerDir, "steps.jsonl");
+    // What one earlier sudo run leaves behind: a previous, entirely successful
+    // step-3 receipt in a file this user can no longer append to.
+    writeFileSync(ledgerPath, `${JSON.stringify({
+      attempt: "yesterday",
+      step: 3,
+      key: "install-system-daemons",
+      exitCode: 0,
+      head: "14b1202",
+      finishedAt: "2026-07-28T01:00:00.000Z"
+    })}\n`);
+    chmodSync(ledgerPath, 0o444);
+
+    try {
+      const { status, output } = runSystemDaemonsExpectingFailure(machine);
+
+      expect(status).toBe(4);
+      expect(output).toMatch(/could NOT write this run's deploy receipt/u);
+      expect(output).toMatch(/judge this machine on the PREVIOUS/u);
+      // Yesterday's green row is untouched, which is exactly why exiting 0 here
+      // would have been indistinguishable from a successful install.
+      expect(readFileSync(ledgerPath, "utf8").trim().split("\n")).toHaveLength(1);
+    } finally {
+      chmodSync(ledgerPath, 0o644);
+    }
   });
 });
 
@@ -1460,6 +1528,15 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     const binDir = join(root, "bin");
     mkdirSync(binDir, { recursive: true });
     const callLog = join(root, "calls.log");
+    // Round-7 finding K9: the script now refuses to touch the machine at all
+    // when the two variables that decide where a public report card lands are
+    // unset, so every case that is NOT about that refusal starts from a
+    // configured sandbox. Quoted on purpose - the parser has to strip them, the
+    // same way loadLocalEnv does.
+    writeFileSync(
+      join(root, ".env.local"),
+      "# sandbox\nFEISHU_GROUP_CHAT_ID=oc_sandbox_group\nPLATFORM_PUBLIC_BASE_URL=\"https://alphaloop.invalid\"\n"
+    );
 
     // Each stub logs what it was asked to do and honours one injection env
     // var. `$1` is enough to identify the subcommand for all of them.
@@ -1501,17 +1578,16 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     };
   }
 
+  // spawnSync, not execFileSync: the latter hands back stdout only on success,
+  // and round 7 put operator-facing text on stderr for runs that SUCCEED (the
+  // config-gap override warning), so a test that only saw stdout could not read
+  // what the operator reads.
   function runDeploy(runbook: Runbook): { status: number; output: string } {
-    try {
-      const stdout = execFileSync("zsh", [deployScript], { env: runbook.env, encoding: "utf8", stdio: "pipe" });
-      return { status: 0, output: stdout };
-    } catch (error) {
-      const failure = error as { status?: number; stdout?: string; stderr?: string };
-      if (typeof failure.status !== "number") {
-        throw error;
-      }
-      return { status: failure.status, output: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+    const result = spawnSync("zsh", [deployScript], { env: runbook.env, encoding: "utf8" });
+    if (result.error) {
+      throw result.error;
     }
+    return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
   }
 
   function receipts(runbook: Runbook): Array<{ step: number; exitCode: number }> {
@@ -1613,7 +1689,7 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     const { status, output } = runDeploy(runbook);
 
     expect(status).toBe(0);
-    expect(output).toMatch(/0-8 全部通过/u);
+    expect(output).toMatch(/本次执行的步骤：第 0 1 2 3 4 5 6 7 8 步 —— 全部退出 0/u);
     expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
     expect(receipts(runbook).every((entry) => entry.exitCode === 0)).toBe(true);
 
@@ -1647,5 +1723,212 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     expect(output).toMatch(/第 0 步 拉取新代码：按 DEPLOY_FROM_STEP=4 跳过/u);
     expect(calls(runbook)).not.toMatch(/git pull/u);
     expect(receipts(runbook).map((entry) => entry.step)).toEqual([4, 5, 6, 7, 8]);
+    // Round-7 finding K3: it used to print the constant 「0-8 全部通过」 here,
+    // though steps 0-3 had not run at all in this invocation.
+    expect(output).toMatch(/本次执行的步骤：第 4 5 6 7 8 步 —— 全部退出 0/u);
+    expect(output).toMatch(/跳过的步骤：第 0 1 2 3 步 —— 这些【本次没有跑】/u);
+    expect(output).not.toMatch(/0-8 全部通过/u);
+  });
+
+  // =========================================================================
+  // ROUND 7. Everything below is a case where the machine was broken and the
+  // acceptance gate said nothing - each one measured against these same real
+  // scripts before it was fixed.
+  // =========================================================================
+
+  // K3. `DEPLOY_FROM_STEP` had no upper bound and no shape check: run_step's
+  // skip test was `number < FROM_STEP`, and report_and_exit printed its
+  // all-passed line whenever nothing had failed. MEASURED: `=9` and `=99` each
+  // skipped all nine steps, called launchctl zero times, never ran the doctor,
+  // exited 0 and announced 「0-8 全部通过……上面已经跑过了」.
+  it.each([["9"], ["99"], ["abc"], ["-1"], ["3.5"]])(
+    "refuses DEPLOY_FROM_STEP=%s instead of skipping every step and calling it a pass",
+    (value) => {
+      const runbook = makeRunbook(`alphaloop-r7-fromstep-${value || "empty"}-`);
+      runbook.env.DEPLOY_FROM_STEP = value;
+
+      const { status, output } = runDeploy(runbook);
+
+      expect(status).toBe(2);
+      expect(output).toMatch(/什么都还没做/u);
+      expect(output).not.toMatch(/全部通过|全部退出 0/u);
+      expect(calls(runbook)).toBe("");
+      expect(receipts(runbook)).toEqual([]);
+    }
+  );
+
+  // K4. `$0` was interpolated inside report_and_exit(), and zsh's
+  // FUNCTION_ARGZERO makes that the FUNCTION NAME - so every failing run handed
+  // the operator `DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=3 zsh
+  // report_and_exit` at the exact moment they needed something pasteable.
+  it("prints a resume command that is a real script path", () => {
+    const runbook = makeRunbook("alphaloop-r7-resume-cmd-", { FAIL_SUDO: "1" });
+
+    const { output } = runDeploy(runbook);
+
+    expect(output).not.toMatch(/zsh report_and_exit/u);
+    expect(output).toMatch(/DEPLOY_FROM_STEP=3 zsh \/.*\/deploy\.sh/u);
+  });
+
+  // K1. THE LEDGER'S OWN WRITE FAILURE. MEASURED: a clean deploy leaves nine
+  // `exitCode: 0` receipts; `chmod 444` on the ledger is what one prior sudo
+  // run leaves behind; the next deploy fails at step 1, cannot record it, and
+  // the gate reads last time's nine green rows and answers ok=true, exit 0 -
+  // right after the script promised 「验收门（第 8 步）现在也会因为这条失败记录
+  // 而报错」.
+  it("stops, and takes the gate down with it, when a receipt cannot be written", async () => {
+    const runbook = makeRunbook("alphaloop-r7-ledger-ro-");
+
+    expect(runDeploy(runbook).status).toBe(0);
+    const green = receipts(runbook);
+    expect(green).toHaveLength(9);
+    expect(green.every((entry) => entry.exitCode === 0)).toBe(true);
+
+    const ledgerPath = join(runbook.runtimeRoot, "deploy", "steps.jsonl");
+    chmodSync(ledgerPath, 0o444);
+    try {
+      runbook.env.FAIL_PNPM_SCRIPT = "build";
+      const { status, output } = runDeploy(runbook);
+
+      // 4, not 1: "this deploy cannot be recorded" is not "a step failed".
+      expect(status).toBe(4);
+      expect(output).toMatch(/没能写进部署账本/u);
+      expect(output).toMatch(/验收门读到的是【上一次部署】留下的那些收据/u);
+      // The promise it can no longer keep is not printed on this path.
+      expect(output).not.toMatch(/验收门（第 8 步）现在也会因为这条失败记录而报错/u);
+      // Nothing was appended - which is the whole problem, and why the gate
+      // cannot be allowed to judge on what IS there.
+      expect(receipts(runbook)).toEqual(green);
+
+      const analysis = await gateFromLedger(runbook);
+      expect(analysis.ok).toBe(false);
+      const unwritable = analysis.findings.find((f) => f.code === "deploy-ledger.unwritable");
+      expect(unwritable?.severity).toBe("error");
+      expect(unwritable?.message).toMatch(/只能证明【上一次能写进去的那次部署】/u);
+    } finally {
+      chmodSync(ledgerPath, 0o644);
+    }
+  });
+
+  // K2. "The checkout is newer than every receipt" was a warn, justified by
+  // "the doctor's own git check is what calls a stale checkout an error" - which
+  // it does not: that check only errors when the checkout is BEHIND origin, and
+  // an operator who pulls by hand is not behind anything. dist and all eight
+  // daemons are still running the old commit at that moment.
+  it("fails the gate when every receipt was recorded against another commit", async () => {
+    const runbook = makeRunbook("alphaloop-r7-stale-");
+    expect(runDeploy(runbook).status).toBe(0);
+
+    const analysis = await gateFromLedger(runbook, "beef456");
+
+    expect(analysis.ok).toBe(false);
+    const stale = analysis.findings.find((f) => f.code === "deploy-ledger.stale");
+    expect(stale?.severity).toBe("error");
+    expect(stale?.message).toMatch(/dist 产物和 launchd 里跑着的仍然是旧那份/u);
+  });
+
+  // K9. The deploy target has FEISHU_GROUP_CHAT_ID and PLATFORM_PUBLIC_BASE_URL
+  // unset (verified read-only) and a heavy deploy footprint, so steps 0-7 can
+  // all succeed and step 8 still exit 1 on a configuration gap. That is
+  // semantically right and reads to a controller as a deploy regression - so it
+  // is now refused BEFORE step 0, with its own exit code and its own words.
+  it("refuses up front when the report-routing config is missing, without touching the machine", () => {
+    const runbook = makeRunbook("alphaloop-r7-preflight-");
+    rmSync(join(runbook.root, ".env.local"));
+    delete runbook.env.FEISHU_GROUP_CHAT_ID;
+    delete runbook.env.PLATFORM_PUBLIC_BASE_URL;
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(3);
+    expect(output).toMatch(/配置未就绪 —— 这【不是部署失败】/u);
+    expect(output).toMatch(/FEISHU_GROUP_CHAT_ID/u);
+    expect(output).toMatch(/PLATFORM_PUBLIC_BASE_URL/u);
+    expect(calls(runbook)).toBe("");
+    expect(receipts(runbook)).toEqual([]);
+  });
+
+  it("still lets an operator deploy on purpose with the config gap, and says what it will cost", () => {
+    const runbook = makeRunbook("alphaloop-r7-preflight-override-");
+    rmSync(join(runbook.root, ".env.local"));
+    delete runbook.env.FEISHU_GROUP_CHAT_ID;
+    delete runbook.env.PLATFORM_PUBLIC_BASE_URL;
+    runbook.env.DEPLOY_ALLOW_MISSING_CONFIG = "yes";
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(0);
+    expect(output).toMatch(/第 8 步预计会因为上面这些变量报 error/u);
+    expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  });
+
+  it("reads the config out of .env.local exactly the way the daemons do", () => {
+    const runbook = makeRunbook("alphaloop-r7-preflight-envfile-");
+    // Quoted, commented, and overridden further down - the shapes loadLocalEnv
+    // handles, so the pre-flight has to handle them identically or it will
+    // refuse a machine that is in fact configured.
+    writeFileSync(join(runbook.root, ".env.local"), [
+      "# 部署机配置",
+      "FEISHU_GROUP_CHAT_ID=''",
+      "  PLATFORM_PUBLIC_BASE_URL = ignored, there is a space before the =",
+      "PLATFORM_PUBLIC_BASE_URL=\"https://alphaloop.invalid\"",
+      "FEISHU_GROUP_CHAT_ID='oc_real_group'"
+    ].join("\n"));
+    delete runbook.env.FEISHU_GROUP_CHAT_ID;
+    delete runbook.env.PLATFORM_PUBLIC_BASE_URL;
+
+    expect(runDeploy(runbook).status).toBe(0);
+  });
+
+  // THE MATRIX. One row per step, each one injected into the real script: the
+  // deploy must stop there, every later step must not run, and the gate must be
+  // able to see it afterwards.
+  const injections: Array<[number, string, Record<string, string>, RegExp]> = [
+    [0, "拉取新代码", { FAIL_GIT_PULL: "1" }, /pnpm install|pnpm build/u],
+    [1, "安装依赖并构建", { FAIL_PNPM_SCRIPT: "build" }, /launchd:install-backup-alerts/u],
+    [2, "安装用户级 LaunchAgent", { FAIL_PNPM_SCRIPT: "launchd:install-backup-alerts" }, /sudo/u],
+    [3, "安装系统 daemon", { FAIL_SUDO: "1" }, /launchd:install-user/u],
+    [4, "退役旧的用户级副本", { FAIL_PNPM_SCRIPT: "launchd:install-user" }, /openclaw:cron:install/u],
+    [5, "注册 openclaw cron 任务", { FAIL_PNPM_SCRIPT: "openclaw:cron:install" }, /render-openclaw-config/u],
+    [6, "部署 control agent 人设", { FAIL_NODE: "1" }, /loginshell/u],
+    [7, "启动 rsshub 容器", { FAIL_DOCKER: "1" }, /openclaw:runtime:doctor/u]
+  ];
+
+  it.each(injections)(
+    "step %i (%s) failing stops the deploy there and the gate goes red",
+    async (step, _name, failure, laterCall) => {
+      const runbook = makeRunbook(`alphaloop-r7-matrix-${step}-`, failure);
+
+      const { status, output } = runDeploy(runbook);
+
+      expect(status).toBe(1);
+      expect(output).toMatch(new RegExp(`部署在第 ${step} 步`, "u"));
+      expect(calls(runbook)).not.toMatch(laterCall);
+      const recorded = receipts(runbook);
+      expect(recorded.map((entry) => entry.step)).toEqual(
+        Array.from({ length: step + 1 }, (_unused, index) => index)
+      );
+      expect(recorded.at(-1)).toMatchObject({ step, exitCode: 1 });
+
+      const analysis = await gateFromLedger(runbook);
+      expect(analysis.ok).toBe(false);
+      expect(analysis.findings.map((f) => f.code)).toContain(`deploy-ledger.step_${step}_failed`);
+    }
+  );
+
+  // Step 8 is the gate itself, so it has no ledger row of its own to fail on
+  // (REQUIRED_DEPLOY_STEPS excludes it): a failed acceptance step IS the doctor
+  // exiting non-zero, in this run and in every re-run while the cause stands.
+  // What has to hold is that the deploy reports it as a failure rather than
+  // ending on 「全部退出 0」.
+  it("step 8 (验收 doctor) failing is reported as a failed deploy, not a pass", () => {
+    const runbook = makeRunbook("alphaloop-r7-matrix-8-", { FAIL_PNPM_SCRIPT: "openclaw:runtime:doctor" });
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/部署在第 8 步（验收 doctor）失败/u);
+    expect(output).not.toMatch(/全部退出 0/u);
+    expect(receipts(runbook).at(-1)).toMatchObject({ step: 8, exitCode: 1 });
   });
 });

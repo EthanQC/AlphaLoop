@@ -1,11 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { formatLocalDate, parseBackupFileDate } from "./backup-trading-data.mjs";
-import { judgeDeployLedger, readDeployLedger, REQUIRED_DEPLOY_STEPS } from "./deploy-ledger.mjs";
+import {
+  judgeDeployLedger,
+  lastSuccessfulInstallAt,
+  probeDeployLedgerWritable,
+  readDeployLedger,
+  REQUIRED_DEPLOY_STEPS
+} from "./deploy-ledger.mjs";
 import { readLaunchdOwnership } from "./install-launchd-ownership.mjs";
 import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
 import {
@@ -14,6 +20,7 @@ import {
   LAUNCHD_SERVICE_HEALTH,
   parseLaunchdPrint,
   RESIDENT_CRASH_LOOP_RUNS,
+  RESIDENT_CRASH_LOOP_WINDOW_MS,
   toFiniteNumber
 } from "./launchd-health.mjs";
 import { newsEngineHealthStats } from "./news-store.mjs";
@@ -27,7 +34,7 @@ import { getZonedParts, isUsRegularMarketHours } from "./trading-schedule.mjs";
 // `launchctl print`, which proves registration, not work). Re-exported here
 // because this module is the published surface the suite and the CLI read it
 // from.
-export { LAUNCHD_SERVICE_HEALTH, RESIDENT_CRASH_LOOP_RUNS };
+export { LAUNCHD_SERVICE_HEALTH, RESIDENT_CRASH_LOOP_RUNS, RESIDENT_CRASH_LOOP_WINDOW_MS };
 
 // The command that actually installs each domain's jobs. Round-3 finding F2:
 // the old hint named `pnpm launchd:install-backup-alerts` for every missing
@@ -344,7 +351,7 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "gateway-restart-storm", run: () => checkGatewayRestartStorm(gatewayErrorLines, nowMs, gatewayErrorWindowMs) },
     { name: "runner-listeners", run: () => checkRunnerListeners(runnerPids) },
     { name: "runner-recent-failures", run: () => checkRecentRunnerFailures(recentRunnerResults) },
-    { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot) },
+    { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot, nowMs) },
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
     { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
     { name: "broker-executor-health", run: () => checkBrokerExecutorHealth(snapshot) },
@@ -513,10 +520,15 @@ function warn(code, message) {
 //                                                 label is the exact race
 //                                                 install-launchd-ownership.txt
 //                                                 exists to prevent
-function checkLaunchdJobs(snapshot) {
+function checkLaunchdJobs(snapshot, nowMs) {
   const rows = Array.isArray(snapshot.launchdJobs) ? snapshot.launchdJobs : [];
   const byLabel = new Map(rows.map((row) => [String(row?.label), row]));
   const findings = [];
+  // Round-7 finding K6: a restart COUNT needs the window it happened in, and
+  // the window starts at the install that reset the counter - the newest
+  // successful step-3 receipt. Unknown here (no ledger) means the count cannot
+  // be called a loop; see judgeLaunchdRuntime.
+  const installedAt = lastSuccessfulInstallAt(readLedgerEntries(snapshot));
 
   for (const job of REQUIRED_LAUNCHD_JOBS) {
     const row = byLabel.get(job.label);
@@ -581,7 +593,7 @@ function checkLaunchdJobs(snapshot) {
     // crash-looping is two separate problems, and hiding the second until
     // the first is fixed is how a machine passes an acceptance gate while
     // every service on it is dead.
-    findings.push(...checkLaunchdJobRuntime(job, row));
+    findings.push(...checkLaunchdJobRuntime(job, row, { installedAt, now: nowMs }));
   }
 
   return findings;
@@ -604,17 +616,24 @@ function checkLaunchdJobs(snapshot) {
 // a service's fallback. This function only maps a verdict to a finding. Two of
 // those verdicts changed there, both measured:
 //
-//   · a resident daemon at runs >= 20 is a crash loop WHATEVER launchd says
+//   · a resident daemon at runs >= 20 is worth reporting WHATEVER launchd says
 //     about the last termination. `runs` resets on re-bootstrap (measured), so
 //     it cannot accumulate across deploys, and the old rule - which required a
 //     non-zero `last exit code` - was unreachable for a signal-killed daemon,
 //     the shape the mini's platform-app prints right now.
+//     Round 7 (K6) added the missing half: WHEN. `runs` does accumulate between
+//     installs, and the deploy target is already at 10 for the gateway with a
+//     process alive 10 days, so the count alone would eventually light a
+//     permanent red on a machine that is simply old. A loop is 20 relaunches
+//     inside a day of the install that reset the counter; the same count over
+//     an unknown or much longer stretch is `restarted_many_times`, a warn that
+//     says exactly that instead.
 //   · a signal death is read out of `last terminating signal`, which is the
 //     line launchd prints INSTEAD of `last exit code`. SIGTERM/SIGKILL are
 //     excluded: those are what launchd itself sends on bootout and
 //     `kickstart -k`, i.e. what the installer does to every daemon on every
 //     run.
-function checkLaunchdJobRuntime(job, row) {
+function checkLaunchdJobRuntime(job, row, { installedAt = null, now = Date.now() } = {}) {
   const contract = LAUNCHD_SERVICE_HEALTH[job.label];
   if (!contract) {
     return [error(
@@ -631,7 +650,7 @@ function checkLaunchdJobRuntime(job, row) {
     return [];
   }
 
-  const verdict = judgeLaunchdRuntime(job.label, row, contract);
+  const verdict = judgeLaunchdRuntime(job.label, row, contract, { installedAt, now });
   const where = verdict.evidence;
   const logs = row.stderrPath ? `错误日志：${row.stderrPath}。` : "";
   const install = LAUNCHD_INSTALL_COMMAND[job.domain];
@@ -655,8 +674,23 @@ function checkLaunchdJobRuntime(job, row) {
       return [error(
         `launchd-jobs.${job.slug}.crash_looping`,
         `launchd 任务 ${job.label} 在反复崩溃重启（${where.replace(/^，/u, "")}）——它是常驻服务，而 runs 只在它死掉时才增加，`
-          + `且每次重新 bootstrap 都会清零，所以 ${verdict.runs} 次意味着自上次安装以来它已经死了 ${verdict.runs - 1} 次。`
+          + `且每次重新 bootstrap 都会清零，所以 ${verdict.runs} 次意味着自 ${installedAt}（上一次装系统 daemon）以来它已经死了 ${verdict.runs - 1} 次，`
+          + `而那距今只有 ${describeElapsed(verdict.sinceInstallMs)}。`
           + `此刻 state = running 只是 launchd 刚把它拉起来的瞬间，不代表它可用。${logs}`
+      )];
+    case "restarted_many_times":
+      // Round-7 K6. Same count, no window to call it a loop in - say which of
+      // the two facts is missing rather than picking the louder claim.
+      return [warn(
+        `launchd-jobs.${job.slug}.restarted_many_times`,
+        `launchd 任务 ${job.label} 自上次安装以来已经被拉起 ${verdict.runs} 次（${where.replace(/^，/u, "")}）——它是常驻服务，`
+          + `每多一次就是它死过一次。`
+          + `${verdict.sinceInstallMs === null
+            ? `但这台机器上没有「上次装系统 daemon 是什么时候」的收据，所以无法判断这是崩溃重启循环、还是几个月里偶尔重启攒出来的。`
+              + `跑一遍 zsh apps/openclaw-config/scripts/deploy.sh 会把计数清零并留下时间戳，之后同样的次数才判定得了。`
+            : `不过距上次安装已经 ${describeElapsed(verdict.sinceInstallMs)}，摊到这个跨度上不算崩溃重启循环`
+              + `（那要求 ${describeElapsed(RESIDENT_CRASH_LOOP_WINDOW_MS)}之内 ${RESIDENT_CRASH_LOOP_RUNS} 次）。`}`
+          + `${logs}`
       )];
     case "restarted_after_failure":
       return [warn(
@@ -673,6 +707,21 @@ function checkLaunchdJobRuntime(job, row) {
     default:
       return [];
   }
+}
+
+/** `3 小时` / `12 天` - Chinese half of launchd-health's describeElapsedHours. */
+function describeElapsed(elapsedMs) {
+  if (elapsedMs === null || elapsedMs === undefined) {
+    return "时间不详";
+  }
+  const hours = elapsedMs / (60 * 60 * 1000);
+  if (hours < 1) {
+    return `${Math.max(1, Math.round(elapsedMs / 60000))} 分钟`;
+  }
+  if (hours < 48) {
+    return `${Math.round(hours)} 小时`;
+  }
+  return `${Math.round(hours / 24)} 天`;
 }
 
 // Whether launchd currently holds this label in ANY domain, per the same
@@ -791,23 +840,55 @@ function readLedgerEntries(snapshot) {
 // missing/stale receipts are reported without being called failures.
 function checkDeployLedger(snapshot) {
   const entries = readLedgerEntries(snapshot);
+  const findings = [];
+
+  // Round-7 finding K1, and it is deliberately the FIRST thing said here: if
+  // receipts cannot be appended, every receipt below is evidence about some
+  // earlier deploy and none of it is evidence about the latest one.
+  //
+  // MEASURED: clean deploy (nine `exitCode: 0` rows) -> `chmod 444` on the
+  // ledger, which is what one prior sudo run leaves behind -> a deploy whose
+  // build step fails. The failure could not be recorded, the nine green rows
+  // stayed, and this gate answered ok=true with zero errors.
+  //
+  // This probe needs no cooperation from the writer that failed - it asks the
+  // kernel whether this process could append, and writes nothing itself. With
+  // no runtime root (callers that hand this analyzer a ledger array directly)
+  // there is no path to judge, and nothing is claimed.
+  const writability = snapshot.runtimeRoot
+    ? probeDeployLedgerWritable(snapshot.runtimeRoot)
+    : { writable: null, path: null, checked: null };
+  if (writability.writable === false) {
+    const severity = deployTargetSeverityFor(snapshot);
+    findings.push(severity(
+      "deploy-ledger.unwritable",
+      `部署账本写不进去：${writability.error}（检查的路径是 ${writability.checked}）。`
+        + `${entries.length > 0
+          ? `这个文件里现在有 ${entries.length} 条收据，但它们只能证明【上一次能写进去的那次部署】——`
+            + `此后任何一次部署的成败都记不下来，包括失败。`
+          : "也就是说接下来任何一次部署的成败都记不下来。"}`
+        + `所以下面关于部署步骤的结论一律不作数，先把它修回可写：`
+        + `ls -l ${writability.path}；sudo chown -R "$(id -un)":staff ${dirname(writability.path)}。`
+    ));
+  }
+
   const verdict = judgeDeployLedger(entries, { head: snapshot.gitHead ?? null });
   if (!verdict.deployed) {
     // No receipts at all. On a machine with a deploy footprint this is worth
     // saying (the runbook was followed by hand, or predates the ledger); on a
     // dev box it is simply the normal state and nothing is reported.
     if (!deployFootprint(snapshot).deployed) {
-      return [];
+      return findings;
     }
-    return [warn(
+    findings.push(warn(
       "deploy-ledger.absent",
       `这台机器有部署痕迹，但没有任何部署收据（${join(String(snapshot.runtimeRoot ?? "runtime"), "deploy", "steps.jsonl")} 不存在）。`
         + `照 README 的 0→8 一步步手敲也会是这个结果——用 zsh apps/openclaw-config/scripts/deploy.sh 跑一遍，`
         + `每一步的退出码就会被记下来，这道门也才拦得住"某一步失败了但没人发现"。`
-    )];
+    ));
+    return findings;
   }
 
-  const findings = [];
   for (const step of verdict.failedSteps) {
     findings.push(error(
       `deploy-ledger.step_${step.step}_failed`,
@@ -824,10 +905,21 @@ function checkDeployLedger(snapshot) {
     ));
   }
   if (verdict.staleSteps.length > 0) {
-    findings.push(warn(
+    // Round-7 finding K2. This was a warn, on the grounds that "the doctor's
+    // own git check is what calls a stale checkout an error". It is not:
+    // checkDeployCheckout errors only when the checkout is BEHIND origin.
+    // MEASURED with a real local origin and two real commits - deploy at A,
+    // origin advances to B, the operator pulls by hand and never re-runs
+    // deploy.sh: behind = 0, this was the only complaint, it was a warn, and
+    // the gate exited 0 while dist and all eight daemons were still running A.
+    // That is precisely 「跑的不是你 push 的代码」, which cannot be a warning.
+    findings.push(error(
       "deploy-ledger.stale",
       `以下步骤上一次成功是在别的 commit 上跑的（当前检出 ${snapshot.gitHead ?? "未知"}）：`
-        + `${verdict.staleSteps.map((step) => `第 ${step.step} 步 @ ${step.head}`).join("、")}。代码换了就要重跑。`
+        + `${verdict.staleSteps.map((step) => `第 ${step.step} 步 @ ${step.head}`).join("、")}。`
+        + `工作区已经换了代码，但这些步骤没有在新代码上跑过——dist 产物和 launchd 里跑着的仍然是旧那份。`
+        + `手动 git pull 不会更新这些收据，也不会重启任何服务；`
+        + `重跑一遍 DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh 才会。`
     ));
   }
   return findings;
@@ -853,6 +945,44 @@ function checkDeployCheckout(snapshot) {
   // equality test alone reported that as "this is not the code you pushed".
   const behind = Number.isFinite(git.behind) ? git.behind : null;
   const ahead = Number.isFinite(git.ahead) ? git.ahead : null;
+
+  // Round-7 finding K7, and it is checked BEFORE `behind`, because `behind` is
+  // computed from the local origin/main ref and on the machine this matters
+  // most that ref was five commits out of date and said 0. `remoteTip` is what
+  // origin answered just now (see readGitCheckout's ls-remote); a commit that
+  // is not even in this object store cannot be what is checked out here.
+  if (git.remoteTip && git.remoteTip !== git.head && git.remoteTipKnownLocally === false) {
+    findings.push(error(
+      "deploy-checkout.never_fetched",
+      `origin/main 现在是 ${git.remoteTip}，而这台机器上【连这个 commit 都没有】——`
+        + `本地那份 origin/main 引用停在 ${git.remoteHead ?? "未知"}，从来没有 fetch 过新的。`
+        + `所以"落后 ${behind ?? "?"} 个提交"这种话在这台机器上算不出真值：它跑的不是你 push 的代码。`
+        + `跑 zsh apps/openclaw-config/scripts/deploy.sh（第 0 步会 fetch + pull，后面的步骤才会把新代码真正装上去）。`
+    ));
+    return findings;
+  }
+  if (git.remoteTip && git.remoteTipKnownLocally && Number(git.behindRemoteTip) > 0) {
+    findings.push(error(
+      "deploy-checkout.behind_origin",
+      `这台机器的检出停在 ${git.head}，而 origin/main 现在是 ${git.remoteTip}，落后 ${git.behindRemoteTip} 个提交`
+        + `${ahead ? `（同时还领先 ${ahead} 个，历史已经分叉）` : ""}——`
+        + `也就是说这里跑的不是你 push 的代码。部署第 0 步（git pull --ff-only）没有真正完成。`
+        + `${git.dirtyFiles?.length ? `工作区还有本地改动挡着：${git.dirtyFiles.slice(0, 5).join("、")}。` : ""}`
+    ));
+    return findings;
+  }
+  if (!git.remoteTip && git.remoteTipError && deployFootprint(snapshot).deployed) {
+    // Honest disclosure with the reason, rather than either silence or a red
+    // light: we asked origin and origin did not answer, so the only thing left
+    // is the local ref, which cannot see commits this machine never fetched.
+    findings.push(warn(
+      "deploy-checkout.remote_unverified",
+      `没能向 origin 核对 main 的真实位置（${git.remoteTipError}），所以下面这些结论只基于本地那份 origin/main 引用`
+        + `（${git.remoteHead ?? "无"}）——它可能比真正的 origin/main 旧很多，而那种情况下"没落后"是假的。`
+        + `网络/凭据恢复后重跑本体检，或先手动 git fetch origin。`
+    ));
+  }
+
   if (behind !== null && behind > 0) {
     findings.push(error(
       "deploy-checkout.behind_origin",
@@ -931,17 +1061,54 @@ function checkOpenClawCronJobs(snapshot) {
     )];
   }
 
+  const findings = [];
   const installed = new Set((registry.names ?? []).map(String));
-  const missing = expected.filter((name) => !installed.has(name));
-  if (missing.length === 0) {
-    return [];
+  // Round-7 finding K8, second half: `openclaw cron list` hides disabled jobs
+  // unless asked (`--all`, which the CLI now passes), so a job that exists but
+  // will never fire used to read as "missing". Both are broken; they are not
+  // the same repair, and the message has to say which one this is.
+  const disabled = new Set((registry.disabledNames ?? []).map(String));
+  const missing = expected.filter((name) => !installed.has(name) && !disabled.has(name));
+  const disabledExpected = expected.filter((name) => disabled.has(name));
+
+  if (disabledExpected.length > 0) {
+    findings.push(error(
+      "openclaw-cron.jobs_disabled",
+      `openclaw cron 里有 ${disabledExpected.length}/${expected.length} 个报告类任务处于 disabled：${disabledExpected.join("、")}。`
+        + `任务还在，但 disabled 的任务不会被派发——效果和不存在一样。`
+        + `用 openclaw cron enable <name> 打开，或重跑 pnpm openclaw:cron:install 重建。`
+    ));
   }
-  return [error(
+
+  if (missing.length === 0) {
+    return findings;
+  }
+
+  // Round-7 finding K8, first half. The envelope carries {total, offset, limit,
+  // hasMore, nextOffset} and this gateway also serves the operator's personal
+  // 186-agent fleet - so a truncated page is a real possibility, and "not in
+  // the page I was given" is not "not installed". Measured read-only on the
+  // deploy target (2026-07-29): the query the CLI now sends is scoped with
+  // `--agent control --all`, and it answers total=5, limit=5, hasMore=false,
+  // with all five managed jobs present - so this branch is about the future
+  // shape, not today's.
+  if (registry.truncated) {
+    findings.push(warn(
+      "openclaw-cron.list_truncated",
+      `openclaw cron 任务表被截断了（这次拿到 ${registry.names?.length ?? 0} 条，总数 ${registry.total ?? "未知"}，hasMore=true），`
+        + `所以没能确认这 ${missing.length} 个报告类任务在不在：${missing.join("、")}。`
+        + `这不是"它们不存在"，是"这次没看全"——请手动确认：openclaw cron list --agent control --all | grep openclaw-trading。`
+    ));
+    return findings;
+  }
+
+  findings.push(error(
     "openclaw-cron.jobs_missing",
     `openclaw cron 里缺 ${missing.length}/${expected.length} 个报告类任务：${missing.join("、")}。`
       + `这 5 条任务就是日报、周报和个股分析本身——少一条就是那条流水线在这台机器上根本不会触发。`
       + `请重跑 pnpm openclaw:cron:install，并确认它这次以退出码 0 结束。`
-  )];
+  ));
+  return findings;
 }
 
 // Round-6 finding S3h: every public report card can be delivered "successfully"
@@ -984,12 +1151,33 @@ function checkNotificationRouting(snapshot) {
     ));
   }
 
+  // Round-7 finding K5. This check was `error`-severity and could not fire.
+  //
+  // It read `groupFallback === true` off the newest state entry that HAS a
+  // `deliveredAt`. After J2 that combination stopped existing: a circle-public
+  // report with no group chat is REFUSED by the delivery layer, so
+  // `groupFallback: true` now always arrives with `sent: false`, and
+  // scheduled-report.mjs's refusal branch (the only one that runs then) writes
+  // `deliveryFailedAt`, never `deliveredAt`. An error-severity check that
+  // nothing can trigger is worse than no check, because the code list reads as
+  // coverage.
+  //
+  // Both halves were fixed rather than deleting it: scheduled-report.mjs now
+  // records `groupFallback`/`groupFallbackReason` on the refusal too (its own
+  // comment already claimed it did), and the CLI ranks entries by
+  // `deliveredAt ?? deliveryFailedAt`, carrying `lastDeliverySent` so this can
+  // tell the two outcomes apart instead of assuming one.
   if (routing.lastDeliveryGroupFallback) {
+    const when = `${routing.lastDeliveryLabel ?? "未知窗口"}，${routing.lastDeliveryAt ?? "时间未知"}`;
     findings.push(error(
-      "notification-routing.last_delivery_fell_back",
-      `最近一次报告投递（${routing.lastDeliveryLabel ?? "未知窗口"}，${routing.lastDeliveryAt ?? "时间未知"}）是"群改单聊"的降级投递：`
-        + `${routing.lastDeliveryReason ?? "报告投递状态里记着 groupFallback=true"}。`
-        + `也就是说圈子里没有人在群里看到那张卡。`
+      "notification-routing.last_delivery_missed_group",
+      routing.lastDeliverySent === false
+        ? `最近一次报告投递（${when}）被投递层拒发：${routing.lastDeliveryReason ?? "报告投递状态里记着 groupFallback=true"}。`
+          + `报告本身生成了、也在磁盘上，但圈子群里一张卡都没有——`
+          + `这条流水线在配好 FEISHU_GROUP_CHAT_ID 之前每一轮都会这样结束。`
+        : `最近一次报告投递（${when}）是"群改单聊"的降级投递：`
+          + `${routing.lastDeliveryReason ?? "报告投递状态里记着 groupFallback=true"}。`
+          + `也就是说圈子里没有人在群里看到那张卡。`
     ));
   }
 
