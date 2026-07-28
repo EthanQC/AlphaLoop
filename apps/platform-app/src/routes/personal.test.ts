@@ -283,6 +283,33 @@ describe("personal page routes (GET /daily/<date>/me, GET /weekly/<date>/me)", (
     expect(unknown.status).toBe(403);
   });
 
+  // -------------------------------------------------------------------------
+  // Defect B2 (2026-07-28 adversarial review): "only the owner sees this" has
+  // to hold at the CACHE layer too. This is the batch's owner-private HTML
+  // page and it is served through cloudflared, so every response on the route
+  // family must forbid shared/intermediary storage - not just the 200, since
+  // the 403/404 shells are still per-viewer answers about a private resource.
+  // -------------------------------------------------------------------------
+  it("sends cache-control: private, no-store on the owner's page - and on every other status this route returns", async () => {
+    seedA();
+
+    const own = await get(`/daily/${TODAY}/me`, withBearer(tokenA));
+    expect(own.status).toBe(200);
+    expect(own.headers.get("cache-control")).toBe("private, no-store");
+
+    const missing = await get(`/daily/2026-07-13/me`, withBearer(tokenA));
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get("cache-control")).toBe("private, no-store");
+
+    const refusedOwnerParam = await get(`/daily/${TODAY}/me?owner=${memberA.id}`, withBearer(tokenA));
+    expect(refusedOwnerParam.status).toBe(403);
+    expect(refusedOwnerParam.headers.get("cache-control")).toBe("private, no-store");
+
+    const anonymous = await get(`/daily/${TODAY}/me`);
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers.get("cache-control")).toBe("private, no-store");
+  });
+
   it("leaves the public reading page untouched: /daily/<date> is still the report route's 404, not a personal page", async () => {
     seedA();
     const response = await get(`/daily/${TODAY}`, withBearer(tokenA));

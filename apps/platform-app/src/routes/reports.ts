@@ -81,6 +81,7 @@ import {
 } from "../reports/scanner.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
+import { applyPrivateCacheHeaders } from "../security.js";
 
 export interface ReportsRouteDeps {
   db: DatabaseSync;
@@ -229,7 +230,21 @@ function isOwnerScopedType(type: ReportType): boolean {
   return OWNER_SCOPED_REPORT_TYPES.includes(type);
 }
 
-function sendHtml(res: ServerResponse, status: number, body: string): void {
+/** `ownerPrivate` marks a response that only one member may ever see (the
+ * 模拟盘快照 reading page and its refusals - see the module header's B1
+ * section). Those get `cache-control: private, no-store` so an owner-only
+ * answer cannot be stored by the cloudflared edge or a shared proxy and
+ * replayed to somebody else (defect B2). The circle-wide report pages are
+ * left cacheable exactly as before. */
+function sendHtml(
+  res: ServerResponse,
+  status: number,
+  body: string,
+  options: { ownerPrivate?: boolean } = {}
+): void {
+  if (options.ownerPrivate) {
+    applyPrivateCacheHeaders(res);
+  }
   res.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(body)
@@ -787,7 +802,7 @@ function refusedOwnerScopedReport(
           这份模拟盘快照在磁盘上没有归属标注，系统也无法确认它写的是谁的账户（${attribution.reason}）。为避免把别人的账户内容给错人，它对任何成员都不开放；你自己的账户数据在
           <a href="/paper" style="color:var(--accent)">模拟盘</a> 页面。
         </p>`;
-  sendHtml(res, 403, renderPaperForbiddenPage(member, nonce, now, detail));
+  sendHtml(res, 403, renderPaperForbiddenPage(member, nonce, now, detail), { ownerPrivate: true });
   return true;
 }
 
@@ -800,18 +815,22 @@ function renderReadingPage(
   nonce: string
 ): void {
   const now = currentNow(deps);
+  // Owner-scoped types (模拟盘快照) answer only their owner, so EVERY response
+  // on that path - 404 shells included - is owner-private for caching purposes
+  // (defect B2).
+  const ownerScoped = isOwnerScopedType(type);
+  const send = (status: number, body: string): void => sendHtml(res, status, body, { ownerPrivate: ownerScoped });
 
   // Validate BEFORE touching the filesystem at all (path traversal guard -
   // e.g. `/daily/../../etc/passwd` never reaches scanReports/readFileSync
   // because dateParam fails this check first).
   if (!DATE_PARAM_RE.test(dateParam)) {
-    sendHtml(res, 404, renderNotFoundPage(member, nonce, now));
+    send(404, renderNotFoundPage(member, nonce, now));
     return;
   }
 
-  // Owner-scoped types (模拟盘快照) are gated on ownership before anything is
-  // scanned or read - see refusedOwnerScopedReport.
-  const ownerScoped = isOwnerScopedType(type);
+  // Ownership is resolved before anything is scanned or read - see
+  // refusedOwnerScopedReport.
   if (ownerScoped && refusedOwnerScopedReport(res, deps, dateParam, member, nonce, now)) {
     return;
   }
@@ -819,7 +838,7 @@ function renderReadingPage(
   const entries = ownerScoped ? scanOwnerScopedReports(deps.repoRoot) : scanReports(deps.repoRoot);
   const entry = entries.find((candidate) => candidate.type === type && candidate.date === dateParam);
   if (!entry) {
-    sendHtml(res, 404, renderNotFoundPage(member, nonce, now));
+    send(404, renderNotFoundPage(member, nonce, now));
     return;
   }
 
@@ -837,5 +856,5 @@ function renderReadingPage(
     nonce,
     now
   });
-  sendHtml(res, 200, page);
+  send(200, page);
 }

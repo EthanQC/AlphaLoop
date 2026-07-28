@@ -537,6 +537,23 @@ describe("reports routes", () => {
       expect(body).toContain("QQQ.US");
     });
 
+    // Defect B2: the snapshot reading page became owner-private with B1, so it
+    // must forbid shared/intermediary caching for the same reason the personal
+    // page does - an owner-only response that a cache may store is not
+    // owner-only.
+    it("owner-private responses forbid caching (cache-control: private, no-store)", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+
+      const own = await authed(`/official-paper/${DATE}`);
+      expect(own.status).toBe(200);
+      expect(own.headers.get("cache-control")).toBe("private, no-store");
+
+      const refused = await authedAsOther(`/official-paper/${DATE}`);
+      expect(refused.status).toBe(403);
+      expect(refused.headers.get("cache-control")).toBe("private, no-store");
+    });
+
     it("non-owner: 403 and NOT ONE account figure in the body", async () => {
       writePaperReport();
       seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
