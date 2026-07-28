@@ -147,12 +147,20 @@ function producedSnapshot(input: {
     positions: longbridgeShape.buildPositionsPayload(input.positions),
     fetchedAt: input.fetchedAt
   });
-  const quotes = normalized.positions.map((position: { symbol: string }) =>
-    reportData.normalizeQuotePayload(
-      longbridgeShape.buildQuoteRows([position.symbol], input.quotes),
-      position.symbol
-    )
-  );
+  // Mirrors fetchOfficialPaperSnapshot's own per-symbol loop, catch included
+  // (official-paper-monitor.mjs:381-388): a symbol whose quote never arrives
+  // becomes `{symbol, error}` and lets attachPriceSource decide the degradation,
+  // instead of a test typing `priceSource: "cost"` into a position by hand (H2).
+  const quotes = normalized.positions.map((position: { symbol: string }) => {
+    try {
+      return reportData.normalizeQuotePayload(
+        longbridgeShape.buildQuoteRows([position.symbol], input.quotes),
+        position.symbol
+      );
+    } catch (error) {
+      return { symbol: position.symbol, error: String((error as Error)?.message ?? error).slice(0, 160) };
+    }
+  });
   const { positions, degradedSymbols } = officialPaperMonitor.attachPriceSource(normalized.positions, quotes);
   return {
     ...normalized,
@@ -161,6 +169,50 @@ function producedSnapshot(input: {
     degraded: degradedSymbols.length > 0,
     degradedReason: degradedSymbols.length > 0 ? `行情读取失败：${degradedSymbols.join("、")}` : null
   };
+}
+
+/**
+ * H2 (2026-07-28, round-5): a produced snapshot with the balances a case needs.
+ *
+ * I9 moved the 收支变化表 block off `buildSnapshot({primaryAsset: ...})` but left
+ * the same hand-shaped literal in the blocks below it: `{net_assets: "1200",
+ * total_cash: "140"}` has no `currency`, which is exactly what
+ * report-data.mjs's validateOfficialPrimaryAsset throws on - a fetch cannot
+ * produce it. The reader-facing figures (1200.00 USD / 140.00 USD / +200.00 USD
+ * / -60.00 USD) were riding on that.
+ *
+ * Going through buildAssetsPayload -> normalizeOfficialPaperSnapshot means the
+ * asset row is one `longbridge-cli trade assets` really prints and one the
+ * validator really accepts; positions and quotes default to the same NVDA row
+ * buildSnapshot uses, so only the balances differ from the shared fixture.
+ *
+ * What this does NOT establish, so that no later reader assumes it: the "USD"
+ * in those strings is still not the row's `currency`. formatMoney/formatDelta
+ * (official-paper-monitor.mjs:834-848) and the remaining-budget clause (:493)
+ * append the literal "USD" and read no currency field anywhere, so setting this
+ * row's currency to HKD leaves every assertion in this file passing (probed
+ * 2026-07-28). The currency is carried and validated, and then ignored by the
+ * renderer.
+ */
+type ProducedSnapshotInput = Parameters<typeof producedSnapshot>[0];
+
+function producedSnapshotWithBalances(
+  netAssets: string,
+  totalCash: string,
+  options: {
+    fetchedAt?: string;
+    positions?: ProducedSnapshotInput["positions"];
+    quotes?: ProducedSnapshotInput["quotes"];
+  } = {}
+) {
+  return producedSnapshot({
+    fetchedAt: options.fetchedAt ?? "2026-07-01T14:00:00.000Z",
+    assets: [{ netAssets, totalCash, currency: "USD", buyPower: totalCash, riskLevel: 1 }],
+    positions: options.positions ?? [
+      { symbol: "NVDA.US", name: "NVIDIA", market: "US", currency: "USD", quantity: "10", available: "10", costPrice: "100" }
+    ],
+    quotes: options.quotes ?? [{ symbol: "NVDA.US", lastDone: "106" }]
+  });
 }
 
 function buildSnapshot(overrides: Record<string, unknown> = {}) {
@@ -283,14 +335,23 @@ describe("buildStrategyReflection: discloses degradation instead of trusting the
   });
 
   it("discloses the number of degraded positions in the summary when the snapshot is degraded", () => {
-    const snapshot = buildSnapshot({
-      degraded: true,
+    // H2 (2026-07-28): the three priceSource values used to be typed in here.
+    // They are attachPriceSource's verdicts, so the run now earns them: NVDA has
+    // a cost basis and no quote (-> cost), TSLA has neither (-> zero), AMD has a
+    // live quote (-> live). 2 of 3 degraded, which is what the summary must say.
+    const snapshot = producedSnapshotWithBalances("1000", "500", {
       positions: [
-        { symbol: "NVDA.US", quantity: 10, priceSource: "cost", price: 100 },
-        { symbol: "TSLA.US", quantity: 5, priceSource: "zero", price: 0 },
-        { symbol: "AMD.US", quantity: 2, priceSource: "live", price: 150 }
-      ]
+        { symbol: "NVDA.US", name: "NVIDIA", market: "US", currency: "USD", quantity: "10", available: "10", costPrice: "100" },
+        { symbol: "TSLA.US", name: "Tesla", market: "US", currency: "USD", quantity: "5", available: "5" },
+        { symbol: "AMD.US", name: "AMD", market: "US", currency: "USD", quantity: "2", available: "2", costPrice: "120" }
+      ],
+      quotes: [{ symbol: "AMD.US", lastDone: "150" }]
     });
+    expect(snapshot.positions.map((position: { priceSource: string }) => position.priceSource)).toEqual([
+      "cost",
+      "zero",
+      "live"
+    ]);
 
     const reflection = officialPaperMonitor.buildStrategyReflection(snapshot);
 
@@ -302,11 +363,15 @@ describe("buildStrategyReflection: discloses degradation instead of trusting the
 
 describe("renderPnlReport: report reading discloses per-position degradation", () => {
   it("annotates a degraded position's line in the rendered markdown", () => {
-    const snapshot = buildSnapshot({
-      degraded: true,
-      positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100, priceSource: "cost", price: 100 }],
-      quotes: [{ symbol: "NVDA.US", error: "timeout" }]
-    });
+    // H2 (2026-07-28): this used to override `degraded`, `positions` and
+    // `quotes` with literals - the position already carrying `priceSource:
+    // "cost"` and `price: 100`, which are attachPriceSource's OUTPUT, and
+    // `degraded: true`, which is fetchOfficialPaperSnapshot's. It asserted the
+    // renderer reacts to a verdict this file had written for it. With no quote
+    // for the symbol, the real chain reaches that verdict on its own.
+    const snapshot = producedSnapshotWithBalances("1000", "500", { quotes: [] });
+    expect(snapshot.degraded).toBe(true);
+    expect(snapshot.positions[0]).toMatchObject({ priceSource: "cost", price: 100 });
 
     const markdown = officialPaperMonitor.renderPnlReport(snapshot, null, null);
 
@@ -783,12 +848,21 @@ describe("the PnL report cannot reach the shared group chat (spec drift R2)", ()
   }
 
   /** The payload sendPnlReport itself builds, from a snapshot this run
-   * persisted - not a fixture shaped to be convenient. */
+   * persisted.
+   *
+   * H2 (2026-07-28): "not a fixture shaped to be convenient" is only true since
+   * this stopped calling buildSnapshot with `primaryAsset` / `positions` /
+   * `quotes` overrides. Those replaced the produced objects wholesale with
+   * literals - an asset row with no `currency` that validateOfficialPrimaryAsset
+   * rejects, and positions carrying `priceSource: "live"` and `price: 731.42`,
+   * which are attachPriceSource's OUTPUT typed in by hand. 731.42 is now a quote
+   * price the real chain resolved, and the priceSource is its verdict. */
   function realPnlPayload(db: DatabaseSync) {
-    const snapshot = buildSnapshot({
-      primaryAsset: { net_assets: "1200", total_cash: "140" },
-      positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 731.42 }],
-      quotes: [{ symbol: "QQQ.US", last: 731.42 }]
+    const snapshot = producedSnapshotWithBalances("1200", "140", {
+      positions: [
+        { symbol: "QQQ.US", name: "Invesco QQQ Trust", market: "US", currency: "USD", quantity: "1", available: "1", costPrice: "663.88" }
+      ],
+      quotes: [{ symbol: "QQQ.US", lastDone: "731.42" }]
     });
     const snapshotId = officialPaperMonitor.saveSnapshot(db, snapshot, "post_open_pnl");
     const markdown = officialPaperMonitor.renderPnlReport(snapshot, null, null);
@@ -852,12 +926,17 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     previousWeek?: Record<string, unknown> | null;
     scope?: Record<string, unknown>;
   } = {}) {
-    const current = overrides.current ?? buildSnapshot({ primaryAsset: { net_assets: "1200", total_cash: "140" } });
+    // H2 (2026-07-28): both defaults used to be
+    // `buildSnapshot({primaryAsset: {net_assets, total_cash}})`, i.e. an asset
+    // row with no `currency` - the shape validateOfficialPrimaryAsset throws on,
+    // so no fetch could ever produce it - and the card figures asserted below
+    // (1200.00 USD / +200.00 USD / -60.00 USD) were measured against it.
+    const current = overrides.current ?? producedSnapshotWithBalances("1200", "140");
     return officialPaperMonitor.buildPnlDeliveryPayload({
       scope: overrides.scope ?? { visibility: "owner-private", ownerOpenId: "ou_paper_owner" },
       current,
       previousDay: overrides.previousDay === undefined
-        ? buildSnapshot({ fetchedAt: "2026-06-30T14:00:00.000Z", primaryAsset: { net_assets: "1000", total_cash: "200" } })
+        ? producedSnapshotWithBalances("1000", "200", { fetchedAt: "2026-06-30T14:00:00.000Z" })
         : overrides.previousDay,
       previousWeek: overrides.previousWeek === undefined ? null : overrides.previousWeek,
       markdown: officialPaperMonitor.renderPnlReport(current, null, null),
@@ -920,7 +999,7 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     it("reports 无法计算 for a change against a baseline, not a 0 change", () => {
       const payload = pnlPayload({
         current: buildSnapshot(NO_ASSET_SNAPSHOT),
-        previousDay: buildSnapshot({ primaryAsset: { net_assets: "1000", total_cash: "200" } })
+        previousDay: producedSnapshotWithBalances("1000", "200")
       });
 
       expect(payload.conclusion.bullets.join("\n")).toContain("无法计算（缺少账户资金数据）");
@@ -948,8 +1027,10 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     // A real zero still reads as a real zero - the fix must not turn every 0
     // into 暂无.
     it("still reports a genuine zero balance as 0.00 USD", () => {
+      // A zero balance is something the broker really returns, so it comes off
+      // the real chain here rather than from a literal (H2).
       const payload = pnlPayload({
-        current: buildSnapshot({ primaryAsset: { net_assets: 0, total_cash: 0 }, positions: [], quotes: [] })
+        current: producedSnapshotWithBalances("0", "0", { positions: [], quotes: [] })
       });
 
       expect(payload.conclusion.headline).toContain("净资产 0.00 USD");
@@ -978,13 +1059,10 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
   });
 
   it("discloses a degraded valuation rather than presenting a fallback price as a real one", () => {
-    const payload = pnlPayload({
-      current: buildSnapshot({
-        primaryAsset: { net_assets: "1200", total_cash: "140" },
-        positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100, priceSource: "cost", price: 100 }],
-        quotes: []
-      })
-    });
+    // No quote comes back for the position, exactly as when the quote call
+    // throws in production - so `priceSource: "cost"` is attachPriceSource's
+    // verdict here rather than an input this file wrote (H2).
+    const payload = pnlPayload({ current: producedSnapshotWithBalances("1200", "140", { quotes: [] }) });
 
     expect(payload.conclusion.bullets.join("\n")).toContain("估值降级");
   });
