@@ -424,6 +424,172 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     expect(launchDaemonLabels(zshMachine).sort()).toEqual([...SYSTEM_LABELS].sort());
   });
 
+  // Round-3 finding F1: TARGET_USER defaulted to the literal "abble" - the
+  // laptop this repo was written on. `id -u abble` fails on the mini (user
+  // `qingchang`) and with `set -e` that aborted the installer on its third
+  // line, so the only script that installs the unattended services could not
+  // be run there at all with its documented arguments. These tests drive the
+  // REAL script's own resolution via PRINT_CONFIG_ONLY, which stops before it
+  // creates a directory, writes a plist or calls launchctl.
+  describe("who it installs for (round-3 finding F1)", () => {
+    function printConfig(env: NodeJS.ProcessEnv): Record<string, string> {
+      const stdout = execFileSync("zsh", [systemDaemonsScript], {
+        env: { ...process.env, TARGET_USER: "", TARGET_HOME: "", SUDO_USER: "", PRINT_CONFIG_ONLY: "1", PNPM_BIN: "/usr/bin/true", ...env },
+        encoding: "utf8"
+      });
+      return Object.fromEntries(
+        stdout.split(/\r?\n/u).filter(Boolean).map((line) => {
+          const index = line.indexOf("=");
+          return [line.slice(0, index), line.slice(index + 1)];
+        })
+      );
+    }
+
+    it("defaults to the operator running it, not a username hardcoded from another machine", () => {
+      const config = printConfig({});
+      expect(config.target_user).toBe(userInfo().username);
+      expect(config.target_user).not.toBe("abble-hardcoded-placeholder");
+      expect(config.target_home).toBe(userInfo().homedir);
+    });
+
+    it("really writes nothing during the preflight, including a temp directory", () => {
+      // The preflight's whole value is that an operator can run it before the
+      // `sudo` invocation without consequences, so "creates nothing" has to be
+      // asserted rather than asserted-in-a-comment: an earlier draft called
+      // `mktemp -d` at the top of the script and leaked one directory per
+      // preflight while the comment above it claimed otherwise. `mktemp`
+      // honours TMPDIR, so pointing TMPDIR at a scratch directory makes the
+      // leak observable.
+      const scratchTmp = makeTempDir("alphaloop-daemons-preflight-tmp-");
+      const scratchSystemDir = join(makeTempDir("alphaloop-daemons-preflight-sys-"), "LaunchDaemons");
+
+      execFileSync("zsh", [systemDaemonsScript], {
+        env: {
+          ...process.env,
+          TARGET_USER: userInfo().username,
+          PRINT_CONFIG_ONLY: "1",
+          PNPM_BIN: "/usr/bin/true",
+          SYSTEM_DIR: scratchSystemDir,
+          TMPDIR: scratchTmp
+        },
+        encoding: "utf8"
+      });
+
+      expect(readdirSync(scratchTmp)).toEqual([]);
+      expect(existsSync(scratchSystemDir)).toBe(false);
+    });
+
+    it("resolves SUDO_USER under sudo, because `id -un` there is root and root is the wrong answer", () => {
+      const config = printConfig({ SUDO_USER: userInfo().username });
+      expect(config.target_user).toBe(userInfo().username);
+    });
+
+    it("refuses rather than installing eight daemons that run as root", () => {
+      expect(() =>
+        execFileSync("zsh", [systemDaemonsScript], {
+          env: { ...process.env, TARGET_USER: "root", PRINT_CONFIG_ONLY: "1" },
+          encoding: "utf8",
+          stdio: "pipe"
+        })
+      ).toThrow(/refusing to install daemons that run as root/u);
+    });
+
+    it("names the missing user instead of dying on an unexplained `id: no such user`", () => {
+      expect(() =>
+        execFileSync("zsh", [systemDaemonsScript], {
+          env: { ...process.env, TARGET_USER: "nobody-with-this-name-exists", PRINT_CONFIG_ONLY: "1" },
+          encoding: "utf8",
+          stdio: "pipe"
+        })
+      ).toThrow(/no such user 'nobody-with-this-name-exists'/u);
+    });
+
+    // Skipped under root ON PURPOSE, and this is not squeamishness: with no
+    // SYSTEM_DIR override this case points the real installer at the real
+    // /Library/LaunchDaemons, so as root it would sail past the guard it is
+    // testing and install eight daemons on the machine running the suite.
+    // The guard is "am I root", so the only way to observe it firing is to
+    // not be root.
+    it.skipIf(process.getuid?.() === 0)("stops with the sudo command up front instead of failing halfway into /Library/LaunchDaemons", () => {
+      // No SYSTEM_DIR override => the real system directory => needs root.
+      expect(() =>
+        execFileSync("zsh", [systemDaemonsScript], {
+          env: { ...process.env, TARGET_USER: userInfo().username, PNPM_BIN: "/usr/bin/true" },
+          encoding: "utf8",
+          stdio: "pipe"
+        })
+      ).toThrow(/needs root[\s\S]*re-run as: sudo zsh/u);
+    });
+  });
+
+  // Round-3 finding F3: the proxy block used to be written for every daemon
+  // this script renders. Before ac741d8 it only ever reached gateway and
+  // broker-executor - the six promoted services came from templates that
+  // exported PATH and nothing else (see apps/openclaw-config/launchd/
+  // *.plist.template), so they silently changed egress path when they moved
+  // here. Asserted through plutil, i.e. the key really is absent from the
+  // parsed plist rather than merely absent from our string matching.
+  describe("per-service egress policy (round-3 finding F3)", () => {
+    const PROXY_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"];
+
+    function hasProxyEnv(file: string): boolean {
+      return PROXY_KEYS.some((key) => {
+        try {
+          execFileSync("plutil", ["-extract", `EnvironmentVariables.${key}`, "raw", "-o", "-", file], { stdio: "pipe" });
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    }
+
+    it("proxies only the two services that were already proxied before the promotion", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-egress-");
+      runSystemDaemons(machine);
+
+      const proxied = SYSTEM_LABELS.filter((label) => hasProxyEnv(join(machine.systemDir, `${label}.plist`)));
+      expect(proxied.sort()).toEqual([
+        "ai.openclaw.system.gateway",
+        "com.openclaw.system.trading.broker-executor"
+      ]);
+    });
+
+    it("gives the six promoted services back the PATH-only environment their LaunchAgent templates had", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-egress-direct-");
+      runSystemDaemons(machine);
+
+      for (const label of [
+        "com.alphaloop.platform-app",
+        "com.alphaloop.market-alerts",
+        "com.alphaloop.daily-backup",
+        "com.openclaw.trading.cron-runner",
+        "com.openclaw.trading.official-paper.poll",
+        "com.openclaw.trading.official-paper.pnl"
+      ]) {
+        const plist = join(machine.systemDir, `${label}.plist`);
+        expect(lintPlist(plist)).toContain("OK");
+        expect(hasProxyEnv(plist)).toBe(false);
+        // PATH and HOME are still there - "no proxy" must not mean "no env".
+        expect(plistValue(plist, "EnvironmentVariables.HOME")).toBe(machine.home);
+        expect(plistValue(plist, "EnvironmentVariables.PATH")).toContain("/opt/homebrew/bin");
+      }
+    });
+
+    it("lets a machine without a transparent proxy opt a service in explicitly", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-egress-optin-");
+      runSystemDaemons({
+        ...machine,
+        env: { ...machine.env, OPENCLAW_PROXY_LABELS: "com.openclaw.trading.cron-runner", OPENCLAW_PROXY_URL: "http://127.0.0.1:1080" }
+      });
+
+      const runner = join(machine.systemDir, "com.openclaw.trading.cron-runner.plist");
+      expect(plistValue(runner, "EnvironmentVariables.HTTPS_PROXY")).toBe("http://127.0.0.1:1080");
+      // ...and opting one in does not opt everything else in.
+      expect(hasProxyEnv(join(machine.systemDir, "ai.openclaw.system.gateway.plist"))).toBe(false);
+      expect(hasProxyEnv(join(machine.systemDir, "com.alphaloop.daily-backup.plist"))).toBe(false);
+    });
+  });
+
   it("refuses to touch LaunchDaemons when the rendered daemons and the manifest disagree", () => {
     const machine = makeFakeMachine("alphaloop-daemons-drift-");
     const driftedManifest = join(machine.home, "ownership.txt");
