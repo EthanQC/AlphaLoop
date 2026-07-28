@@ -133,7 +133,10 @@ describe("email-code login", () => {
 
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/html");
-      expect(response.headers.get("cache-control")).toBe("no-store");
+      // `private` as well as `no-store` since N1: this response's writeHead map
+      // overrides the server-wide baseline for this key, so it has to carry the
+      // whole value (see security.ts / cache-headers.test.ts).
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
       expect(body).toContain("登录 AlphaLoop");
       expect(body).toContain('name="email"');
       expect(body).toContain("发送验证码");

@@ -76,6 +76,7 @@ import {
 
 import { createFeishuLoginCodeSender, type LoginCodeSender } from "../data/login-code-notifier.js";
 import { renderLoginPage } from "../render/login-page.js";
+import { NO_SHARED_CACHE } from "../security.js";
 import { buildLogoutCookie, buildSessionCookie, resolveSessionMemberId } from "../session.js";
 import { guardAsyncWrite } from "./async-guard.js";
 
@@ -129,8 +130,12 @@ function sendHtml(res: ServerResponse, status: number, body: string, extraHeader
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(body),
     // A login screen (and anything gated behind one) must never sit in a
-    // shared/browser cache.
-    "cache-control": "no-store",
+    // shared/browser cache. This repeats the server-wide baseline
+    // (security.ts's applySecurityHeaders) rather than replacing it: writeHead's
+    // own map WINS over setHeader for the keys it lists, so spelling a bare
+    // "no-store" here would silently drop the baseline's `private` on exactly
+    // the three responses that carry a session cookie. Use the constant.
+    "cache-control": NO_SHARED_CACHE,
     ...extraHeaders
   });
   res.end(body);
@@ -139,7 +144,9 @@ function sendHtml(res: ServerResponse, status: number, body: string, extraHeader
 function redirect(res: ServerResponse, location: string, extraHeaders: Record<string, string> = {}): void {
   // 303 (not 302): the browser's follow-up must be a GET regardless of the
   // method that got here - same rule api-research.ts's form path follows.
-  res.writeHead(303, { location, "cache-control": "no-store", ...extraHeaders });
+  // `cache-control` here for the same reason as sendHtml's above - writeHead's
+  // map overrides the baseline setHeader, so it must carry the full value.
+  res.writeHead(303, { location, "cache-control": NO_SHARED_CACHE, ...extraHeaders });
   res.end();
 }
 

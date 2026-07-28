@@ -81,7 +81,6 @@ import {
 } from "../reports/scanner.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
-import { applyPrivateCacheHeaders } from "../security.js";
 
 export interface ReportsRouteDeps {
   db: DatabaseSync;
@@ -230,21 +229,15 @@ function isOwnerScopedType(type: ReportType): boolean {
   return OWNER_SCOPED_REPORT_TYPES.includes(type);
 }
 
-/** `ownerPrivate` marks a response that only one member may ever see (the
- * 模拟盘快照 reading page and its refusals - see the module header's B1
- * section). Those get `cache-control: private, no-store` so an owner-only
- * answer cannot be stored by the cloudflared edge or a shared proxy and
- * replayed to somebody else (defect B2). The circle-wide report pages are
- * left cacheable exactly as before. */
-function sendHtml(
-  res: ServerResponse,
-  status: number,
-  body: string,
-  options: { ownerPrivate?: boolean } = {}
-): void {
-  if (options.ownerPrivate) {
-    applyPrivateCacheHeaders(res);
-  }
+/** Sets no cache header of its own. `cache-control: private, no-store` + the
+ * identity `vary` are part of the server-wide baseline (security.ts's
+ * applySecurityHeaders, defect N1), which covers every response this module
+ * sends - the owner-scoped 模拟盘快照 page and its refusals, and equally the
+ * circle-wide report pages, whose bodies still carry the viewer's own name and
+ * their owner-scoped 研判/复盘 entries. B2's per-route opt-in is deliberately
+ * gone: B1 made this module viewer-dependent and shipped without opting in,
+ * because an opt-in only protects the routes whose author remembered it. */
+function sendHtml(res: ServerResponse, status: number, body: string): void {
   res.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(body)
@@ -802,7 +795,7 @@ function refusedOwnerScopedReport(
           这份模拟盘快照在磁盘上没有归属标注，系统也无法确认它写的是谁的账户（${attribution.reason}）。为避免把别人的账户内容给错人，它对任何成员都不开放；你自己的账户数据在
           <a href="/paper" style="color:var(--accent)">模拟盘</a> 页面。
         </p>`;
-  sendHtml(res, 403, renderPaperForbiddenPage(member, nonce, now, detail), { ownerPrivate: true });
+  sendHtml(res, 403, renderPaperForbiddenPage(member, nonce, now, detail));
   return true;
 }
 
@@ -819,7 +812,7 @@ function renderReadingPage(
   // on that path - 404 shells included - is owner-private for caching purposes
   // (defect B2).
   const ownerScoped = isOwnerScopedType(type);
-  const send = (status: number, body: string): void => sendHtml(res, status, body, { ownerPrivate: ownerScoped });
+  const send = (status: number, body: string): void => sendHtml(res, status, body);
 
   // Validate BEFORE touching the filesystem at all (path traversal guard -
   // e.g. `/daily/../../etc/passwd` never reaches scanReports/readFileSync

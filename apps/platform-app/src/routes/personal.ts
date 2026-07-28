@@ -45,7 +45,6 @@ import { renderMarkdown } from "../reports/markdown.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
 import { renderPage, type Freshness } from "../render/layout.js";
-import { applyPrivateCacheHeaders } from "../security.js";
 import { REPORT_BODY_STYLE, formatBeijingDate } from "./reports.js";
 
 export interface PersonalRouteDeps {
@@ -74,10 +73,11 @@ interface PersonalPageRow {
 /** Every response this module sends is owner-private, INCLUDING the 401/403/404
  * shells - they are still per-viewer answers about a private resource, and a
  * cached "here is your page" for one member must never be replayed to another.
- * So the no-store header goes on unconditionally here rather than only on the
- * 200 path (defect B2 - see security.ts's applyPrivateCacheHeaders). */
+ * The `cache-control: private, no-store` + `vary` headers that say so are now
+ * part of the server-wide baseline (security.ts's applySecurityHeaders, defect
+ * N1), so this deliberately sets no cache header of its own - one source of
+ * truth, and no writeHead key here can override the baseline. */
 function sendHtml(res: ServerResponse, status: number, body: string): void {
-  applyPrivateCacheHeaders(res);
   res.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(body)
