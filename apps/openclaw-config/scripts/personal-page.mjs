@@ -632,7 +632,7 @@ function renderTradeConsistency(db, ownerId, window, helpers) {
   }
 
   const theses = loadThesesBySymbol(db, ownerId);
-  const lines = rows.map((row) => renderConsistencyLine(row, theses, disciplines, helpers));
+  const lines = rows.map((row) => renderConsistencyLine(db, row, theses, disciplines, helpers));
 
   return [
     `- 本周共有 ${rows.length} 条归属本人的执行记录，逐条与本人论点、纪律对照如下。`,
@@ -642,36 +642,122 @@ function renderTradeConsistency(db, ownerId, window, helpers) {
   ].join("\n");
 }
 
-function renderConsistencyLine(row, theses, disciplines, helpers) {
-  const summary = helpers.summarizeExecutionRow(row);
-  const text = `${row.title ?? ""}\n${row.body ?? ""}`;
-  const symbol = extractOwnedSymbol(text);
-  const side = extractOwnedSide(text);
-  const verdict = judgeConsistency(symbol, side, theses);
-  const ruleNote = describeSymbolDisciplines(symbol, disciplines);
+// R5 (2026-07-28 verifier): the facts are resolved ONCE, here, and the same
+// object feeds both the heading and the verdict - they cannot disagree about
+// what was traded. It used to re-regex the body for symbol/side with patterns
+// no live writer's output matches, so against production rows every line read
+// 「无对照（读不出买卖方向）」 while the heading said 「NVDA.US 记录」.
+function renderConsistencyLine(db, row, theses, disciplines, helpers) {
+  const facts = resolveOwnedExecutionFacts(db, row, helpers);
+  const summary = helpers.summarizeExecutionRow(row, facts);
+  const verdict = judgeConsistency(facts, theses);
+  const ruleNote = describeSymbolDisciplines(facts.symbol, disciplines);
+  const provenance = describeFactProvenance(facts);
 
   return [
     `- ${formatDateTime(row.created_at)} ${summary.heading}：${summary.summary}`,
+    ...(provenance ? [`  - 事实来源：${provenance}`] : []),
     `  - 一致性：${verdict.label}（${verdict.reason}）`,
     `  - 状态：${summary.status}`,
     `  - 纪律对照：${ruleNote}`
   ].join("\n");
 }
 
+/**
+ * Metadata -> body -> the row's own linked proposal, in that order.
+ *
+ * The third step exists because rows written before the writers recorded
+ * symbol/side structurally carry neither, yet they DO carry the proposal they
+ * came from (`metadata.proposalId`, or the `ticket_prop_<id>` ticket id the
+ * body prints). That proposal is the server-side order of record - the same
+ * object broker-executor built the ticket from - so reading the direction off
+ * it recovers a real fact instead of inventing one.
+ *
+ * Two guards keep it honest:
+ *   - the proposal must belong to the SAME owner as the report row, so a
+ *     mis-derived id can never attribute someone else's direction here;
+ *   - only symbol and side are taken. Quantity and price are NOT: an
+ *     approved_half proposal executes at a different quantity than it asked
+ *     for, so the proposal's numbers are an intention, not a fill.
+ */
+function resolveOwnedExecutionFacts(db, row, helpers) {
+  const facts = helpers.extractExecutionFacts(row);
+  if (facts.symbol && facts.side) {
+    return facts;
+  }
+  const proposalId = readLinkedProposalId(row);
+  if (!proposalId) {
+    return facts;
+  }
+  const proposal = db
+    .prepare(`SELECT id, owner_id, symbol, side FROM proposals WHERE id = ?`)
+    .get(proposalId);
+  if (!proposal || String(proposal.owner_id) !== String(row.owner_id ?? "")) {
+    return facts;
+  }
+  const proposalSideRaw = String(proposal.side ?? "").toLowerCase();
+  const proposalSide = proposalSideRaw === "buy" ? "买入" : proposalSideRaw === "sell" ? "卖出" : null;
+  const proposalSymbol = String(proposal.symbol ?? "").trim().toUpperCase() || null;
+
+  const symbol = facts.symbol ?? proposalSymbol;
+  const side = facts.side ?? proposalSide;
+  return {
+    ...facts,
+    symbol,
+    side,
+    sources: {
+      ...facts.sources,
+      symbol: facts.symbol ? facts.sources.symbol : symbol ? "proposal" : null,
+      side: facts.side ? facts.sources.side : side ? "proposal" : null
+    },
+    proposalId: String(proposal.id)
+  };
+}
+
+function readLinkedProposalId(row) {
+  const metadata = parseSnapshot(row?.metadata ?? "null");
+  const fromMetadata = metadata && typeof metadata.proposalId === "string" ? metadata.proposalId.trim() : "";
+  if (fromMetadata !== "") {
+    return fromMetadata;
+  }
+  // broker-executor and reconcile both print 「工单：ticket_prop_<proposalId>」,
+  // and that prefix is derived deterministically (deriveTicketId), never typed
+  // by a human - see reconcile-official-paper-orders.mjs's proposalIdFromTicketId.
+  const ticketId = String(row?.body ?? "").match(/工单[：:]\s*(\S+)/u)?.[1] ?? "";
+  return ticketId.startsWith("ticket_prop_") ? ticketId.slice("ticket_prop_".length) : null;
+}
+
+// Says out loud when a fact was not stated by the execution record itself. A
+// direction recovered from the linked proposal is a real record, but it is a
+// DIFFERENT record from the fill, and the member is told which one they are
+// reading.
+function describeFactProvenance(facts) {
+  if (facts.sources?.side !== "proposal" && facts.sources?.symbol !== "proposal") {
+    return null;
+  }
+  const recovered = [
+    facts.sources.symbol === "proposal" ? "标的" : null,
+    facts.sources.side === "proposal" ? "买卖方向" : null
+  ].filter(Boolean).join("与");
+  return `这条执行记录本身没有记录${recovered}，已按它关联的提案 ${facts.proposalId}（同属本人）读取；数量与价格不据此推断。`;
+}
+
 // The comparison itself. `theses` is a symbol -> thesis map of the owner's own
 // ACTIVE theses; a withdrawn/superseded thesis is not a live commitment, so it
 // is not used to convict a fill.
-function judgeConsistency(symbol, side, theses) {
+function judgeConsistency(facts, theses) {
+  const symbol = facts.symbol;
+  const side = facts.side;
   if (!symbol) {
     return {
       label: "无对照",
-      reason: "原因：这条执行记录的正文里读不出标的，无法定位对应论点"
+      reason: "原因：这条执行记录的结构化字段、正文与其关联提案里都读不出标的，无法定位对应论点"
     };
   }
   if (!side) {
     return {
       label: "无对照",
-      reason: `原因：这条执行记录的正文里读不出买卖方向，${symbol} 的论点方向无从比较`
+      reason: `原因：这条执行记录的结构化字段、正文与其关联提案里都读不出买卖方向，${symbol} 的论点方向无从比较；本页不据此猜测方向`
     };
   }
   const thesis = theses.get(symbol);
@@ -752,32 +838,12 @@ function renderDisciplineFootnote(disciplines) {
     : "- 判定口径：一致/冲突只在本人存在同标的方向性论点时给出；纪律条目是自然语言，本节只列出相关条目供本人对照，不做机器判定。";
 }
 
-// Symbol/side re-extracted here (rather than read off summarizeExecutionRow's
-// formatted heading) because the verdict must key on the RAW value, not on a
-// display string that may carry a fallback label like 「未标明标的」.
-function extractOwnedSymbol(text) {
-  const patterns = [
-    /\bSymbol:\s*([A-Z]{1,5}(?:\.US)?)/iu,
-    /\bfor\s+([A-Z]{1,5}(?:\.US)?)/iu,
-    /\border\s+(?:buy|sell)\s+([A-Z]{1,5}(?:\.US)?)/iu,
-    /\b([A-Z]{1,5}\.US)\b/u
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) {
-      return match[1].toUpperCase();
-    }
-  }
-  return null;
-}
-
-function extractOwnedSide(text) {
-  const match = text.match(/\b(?:Side:\s*|order\s+)(buy|sell)\b/iu);
-  if (!match?.[1]) {
-    return null;
-  }
-  return match[1].toLowerCase() === "buy" ? "买入" : "卖出";
-}
+// R5 removed this module's private extractOwnedSymbol/extractOwnedSide. They
+// duplicated scheduled-report.mjs's body regexes - including the defect: both
+// copies only understood English 「Side: buy」, which NO writer in this repo
+// emits. The one metadata-first reader (extractExecutionFacts) is now the only
+// place that answers "what was traded", so a writer format change cannot leave
+// one of two copies silently wrong again.
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -807,6 +873,10 @@ const REQUIRED_HELPERS = [
   "summarizeOfficialPositions",
   "selectExecutionReports",
   "countUnattributedExecutionReports",
+  // R5: the metadata-first reader of symbol/side/quantity/price. Required, not
+  // optional - falling back to "no facts" here would silently reproduce the
+  // 「无对照」-forever defect instead of failing loudly at wiring time.
+  "extractExecutionFacts",
   "summarizeExecutionRow"
 ];
 

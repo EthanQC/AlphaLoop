@@ -121,6 +121,9 @@ async function prepareReport(reportKind, info) {
       // 「本周我的交易 vs 策略一致性回顾」 section.
       selectExecutionReports,
       countUnattributedExecutionReports,
+      // R5: the metadata-first reader of what was actually traded. Without it
+      // §3.3 had only the body regexes, which no live writer's output matches.
+      extractExecutionFacts,
       summarizeExecutionRow
     }
   });
@@ -894,52 +897,164 @@ function renderPublicExecutionScopeNotice() {
   ].join("\n");
 }
 
+/**
+ * R5 (2026-07-28 verifier): what was actually traded, read from the row's own
+ * STRUCTURED metadata first and only then from prose.
+ *
+ * Every consumer of execution_reports used to regex the body, and the body the
+ * real writer emits (broker-executor's buildExecutionReportBody) was pure
+ * Chinese 工单/状态/执行方/… with no side, quantity or price in it at all - so
+ * against production rows the extraction returned nothing and the weekly
+ * consistency section rendered 「无对照」 for every record, permanently. The
+ * writers persist these facts in `metadata`; that is the source of truth.
+ *
+ * Order per field: metadata (exact, written by the producer) -> body/title
+ * regex (best effort, covers legacy rows and the reconcile writer's prose) ->
+ * null. `null` means NOT KNOWN and must be disclosed as such by the caller -
+ * never defaulted, never guessed.
+ *
+ * `source` records which of the two answered, so a page can say where a fact
+ * came from instead of presenting a parse as if it were a record.
+ *
+ * @param {{title?: string, body?: string, metadata?: unknown}} row
+ */
+export function extractExecutionFacts(row) {
+  const text = `${row?.title ?? ""}\n${row?.body ?? ""}`;
+  const metadata = parseExecutionMetadata(row?.metadata);
+  const result = metadata.result && typeof metadata.result === "object" ? metadata.result : {};
+
+  const symbol = firstKnown([
+    ["metadata", normalizeFactSymbol(metadata.symbol)],
+    ["body", extractSymbol(text)]
+  ]);
+  const side = firstKnown([
+    ["metadata", normalizeFactSide(metadata.side)],
+    ["body", extractSide(text)]
+  ]);
+  const quantity = firstKnown([
+    ["metadata", normalizeFactNumber(metadata.quantity)],
+    ["body", extractQuantity(text)]
+  ]);
+  // A fill price and a limit price are different claims - what was PAID vs what
+  // was ASKED - so which one was found is carried alongside the number and the
+  // page labels it accordingly. Collapsing both into 「参考价格」 would present a
+  // limit price as if the trade had executed there.
+  const fillPrice = normalizeFactNumber(metadata.fillPrice ?? result.fillPrice);
+  const limitPrice = normalizeFactNumber(metadata.limitPrice ?? result.limitPrice);
+  const price = firstKnown([
+    ["metadata", fillPrice],
+    ["metadata", limitPrice],
+    ["body", extractPrice(text)]
+  ]);
+  const priceKind = price.value === null ? null : fillPrice !== null ? "成交价" : limitPrice !== null ? "限价" : "参考价格";
+
+  return {
+    symbol: symbol.value,
+    side: side.value,
+    quantity: quantity.value,
+    price: price.value,
+    priceKind,
+    sources: { symbol: symbol.source, side: side.source, quantity: quantity.source, price: price.source }
+  };
+}
+
+function firstKnown(candidates) {
+  for (const [source, value] of candidates) {
+    if (value !== null && value !== undefined && value !== "") {
+      return { value, source };
+    }
+  }
+  return { value: null, source: null };
+}
+
+function parseExecutionMetadata(raw) {
+  if (raw && typeof raw === "object") {
+    return raw;
+  }
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeFactSymbol(value) {
+  const text = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return text === "" ? null : text;
+}
+
+// Only the two order sides the system can actually place are accepted. An
+// unrecognized string is NOT KNOWN, not a coin flip.
+function normalizeFactSide(value) {
+  const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (text === "buy") {
+    return "买入";
+  }
+  if (text === "sell") {
+    return "卖出";
+  }
+  return null;
+}
+
+function normalizeFactNumber(value) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? String(parsed) : null;
+}
+
 // Kept and exported for the personal page (C2): the same extraction that used
 // to feed the public digest now feeds 「本周我的交易 vs 策略一致性回顾」, where
 // the reader IS the owner of the row. Injected into personal-page.mjs through
 // `helpers` rather than imported, because scheduled-report.mjs imports that
 // module (see its header on the one-directional dependency).
-export function summarizeExecutionRow(row) {
+//
+// R5: `facts` is passed in by callers that already resolved them (the personal
+// page also consults the row's linked proposal), so the heading and the
+// verdict on the same line can never disagree about what was traded.
+export function summarizeExecutionRow(row, facts = extractExecutionFacts(row)) {
   const text = `${row.title ?? ""}\n${row.body ?? ""}`;
-  const symbol = extractSymbol(text) ?? "未标明标的";
-  const side = extractSide(text);
-  const quantity = extractQuantity(text);
-  const price = extractPrice(text);
+  const symbol = facts.symbol ?? "未标明标的";
+  const side = facts.side;
+  const quantity = facts.quantity;
+  const price = facts.price;
   const strategy = extractOptionStrategy(text);
-  const facts = [`标的 ${symbol}`];
+  const details = [`标的 ${symbol}`];
 
   if (side) {
-    facts.push(`方向 ${side}`);
+    details.push(`方向 ${side}`);
   }
   if (quantity) {
-    facts.push(`数量 ${quantity}`);
+    details.push(`数量 ${quantity}`);
   }
   if (price) {
-    facts.push(`参考价格 ${price}`);
+    details.push(`${facts.priceKind ?? "参考价格"} ${price}`);
   }
   if (strategy) {
-    facts.push(`检测到${translateOptionStrategy(strategy)}，期权自动化保持禁用`);
+    details.push(`检测到${translateOptionStrategy(strategy)}，期权自动化保持禁用`);
   }
   if (/token empty|401001/iu.test(text)) {
-    facts.push("鉴权为空导致官方模拟盘提交失败");
+    details.push("鉴权为空导致官方模拟盘提交失败");
   }
   if (/not valid JSON|Unexpected token/iu.test(text)) {
-    facts.push("返回内容不是结构化响应，记录为解析失败");
+    details.push("返回内容不是结构化响应，记录为解析失败");
   }
   if (/No real-money order was submitted/iu.test(text)) {
-    facts.push("回查记录声明没有提交真实资金订单");
+    details.push("回查记录声明没有提交真实资金订单");
   }
   if (/Status:\s*NotReported/iu.test(text)) {
-    facts.push("订单状态为未上报");
+    details.push("订单状态为未上报");
   }
-  if (facts.length === 1) {
-    facts.push("详细内容保存在本地数据库，中文报告不直接展开旧英文正文");
+  if (details.length === 1) {
+    details.push("详细内容保存在本地数据库，中文报告不直接展开旧英文正文");
   }
 
   return {
     heading: side ? `${symbol} ${side}记录` : `${symbol} 记录`,
     status: classifyExecutionStatus(row, text),
-    summary: `${facts.join("；")}。`
+    summary: `${details.join("；")}。`
   };
 }
 
@@ -962,8 +1077,15 @@ function classifyExecutionStatus(row, text) {
   return "执行记录已入库。";
 }
 
+// R5: the Chinese patterns come FIRST because they are what this repo's own
+// writers emit today - broker-executor's buildExecutionReportBody and
+// reconcile-official-paper-orders.mjs both write 标的/方向/数量/限价/成交价.
+// The English ones are kept for the pre-Chinese rows still in the table; the
+// set used to contain ONLY those, which is why every production row parsed as
+// "nothing known".
 function extractSymbol(text) {
   const patterns = [
+    /标的[：:]\s*([A-Z]{1,5}(?:\.[A-Z]{2})?)/iu,
     /\bSymbol:\s*([A-Z]{1,5}(?:\.US)?)/iu,
     /\bfor\s+([A-Z]{1,5}(?:\.US)?)/iu,
     /\border\s+(?:buy|sell)\s+([A-Z]{1,5}(?:\.US)?)/iu,
@@ -979,6 +1101,10 @@ function extractSymbol(text) {
 }
 
 function extractSide(text) {
+  const chinese = text.match(/方向[：:]\s*(买入|卖出)/u);
+  if (chinese?.[1]) {
+    return chinese[1];
+  }
   const match = text.match(/\b(?:Side:\s*|order\s+)(buy|sell)\b/iu);
   if (!match?.[1]) {
     return null;
@@ -987,11 +1113,17 @@ function extractSide(text) {
 }
 
 function extractQuantity(text) {
-  return text.match(/\bQuantity:\s*([0-9.]+)/iu)?.[1] ?? null;
+  return text.match(/数量[：:]\s*([0-9.]+)/u)?.[1] ?? text.match(/\bQuantity:\s*([0-9.]+)/iu)?.[1] ?? null;
 }
 
 function extractPrice(text) {
-  return text.match(/--price\s+([0-9.]+)/iu)?.[1] ?? text.match(/\bprice[:\s]+([0-9.]+)/iu)?.[1] ?? null;
+  return (
+    text.match(/成交价[：:]\s*([0-9.]+)/u)?.[1] ??
+    text.match(/限价[：:]\s*([0-9.]+)/u)?.[1] ??
+    text.match(/--price\s+([0-9.]+)/iu)?.[1] ??
+    text.match(/\bprice[:\s]+([0-9.]+)/iu)?.[1] ??
+    null
+  );
 }
 
 function extractOptionStrategy(text) {

@@ -36,6 +36,7 @@ const helpers = {
   // 「本周我的交易 vs 策略一致性回顾」 section needs.
   selectExecutionReports: scheduledReport.selectExecutionReports,
   countUnattributedExecutionReports: scheduledReport.countUnattributedExecutionReports,
+  extractExecutionFacts: scheduledReport.extractExecutionFacts,
   summarizeExecutionRow: scheduledReport.summarizeExecutionRow
 };
 

@@ -7,6 +7,7 @@ import {
   OfficialPaperOrderLifecycleRepository,
   ProposalRepository,
   type ExecutionResult,
+  type JsonValue,
   type OrderTicket,
   type RuleSet,
   assertOrderTicket,
@@ -515,14 +516,8 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
           // never a request-body ownerId.
           ownerId: proposal.ownerId,
           title: `${ticket.symbol} 执行报告`,
-          body: buildExecutionReportBody(ticket.id, safeResult),
-          metadata: {
-            ticketId: ticket.id,
-            proposalId,
-            environment: ticket.environment,
-            assetClass: ticket.assetClass,
-            result: redactSensitiveJsonValue(toJsonValue(safeResult))
-          },
+          body: buildExecutionReportBody(ticket, safeResult),
+          metadata: buildExecutionReportMetadata(ticket, proposalId, safeResult),
           createdAt: new Date().toISOString()
         });
 
@@ -549,9 +544,23 @@ function sanitizeExecutionResult(result: ExecutionResult): ExecutionResult {
   return redactSensitiveJsonValue(toJsonValue(result)) as unknown as ExecutionResult;
 }
 
-function buildExecutionReportBody(ticketId: string, result: ExecutionResult): string {
+/**
+ * R5 (2026-07-28 verifier): this used to take only the ticket ID, so the body
+ * it produced named the WORKORDER but never the TRADE - no symbol, no side, no
+ * quantity anywhere in it. The member's weekly
+ * 「本周我的交易 vs 策略一致性回顾」 reads these rows, and against this body
+ * every line degraded to 「无对照（读不出买卖方向）」 forever: the section had
+ * nothing to compare a thesis against. It takes the whole ticket now, and the
+ * three facts that define the trade are stated in the body a member actually
+ * reads. Exported so the page's own test can seed with THIS function's output
+ * instead of a hand-written string that happens to match the parser.
+ */
+export function buildExecutionReportBody(ticket: OrderTicket, result: ExecutionResult): string {
   const lines = [
-    `工单：${redactSensitiveText(ticketId)}`,
+    `工单：${redactSensitiveText(ticket.id)}`,
+    `标的：${redactSensitiveText(ticket.symbol)}`,
+    `方向：${translateSide(ticket.side)}`,
+    `数量：${ticket.quantity}`,
     `状态：${translateExecutionStatus(result.status)}`,
     `执行方：${translateProvider(result.provider)}`
   ];
@@ -568,12 +577,51 @@ function buildExecutionReportBody(ticketId: string, result: ExecutionResult): st
   if (typeof result.limitPrice === "number") {
     lines.push(`限价：${result.limitPrice.toFixed(2)}`);
   }
+  // The fill price was already carried on the result and never printed, so a
+  // report of an executed order did not say at what price it executed.
+  if (typeof result.fillPrice === "number") {
+    lines.push(`成交价：${result.fillPrice.toFixed(2)}`);
+  }
 
   lines.push("", "原因：");
   for (const reason of result.reasons) {
     lines.push(`- ${redactSensitiveText(reason)}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * R5: what the report row records ABOUT THE ORDER, structurally.
+ *
+ * symbol/side/quantity used to live only inside the prose body, so the weekly
+ * 「本周我的交易 vs 策略一致性回顾」 had to regex them back out - and could
+ * not, because the body never contained them. They are columns of the trade,
+ * not decoration, so they are stored as data. `result` stays alongside as the
+ * broker-side outcome (limitPrice/fillPrice/brokerStatus/stage).
+ *
+ * Exported next to buildExecutionReportBody so a downstream test seeds a row
+ * with what this writer ACTUALLY writes rather than a shape invented to match
+ * the reader.
+ */
+export function buildExecutionReportMetadata(
+  ticket: OrderTicket,
+  proposalId: string,
+  result: ExecutionResult
+): Record<string, JsonValue> {
+  return {
+    ticketId: ticket.id,
+    proposalId,
+    environment: ticket.environment,
+    assetClass: ticket.assetClass,
+    symbol: ticket.symbol,
+    side: ticket.side,
+    quantity: ticket.quantity,
+    result: redactSensitiveJsonValue(toJsonValue(result))
+  };
+}
+
+function translateSide(side: OrderTicket["side"]): string {
+  return side === "buy" ? "买入" : "卖出";
 }
 
 function translateExecutionStatus(status: ExecutionResult["status"]): string {

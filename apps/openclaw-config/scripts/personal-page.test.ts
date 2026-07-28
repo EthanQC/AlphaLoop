@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   MemberRepository,
+  ProposalRepository,
   SCHEMA_VERSION,
   getSchemaVersion,
   openTradingDatabase
@@ -24,6 +25,14 @@ import { normalizeOfficialPaperSnapshot } from "./report-data.mjs";
 
 const personalPage = await import("./personal-page.mjs");
 const scheduledReport = await import("./scheduled-report.mjs");
+// R5 (2026-07-28 verifier): the REAL producer of execution_reports rows. The
+// previous version of this file hand-wrote 「Side: buy」 bodies - a format
+// nothing in this repo emits - so §3.3 passed every assertion here while
+// rendering 「无对照」 for every production record. Seeding now goes through the
+// same two functions the broker-executor success path calls, so a change to
+// what that writer records breaks these tests instead of hiding behind them.
+const brokerExecutor = await import("../../broker-executor/src/server.ts");
+const reconcileModule = await import("./reconcile-official-paper-orders.mjs");
 
 // The three renderers Task 4 exported as the seam for this page (see their doc
 // comments in scheduled-report.mjs). Injected rather than imported by
@@ -38,39 +47,82 @@ const helpers = {
   // feed the PUBLIC digest. Injected through the same seam for the same reason.
   selectExecutionReports: scheduledReport.selectExecutionReports,
   countUnattributedExecutionReports: scheduledReport.countUnattributedExecutionReports,
+  extractExecutionFacts: scheduledReport.extractExecutionFacts,
   summarizeExecutionRow: scheduledReport.summarizeExecutionRow
 };
 
-// One fill for `ownerId`, worded the way broker-executor's
-// buildExecutionReportBody words a real one, so the extraction the page reuses
-// (summarizeExecutionRow) is exercised on realistic text rather than on a
-// string shaped to match it.
-function seedExecutionReport(
-  db: DatabaseSync,
-  input: {
-    id: string;
-    ownerId: string | null;
-    symbol: string;
-    side: "buy" | "sell";
-    quantity: number;
-    price?: number;
-    createdAt: string;
-    category?: string;
-    extra?: string;
-  }
-): void {
-  const body = [
-    `Ticket: ${input.id}`,
-    `Symbol: ${input.symbol}`,
-    `Side: ${input.side}`,
-    `Quantity: ${input.quantity}`,
-    ...(input.price === undefined ? [] : [`Price: ${input.price}`]),
-    ...(input.extra ? [input.extra] : [])
-  ].join("\n");
+interface FillInput {
+  id: string;
+  ownerId: string | null;
+  symbol: string;
+  side: "buy" | "sell";
+  quantity: number;
+  price?: number;
+  createdAt: string;
+  category?: string;
+  proposalId?: string;
+  /** Omit the structured facts, leaving only the prose body - the shape of a row written before R5. */
+  legacyMetadataOnly?: boolean;
+}
+
+/**
+ * One fill written the way apps/broker-executor/src/server.ts writes a real
+ * one: the body is produced by the exported buildExecutionReportBody and the
+ * metadata by the exported buildExecutionReportMetadata - the two functions the
+ * success path itself calls, not a local imitation of them.
+ */
+function seedExecutionReport(db: DatabaseSync, input: FillInput): void {
+  const ticketId = `ticket_prop_${input.proposalId ?? input.id}`;
+  const ticket = {
+    id: ticketId,
+    source: "proposals-cli",
+    submittedAt: input.createdAt,
+    environment: "paper" as const,
+    assetClass: "stock" as const,
+    symbol: input.symbol,
+    side: input.side,
+    quantity: input.quantity,
+    conviction: "normal" as const,
+    notionalUsd: input.quantity * (input.price ?? 0),
+    ownerId: input.ownerId ?? undefined,
+    proposalId: input.proposalId ?? input.id
+  };
+  const result = {
+    ticketId,
+    environment: "paper" as const,
+    status: "submitted" as const,
+    provider: "longbridge-paper" as const,
+    externalOrderId: `ext_${input.id}`,
+    brokerStatus: "Filled",
+    brokerOrderStage: "filled" as const,
+    ...(input.price === undefined ? {} : { limitPrice: input.price, fillPrice: input.price }),
+    reasons: ["长桥官方模拟盘已接受该订单。"]
+  };
+
+  const body = brokerExecutor.buildExecutionReportBody(ticket, result);
+  const metadata = input.legacyMetadataOnly
+    // What the rows already in production look like: the ticket/proposal
+    // linkage and the broker result, but no symbol/side/quantity of their own.
+    ? { ticketId, proposalId: input.proposalId ?? input.id, environment: "paper", assetClass: "stock", result }
+    : brokerExecutor.buildExecutionReportMetadata(ticket, input.proposalId ?? input.id, result);
+  // A legacy row's body predates R5 too - it named the workorder and nothing
+  // about the trade. Reproduced by stripping exactly the lines R5 added.
+  const storedBody = input.legacyMetadataOnly
+    ? body.split("\n").filter((line) => !/^(标的|方向|数量|成交价)[：:]/u.test(line)).join("\n")
+    : body;
+
   db.prepare(`
     INSERT INTO execution_reports (id, category, title, body, metadata, created_at, owner_id)
-    VALUES (?, ?, ?, ?, '{}', ?, ?)
-  `).run(input.id, input.category ?? "trade", `${input.symbol} 执行报告`, body, input.createdAt, input.ownerId);
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.id,
+    input.category ?? "trade",
+    `${input.symbol} 执行报告`,
+    storedBody,
+    JSON.stringify(metadata),
+    input.createdAt,
+    input.ownerId
+  );
 }
 
 const tempDirs: string[] = [];
@@ -947,6 +999,133 @@ describe("C2: the weekly personal page reviews this week's trades against the ow
     expect(body).toContain("本周没有属于本人的执行记录");
     // Never "flat"/"no trades were made" as a conclusion about the ACCOUNT.
     expect(body).toMatch(/原因|说明/u);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R5 (2026-07-28 verifier): §3.3 could not read production data, and its test
+// concealed that. The seeder above wrote 「Side: buy」 - a format no writer in
+// this repo produces - so every assertion passed while the live rendering was:
+//
+//   - 2026-07-15 18:00 NVDA.US 记录：标的 NVDA.US；详细内容保存在本地数据库，
+//     中文报告不直接展开旧英文正文。
+//     - 一致性：无对照（原因：这条执行记录的正文里读不出买卖方向…）
+//
+// ...for EVERY record, forever. These cases drive the real writers end to end:
+// no body or metadata below is written by this file.
+// ---------------------------------------------------------------------------
+describe("R5: the consistency verdict is computed from what the real writers actually record", () => {
+  function seedBullOwner(db: DatabaseSync, ownerId: string): void {
+    seedMember(db, ownerId, "小实盘");
+    seedThesis(db, { id: `thesis_${ownerId}`, ownerId, symbol: "NVDA.US", direction: "bull", targetHigh: 300, invalidationPrice: 150 });
+  }
+
+  function consistencyBody(db: DatabaseSync, ownerId: string): string {
+    const weekly = personalPage.renderPersonalPage({
+      db, ownerId, kind: "weekly", date: "2026-07-28", now: "2026-07-28T12:05:00.000Z", helpers
+    });
+    return weekly.sections.find((entry: { key: string }) => entry.key === "consistency")?.body ?? "";
+  }
+
+  it("reaches a verdict on a row whose body came from broker-executor's own buildExecutionReportBody", () => {
+    const db = makeDb();
+    seedBullOwner(db, "member_r5");
+    seedExecutionReport(db, {
+      id: "er_r5_real", ownerId: "member_r5", symbol: "NVDA.US", side: "sell",
+      quantity: 6, price: 170.5, createdAt: "2026-07-24T14:00:00.000Z"
+    });
+
+    // The stored body is the writer's, and it is genuinely Chinese prose with
+    // none of the English markers the old extraction depended on.
+    const stored = db.prepare(`SELECT body FROM execution_reports WHERE id = 'er_r5_real'`).get() as { body: string };
+    expect(stored.body).toContain("工单：");
+    expect(stored.body).not.toMatch(/Side:/u);
+
+    const body = consistencyBody(db, "member_r5");
+    expect(body).toContain("一致性：冲突（");
+    expect(body).toContain("方向 卖出");
+    expect(body).toContain("数量 6");
+    expect(body).toContain("成交价 170.5");
+    expect(body).not.toContain("读不出买卖方向");
+  });
+
+  it("recovers the direction of a pre-R5 row from its own linked proposal, and says that it did", () => {
+    const db = makeDb();
+    seedBullOwner(db, "member_r5_legacy");
+    const proposal = new ProposalRepository(db).create({
+      ownerId: "member_r5_legacy", symbol: "NVDA.US", side: "sell", quantity: 6,
+      orderType: "limit", limitPrice: 170.5, reason: "减仓", expiresAt: "2026-08-01T00:00:00.000Z"
+    });
+    seedExecutionReport(db, {
+      id: "er_r5_legacy", ownerId: "member_r5_legacy", symbol: "NVDA.US", side: "sell",
+      quantity: 6, price: 170.5, createdAt: "2026-07-24T14:00:00.000Z",
+      proposalId: proposal.id, legacyMetadataOnly: true
+    });
+
+    const body = consistencyBody(db, "member_r5_legacy");
+    expect(body).toContain("一致性：冲突（");
+    expect(body).toContain(`已按它关联的提案 ${proposal.id}`);
+    // The proposal's quantity is an INTENTION (approved_half executes fewer
+    // shares than it asked for), so it is never presented as the fill's size.
+    expect(body).not.toContain("数量 6");
+    expect(body).toContain("数量与价格不据此推断");
+  });
+
+  it("refuses to borrow a direction from a proposal that belongs to somebody else", () => {
+    const db = makeDb();
+    seedBullOwner(db, "member_r5_mine");
+    seedMember(db, "member_r5_theirs", "别人");
+    const foreign = new ProposalRepository(db).create({
+      ownerId: "member_r5_theirs", symbol: "NVDA.US", side: "sell", quantity: 6,
+      orderType: "limit", limitPrice: 170.5, reason: "别人的提案", expiresAt: "2026-08-01T00:00:00.000Z"
+    });
+    seedExecutionReport(db, {
+      id: "er_r5_foreign", ownerId: "member_r5_mine", symbol: "NVDA.US", side: "sell",
+      quantity: 6, price: 170.5, createdAt: "2026-07-24T14:00:00.000Z",
+      proposalId: foreign.id, legacyMetadataOnly: true
+    });
+
+    const body = consistencyBody(db, "member_r5_mine");
+    expect(body).toContain("一致性：无对照（");
+    expect(body).toContain("读不出买卖方向");
+    expect(body).not.toContain(foreign.id);
+    // Never invents the other side either.
+    expect(body).not.toContain("一致性：冲突（");
+  });
+
+  it("renders a row written end to end by the REAL reconcile writer on its owner's own page", async () => {
+    const db = makeDb();
+    seedBullOwner(db, "member_r5_rec");
+    const proposal = new ProposalRepository(db).create({
+      ownerId: "member_r5_rec", symbol: "NVDA.US", side: "buy", quantity: 4,
+      orderType: "limit", limitPrice: 160, reason: "加仓", expiresAt: "2026-08-01T00:00:00.000Z"
+    });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认（submit_unconfirmed）。");
+    db.prepare(`
+      INSERT INTO official_paper_order_lifecycle
+      (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+       side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+       last_observed_at, raw, notes)
+      VALUES ('row_r5', ?, NULL, 'longbridge-paper', 'paper', 'paper', 'NVDA.US', 'stock',
+       'buy', 4, 160, 'unconfirmed', 'pending', 'submit_unconfirmed', '2026-07-24T14:00:00.000Z',
+       '2026-07-24T14:00:00.000Z', 'null', '[]')
+    `).run(ticketId);
+
+    await reconcileModule.reconcileOfficialPaperOrders(db, {
+      fetchOrders: () => [{
+        order_id: "EXT_R5", symbol: "NVDA.US", side: "Buy", quantity: 4, price: 160,
+        status: "Filled", created_at: "2026-07-24T14:02:00.000Z"
+      }],
+      fetchExecutions: () => [],
+      now: () => new Date("2026-07-24T14:05:00.000Z")
+    });
+
+    const body = consistencyBody(db, "member_r5_rec");
+    expect(body).toContain("一致性：一致（");
+    expect(body).toContain("方向 买入");
+    expect(body).toContain("数量 4");
+    expect(body).not.toContain("未按成员归属");
   });
 });
 
