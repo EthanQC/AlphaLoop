@@ -264,6 +264,15 @@ async function handleRequestCode(
  * records it in the ledger. Recording happens here - BEFORE delivery is
  * attempted - on purpose: a Feishu outage must not hand out unlimited retries,
  * and the ledger must be written for addresses that match no member too.
+ *
+ * The cost of that ordering, stated rather than discovered later: `login_send_log`
+ * records sends that may never have arrived, so during a Feishu outage a member
+ * burns all three of their 15-minute slots on codes that do not exist and is
+ * then throttled out of the recovery too. Deliberate - the alternative (record
+ * only what was delivered) makes the endpoint unlimited during exactly the
+ * outage an attacker would pick - and it is the reason DELIVERY_ALARM below has
+ * to be findable: the ledger cannot tell an operator that this happened, since
+ * a burnt slot and a delivered one are the same row.
  */
 function reserveSendSlot(deps: LoginRouteDeps, email: string, clientIp: string, now: Date): boolean {
   const throttle = new LoginThrottleRepository(deps.db);
@@ -292,6 +301,35 @@ function reserveSendSlot(deps: LoginRouteDeps, email: string, clientIp: string, 
 }
 
 /**
+ * The one string an operator has to be able to grep for (J4, 2026-07-29).
+ *
+ * A member whose code never arrives sees a perfectly normal 「已发送」 page and
+ * tries again; the anti-enumeration rule above means they MUST, so the login
+ * flow can be entirely broken while looking entirely healthy from outside. The
+ * only trace is stderr, and until now the three ways it can break wrote three
+ * unrelated sentences, none of which a log watch could key on.
+ *
+ * Every one of them now carries this token. It is deliberately ugly and
+ * unique: `grep -c LOGIN-DELIVERY-FAILED platform-app.err.log` is the check,
+ * and a non-zero count on a deployment with real members means people cannot
+ * log in right now.
+ *
+ * Why not escalate to Feishu instead: the dominant failure this reports IS
+ * Feishu being unreachable, so an alert card would ride the channel that just
+ * failed. market-alerts-poll.mjs hit the same wall (its "Fix 3" note) and
+ * answered it with an out-of-band artifact rather than a message. This stops
+ * at making the evidence findable, because the artifact-plus-doctor-check half
+ * belongs with the deploy path rather than in a request handler.
+ *
+ * NOT emitted for an address that matches no member, an inactive member, or a
+ * throttled attempt. Those are all normal traffic - anyone can type any
+ * address into the form - and counting them would bury the real signal under
+ * noise a stranger controls. This fires only when a REAL, ACTIVE member with a
+ * Feishu id on file could not be reached, which is never normal.
+ */
+const DELIVERY_ALARM = "LOGIN-DELIVERY-FAILED";
+
+/**
  * Mints + stores + delivers the code without the HTTP response waiting on any
  * of it (module header: the response must not be a timing oracle, and a slow
  * Feishu API must not hang the browser). Nothing it does can change what the
@@ -300,7 +338,7 @@ function reserveSendSlot(deps: LoginRouteDeps, email: string, clientIp: string, 
 function runSendInBackground(deps: LoginRouteDeps, email: string, now: Date): void {
   const settled = deliverCode(deps, email, now).catch((error: unknown) => {
     console.error(
-      `login: code delivery job failed: ${error instanceof Error ? error.message : String(error)}`
+      `login: ${DELIVERY_ALARM} code delivery job threw: ${error instanceof Error ? error.message : String(error)}`
     );
   });
   deps.onSendSettled?.(settled);
@@ -312,7 +350,12 @@ async function deliverCode(deps: LoginRouteDeps, email: string, now: Date): Prom
     return;
   }
   if (!member.feishuOpenId) {
-    console.warn(`login: member ${member.id} has no feishu_open_id on file; no code delivered.`);
+    // An active member who can never log in: nothing about this recovers on its
+    // own, and the member's own view of it is an endless 「已发送」.
+    console.error(
+      `login: ${DELIVERY_ALARM} member ${member.id} is active but has no feishu_open_id on file, ` +
+        `so no code can ever be delivered to them.`
+    );
     return;
   }
 
@@ -330,7 +373,11 @@ async function deliverCode(deps: LoginRouteDeps, email: string, now: Date): Prom
   const send = deps.loginCodeSender ?? createFeishuLoginCodeSender();
   const result = await send({ openId: member.feishuOpenId, code, ttlMinutes: CODE_TTL_MINUTES });
   if (!result.ok) {
-    console.error(`login: Feishu code delivery failed for member ${member.id}: ${result.reason ?? "unknown"}`);
+    // The member has already been told 「已发送」 and has already spent one of
+    // their three sends per 15 minutes on a code that does not exist.
+    console.error(
+      `login: ${DELIVERY_ALARM} Feishu code delivery failed for member ${member.id}: ${result.reason ?? "unknown"}`
+    );
   }
 }
 

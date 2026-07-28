@@ -225,7 +225,9 @@ describe("email-code login", () => {
     it("says the same thing for a member with no feishu_open_id on file, and sends nothing", async () => {
       const { feishuOpenId: _dropped, ...withoutOpenId } = makeMember();
       new MemberRepository(db).upsert(withoutOpenId as Member);
-      vi.spyOn(console, "warn").mockImplementation(() => {});
+      // console.error since J4: an active member with no Feishu id can never
+      // log in, which is an operator problem rather than a curiosity.
+      vi.spyOn(console, "error").mockImplementation(() => {});
 
       const response = await requestCode(MEMBER_EMAIL);
 
@@ -579,6 +581,51 @@ describe("email-code login", () => {
       expect(errorSpy).toHaveBeenCalled();
       expect(everythingLogged).toContain("Feishu rejected the card");
       expect(everythingLogged).not.toContain(code);
+    });
+
+    // J4 (2026-07-29). A member whose code never arrives sees the ordinary
+    // 「已发送」 page - the anti-enumeration rule requires that - so a totally
+    // broken login flow looks healthy from outside and the ONLY evidence is
+    // stderr. login.ts tells the operator to watch for one token; these two
+    // cases are what make that instruction true rather than merely written.
+    it("marks a failed Feishu delivery with the operator's grep token", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu rejected the card" };
+
+      const response = await requestCode(MEMBER_EMAIL);
+
+      // The member is told nothing is wrong. That is the design, and it is
+      // exactly why the operator's side has to be loud.
+      expect(await response.text()).toContain("验证码已发送");
+
+      const logged = errorSpy.mock.calls.flat().map(String).join("\n");
+      expect(logged).toContain("LOGIN-DELIVERY-FAILED");
+      expect(logged).toContain("member_1");
+    });
+
+    it("marks an active member who has no feishu_open_id at all", async () => {
+      const { feishuOpenId: _dropped, ...withoutOpenId } = makeMember();
+      new MemberRepository(db).upsert(withoutOpenId as Member);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await requestCode(MEMBER_EMAIL);
+
+      expect(errorSpy.mock.calls.flat().map(String).join("\n")).toContain("LOGIN-DELIVERY-FAILED");
+    });
+
+    it("stays silent for traffic a stranger controls, so the token cannot be buried in noise", async () => {
+      // Anyone can type any address into the form. If unknown/inactive
+      // addresses raised the alarm too, an operator watching the token would
+      // learn only that the internet exists.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      new MemberRepository(db).upsert(
+        makeMember({ id: "member_2", email: "revoked@example.com", feishuOpenId: "ou_member_2", status: "revoked" })
+      );
+
+      await requestCode("nobody@example.com");
+      await requestCode("revoked@example.com");
+
+      expect(errorSpy.mock.calls.flat().map(String).join("\n")).not.toContain("LOGIN-DELIVERY-FAILED");
     });
   });
 });
