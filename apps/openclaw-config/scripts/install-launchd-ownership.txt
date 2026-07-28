@@ -1,0 +1,78 @@
+# Single source of truth for "which launchd domain owns which label".
+#
+# Task 9 (2026-07-28 spec-drift remediation): the unattended services used to
+# be installed as USER-level LaunchAgents under ~/Library/LaunchAgents. A
+# LaunchAgent is only bootstrapped once a GUI login session for that user
+# exists, so a reboot that stops at the login window (a panic, a power cut, a
+# `sudo reboot` over ssh) left platform-app / cron-runner / market-alerts /
+# daily-backup / official-paper poll+pnl DOWN until a human physically logged
+# in. The "重启自愈" property the project claims was therefore not real.
+# Those labels now live in /Library/LaunchDaemons with an explicit UserName,
+# which launchd bootstraps at boot with no session at all.
+#
+# Format: "<scope> <label>", one per line, "#" starts a comment.
+#
+#   system    installed by install-system-daemons.sh into /Library/LaunchDaemons
+#             (needs sudo). No other installer may write this label anywhere.
+#   user      installed by install-launchd.sh into ~/Library/LaunchAgents.
+#             Only for jobs that genuinely need the user's login session.
+#   retired   must never be installed by anyone; the installers boot it out and
+#             move any leftover plist into the backup directory.
+#   external  owned by a third-party installer (the `openclaw` CLI), not by
+#             anything in this repo. Listed only so install-launchd.sh knows to
+#             leave the checked-in template alone instead of treating an
+#             unlisted label as a mistake.
+#
+# Every consumer reads THIS file rather than keeping its own copy, so a label
+# has exactly one owner by construction:
+#   - install-system-daemons.sh  aborts unless the set of daemons it renders
+#     equals the "system" rows here, and retires every "system"/"retired"
+#     label from ~/Library/LaunchAgents before bootstrapping the daemons.
+#   - install-launchd.sh         installs a template only when its label is
+#     scoped "user"; an unlisted template is a hard error, never a silent skip.
+#   - install-user-schedules.mjs / install-openclaw-cron.mjs no longer install
+#     any plist; they only retire "system"/"retired" labels, so re-running them
+#     in any order can never resurrect a user-level copy of a system daemon.
+#
+# Labels that are NOT ours (the mini also runs the operator's personal
+# 185-agent OpenClaw: com.qingverse.*, com.xhs.*, com.kb.*, pm2.*,
+# homebrew.mxcl.*, com.google.*, com.microsoft.*) must never appear here and
+# are never touched by any of these installers.
+
+system   ai.openclaw.system.gateway
+system   com.openclaw.system.trading.broker-executor
+system   com.alphaloop.platform-app
+system   com.alphaloop.market-alerts
+system   com.alphaloop.daily-backup
+system   com.openclaw.trading.cron-runner
+system   com.openclaw.trading.official-paper.poll
+system   com.openclaw.trading.official-paper.pnl
+
+# com.alphaloop.rsshub stays user-level ON PURPOSE. Its whole body is
+# `docker start rsshub`, and the container runtime it talks to on the mini is
+# itself a per-user LaunchAgent (homebrew.mxcl.colima) whose socket and
+# context live under the user's ~/.colima + ~/.docker. A system daemon would
+# fire before that socket exists and die with "Cannot connect to the Docker
+# daemon"; promoting it would make the news pipeline's RSS source LESS
+# reliable, not more. It follows the runtime it depends on.
+user     com.alphaloop.rsshub
+
+# Superseded by com.openclaw.system.trading.broker-executor above. Kept here
+# (rather than deleted) so every installer keeps actively booting it out: a
+# machine that ran an older checkout still has the user-level copy on disk,
+# and two broker-executors racing on the same trading database is exactly the
+# failure this manifest exists to prevent.
+retired  com.openclaw.trading.broker-executor
+
+# The gateway labels are installed by `openclaw gateway install`, not by us.
+# install-system-daemons.sh runs ai.openclaw.system.gateway as a real system
+# daemon and boots out ai.openclaw.gateway on the way (unchanged behaviour,
+# see that script). KNOWN, PRE-EXISTING LIMITATION, not fixed by this task:
+# install-launchd.sh still ends with `openclaw gateway install`, so running it
+# AFTER install-system-daemons.sh re-creates the user-level ai.openclaw.gateway
+# agent. That agent binds the same port as the system daemon and loses, so it
+# is noisy rather than dangerous - but it means the documented deploy order
+# (install-launchd.sh first, install-system-daemons.sh last) still matters for
+# the gateway alone. Every other label above is order-independent.
+external ai.openclaw.gateway
+external com.openclaw.gateway

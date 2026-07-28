@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
+import { userLevelLabelsToRetire } from "./install-launchd-ownership.mjs";
 import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -13,7 +14,7 @@ const jobs = buildManagedOpenClawCronJobs(repoRoot);
 const uid = process.getuid?.();
 
 retireLegacyLaunchdReportSchedules();
-installCronRunnerService();
+retireUserLevelDaemonAgents();
 
 for (const job of jobs) {
   removeExistingJob(job.name);
@@ -51,58 +52,37 @@ for (const job of jobs) {
   }, null, 2));
 }
 
-function installCronRunnerService() {
+// Task 9 (2026-07-28 spec-drift remediation): this installer used to write
+// com.openclaw.trading.cron-runner into ~/Library/LaunchAgents. launchd only
+// bootstraps a LaunchAgent once a GUI login session exists, so a reboot that
+// stopped at the login window left the runner - and therefore every scheduled
+// report, poll and sweep the openclaw cron channel dispatches to it - dead
+// until a human logged in. The runner is a LaunchDaemon now
+// (install-system-daemons.sh, with UserName + RunAtLoad and the PNPM_BIN it
+// needs). This installer keeps owning the `openclaw cron add` jobs below,
+// which genuinely need the operator's own gateway session and ~/.openclaw
+// config and so cannot move to a system daemon.
+//
+// What replaces the install here is its inverse: boot out and delete the
+// user-level copy of every label a system daemon now owns. That is what makes
+// `openclaw:cron:install` safe to re-run after `launchd:install-system`
+// without resurrecting a second cron-runner racing the first one.
+function retireUserLevelDaemonAgents() {
   if (uid === undefined) {
     return;
   }
-  const label = "com.openclaw.trading.cron-runner";
-  const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
-  const logDir = join(repoRoot, "runtime", "launchd");
-  const runnerPath = join(repoRoot, "apps", "openclaw-config", "scripts", "openclaw-cron-runner.mjs");
-  const nodeBin = process.execPath;
-  const pnpmBin = resolveExecutable("pnpm");
-  const runnerPathEnv = buildLaunchdPath([dirname(nodeBin), dirname(pnpmBin)]);
-  mkdirp(logDir);
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${escapeXml(nodeBin)}</string>
-    <string>${escapeXml(runnerPath)}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>WorkingDirectory</key>
-  <string>${escapeXml(repoRoot)}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${escapeXml(runnerPathEnv)}</string>
-    <key>PNPM_BIN</key>
-    <string>${escapeXml(pnpmBin)}</string>
-  </dict>
-  <key>StandardOutPath</key>
-  <string>${escapeXml(join(logDir, `${label}.out.log`))}</string>
-  <key>StandardErrorPath</key>
-  <string>${escapeXml(join(logDir, `${label}.err.log`))}</string>
-</dict>
-</plist>
-`;
-  writeText(plistPath, plist);
-  try {
-    execFileSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "ignore" });
-  } catch {
-    // Not loaded yet.
+  for (const label of userLevelLabelsToRetire()) {
+    const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+    try {
+      execFileSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "ignore" });
+    } catch {
+      // Not loaded on this machine.
+    }
+    if (existsSync(plistPath)) {
+      rmSync(plistPath);
+      console.log(JSON.stringify({ retiredLaunchAgent: true, label, plistPath }, null, 2));
+    }
   }
-  execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
-  execFileSync("launchctl", ["enable", `gui/${uid}/${label}`], { stdio: "ignore" });
-  console.log(JSON.stringify({ installedRunner: true, label, plistPath }, null, 2));
 }
 
 function retireLegacyLaunchdReportSchedules() {
@@ -174,36 +154,3 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function resolveExecutable(command) {
-  return execFileSync("which", [command], { encoding: "utf8" }).trim();
-}
-
-function buildLaunchdPath(extraDirs) {
-  return [
-    ...extraDirs,
-    ...(process.env.PATH ?? "").split(":"),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin"
-  ].filter(Boolean).filter((value, index, all) => all.indexOf(value) === index).join(":");
-}
-
-function mkdirp(path) {
-  mkdirSync(path, { recursive: true });
-}
-
-function writeText(path, value) {
-  writeFileSync(path, value, "utf8");
-}
-
-function escapeXml(value) {
-  return String(value)
-    .replace(/&/gu, "&amp;")
-    .replace(/</gu, "&lt;")
-    .replace(/>/gu, "&gt;")
-    .replace(/"/gu, "&quot;")
-    .replace(/'/gu, "&apos;");
-}

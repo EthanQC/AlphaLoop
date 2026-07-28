@@ -1,51 +1,45 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
+import { userLevelLabelsToRetire } from "./install-launchd-ownership.mjs";
 import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
 
-const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
-const nodeBin = process.execPath;
+// Task 9 (2026-07-28 spec-drift remediation): this installer no longer
+// installs ANY plist. It used to own the two official-paper schedules
+// (com.openclaw.trading.official-paper.poll / .pnl) as user-level
+// LaunchAgents - which launchd only bootstraps once a GUI login session
+// exists, so a reboot that stopped at the login window left the official
+// paper account unpolled (and, with no snapshot fresher than 90 minutes, every
+// paper order server-side-rejected) until a human logged in. Those two labels
+// are LaunchDaemons now, installed by install-system-daemons.sh; see
+// install-launchd-ownership.txt for the label -> owner manifest.
+//
+// What is left here is the cleanup half, kept because it is what makes the
+// migration safe to run in any order and any number of times: it boots out and
+// deletes the user-level copy of every label a system daemon now owns, plus
+// the labels nobody may own. Running this AFTER install-system-daemons.sh can
+// therefore never resurrect a second, user-level copy of a daemon - the
+// installer-fight failure mode task H7 already had to fix once.
+//
+// Task H7 (2026-07-14 legacy audit) context, still true: the daily/weekly
+// report and stock-analysis jobs are owned by the openclaw cron channel
+// (install-openclaw-cron.mjs), never by launchd. Their labels are retired here
+// too, single-sourced from openclaw-report-launchd-jobs.mjs.
+
 const launchAgentsDir = join(homedir(), "Library", "LaunchAgents");
-const runtimeLogDir = join(repoRoot, "runtime", "launchd");
 const uid = process.getuid?.();
 
 if (uid === undefined) {
-  throw new Error("Cannot determine current uid for launchctl bootstrap.");
+  throw new Error("Cannot determine current uid for launchctl bootout.");
 }
 
 mkdirSync(launchAgentsDir, { recursive: true });
-mkdirSync(runtimeLogDir, { recursive: true });
-
-// Task H7 (2026-07-14 legacy audit): the daily/weekly report and
-// stock-analysis jobs used to be installed HERE as direct launchd plists -
-// the exact same 5 jobs install-openclaw-cron.mjs retires in favor of its
-// openclaw-cron + cron-runner equivalents (per
-// docs/superpowers/specs/2026-06-14-openclaw-report-quality-cron-design.md,
-// the openclaw cron channel is the intended owner of scheduled report
-// production, not direct launchd). Re-running this installer after
-// `openclaw:cron:install` - the documented fix when official-paper polling
-// needs a (re)install, since ONLY this script installs those two jobs -
-// used to silently resurrect the 5 retired jobs, so every report was
-// generated and delivered TWICE. Those 5 are no longer installed here at
-// all; only the two jobs unique to this installer remain.
-const jobs = [
-  {
-    label: "com.openclaw.trading.official-paper.poll",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/official-paper-monitor.mjs poll`,
-    schedule: [{ Minute: 30 }]
-  },
-  {
-    label: "com.openclaw.trading.official-paper.pnl",
-    command: `${quote(nodeBin)} apps/openclaw-config/scripts/official-paper-monitor.mjs pnl`,
-    schedule: [{ Minute: 0 }]
-  }
-];
 
 const retiredLabels = [
+  ...userLevelLabelsToRetire(),
   "com.openclaw.trading.event-bus",
   "com.openclaw.trading.event-ingestor",
   "com.openclaw.trading.live-advisor",
@@ -53,10 +47,6 @@ const retiredLabels = [
   "com.openclaw.trading.catchup",
   "com.openclaw.trading.maintenance.latest",
   "com.openclaw.trading.context.maintenance",
-  // Task H7: defensively retire these too (idempotent no-op if
-  // install-openclaw-cron.mjs already did) - single-sourced from
-  // openclaw-report-launchd-jobs.mjs so this installer can never again
-  // reinstall what the cron channel owns.
   ...MANAGED_REPORT_LAUNCHD_LABELS
 ];
 
@@ -69,70 +59,11 @@ for (const label of retiredLabels) {
   }
   if (existsSync(plistPath)) {
     rmSync(plistPath);
+    console.log(JSON.stringify({ retiredLaunchAgent: true, label, plistPath }, null, 2));
   }
 }
 
-for (const job of jobs) {
-  const plistPath = join(launchAgentsDir, `${job.label}.plist`);
-  writeFileSync(plistPath, renderPlist(job), "utf8");
-
-  try {
-    execFileSync("launchctl", ["bootout", `gui/${uid}`, plistPath], { stdio: "ignore" });
-  } catch {
-    // Not loaded yet.
-  }
-
-  execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "inherit" });
-  execFileSync("launchctl", ["enable", `gui/${uid}/${job.label}`], { stdio: "ignore" });
-  console.log(plistPath);
-}
-
-function renderPlist(job) {
-  const outPath = join(runtimeLogDir, `${job.label}.out.log`);
-  const errPath = join(runtimeLogDir, `${job.label}.err.log`);
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${escapeXml(job.label)}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string>
-    <string>-lc</string>
-    <string>${escapeXml(`cd ${quote(repoRoot)} && ${job.command}`)}</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  ${renderSchedule(job.schedule)}
-  <key>StandardOutPath</key>
-  <string>${escapeXml(outPath)}</string>
-  <key>StandardErrorPath</key>
-  <string>${escapeXml(errPath)}</string>
-  <key>WorkingDirectory</key>
-  <string>${escapeXml(repoRoot)}</string>
-</dict>
-</plist>
-`;
-}
-
-function renderSchedule(schedule) {
-  const items = schedule.map((entry) => {
-    const keys = Object.entries(entry).map(([key, value]) => `    <key>${key}</key>\n    <integer>${value}</integer>`).join("\n");
-    return `  <dict>\n${keys}\n  </dict>`;
-  });
-  return `<array>\n${items.join("\n")}\n  </array>`;
-}
-
-function quote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
-}
-
-function escapeXml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
+console.log(JSON.stringify({
+  installedLaunchAgents: [],
+  note: "所有无人值守服务已改为 /Library/LaunchDaemons，请运行 pnpm launchd:install-system 安装。"
+}, null, 2));
