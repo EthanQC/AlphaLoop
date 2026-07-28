@@ -7,6 +7,7 @@ import {
   NotificationTargetRepository,
   openTradingDatabase
 } from "./database.js";
+import { buildDeepLink, type DeepLinkKind } from "./deep-links.js";
 import { resolveRepoRoot, resolveRuntimePaths } from "./runtime.js";
 
 export interface NotificationPayload {
@@ -39,6 +40,19 @@ export interface NotificationReadiness {
   reason?: string;
 }
 
+/**
+ * What the delivery card says up front. Callers that already computed a
+ * conclusion box (日报/周报/个股分析) pass it verbatim so the card and the
+ * report agree word for word; callers that did not get the report's own
+ * actionable bullets extracted instead (buildReportConclusionCard).
+ */
+export interface ReportConclusion {
+  headline: string;
+  /** 高 / 中 / 低, as rendered in the report's own conclusion box. */
+  confidence?: string;
+  bullets: string[];
+}
+
 export interface ReportDeliveryPayload {
   title: string;
   markdown: string;
@@ -58,6 +72,16 @@ export interface ReportDeliveryPayload {
    * global target from resolveFeishuAppTarget.
    */
   openId?: string;
+  /**
+   * Which platform page holds the full report and under which id (the report
+   * date for daily/weekly, the batch date for 个股分析, ...). Both are needed
+   * to build the card's 查看完整报告 button; with either missing the card
+   * ships button-free and says the full text lives on the platform - never a
+   * bare path, never a guessed host (see deep-links.ts).
+   */
+  reportKind?: DeepLinkKind;
+  reportDate?: string;
+  conclusion?: ReportConclusion;
 }
 
 export interface ReportDeliveryEntry {
@@ -202,7 +226,7 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
   const credentials = resolveFeishuAppCredentials();
   if (credentials) {
     try {
-      return await deliverReportViaAppCredentials(payload, credentials);
+      return await deliverReportViaAppCredentials(payload);
     } catch (error) {
       return {
         sent: false,
@@ -416,24 +440,21 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
 // deliverReportToFeishu's doc comment for the production failure this
 // replaces). Same API surface directHttpCardTransport uses for cards.
 //
-// Message shape: "post" (rich text), not "text". Report bodies are markdown -
-// headings, bullets, tables - and markdownToFeishuPostContent (already used
-// by the webhook and app notification paths) turns headings into 【…】/— …
-// and strips ** / ` so the body reads as prose in the client instead of
-// showing raw markdown syntax; "post" also carries a per-message title, which
-// is what makes a multi-message report navigable. An interactive card was
-// rejected for the body because a report chapter routinely exceeds what a
-// card renders comfortably; cards stay for alerts/approvals.
+// ONE interactive card per report (2026-07-28, spec drift CRIT-1/2; §0.2 飞书
+// 只投递结论卡 + §1.1 深链). This path used to send the summary AND every
+// chapter as "post" messages, with a comment declaring it deliberately
+// bypassed the `shouldSendFullReportChapters()` policy because the retired
+// PDF left the full text no other way to arrive. That reasoning was already
+// obsolete when it was written - the platform app IS where the full text
+// lives - and the cost was real: one live daily run pushed 10 Feishu
+// messages, burying the conclusion the reader actually needed.
 //
-// Unlike the legacy channel this sends the summary AND every chapter. The
-// `shouldSendFullReportChapters()` policy that suppresses chapters elsewhere
-// encoded "飞书只发送摘要卡片 + PDF" - but the PDF is retired (2026-07-12
-// requirements §0.4), so on this channel the full text has no other way to
-// arrive. Per-message size stays bounded by splitReportIntoChapterMessages.
-async function deliverReportViaAppCredentials(
-  payload: ReportDeliveryPayload,
-  credentials: FeishuAppCredentials
-): Promise<ReportDeliveryResult> {
+// So: the conclusion goes in the card, the body stays on the platform, and
+// the button opens it. The policy is no longer bypassed anywhere - it now
+// reads the same on all three channels (app credentials, legacy user-plugin,
+// degraded fallback). splitReportIntoChapterMessages still serves those other
+// two, which have no card transport of their own.
+async function deliverReportViaAppCredentials(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
   const target = resolveReportDeliveryTarget(payload);
   if (!target) {
     return {
@@ -447,73 +468,102 @@ async function deliverReportViaAppCredentials(
   const entryTarget: NotificationDeliveryTarget = target.targetType === "chat_id"
     ? "feishu-app-chat-id"
     : "feishu-app-open-id";
-  const deliveries: ReportDeliveryEntry[] = [];
-  const summaryTitle = `${payload.title} 摘要`;
-  const summary = await trySendFeishuAppReportMessage(credentials, target, {
-    title: summaryTitle,
-    body: buildReportSummaryMarkdown(payload),
-    format: "post"
-  });
-  deliveries.push({
-    kind: "summary",
-    title: summaryTitle,
-    target: entryTarget,
-    sent: summary.sent,
-    ...(summary.reason ? { reason: summary.reason } : {})
-  });
+  const send = await sendInteractiveCard(
+    buildReportConclusionCard(payload),
+    target.targetType === "chat_id" ? { chatId: target.targetId } : { openId: target.targetId }
+  );
 
-  if (summary.sent) {
-    const sections = splitReportIntoChapterMessages(payload.markdown, payload.maxSectionChars ?? 4800);
-    for (const section of sections) {
-      const chapter = await trySendFeishuAppReportMessage(credentials, target, {
-        title: section.title,
-        body: section.body,
-        format: "post"
-      });
-      deliveries.push({
-        kind: "chapter",
-        title: section.title,
-        target: entryTarget,
-        sent: chapter.sent,
-        ...(chapter.reason ? { reason: chapter.reason } : {}),
-        chapter: section.chapter,
-        part: section.part,
-        parts: section.parts
-      });
-      if (!chapter.sent) {
-        break;
-      }
-    }
-  }
-
-  // `target` names the channel that was USED (attempted), matching the
-  // user-plugin branch above, so a failure still tells the caller where it
-  // tried; `sent` is the only success signal.
-  const firstFailure = deliveries.find((entry) => !entry.sent);
   const result: ReportDeliveryResult = {
-    sent: summary.sent,
+    sent: send.ok,
+    // `target` names the channel that was USED (attempted), matching the
+    // user-plugin branch above, so a failure still tells the caller where it
+    // tried; `sent` is the only success signal.
     target: entryTarget,
-    deliveries
+    deliveries: [{
+      kind: "summary",
+      title: payload.title,
+      target: entryTarget,
+      sent: send.ok,
+      ...(send.messageId ? { detail: send.messageId } : {}),
+      ...(send.error ? { reason: send.error } : {})
+    }]
   };
-  if (firstFailure) {
-    result.reason = `${firstFailure.kind === "summary" ? "摘要" : firstFailure.title} 未送达：${firstFailure.reason ?? "unknown error"}`;
+  if (!send.ok) {
+    result.reason = `结论卡未送达：${send.error ?? "unknown error"}`;
   }
   return result;
 }
 
-async function trySendFeishuAppReportMessage(
-  credentials: FeishuAppCredentials,
-  target: FeishuAppTarget,
-  payload: NotificationPayload
-): Promise<{ sent: boolean; reason?: string }> {
+// How many bullets a conclusion card carries. A Feishu card is a glance
+// surface: past a handful of lines the reader scrolls a card instead of
+// opening the report, which is the failure this whole change is undoing.
+const MAX_CARD_BULLETS = 5;
+
+/**
+ * The single card a report is delivered as: title, the window it covers, the
+ * conclusion (with its confidence tier when the caller computed one), a few
+ * bullets, and a button to the full text on the platform.
+ *
+ * Exported so the delivery orchestration and its tests build the exact same
+ * card, and so nothing has to reach for a second, drifting copy of this shape.
+ */
+export function buildReportConclusionCard(payload: ReportDeliveryPayload): InteractiveCard {
+  const markdown = payload.markdown.replace(/\r\n/gu, "\n");
+  const lines: string[] = [];
+
+  const windowLine = markdown.split("\n").map((line) => line.trim()).find((line) => /^窗口：/u.test(line));
+  if (windowLine) {
+    lines.push(windowLine);
+  }
+
+  const headline = payload.conclusion?.headline.trim();
+  if (headline) {
+    lines.push(`**结论**：${headline}`);
+  }
+  const confidence = payload.conclusion?.confidence?.trim();
+  if (confidence) {
+    lines.push(`**置信度**：${confidence}`);
+  }
+
+  const sourceBullets = payload.conclusion?.bullets.length
+    ? payload.conclusion.bullets
+    : extractActionableSummaryBullets(markdown);
+  lines.push(...sourceBullets
+    .map((bullet) => bullet.trim())
+    .filter(Boolean)
+    .slice(0, MAX_CARD_BULLETS)
+    .map((bullet) => (bullet.startsWith("-") ? bullet : `- ${bullet}`)));
+
+  const href = resolveReportDeepLink(payload);
+  if (lines.length === 0) {
+    // Honest empty state (§0.4): say the card has nothing rather than pad it.
+    lines.push("本次报告未提取到可摘要的结论要点，请在平台查看全文。");
+  } else if (!href) {
+    lines.push("（本部署未配置平台公开地址，请在平台查看全文）");
+  }
+
+  return {
+    title: payload.title,
+    lines,
+    ...(href ? { url: { text: "查看完整报告", href } } : {})
+  };
+}
+
+// A link only when the caller named BOTH the page kind and the id. Anything
+// else - a missing field, an id buildDeepLink rejects, an unconfigured base
+// url - degrades to a button-free card, because a link that looks right and
+// opens the wrong page is worse than no link at all.
+function resolveReportDeepLink(payload: ReportDeliveryPayload): string | null {
+  const kind = payload.reportKind;
+  const id = payload.reportDate?.trim();
+  if (!kind || !id) {
+    return null;
+  }
+
   try {
-    await withNotificationRetry(
-      () => postFeishuAppMessage(credentials, target, payload),
-      "feishu app report send"
-    );
-    return { sent: true };
-  } catch (error) {
-    return { sent: false, reason: sanitizeNotificationError(error) };
+    return buildDeepLink(kind, id);
+  } catch {
+    return null;
   }
 }
 
@@ -615,6 +665,15 @@ export function allowReportFallbackDelivery(): boolean {
   return false;
 }
 
+/**
+ * Feishu never carries a report body. The reader gets one conclusion card
+ * (buildReportConclusionCard) and reads the full text on the platform.
+ *
+ * Constant `false` on purpose: FEISHU_REPORT_DELIVERY_MODE=full used to turn
+ * chapter fan-out back on, and the app-credential path used to skip this
+ * check outright. Both are gone (2026-07-28) - there is no supported way to
+ * push a report body into a chat any more, so this is the whole policy.
+ */
 export function shouldSendFullReportChapters(): boolean {
   return false;
 }
@@ -1302,9 +1361,9 @@ export function buildReportSummaryMarkdown(payload: ReportDeliveryPayload): stri
     "",
     "## 摘要",
     "",
-    // PDF is retired (2026-07-12 requirements §0.4), so the honest pointer is
-    // the chapter messages that follow this summary, not an attachment.
-    ...(bullets.length > 0 ? bullets : ["- 报告没有提取到可行动摘要，请阅读下方章节正文并人工复核。"])
+    // Neither the retired PDF (§0.4) nor a chapter message follows this
+    // summary on any channel any more, so the honest pointer is the platform.
+    ...(bullets.length > 0 ? bullets : ["- 报告没有提取到可行动摘要，请在平台查看全文并人工复核。"])
   ].filter((line) => line !== "").join("\n");
 }
 

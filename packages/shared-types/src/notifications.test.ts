@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   allowReportFallbackDelivery,
   buildFeishuCardPayload,
+  buildReportConclusionCard,
   buildReportSummaryMarkdown,
   deliverReportToFeishu,
   isFeishuProseFailure,
@@ -40,7 +41,7 @@ describe("report delivery policy", () => {
     }
   });
 
-  it("keeps Feishu reports to summary card plus PDF even if the legacy full mode is set", () => {
+  it("keeps Feishu reports to a single conclusion card even if the legacy full mode is set", () => {
     process.env.FEISHU_REPORT_DELIVERY_MODE = "full";
 
     expect(shouldSendFullReportChapters()).toBe(false);
@@ -106,6 +107,110 @@ describe("report delivery policy", () => {
     expect(summary).toContain("AAPL.US");
     expect(summary).toContain("支撑位 276.83");
     expect(summary).not.toContain("本报告已生成");
+  });
+});
+
+// 2026-07-28 (spec drift, §1.1 + §0.2): a report is delivered as ONE
+// conclusion card whose button opens the platform page. These cover the card
+// the delivery path builds; the delivery path itself is covered further down.
+describe("buildReportConclusionCard", () => {
+  const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+
+  afterEach(() => {
+    if (previousBaseUrl === undefined) {
+      delete process.env.PLATFORM_PUBLIC_BASE_URL;
+    } else {
+      process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
+    }
+  });
+
+  it("renders the caller's conclusion, its confidence tier and a deep-link button", () => {
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: "# OpenClaw 日报 2026-07-28\n\n窗口：2026-07-27 20:00 - 2026-07-28 20:00（北京时间）\n",
+      reportKind: "daily",
+      reportDate: "2026-07-28",
+      conclusion: {
+        headline: "科技股情绪回暖，仓位维持不变。",
+        confidence: "中",
+        bullets: ["QQQ 最新价 738.31，较前收上涨 0.37%。", "新闻主线偏中性偏多。"]
+      }
+    });
+
+    expect(card.title).toBe("OpenClaw 日报 2026-07-28");
+    expect(card.url).toEqual({ text: "查看完整报告", href: "https://reports.qingverse.com/daily/2026-07-28" });
+    const text = card.lines.join("\n");
+    expect(text).toContain("窗口：2026-07-27 20:00");
+    expect(text).toContain("科技股情绪回暖，仓位维持不变。");
+    expect(text).toContain("置信度");
+    expect(text).toContain("中");
+    expect(text).toContain("- QQQ 最新价 738.31，较前收上涨 0.37%。");
+  });
+
+  it("falls back to the report's own actionable bullets when the caller supplies no conclusion", () => {
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 个股分析 2026-07-28",
+      markdown: [
+        "# OpenClaw 个股分析 2026-07-28",
+        "",
+        "## 本批次结论",
+        "",
+        "- AAPL.US：支撑位 276.83；阻力位 312.51。"
+      ].join("\n"),
+      reportKind: "stock-analysis",
+      reportDate: "2026-07-28"
+    });
+
+    expect(card.lines.join("\n")).toContain("AAPL.US：支撑位 276.83；阻力位 312.51。");
+    expect(card.url?.href).toBe("https://reports.qingverse.com/stock-analysis/2026-07-28");
+  });
+
+  it("ships without a button - and says where the full text lives - when no public base url is configured", () => {
+    delete process.env.PLATFORM_PUBLIC_BASE_URL;
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: "# OpenClaw 日报 2026-07-28\n\n## 1. 今日结论\n\n- 市场信号：QQQ 走平。",
+      reportKind: "daily",
+      reportDate: "2026-07-28"
+    });
+
+    expect(card.url).toBeUndefined();
+    const text = card.lines.join("\n");
+    expect(text).toContain("请在平台查看全文");
+    // A path with no origin is useless in a Feishu client, and a made-up host
+    // would be fabricated data (deep-links.ts, §0.4).
+    expect(text).not.toContain("/daily/");
+  });
+
+  it("has no button when the caller does not say which page holds the report", () => {
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 模拟盘收支变化 2026-07-28",
+      markdown: "# OpenClaw 模拟盘收支变化 2026-07-28\n\n## 收支变化表\n\n- 今日净值持平。"
+    });
+
+    expect(card.url).toBeUndefined();
+    expect(card.lines.join("\n")).toContain("请在平台查看全文");
+  });
+
+  it("states the gap honestly when the report yields no summarizable conclusion", () => {
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 日报 2026-07-28",
+      markdown: "# OpenClaw 日报 2026-07-28\n\n## 1. 今日结论\n\n正文没有任何要点行。",
+      reportKind: "daily",
+      reportDate: "2026-07-28"
+    });
+
+    expect(card.lines.join("\n")).toContain("未提取到");
+    expect(card.url?.href).toBe("https://reports.qingverse.com/daily/2026-07-28");
   });
 });
 
@@ -400,6 +505,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     "FEISHU_WEBHOOK_URL",
     "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
     "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "PLATFORM_PUBLIC_BASE_URL",
     "HOME"
   ] as const;
   const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
@@ -480,37 +586,83 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
       }));
   }
 
-  it("posts the summary and every chapter to the global target with the app tenant token", async () => {
+  interface CardJson {
+    header: { title: { content: string } };
+    body: {
+      elements: Array<{
+        tag: string;
+        content?: string;
+        actions?: Array<{ tag: string; text: { tag: string; content: string }; type?: string; url?: string }>;
+      }>;
+    };
+  }
+
+  function cardFrom(send: { body: { content: string } }): CardJson {
+    return JSON.parse(send.body.content) as CardJson;
+  }
+
+  // 2026-07-28 (spec drift CRIT-1/2). This path used to push the summary AND
+  // every chapter, deliberately bypassing shouldSendFullReportChapters() - a
+  // live daily run pushed 10 Feishu messages. One card, one link.
+  it("delivers ONE interactive card with a platform deep link, not the summary plus every chapter", async () => {
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
     const calls = stubFetch(okFeishu());
 
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
-      markdown: REPORT_MARKDOWN
+      markdown: REPORT_MARKDOWN,
+      reportKind: "daily",
+      reportDate: "2026-07-26"
     });
 
     expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-app-open-id");
 
     const sends = messageCalls(calls);
-    // 1 summary + 3 chapters (the pre-`##` header block, 今日结论, 明日跟踪).
-    expect(sends).toHaveLength(4);
-    for (const send of sends) {
-      expect(send.url).toContain("receive_id_type=open_id");
-      expect(send.body.receive_id).toBe("ou_global_member");
-      expect(send.headers.authorization).toBe("Bearer t-token-report");
-      // "post" (rich text), not "text": the report body is markdown-ish and
-      // markdownToFeishuPostContent already renders headings/bullets for the
-      // webhook + app notification paths.
-      expect(send.body.msg_type).toBe("post");
-    }
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=open_id");
+    expect(sends[0]!.body.receive_id).toBe("ou_global_member");
+    expect(sends[0]!.headers.authorization).toBe("Bearer t-token-report");
+    expect(sends[0]!.body.msg_type).toBe("interactive");
 
-    const summary = JSON.parse(sends[0]!.body.content) as { zh_cn: { title: string; content: unknown[] } };
-    expect(summary.zh_cn.title).toBe("OpenClaw 日报 2026-07-26 摘要");
-    expect(JSON.stringify(summary.zh_cn.content)).toContain("QQQ 最新价 738.31");
+    const card = cardFrom(sends[0]!);
+    expect(card.header.title.content).toBe("OpenClaw 日报 2026-07-26");
+    expect(JSON.stringify(card.body.elements)).toContain("QQQ 最新价 738.31");
+    const action = card.body.elements.find((element) => element.tag === "action");
+    expect(action?.actions).toContainEqual({
+      tag: "button",
+      text: { tag: "plain_text", content: "查看完整报告" },
+      type: "default",
+      url: "https://reports.qingverse.com/daily/2026-07-26"
+    });
+    // The card carries the conclusion, not the body: the 明日跟踪 chapter
+    // lives on the platform page the button opens.
+    expect(JSON.stringify(card)).not.toContain("先看 730 - 745 区间");
 
-    expect(result.deliveries.map((entry) => entry.kind)).toEqual(["summary", "chapter", "chapter", "chapter"]);
+    expect(result.deliveries.map((entry) => entry.kind)).toEqual(["summary"]);
     expect(result.deliveries.every((entry) => entry.sent)).toBe(true);
+  });
+
+  it("sends a button-free card that points at the platform in prose when no base url is configured", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    delete process.env.PLATFORM_PUBLIC_BASE_URL;
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      reportKind: "daily",
+      reportDate: "2026-07-26"
+    });
+
+    expect(result.sent).toBe(true);
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    const card = cardFrom(sends[0]!);
+    expect(card.body.elements.some((element) => element.tag === "action")).toBe(false);
+    expect(JSON.stringify(card)).toContain("请在平台查看全文");
+    expect(JSON.stringify(card)).not.toContain("/daily/");
   });
 
   it("prefers a per-owner openId on the payload over the global notify target", async () => {
@@ -524,8 +676,9 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     });
 
     expect(result.sent).toBe(true);
-    const receivers = new Set(messageCalls(calls).map((send) => send.body.receive_id));
-    expect(receivers).toEqual(new Set(["ou_owner_specific"]));
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.body.receive_id).toBe("ou_owner_specific");
   });
 
   it("returns a structured not-delivered result - never throws - when no target resolves", async () => {
@@ -563,13 +716,15 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(result.sent).toBe(false);
     expect(result.reason).toContain("invalid receive_id");
     expect(result.reason).not.toContain("secret-token-x");
+    expect(result.deliveries).toHaveLength(1);
+    expect(result.deliveries[0]!.sent).toBe(false);
     expect(JSON.stringify(result.deliveries)).not.toContain("secret-token-x");
   });
 
-  it("keeps splitting oversized chapters with maxSectionChars", async () => {
+  it("stays at one message for a long report - no chapter fan-out to fall back to", async () => {
     process.env.FEISHU_NOTIFY_CHAT_ID = "oc_group_chat";
     const calls = stubFetch(okFeishu());
-    const longSection = ["## 1. 今日结论", "", "段落一".repeat(40), "", "段落二".repeat(40)].join("\n");
+    const longSection = ["## 1. 今日结论", "", "段落一".repeat(400), "", "段落二".repeat(400)].join("\n");
 
     const result = await deliverReportToFeishu({
       title: "OpenClaw 日报 2026-07-26",
@@ -579,14 +734,11 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
 
     expect(result.sent).toBe(true);
     expect(result.target).toBe("feishu-app-chat-id");
-    const chapters = result.deliveries.filter((entry) => entry.kind === "chapter");
-    const multiPart = chapters.filter((entry) => (entry.parts ?? 1) > 1);
-    expect(multiPart.length).toBeGreaterThan(0);
-    expect(multiPart[0]!.title).toContain("（1/");
-    for (const send of messageCalls(calls)) {
-      expect(send.url).toContain("receive_id_type=chat_id");
-      expect(send.body.receive_id).toBe("oc_group_chat");
-    }
+    expect(result.deliveries.map((entry) => entry.kind)).toEqual(["summary"]);
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=chat_id");
+    expect(sends[0]!.body.receive_id).toBe("oc_group_chat");
   });
 });
 
