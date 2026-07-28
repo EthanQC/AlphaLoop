@@ -1,8 +1,9 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { NotificationTargetRepository, openTradingDatabase } from "./database.js";
 import {
   allowReportFallbackDelivery,
   buildFeishuCardPayload,
@@ -11,14 +12,17 @@ import {
   deliverOperationalAlertToFeishu,
   deliverReportToFeishu,
   isFeishuProseFailure,
+  isUnconfiguredCardTargetError,
   directHttpCardTransport,
   sendInteractiveCard,
   shouldSendFullReportChapters,
   updateInteractiveCard,
+  type CardTarget,
   type CardTransport,
   type InteractiveCard,
   type ReportScope
 } from "./notifications.js";
+import { resolveRuntimePaths } from "./runtime.js";
 
 describe("report delivery policy", () => {
   const previousMode = process.env.FEISHU_REPORT_DELIVERY_MODE;
@@ -1323,6 +1327,62 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(calls).toHaveLength(0);
   });
 
+  // 2026-07-28 R5 (E2). The owner field was never shape-checked: any string
+  // went out as a receive_id with receive_id_type=open_id. Measured before the
+  // fix, against the built dist with app credentials set - both of these came
+  // back `sent: true` after a real im/v1/messages POST carrying
+  // `receive_id=oc_public_group`. The value is a CHAT id, so what got recorded
+  // as a delivered private report was a card addressed to a group as if the
+  // group were a person. Whether Feishu then rejects it was never measured
+  // (see refuseMalformedOwnerOpenId's note); these two cases exist so the
+  // answer no longer matters - nothing is sent at all.
+  it("refuses an owner-private declaration whose ownerOpenId is a chat id, not an open_id", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "owner-private", ownerOpenId: "oc_public_group" }
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.reason).toContain("oc_public_group");
+    expect(result.reason).toContain("scope.ownerOpenId");
+    expect(messageCalls(calls)).toHaveLength(0);
+  });
+
+  it("refuses the legacy payload.openId routing field when it is not an open_id either", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      openId: "oc_public_group"
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.reason).toContain("payload.openId");
+    expect(messageCalls(calls)).toHaveLength(0);
+  });
+
+  it("still delivers to a well-formed ou_ owner id", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-28",
+      markdown: REPORT_MARKDOWN,
+      scope: { visibility: "owner-private", ownerOpenId: "ou_real_member" }
+    });
+
+    expect(result.sent).toBe(true);
+    expect(messageCalls(calls).map((send) => send.body.receive_id)).toEqual(["ou_real_member"]);
+  });
+
   // 2026-07-28 (R4, C12 CRITICAL). The privacy guard's default used to be
   // fail-OPEN: `visibility` was matched against two members and everything else
   // fell out of the bottom as circle-public - the MOST permissive verdict - and
@@ -1852,5 +1912,197 @@ describe("directHttpCardTransport (2026-07-18 live-send fix)", () => {
     expect(result).toEqual({ ok: true });
     const patchCall = calls.find((c) => c.url.includes("/im/v1/messages/om_77"))!;
     expect(patchCall.init.method).toBe("PATCH");
+  });
+});
+
+// 2026-07-28 R5 (E1). `{operator: true}` means "send this to whoever operates
+// the deployment" - the form market-alerts-poll.mjs uses for its "the alert
+// poller is dead" escalation when no member has a linked Feishu account. That
+// form used to be spelled `{}`, and only legacyMcpCardTransport honored it;
+// THIS transport - the one defaultCardTransport picks whenever app credentials
+// resolve, which is the deploy target's shape - refused it. Measured against
+// the built dist with FEISHU_APP_ID/FEISHU_APP_SECRET set, before the fix (the
+// literal call and the literal return, `{}` and all):
+//   sendInteractiveCard(card, {}) -> {"ok":false,"error":"Interactive card
+//   target needs a chatId or openId."}, and zero HTTP requests attempted.
+// So the one message that reports the alerter itself as broken was the one
+// message that could not be sent.
+//
+// These cases drive the REAL transport, not an injected fake: a fake answering
+// ok:true for the operator form is precisely the fixture that let this survive
+// four rounds (see market-alerts-poll.test.ts's operator-card cases, which are
+// deliberately about the poller's decisions and now say so).
+describe("directHttpCardTransport operator target (2026-07-28 R5)", () => {
+  const realFetch = globalThis.fetch;
+  const envKeys = [
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_NOTIFY_OPEN_ID",
+    "FEISHU_NOTIFY_CHAT_ID",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "HOME"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+  const savedCwd = process.cwd();
+  let tempDir: string;
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      if (key !== "HOME") {
+        delete process.env[key];
+      }
+    }
+    // Isolate BOTH remaining sources resolveFeishuAppTarget can reach with no
+    // FEISHU_NOTIFY_* set - the repo's sqlite notification_targets row (from
+    // cwd) and ~/.openclaw/credentials (from $HOME) - so nothing under the real
+    // runtime/ directory is opened, read or written by these tests.
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-operator-target-"));
+    process.env.HOME = tempDir;
+    process.chdir(tempDir);
+    process.env.FEISHU_APP_ID = "cli_test_app";
+    process.env.FEISHU_APP_SECRET = "test_secret";
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (process.cwd() !== savedCwd) {
+      process.chdir(savedCwd);
+    }
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function stubFetch() {
+    const calls: Array<{ url: string; body: { receive_id: string; msg_type: string } }> = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes("tenant_access_token")) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: "t-op", expire: 7200 }));
+      }
+      calls.push({ url: href, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ code: 0, data: { message_id: "om_op_1" } }));
+    }) as typeof fetch;
+    return calls;
+  }
+
+  const card: InteractiveCard = { title: "⚠ 提醒器连续失败", lines: ["已连续失败 3 次。"] };
+
+  it("delivers to the stored notification target - the deploy target's own shape - when the caller gives no chatId/openId", async () => {
+    // The mini has FEISHU_APP_ID/FEISHU_APP_SECRET and NO FEISHU_NOTIFY_* at
+    // all, plus exactly one notification_targets row: channel feishu, type
+    // open_id, source openclaw-allowFrom (read-only check on the deploy
+    // target; only the channel/type/source and the id's `ou_` prefix were
+    // read, never an id value). That row is what this reconstructs.
+    const db = openTradingDatabase(resolveRuntimePaths(tempDir).dbPath);
+    try {
+      new NotificationTargetRepository(db).save({
+        channel: "feishu",
+        targetType: "open_id",
+        targetId: "ou_operator_stub",
+        source: "openclaw-allowFrom",
+        updatedAt: Date.now()
+      });
+    } finally {
+      db.close();
+    }
+    const calls = stubFetch();
+
+    // notifications.ts memoizes its NotificationTargetRepository against the
+    // FIRST db it ever resolves, and earlier cases in this file already bound
+    // that singleton to their own (since deleted) temp dirs. A fresh module
+    // instance is the only way to exercise the stored-target lookup for real;
+    // stubbing it would be a fixture asserting itself.
+    vi.resetModules();
+    const fresh = await import("./notifications.js");
+
+    const result = await fresh.sendInteractiveCard(card, { operator: true });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toContain("receive_id_type=open_id");
+    expect(calls[0]!.body.receive_id).toBe("ou_operator_stub");
+    expect(calls[0]!.body.msg_type).toBe("interactive");
+  });
+
+  it("delivers to FEISHU_NOTIFY_CHAT_ID when that is how the operator target is configured", async () => {
+    process.env.FEISHU_NOTIFY_CHAT_ID = "oc_ops_chat";
+    const calls = stubFetch();
+
+    const result = await sendInteractiveCard(card, { operator: true });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toContain("receive_id_type=chat_id");
+    expect(calls[0]!.body.receive_id).toBe("oc_ops_chat");
+  });
+
+  it("refuses by name - and flags itself as a CONFIG gap, not a rejected send - when no operator target is configured at all", async () => {
+    const calls = stubFetch();
+
+    const result = await sendInteractiveCard(card, { operator: true });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("FEISHU_NOTIFY_OPEN_ID");
+    expect(isUnconfiguredCardTargetError(result.error)).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not mistake a REJECTED send for an unconfigured deployment", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+    globalThis.fetch = (async (url: string | URL) =>
+      String(url).includes("tenant_access_token")
+        ? new Response(JSON.stringify({ code: 0, tenant_access_token: "t-op", expire: 7200 }))
+        : new Response(JSON.stringify({ code: 230001, msg: "invalid receive_id" }), { status: 400 })) as typeof fetch;
+
+    const result = await sendInteractiveCard(card, { operator: true });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("invalid receive_id");
+    expect(isUnconfiguredCardTargetError(result.error)).toBe(false);
+  });
+
+  it("still prefers an explicitly addressed member over the operator target", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+    const calls = stubFetch();
+
+    await sendInteractiveCard(card, { openId: "ou_member_1" });
+
+    expect(calls[0]!.body.receive_id).toBe("ou_member_1");
+  });
+
+  // The reason `operator` is an explicit flag and not "whatever an empty object
+  // means". Every other caller in this repo addresses ONE member - login codes,
+  // review confirmations, research results, alert cards - via
+  // `{openId: member.feishuOpenId}`. If that id is ever undefined, redirecting
+  // to the operator would put one member's card in someone else's chat and
+  // report it sent. It must stay a refusal.
+  //
+  // The `{openId: undefined}` row is cast because exactOptionalPropertyTypes
+  // rejects it at the type level - which protects the .ts call sites and only
+  // those. The producers that can actually emit it are the ~76 unchecked .mjs
+  // scripts under apps/openclaw-config/scripts that call this same dist export,
+  // so the guard has to exist at runtime, and this row is what covers it.
+  it.each([
+    ["an empty object", {}],
+    ["a member whose openId came back undefined", { openId: undefined } as unknown as CardTarget],
+    ["a member whose openId came back blank", { openId: "  " }]
+  ])("refuses %s rather than redirecting the card to the operator", async (_label, target) => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+    const calls = stubFetch();
+
+    const result = await sendInteractiveCard(card, target);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("needs a chatId or openId");
+    expect(isUnconfiguredCardTargetError(result.error)).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 });

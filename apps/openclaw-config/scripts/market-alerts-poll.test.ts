@@ -4,7 +4,11 @@ import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import {
+  MemberRepository,
+  UNCONFIGURED_CARD_TARGET_MARKER,
+  openTradingDatabase
+} from "../../../packages/shared-types/dist/index.js";
 
 // Fix 4 (task H1 fix round): recordJobRun is mocked (wrapping the REAL
 // implementation by default via vi.fn(actual.recordJobRun)) purely so a
@@ -586,6 +590,19 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
     throw new Error("Longbridge quote failed: LARK_APP_SECRET=shh-do-not-leak-this should never leak");
   };
 
+  // WHAT THIS FIXTURE DOES AND DOES NOT VOUCH FOR (2026-07-28 R5). It answers
+  // ok:true for ANY target, `{}` included. That makes it a fine stand-in for
+  // the poller's OWN decisions - who it addresses, in what order, how many
+  // times, which markers it writes - and it is evidence for nothing whatsoever
+  // about whether the production channel can carry a card to that target.
+  //
+  // It matters because it was the disguise: for four rounds a case named
+  // "a WORKING fallback channel" passed here on the strength of this fixture
+  // while the real defaultCardTransport, on the deploy target's credential
+  // shape, refused an empty target outright and sent nothing. The real
+  // transport's answer to `{}` is now pinned where it can be measured rather
+  // than authored - packages/shared-types/src/notifications.test.ts,
+  // "directHttpCardTransport empty target = the deployment's operator".
   function cardTransport(sink: Array<{ target: unknown; cardJson: any }>) {
     return {
       sendCard: async (target: unknown, cardJson: any) => {
@@ -793,10 +810,10 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
 
       // Escalation is attempted on the 3rd/4th/5th failures (never
       // throttled - no escalation_sent marker is ever written) - each
-      // attempt is exactly the one fallback send (target {}), since there
+      // attempt is exactly the one fallback send (target {operator: true}), since there
       // is no member with a feishuOpenId to try first.
       expect(sent).toHaveLength(3);
-      expect(sent.every((entry) => JSON.stringify(entry.target) === "{}")).toBe(true);
+      expect(sent.every((entry) => JSON.stringify(entry.target) === JSON.stringify({ operator: true }))).toBe(true);
 
       const rows = db
         .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid ASC")
@@ -808,7 +825,12 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
       expect(undeliverable.every((marker) => marker.reason === "no_recipients")).toBe(true);
     });
 
-    it("zero reachable members but a WORKING fallback channel: the escalation still gets delivered (escalation_sent, target {})", async () => {
+    // Scope: the POLLER's decision - with no member to address, it must still
+    // make exactly one send, to the operator target (`{}`), and record
+    // escalation_sent when that send reports success. Whether a real transport
+    // can carry `{}` anywhere is a different question, answered by
+    // notifications.test.ts (see the cardTransport fixture note above).
+    it("zero reachable members: the escalation is addressed to the operator target and, if that send succeeds, records escalation_sent", async () => {
       const { db, dbPath } = makeDb();
       seedMemberNoFeishu(db, "member_1");
       store.insertRule(db, {
@@ -829,7 +851,7 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
       }
 
       expect(sent).toHaveLength(1);
-      expect(sent[0]?.target).toEqual({});
+      expect(sent[0]?.target).toEqual({ operator: true });
       const row = db
         .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid DESC LIMIT 1")
         .get() as { evidence: string };
@@ -852,7 +874,7 @@ describe("run_log heartbeat + failure escalation (task H1)", () => {
       // The real member is tried first, THEN the fallback - both fail.
       expect(sent).toHaveLength(2);
       expect(sent[0]?.target).toEqual({ openId: "ou_member_1" });
-      expect(sent[1]?.target).toEqual({});
+      expect(sent[1]?.target).toEqual({ operator: true });
 
       const row = db
         .prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid DESC LIMIT 1")
@@ -1447,7 +1469,7 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
       ).rejects.toThrow(/unable to open database file/i);
     }
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.target).toEqual({ operator: true });
     expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器数据库不可用");
     const bodyText = JSON.stringify(sent[0]?.cardJson.body);
     expect(bodyText).toContain("已连续 3 次");
@@ -1475,7 +1497,7 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
   });
 
   // Fix 3 + Fix 4: an escalation that ends up undeliverable (the member send
-  // AND the `{}` fallback both fail - exactly "the wire it reports as dead")
+  // AND the `{operator: true}` fallback both fail - exactly "the wire it reports as dead")
   // writes runtime/market-alerts/ALERTER-DOWN.json; a subsequent cycle that
   // is otherwise "ok" (0 enabled rules - nothing to evaluate at all) still
   // reports `alerterDown: true` while the artifact persists; the first
@@ -1551,6 +1573,51 @@ describe("task H1 THIRD fix round: the 200-row LIMIT re-break, db-open failure, 
     expect(quietResult.ok).toBe(true);
     expect(quietResult.alerterDown).toBeUndefined();
     expect(existsSync(artifactPath)).toBe(false);
+  });
+
+  // 2026-07-28 R5. "Nothing is configured to send to" and "something is
+  // configured and the send was rejected" need different fixes from the
+  // operator (set FEISHU_NOTIFY_*/seed a target, versus repair Feishu auth or
+  // the network), and by construction neither can be explained over Feishu -
+  // ALERTER-DOWN.json's `reason` is where that distinction has to survive. It
+  // used to collapse to send_failed/no_recipients for both. The marker the
+  // transport emits is the real one (notifications.ts's
+  // isUnconfiguredCardTargetError). The fixture below does not invent a shape:
+  // it carries UNCONFIGURED_CARD_TARGET_MARKER, the same exported constant the
+  // real refusal embeds and the predicate matches on, so the fixture cannot
+  // drift away from the producer. That the REAL transport's refusal actually
+  // carries the marker is asserted separately, against the real transport, in
+  // packages/shared-types/src/notifications.test.ts.
+  it("R5: an unconfigured operator target is recorded as no_operator_target_configured, not send_failed", async () => {
+    const { db, dbPath } = makeDb();
+    seedOneRule(db); // member_1 HAS a feishuOpenId, so the member send is tried first
+    const unconfiguredTransport = {
+      sendCard: async () => ({
+        ok: false,
+        error: `[${UNCONFIGURED_CARD_TARGET_MARKER}] Interactive card has no target: ... Set FEISHU_NOTIFY_CHAT_ID or FEISHU_NOTIFY_OPEN_ID.`
+      }),
+      updateCard: async () => ({ ok: true })
+    };
+    const failingQuoteProvider = async (): Promise<never> => {
+      throw new Error("Longbridge quote failed: forcing a hard-failure escalation");
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        poll.runMarketAlertsPoll({ dbPath, now: new Date(TRADING_TIME), quoteProvider: failingQuoteProvider, transport: unconfiguredTransport })
+      ).rejects.toThrow();
+    }
+
+    const artifact = JSON.parse(readFileSync(join(dirname(dbPath), "market-alerts", "ALERTER-DOWN.json"), "utf8"));
+    expect(artifact.reason).toBe("no_operator_target_configured");
+
+    const evidence = JSON.parse(
+      (db.prepare("SELECT evidence FROM run_log WHERE job = 'market-alerts' ORDER BY rowid DESC LIMIT 1").get() as { evidence: string }).evidence
+    ) as Array<Record<string, unknown>>;
+    expect(evidence).toContainEqual(
+      expect.objectContaining({ event: "escalation_undeliverable", reason: "no_operator_target_configured" })
+    );
+    db.close();
   });
 
   it("Fix 3: the artifact is deleted the moment an escalation actually gets delivered again", async () => {
@@ -1698,7 +1765,7 @@ describe("task H1 FOURTH fix round: unpersistable counters and the permanently-l
     // Escalated immediately - not throttled/waiting for a 3rd consecutive
     // failure the counter can never actually reach from this state.
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.target).toEqual({ operator: true });
     expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器状态无法持久化（磁盘/权限故障）");
 
     // Proves neither backstop actually persisted this cycle - the db insert
@@ -1734,7 +1801,7 @@ describe("task H1 FOURTH fix round: unpersistable counters and the permanently-l
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.target).toEqual({});
+    expect(sent[0]?.target).toEqual({ operator: true });
     expect(sent[0]?.cardJson.header.title.content).toBe("⚠ 提醒器状态无法持久化（磁盘/权限故障）");
 
     const statePath = join(dir, "market-alerts", "poller-state.json");

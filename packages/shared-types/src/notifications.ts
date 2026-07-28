@@ -261,9 +261,23 @@ export interface CardSendResult {
   error?: string;
 }
 
+/**
+ * Who a card is addressed to. `chatId`/`openId` name one conversation or one
+ * member; `operator: true` asks the transport to resolve the DEPLOYMENT's own
+ * operator target instead (see resolveDirectCardTarget). The flag is required
+ * rather than inferred from an empty object, so a caller whose member id came
+ * back undefined gets a refusal instead of a redirect - see that function's
+ * note for why that distinction is load-bearing.
+ */
+export interface CardTarget {
+  chatId?: string;
+  openId?: string;
+  operator?: boolean;
+}
+
 export interface CardTransport {
   sendCard(
-    target: { chatId?: string; openId?: string },
+    target: CardTarget,
     cardJson: unknown
   ): Promise<{ ok: boolean; messageId?: string; error?: string }>;
   updateCard(messageId: string, cardJson: unknown): Promise<{ ok: boolean; error?: string }>;
@@ -785,12 +799,29 @@ async function deliverReportViaAppCredentials(
 ): Promise<ReportDeliveryResult> {
   const resolved = resolveReportDeliveryTarget(scope);
   if (!resolved) {
+    // An owner-private report always resolves (its own ownerOpenId), so the
+    // ONLY way to land here is a circle-public report on a deployment where
+    // FEISHU_GROUP_CHAT_ID is unset AND no global target resolves either -
+    // the deploy target's shape today. Logged as well as returned: this is a
+    // configuration gap, not a transient send failure, and it must not depend
+    // on the caller choosing to print `reason`.
+    const reason = "No Feishu report target could be resolved for a circle-public report: FEISHU_GROUP_CHAT_ID is unset and no fallback target (FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID / stored target) resolved either. Nothing was sent. Set FEISHU_GROUP_CHAT_ID to the 圈子群 chat id, or DM the bot once to seed the stored target.";
+    console.error(`notifications: ${reason} (report: ${payload.title})`);
     return {
       sent: false,
       target: "none",
-      reason: "No Feishu report target could be resolved. Declare `scope: {visibility: \"owner-private\", ownerOpenId}` on the report payload, set FEISHU_GROUP_CHAT_ID (public reports) / FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
+      reason,
       deliveries: []
     };
+  }
+
+  if (resolved.groupFallback) {
+    // The case that actually occurs on the deploy target: FEISHU_GROUP_CHAT_ID
+    // unset, but a stored notification target resolves, so the public card
+    // ships to a DM and the circle never sees it. `groupFallback` alone lives
+    // or dies by the caller printing it; this line makes the misconfiguration
+    // visible in the job's own stderr either way.
+    console.error(`notifications: ${resolved.groupFallbackReason ?? "FEISHU_GROUP_CHAT_ID is not configured."} (report: ${payload.title})`);
   }
 
   const target = resolved.target;
@@ -1077,7 +1108,8 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
             reason: `报告「${payload.title}」自相矛盾：scope 声明归属 ${ownerOpenId}，payload.openId 却指向 ${routingOpenId}。两者都可能是正确的收件人，投递任何一方都可能把私有内容发错人，因此拒绝。`
           };
         }
-        return { kind: "owner-private", ownerOpenId };
+        return refuseMalformedOwnerOpenId(payload, ownerOpenId, "scope.ownerOpenId")
+          ?? { kind: "owner-private", ownerOpenId };
       }
 
       case "circle-public":
@@ -1095,7 +1127,8 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
   }
 
   if (routingOpenId !== "") {
-    return { kind: "owner-private", ownerOpenId: routingOpenId };
+    return refuseMalformedOwnerOpenId(payload, routingOpenId, "payload.openId")
+      ?? { kind: "owner-private", ownerOpenId: routingOpenId };
   }
   if (payload.audience === "group") {
     return { kind: "circle-public" };
@@ -1108,6 +1141,55 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
       "请在生产方补上 scope：公共报告用 {visibility:\"circle-public\"}，",
       "归属某位成员用 {visibility:\"owner-private\", ownerOpenId}，",
       "知道归属但找不到收件人用 {visibility:\"owner-unresolved\", reason}。"
+    ].join("")
+  };
+}
+
+/**
+ * The one shape check on an owner id, applied to BOTH the declared
+ * `scope.ownerOpenId` and the legacy `payload.openId` routing field. A Feishu
+ * open_id is `ou_` followed by the account's opaque suffix; an `oc_` chat id,
+ * an `on_` union id, an internal member id or an email in this field is a
+ * producer bug, and such a report must not be handed to a transport as though
+ * the string named a person.
+ *
+ * MEASURED (2026-07-28 R5, against the built dist, FEISHU_APP_ID/SECRET set):
+ * before this guard, `scope: {visibility: "owner-private", ownerOpenId:
+ * "oc_public_group"}` returned `sent: true` after POSTing im/v1/messages with
+ * `receive_id_type=open_id receive_id=oc_public_group`; the legacy
+ * `openId: "oc_public_group"` form behaved identically. So a chat id really did
+ * go out on the wire addressed as a person, and the run log recorded it as
+ * delivered.
+ *
+ * INFERRED, NOT MEASURED: that Feishu rejects such a send rather than
+ * delivering it into that chat. The only supporting evidence in this repo is
+ * the 2026-07-18 live probe recorded on directHttpCardTransport below - HTTP
+ * 400 code=230001 invalid receive_id - and that was a DIFFERENT mismatched id
+ * on the same endpoint, not this one. Nobody has sent an `oc_` id as an
+ * open_id at Feishu and watched what came back. This guard exists so the
+ * outcome stops depending on that inference: the refusal is local, named, and
+ * happens before any send.
+ *
+ * The `ou_` rule is Feishu's documented open_id format. Corroboration on the
+ * deploy target: its single linked member's stored id has the `ou_` prefix
+ * (read-only check, prefix only - no id values were read or printed).
+ */
+function refuseMalformedOwnerOpenId(
+  payload: ReportDeliveryPayload,
+  ownerOpenId: string,
+  field: "scope.ownerOpenId" | "payload.openId"
+): ReportScopeDecision | null {
+  if (/^ou_.+/u.test(ownerOpenId)) {
+    return null;
+  }
+
+  return {
+    kind: "undeliverable",
+    reason: [
+      `报告「${payload.title}」声明归属某位成员，但 ${field} 的值「${ownerOpenId}」不是飞书 open_id`,
+      "（open_id 形如 ou_xxx；oc_ 是会话 id，on_ 是 union_id）。",
+      "把它当作 open_id 发出去会把该成员的私有内容投给一个身份不明的收件人，因此在本地直接拒绝、不做任何发送。",
+      "请在生产方改用该成员真实的飞书 open_id，或改用 {visibility:\"owner-unresolved\", reason} 说明找不到收件人。"
     ].join("")
   };
 }
@@ -1617,7 +1699,7 @@ export function buildFeishuCardPayload(card: InteractiveCard): unknown {
 
 export async function sendInteractiveCard(
   card: InteractiveCard,
-  target: { chatId?: string; openId?: string },
+  target: CardTarget,
   transport: CardTransport = defaultCardTransport
 ): Promise<CardSendResult> {
   const payload = buildFeishuCardPayload(card);
@@ -1666,11 +1748,11 @@ export const directHttpCardTransport: CardTransport = {
     if (!credentials) {
       return { ok: false, error: "FEISHU_APP_ID / FEISHU_APP_SECRET are not configured for direct card send." };
     }
-    const targetType: "open_id" | "chat_id" = target.chatId ? "chat_id" : "open_id";
-    const targetId = target.chatId ?? target.openId;
-    if (!targetId) {
-      return { ok: false, error: "Interactive card target needs a chatId or openId." };
+    const resolvedTarget = resolveDirectCardTarget(target);
+    if (!resolvedTarget.ok) {
+      return { ok: false, error: resolvedTarget.error };
     }
+    const { targetType, targetId } = resolvedTarget;
     try {
       return await withNotificationRetry(async () => {
         const response = await fetch(
@@ -1732,6 +1814,112 @@ export const directHttpCardTransport: CardTransport = {
   }
 };
 
+type ResolvedCardTarget =
+  | { ok: true; targetType: "open_id" | "chat_id"; targetId: string }
+  | { ok: false; error: string };
+
+/**
+ * `{operator: true}` means "send this to whoever OPERATES this deployment" -
+ * how market-alerts-poll.mjs's escalation reaches a human when no member has a
+ * linked Feishu account, i.e. when the message being sent is "the alert poller
+ * itself is dead". Each transport resolves it its own way and neither consults
+ * the members table (the point - that table is what just came up empty): this
+ * one through resolveFeishuAppTarget() (the same FEISHU_NOTIFY_CHAT_ID /
+ * FEISHU_NOTIFY_OPEN_ID / stored-target / paired-chat chain the text and
+ * operational-alert paths above already use), the legacy MCP transport below
+ * through resolveFeishuUserPluginBotChatId().
+ *
+ * It has to be REQUESTED, never inferred from an absence. Every other caller in
+ * this repo addresses one member (`{openId: member.feishuOpenId}`), and if that
+ * id is ever undefined the card must be refused, NOT redirected: a login code
+ * or a review card quietly arriving in the operator's DM (or, on the legacy
+ * transport, the shared group chat) is precisely the owner-scoped-content-on-a-
+ * shared-surface failure this codebase keeps closing. So an empty target is
+ * still a refusal, and only the explicit flag opts in.
+ *
+ * 2026-07-28 R5. Before this, the operator form was spelled `{}` and THIS
+ * transport rejected it - while defaultCardTransport selects this transport
+ * whenever app credentials resolve, which is the deploy target's confirmed
+ * shape. Measured against the built dist with FEISHU_APP_ID/FEISHU_APP_SECRET
+ * set:
+ *   sendInteractiveCard(card, {}) -> {"ok":false,"error":"Interactive card
+ *   target needs a chatId or openId."}, zero HTTP requests attempted.
+ * The `{}` -> shared-chat behaviour that two comments in market-alerts-poll.mjs
+ * attributed to "defaultCardTransport" only ever existed in
+ * legacyMcpCardTransport, which a credentialed deployment never selects. So the
+ * one message whose job is to report the alerter as broken was the one message
+ * that could not be sent.
+ *
+ * On the deploy target this resolves through the STORED target rather than an
+ * env var: its .env.local sets FEISHU_APP_ID/FEISHU_APP_SECRET and no
+ * FEISHU_NOTIFY_* at all, and its notification_targets table already holds one
+ * `feishu` row of type open_id, source `openclaw-allowFrom` (read-only check;
+ * only the channel/type/source and the id's `ou_` prefix were read).
+ *
+ * Every failure here is NAMED and also logged, and the failures are kept apart:
+ * no target requested at all, versus nothing configured to be the operator
+ * (set an env var / DM the bot), versus the lookup itself throwing (the runtime
+ * is broken). The caller of the operator form reads a false return as "the
+ * whole Feishu channel is dead" and has no other channel left to explain
+ * itself on.
+ */
+function resolveDirectCardTarget(target: CardTarget): ResolvedCardTarget {
+  const chatId = target.chatId?.trim();
+  if (chatId) {
+    return { ok: true, targetType: "chat_id", targetId: chatId };
+  }
+
+  const openId = target.openId?.trim();
+  if (openId) {
+    return { ok: true, targetType: "open_id", targetId: openId };
+  }
+
+  if (!target.operator) {
+    return { ok: false, error: "Interactive card target needs a chatId or openId (or `operator: true` to address the deployment's operator)." };
+  }
+
+  // Deliberately NOT tryResolveGlobalFeishuTarget(): that helper maps a THROW
+  // and a clean "nothing is configured" onto the same `null`, and here they
+  // are different operator instructions. The lookup reads sqlite and $HOME, so
+  // it throws on exactly the broken-runtime scenario the loudest caller of the
+  // operator form (market-alerts-poll's db-open-failure escalation) is
+  // reporting - calling that "not configured" would send the operator to edit
+  // an env var over a corrupt database.
+  let operatorTarget: FeishuAppTarget | null = null;
+  try {
+    operatorTarget = resolveFeishuAppTarget();
+  } catch (lookupError) {
+    const error = `Interactive card operator-target lookup failed (no chatId/openId was given, so the deployment target had to be resolved): ${sanitizeNotificationError(lookupError)}`;
+    console.error(`notifications: ${error}`);
+    return { ok: false, error };
+  }
+
+  if (operatorTarget) {
+    return { ok: true, targetType: operatorTarget.targetType, targetId: operatorTarget.targetId };
+  }
+
+  const error = [
+    `[${UNCONFIGURED_CARD_TARGET_MARKER}] Interactive card has no target:`,
+    "the caller asked for the operator target (no chatId/openId given) and none is configured",
+    "for this deployment. Set FEISHU_NOTIFY_CHAT_ID or FEISHU_NOTIFY_OPEN_ID,",
+    "or DM the bot once so a target can be stored."
+  ].join(" ");
+  console.error(`notifications: ${error}`);
+  return { ok: false, error };
+}
+
+/**
+ * Embedded in the refusal above so a caller can tell "this deployment has no
+ * operator target configured" (fix the config) apart from "a target IS
+ * configured and the send was rejected" (fix auth/network) without
+ * pattern-matching prose that is free to change.
+ */
+export const UNCONFIGURED_CARD_TARGET_MARKER = "no_operator_target_configured";
+
+export function isUnconfiguredCardTargetError(error: string | undefined): boolean {
+  return typeof error === "string" && error.includes(UNCONFIGURED_CARD_TARGET_MARKER);
+}
+
 // Legacy transport reuses the feishu-user-plugin MCP subprocess channel
 // (see callFeishuUserPluginTool below) - a different Feishu app entirely.
 // Kept ONLY as the no-credentials fallback so pre-P10 dev setups keep their
@@ -1740,7 +1928,17 @@ export const directHttpCardTransport: CardTransport = {
 const legacyMcpCardTransport: CardTransport = {
   async sendCard(target, cardJson) {
     try {
-      const chatId = target.chatId ?? target.openId ?? resolveFeishuUserPluginBotChatId();
+      // 2026-07-28 R5: the fall-through used to be
+      // `target.chatId ?? target.openId ?? resolveFeishuUserPluginBotChatId()`,
+      // so a caller whose `member.feishuOpenId` came back undefined posted that
+      // member's card into the ONE SHARED GROUP CHAT this transport can reach,
+      // and reported ok. Reaching the shared chat now requires asking for the
+      // operator explicitly, exactly as in directHttpCardTransport.
+      const explicitTarget = target.chatId?.trim() || target.openId?.trim();
+      if (!explicitTarget && !target.operator) {
+        return { ok: false, error: "Interactive card target needs a chatId or openId (or `operator: true` to address the deployment's operator)." };
+      }
+      const chatId = explicitTarget || resolveFeishuUserPluginBotChatId();
       return await withNotificationRetry(async () => {
         const result = await callFeishuUserPluginTool("send_message_as_bot", {
           chat_id: chatId,

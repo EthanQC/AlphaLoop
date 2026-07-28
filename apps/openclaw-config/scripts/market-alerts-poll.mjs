@@ -212,10 +212,12 @@
 //   handle at all: it reads/bumps the SAME poller-state.json file Fix 4 (task
 //   H1 second fix round) already introduced (pure fs, no db needed) and, on
 //   the 3rd+ consecutive failure (honoring the identical 12h throttle), sends
-//   the escalation card straight to the `{}` fallback target - which also
-//   needs no db (see sendInteractiveCard/notifications.ts's
-//   defaultCardTransport: an empty target resolves via
-//   resolveFeishuUserPluginBotChatId(), independent of the members table).
+//   the escalation card straight to the `{operator: true}` target - which also
+//   needs no members table (see sendOperatorCard's own comment below for how
+//   each transport resolves an empty target; note that the direct HTTP one
+//   does consult the notification_targets row, so "no db needed" here means
+//   no db handle of OUR OWN - notifications.ts opens and closes its own, and
+//   degrades to a named refusal if it cannot).
 //
 //   Fix 3 - for `reason === "send_failed"` the delivery escalation card says
 //   the likely cause is Feishu auth expiry - but the member send AND the `{}`
@@ -337,6 +339,7 @@ import { fileURLToPath } from "node:url";
 import {
   MemberRepository,
   loadLocalEnv,
+  isUnconfiguredCardTargetError,
   openTradingDatabase,
   resolveRuntimePaths,
   sendInteractiveCard
@@ -546,7 +549,7 @@ async function logFailureWithFreshDb(dbPath, { now, error, transport }) {
     // open error every single cycle forever with nothing but a stderr line -
     // 100% silent. escalateWithoutDb does the escalation entirely without a
     // db: both the file counter (poller-state.json, Fix 4's own file - see
-    // its doc comment) and the `{}` fallback Feishu send work with no db
+    // its doc comment) and the `{operator: true}` fallback Feishu send work with no db
     // handle at all.
     //
     // Fix D (task H1 FOURTH fix round, this task): this function's own
@@ -618,7 +621,7 @@ async function escalateWithoutDb(dbPath, { now, error, openError, transport }) {
     // sendInteractiveCard's default transport, same as sendOperatorCard's
     // own fallback tier (see that function's doc comment).
     try {
-      const send = await sendInteractiveCard(card, {}, transport);
+      const send = await sendInteractiveCard(card, { operator: true }, transport);
       if (send.ok) {
         escalationSentAt = now.toISOString();
         clearAlerterDown(dbPath);
@@ -912,7 +915,7 @@ async function forceEscalateUnpersistable(dbPath, { now, transport, errorSummary
     ]
   };
   try {
-    const send = await sendInteractiveCard(card, {}, transport);
+    const send = await sendInteractiveCard(card, { operator: true }, transport);
     if (send.ok) {
       clearAlerterDown(dbPath);
       writeLastResortThrottle(dbPath, now);
@@ -1501,15 +1504,23 @@ async function sendRecoveryCard(db, transport, now, card, recoveryEvent) {
 // Fix 1: production currently has ZERO active members with a feishuOpenId,
 // and even when members exist, a send can fail (expired Feishu token,
 // network blip). Neither case may be silently treated as "delivered" - both
-// fall through to a FALLBACK send to the fixed channel
-// openclaw-cron-runner.mjs's own failure-alert path resolves independent of
-// the members table (see notifications.ts's defaultCardTransport:
-// sendInteractiveCard with neither chatId nor openId set falls back to
-// resolveFeishuUserPluginBotChatId(), the exact same bot chat id
-// deliverReportToFeishu ultimately posts cron failure/halt alerts to - so
-// passing an EMPTY target here reuses that same resolution rather than
-// re-implementing it). Only if that also fails/there is nothing to fall
-// back to do we report `delivered: false`.
+// fall through to a FALLBACK send addressed to the deployment's OPERATOR,
+// requested with `{operator: true}` on sendInteractiveCard. Both card
+// transports understand that form and neither reads the members table (the
+// point: this path exists because the members table just came up empty):
+// directHttpCardTransport - the one a credentialed deployment gets - resolves
+// it via resolveFeishuAppTarget() (FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID
+// / stored target / paired chat), and legacyMcpCardTransport via
+// resolveFeishuUserPluginBotChatId(). Only if that also fails, or nothing is
+// configured to fall back TO, do we report `delivered: false`.
+//
+// 2026-07-28 R5: this comment used to say the empty target "falls back to
+// resolveFeishuUserPluginBotChatId()" full stop. That was true only of the
+// LEGACY transport; directHttpCardTransport - which defaultCardTransport picks
+// whenever FEISHU_APP_ID/FEISHU_APP_SECRET resolve, the deploy target's shape -
+// refused an empty target outright, so this escalation could not be delivered
+// on the machine it was written to protect. Measured, then fixed in
+// notifications.ts (resolveDirectCardTarget); see that function's note.
 async function sendOperatorCard(db, transport, card) {
   const reachableMembers = new MemberRepository(db).listActive().filter((member) => member.feishuOpenId);
   let anyDelivered = false;
@@ -1537,12 +1548,18 @@ async function sendOperatorCard(db, transport, card) {
     return { delivered: true };
   }
 
-  const reason = reachableMembers.length === 0 ? "no_recipients" : "send_failed";
-  const fallback = await sendInteractiveCard(card, {}, transport);
+  const memberReason = reachableMembers.length === 0 ? "no_recipients" : "send_failed";
+  const fallback = await sendInteractiveCard(card, { operator: true }, transport);
   if (fallback.ok) {
     return { delivered: true };
   }
 
+  // "nothing is configured to send to" and "something is configured and the
+  // send was rejected" need different operator actions (set FEISHU_NOTIFY_* vs
+  // fix Feishu auth/network). By construction nobody can be told over Feishu at
+  // this point, so ALERTER-DOWN.json's `reason` and this stderr line are the
+  // only places that distinction survives - keep them apart.
+  const reason = isUnconfiguredCardTargetError(fallback.error) ? "no_operator_target_configured" : memberReason;
   console.error(
     `market-alerts-poll: operator card fallback delivery also failed (${reason}): ${fallback.error ?? "unknown error"}`
   );
