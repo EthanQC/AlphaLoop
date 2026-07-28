@@ -1,13 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
+import { createBrokerExecutorServer } from "../../broker-executor/dist/server.js";
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { runBackup } from "./backup-trading-data.mjs";
 import { recordJobRun } from "./job-run-log.mjs";
+import { saveSnapshot } from "./official-paper-monitor.mjs";
 
 const doctor = await import("./openclaw-runtime-doctor-core.mjs");
 const newsStore = await import("./news-store.mjs");
@@ -26,12 +30,38 @@ const HEALTHY_LISTENERS = {
 // the bottom of this file pins that shape against a REAL launchctl on the
 // machine running the tests, so this fixture cannot quietly drift into an
 // input no producer ever emits.
-const ALL_LAUNCHD_JOBS_LOADED = doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
-  label: job.label,
-  expectedDomain: job.domain,
-  loadedDomains: [job.domain],
-  state: "running"
-}));
+// Round-4 finding I5: "loaded" is no longer enough for this fixture to mean
+// "healthy" - checkLaunchdJobs now also asserts on the runtime fields the
+// probe collects. The healthy state differs per service and this fixture says
+// so, exactly as the mini's real `launchctl print` does: KeepAlive services
+// report `state = running` with a pid, scheduled ones report `state = not
+// running` with `last exit code = 0` BETWEEN runs (measured 2026-07-28 on the
+// mini: market-alerts runs=2945 last exit code=0, daily-backup runs=10 last
+// exit code=0, official-paper poll/pnl runs=240/239 last exit code=0). The
+// old fixture claimed `state: "running"` for all nine, which is a shape no
+// real machine ever reports.
+const ALL_LAUNCHD_JOBS_LOADED = doctor.REQUIRED_LAUNCHD_JOBS.map((job) => {
+  const resident = doctor.LAUNCHD_SERVICE_HEALTH[job.label].residency === "resident";
+  return {
+    label: job.label,
+    expectedDomain: job.domain,
+    loadedDomains: [job.domain],
+    state: resident ? "running" : "not running",
+    lastExitCode: resident ? null : 0,
+    lastExitReason: null,
+    pid: resident ? 4242 : null,
+    runs: 7,
+    stderrPath: `/tmp/${job.label}.err.log`
+  };
+});
+
+// Round-4 finding I5: official-paper-health and daily-backup-health read the
+// clock (the first only speaks during US regular market hours; the second
+// compares backup file stamps against today's Asia/Shanghai date). Tests that
+// supply a real dbPath/runtimeRoot but are NOT about those checks pin the
+// clock to a Saturday, so this file cannot behave differently depending on
+// what time of day the suite happens to run.
+const OUTSIDE_MARKET_HOURS = { nowMs: Date.parse("2026-07-11T12:00:00.000Z") };
 
 const otherDomain = (domain: string): string => (domain === "system" ? "user" : "system");
 
@@ -53,6 +83,13 @@ const PLATFORM_APP_HEALTH_DISABLED = { platformAppPort: 1 };
 // suite's behavior). Port 1 refuses the connection practically instantly
 // without needing a fake listener.
 const RSSHUB_HEALTH_DISABLED = { rsshubBaseUrl: "http://127.0.0.1:1" };
+
+// Round-4 finding I5: analyzeOpenClawRuntimeSnapshot now also probes
+// broker-executor's own /health over loopback - same hermetic-suite concern as
+// PLATFORM_APP_HEALTH_DISABLED / RSSHUB_HEALTH_DISABLED above. Port 1 refuses
+// instantly, so whether a real broker-executor happens to be running on 4312
+// on the machine executing this suite cannot change any test's outcome.
+const BROKER_EXECUTOR_HEALTH_DISABLED = { brokerExecutorPort: 1 };
 
 // v2 persona deployment fix: analyzeOpenClawRuntimeSnapshot now also checks
 // that the control agent workspace's AGENTS.md (the persona file
@@ -95,6 +132,7 @@ describe("OpenClaw runtime doctor core", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       gatewayListeners: [
         { pid: 100, command: "node", endpoint: "127.0.0.1:18789" }
       ],
@@ -122,6 +160,7 @@ describe("OpenClaw runtime doctor core", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [],
       cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
@@ -137,6 +176,7 @@ describe("OpenClaw runtime doctor core", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [],
       cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
@@ -154,6 +194,7 @@ describe("OpenClaw runtime doctor core", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       nowMs: Date.parse("2026-06-19T12:10:00.000Z"),
       gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
       gatewayErrorLines: [
@@ -193,6 +234,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
         label: job.label,
         expectedDomain: job.domain,
@@ -215,6 +257,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
         label: job.label,
         expectedDomain: job.domain,
@@ -243,6 +286,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED
     });
 
@@ -260,6 +304,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED
     });
 
@@ -273,6 +318,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
         label: job.label,
         expectedDomain: job.domain,
@@ -295,6 +341,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED.map((row) =>
         row.label === "com.openclaw.system.trading.broker-executor"
           ? { ...row, loadedDomains: ["system", "user"] }
@@ -313,6 +360,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: []
     });
 
@@ -377,6 +425,7 @@ describe("readLaunchdJobStates against the real launchctl (round-3 finding F2)",
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: doctor.readLaunchdJobStates()
     });
 
@@ -384,6 +433,339 @@ describe("readLaunchdJobStates against the real launchctl (round-3 finding F2)",
     for (const finding of report.findings.filter((entry: { code: string }) => entry.code.startsWith("launchd-jobs."))) {
       expect(finding.code).toMatch(/\.(?:not_loaded|wrong_domain)$/u);
     }
+  });
+});
+
+// Round-4 finding I5. Captured VERBATIM from the mini on 2026-07-28 with
+// `launchctl print gui/501/com.alphaloop.rsshub` (read-only ssh, nothing was
+// written there). Not hand-authored: it is what the real producer emits for
+// a scheduled job whose last run FAILED - the exact case the pre-I5 doctor
+// reported as perfectly healthy, because it only ever looked at
+// `loadedDomains`. It is also the case that breaks a naive `state` regex: the
+// job's own `state = not running` sits at one tab, and two more `state =
+// active` lines sit at two tabs inside the coalition dicts further down.
+const MINI_RSSHUB_PRINT_FAILED = `gui/501/com.alphaloop.rsshub = {
+	active count = 0
+	path = /Users/qingchang/Library/LaunchAgents/com.alphaloop.rsshub.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/zsh
+	arguments = {
+		/bin/zsh
+		-lc
+		export PATH="$HOME/.local/node-v24/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; cd "/Users/qingchang/AlphaLoop" && docker start rsshub
+	}
+
+	working directory = /Users/qingchang/AlphaLoop
+
+	stdout path = /Users/qingchang/AlphaLoop/logs/rsshub.log
+	stderr path = /Users/qingchang/AlphaLoop/logs/rsshub.err.log
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.dvs9W2Dl02/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.alphaloop.rsshub
+	}
+
+	domain = gui/501 [100015]
+	asid = 100015
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 1
+
+	resource coalition = {
+		ID = 338238
+		type = resource
+		state = active
+		active count = 1
+		name = com.alphaloop.rsshub
+	}
+
+	jetsam coalition = {
+		ID = 338239
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.alphaloop.rsshub
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	submitted job. ignore execute allowed
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = runatload | inferred program
+}
+`;
+
+// The same capture with the two lines that differ on a healthy run swapped
+// for the values the mini's OTHER scheduled agents really report (measured in
+// the same session: market-alerts `runs = 2945` / `last exit code = 0`,
+// daily-backup `runs = 10` / `last exit code = 0`).
+const MINI_RSSHUB_PRINT_OK = MINI_RSSHUB_PRINT_FAILED.replace("\tlast exit code = 1", "\tlast exit code = 0");
+
+// A resident daemon that is up, in the shape `launchctl print system/<label>`
+// really answers - measured on the mini for ai.openclaw.system.gateway
+// (`state = running`, `runs = 10`, `pid = 21802`, no `last exit code` line at
+// all while it has never exited).
+const MINI_RESIDENT_PRINT_RUNNING = `system/ai.openclaw.system.gateway = {
+	active count = 1
+	path = /Library/LaunchDaemons/ai.openclaw.system.gateway.plist
+	type = LaunchDaemon
+	state = running
+
+	stdout path = /Users/qingchang/.openclaw/logs/gateway.system.log
+	stderr path = /Users/qingchang/.openclaw/logs/gateway.system.err.log
+	domain = system
+	username = qingchang
+	group = staff
+
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 10
+	pid = 21802
+	last exit code = 0
+
+	resource coalition = {
+		ID = 338240
+		type = resource
+		state = active
+		active count = 1
+		name = ai.openclaw.system.gateway
+	}
+}
+`;
+
+// Drives the REAL readLaunchdJobStates with a stub `launchctl` that replays
+// real captured text, so the scenarios below go through the real parser and
+// the real check - no hand-written snapshot rows in between.
+function replayLaunchctl(options: {
+  userLabels: string[];
+  systemLabels: string[];
+  textFor?: (domain: "user" | "system", label: string) => string;
+}) {
+  const text = options.textFor ?? (() => MINI_RESIDENT_PRINT_RUNNING);
+  return (args: string[]): string | null => {
+    if (args[0] === "list") {
+      return ["PID\tStatus\tLabel", ...options.userLabels.map((label) => `-\t0\t${label}`)].join("\n");
+    }
+    const target = String(args[1] ?? "");
+    const label = target.replace(/^system\//u, "").replace(/^gui\/\d+\//u, "");
+    if (target.startsWith("system/")) {
+      return options.systemLabels.includes(label) ? text("system", label) : null;
+    }
+    return options.userLabels.includes(label) ? text("user", label) : null;
+  };
+}
+
+const isResident = (label: string): boolean =>
+  doctor.LAUNCHD_SERVICE_HEALTH[label]?.residency === "resident";
+
+const REQUIRED_LABELS = doctor.REQUIRED_LAUNCHD_JOBS.map((job: { label: string }) => job.label);
+const SYSTEM_LABELS = doctor.REQUIRED_LAUNCHD_JOBS
+  .filter((job: { domain: string }) => job.domain === "system")
+  .map((job: { label: string }) => job.label);
+
+async function analyzeLaunchdOnly(launchdJobs: unknown[]) {
+  return doctor.analyzeOpenClawRuntimeSnapshot({
+    ...CONTROL_PERSONA_HEALTHY,
+    ...HEALTHY_LISTENERS,
+    ...PLATFORM_APP_HEALTH_DISABLED,
+    ...RSSHUB_HEALTH_DISABLED,
+    ...BROKER_EXECUTOR_HEALTH_DISABLED,
+    ...OUTSIDE_MARKET_HOURS,
+    launchdJobs
+  });
+}
+
+const launchdFindings = (report: { findings: Array<{ code: string; severity: string }> }) =>
+  report.findings.filter((finding) => finding.code.startsWith("launchd-jobs."));
+
+describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')", () => {
+  it("gives every label in the ownership manifest a health definition, and nothing else", () => {
+    expect(Object.keys(doctor.LAUNCHD_SERVICE_HEALTH).sort()).toEqual([...REQUIRED_LABELS].sort());
+    for (const [label, contract] of Object.entries(doctor.LAUNCHD_SERVICE_HEALTH)) {
+      expect(["resident", "periodic"], label).toContain((contract as { residency: string }).residency);
+      expect((contract as { probe: string }).probe.length, label).toBeGreaterThan(0);
+    }
+  });
+
+  it("parses the mini's real `launchctl print` output, and is not fooled by the nested `state = active` lines", () => {
+    const [row] = doctor.readLaunchdJobStates(
+      [{ label: "com.alphaloop.rsshub", domain: "user", slug: "rsshub" }],
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: [],
+        textFor: () => MINI_RSSHUB_PRINT_FAILED
+      })
+    );
+
+    expect(row.state).toBe("not running");
+    expect(row.lastExitCode).toBe(1);
+    expect(row.runs).toBe(1);
+    expect(row.pid).toBeNull();
+    expect(row.stderrPath).toBe("/Users/qingchang/AlphaLoop/logs/rsshub.err.log");
+  });
+
+  it("REPLAY - the mini before the migration: six wrong_domain errors, plus the one job whose last run really failed", async () => {
+    // The mini's actual pre-migration layout, measured read-only on
+    // 2026-07-28: seven user-level agents (six of them labels that belong in
+    // the system domain), two real system daemons, and rsshub - which is in
+    // its correct domain but exits 1 every time, because its body is
+    // `docker start rsshub`.
+    const userLabels = [
+      "com.alphaloop.daily-backup",
+      "com.alphaloop.market-alerts",
+      "com.alphaloop.platform-app",
+      "com.alphaloop.rsshub",
+      "com.openclaw.trading.cron-runner",
+      "com.openclaw.trading.official-paper.poll",
+      "com.openclaw.trading.official-paper.pnl"
+    ];
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels,
+        systemLabels: ["ai.openclaw.system.gateway", "com.openclaw.system.trading.broker-executor"],
+        textFor: (_domain, label) => (label === "com.alphaloop.rsshub"
+          ? MINI_RSSHUB_PRINT_FAILED
+          : MINI_RESIDENT_PRINT_RUNNING)
+      })
+    );
+
+    const findings = launchdFindings(await analyzeLaunchdOnly(jobs));
+    expect(findings.filter((finding) => finding.code.endsWith(".wrong_domain"))).toHaveLength(6);
+    expect(findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "launchd-jobs.rsshub.last_run_failed", severity: "error" })
+    ]));
+    expect(findings).toHaveLength(7);
+  });
+
+  it("REPLAY - after the migration, with every service actually up: zero launchd findings", async () => {
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: SYSTEM_LABELS,
+        textFor: (_domain, label) => (label === "com.alphaloop.rsshub"
+          ? MINI_RSSHUB_PRINT_OK
+          : MINI_RESIDENT_PRINT_RUNNING)
+      })
+    );
+
+    expect(launchdFindings(await analyzeLaunchdOnly(jobs))).toEqual([]);
+  });
+
+  it("REPLAY - the defect: every label bootstrapped in the right domain but crash-looping is NOT a pass", async () => {
+    // This is the state that used to produce zero launchd findings and let
+    // the deploy runbook's acceptance step certify a machine on which nothing
+    // works: all nine labels bootstrapped where they belong, every one of them
+    // reporting `state = not running` / `last exit code = 1`.
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: SYSTEM_LABELS,
+        textFor: () => MINI_RSSHUB_PRINT_FAILED
+      })
+    );
+
+    const report = await analyzeLaunchdOnly(jobs);
+    const findings = launchdFindings(report);
+
+    expect(report.ok).toBe(false);
+    expect(findings.every((finding) => finding.severity === "error")).toBe(true);
+    expect(findings).toHaveLength(REQUIRED_LABELS.length);
+    // The four KeepAlive services are called out for being DOWN; the five
+    // scheduled ones for their last run having failed. "state = not running"
+    // alone must never fail a scheduled job - see the healthy replay above,
+    // where the same five report exactly that and produce nothing.
+    expect(findings.filter((finding) => finding.code.endsWith(".not_running")).map((f) => f.code).sort()).toEqual([
+      "launchd-jobs.broker-executor.not_running",
+      "launchd-jobs.cron-runner.not_running",
+      "launchd-jobs.gateway.not_running",
+      "launchd-jobs.platform-app.not_running"
+    ]);
+    expect(findings.filter((finding) => finding.code.endsWith(".last_run_failed"))).toHaveLength(5);
+    // The remediation has to be actionable and correct for the CURRENT
+    // installer, not the retired user-level one.
+    const platformApp = findings.find((finding) => finding.code === "launchd-jobs.platform-app.not_running");
+    expect(platformApp?.message).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+    expect(platformApp?.message).toContain("/Users/qingchang/AlphaLoop/logs/rsshub.err.log");
+    expect(platformApp?.message).not.toContain("launchd:install-backup-alerts");
+  });
+
+  it("warns rather than failing when a KeepAlive service is up but has crashed before", async () => {
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: SYSTEM_LABELS,
+        // Only the KeepAlive services carry the crashed-and-restarted text;
+        // the scheduled ones stay on their real healthy shape, so this test
+        // isolates the resident case instead of tripping five other findings.
+        textFor: (_domain, label) => (isResident(label)
+          ? MINI_RESIDENT_PRINT_RUNNING.replace("\tlast exit code = 0", "\tlast exit code = 1")
+          : MINI_RSSHUB_PRINT_OK)
+      })
+    );
+
+    const report = await analyzeLaunchdOnly(jobs);
+    expect(report.ok).toBe(true);
+    expect(launchdFindings(report).map((finding) => finding.code).sort()).toEqual([
+      "launchd-jobs.broker-executor.restarted_after_failure",
+      "launchd-jobs.cron-runner.restarted_after_failure",
+      "launchd-jobs.gateway.restarted_after_failure",
+      "launchd-jobs.platform-app.restarted_after_failure"
+    ]);
+  });
+
+  it("does not invent an exit code launchd never reported (a signal-killed job prints none)", async () => {
+    // Measured on the mini: com.alphaloop.platform-app was last terminated by
+    // SIGTERM (`launchctl list` status -15) and its `launchctl print` output
+    // carries NO `last exit code` line at all. Defaulting that to 0 would
+    // claim a clean exit launchd never reported; treating it as a failure
+    // would invent one. It must simply not be judged.
+    const withoutExitCode = MINI_RESIDENT_PRINT_RUNNING.replace("\tlast exit code = 0\n", "");
+    const jobs = doctor.readLaunchdJobStates(
+      doctor.REQUIRED_LAUNCHD_JOBS,
+      replayLaunchctl({
+        userLabels: ["com.alphaloop.rsshub"],
+        systemLabels: SYSTEM_LABELS,
+        textFor: (_domain, label) => (isResident(label) ? withoutExitCode : MINI_RSSHUB_PRINT_OK)
+      })
+    );
+
+    expect(jobs.find((row: { label: string }) => row.label === "com.alphaloop.platform-app")).toMatchObject({
+      state: "running",
+      lastExitCode: null
+    });
+    expect(launchdFindings(await analyzeLaunchdOnly(jobs))).toEqual([]);
+  });
+
+  it("stays silent for a snapshot from a caller that predates these fields", async () => {
+    // Forward/backward compatibility: `state`/`lastExitCode` absent means the
+    // probe never reported them, which must read as "not observed", never as
+    // "observed to be broken".
+    const legacyRows = doctor.REQUIRED_LAUNCHD_JOBS.map((job: { label: string; domain: string }) => ({
+      label: job.label,
+      expectedDomain: job.domain,
+      loadedDomains: [job.domain]
+    }));
+
+    expect(launchdFindings(await analyzeLaunchdOnly(legacyRows))).toEqual([]);
   });
 });
 
@@ -407,6 +789,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
       // No dbPath at all - this check must work even when the db is the
@@ -436,7 +819,9 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      ...OUTSIDE_MARKET_HOURS,
       dbPath
     });
 
@@ -459,6 +844,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - outside market hours
       dbPath
@@ -487,6 +873,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-13T15:00:00.000Z"), // Monday 11:00am US Eastern (EDT) - regular market hours
       dbPath
@@ -515,6 +902,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - the multi-day gap is expected off-hours
       dbPath
@@ -533,6 +921,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       runtimeRoot
     });
@@ -561,7 +950,9 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      ...OUTSIDE_MARKET_HOURS,
       runtimeRoot,
       dbPath
     });
@@ -596,6 +987,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2027-01-01T15:00:00.000Z"), // >30min after last run; year 2027 uncovered
       dbPath
@@ -630,6 +1022,7 @@ describe("alerts-poller-health check (task H2)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-11T12:00:00.000Z"), // Saturday - keeps this isolated from the stale-heartbeat check
       dbPath
@@ -673,6 +1066,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
+        ...BROKER_EXECUTOR_HEALTH_DISABLED,
         launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -696,6 +1090,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
+        ...BROKER_EXECUTOR_HEALTH_DISABLED,
         launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -721,6 +1116,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
         ...CONTROL_PERSONA_HEALTHY,
         ...HEALTHY_LISTENERS,
         ...RSSHUB_HEALTH_DISABLED,
+        ...BROKER_EXECUTOR_HEALTH_DISABLED,
         launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
         platformAppPort: port
       });
@@ -746,6 +1142,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       platformAppPort: freedPort,
       platformAppHealthTimeoutMs: 500
@@ -992,6 +1389,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED
       // no dbPath
     });
@@ -1009,7 +1407,9 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      ...OUTSIDE_MARKET_HOURS,
       dbPath
     });
 
@@ -1029,6 +1429,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // 24h later
       dbPath
@@ -1050,6 +1451,7 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
       nowMs: Date.parse("2026-07-14T12:00:00.000Z"), // >48h later
       dbPath
@@ -1075,7 +1477,9 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      ...OUTSIDE_MARKET_HOURS,
       dbPath
     });
 
@@ -1094,7 +1498,9 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      ...OUTSIDE_MARKET_HOURS,
       dbPath
     });
 
@@ -1109,6 +1515,435 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
 // system's only external observer - if any ONE check throws, the whole
 // process used to die with it, printing NOTHING (not even findings other
 // checks had already computed). Every check must now be failure-isolated.
+// Round-4 finding I5: broker-executor was one of the four daemons with no
+// health probe at all.
+describe("broker-executor-health check (round-4 finding I5)", () => {
+  function listenEphemeral(server: ReturnType<typeof createServer>): Promise<number> {
+    return new Promise((resolvePort) => {
+      server.listen(0, "127.0.0.1", () => resolvePort((server.address() as AddressInfo).port));
+    });
+  }
+
+  function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+    return new Promise((resolveClose) => server.close(() => resolveClose()));
+  }
+
+  it("reports nothing against the REAL broker-executor /health route", async () => {
+    // Not a stub shaped to match the doctor's expectation - this is
+    // apps/broker-executor's own createBrokerExecutorServer, the exact code
+    // the com.openclaw.system.trading.broker-executor daemon runs, answering
+    // over a real loopback socket. If that route's body ever stops carrying
+    // {ok:true, service:"broker-executor"}, this fails instead of the doctor
+    // quietly reporting a false error on the deploy machine.
+    const dir = makeTempDir("alphaloop-doctor-broker-db-");
+    const db = openTradingDatabase(join(dir, "trading.sqlite"));
+    const server = createBrokerExecutorServer({ db, sharedSecret: "test-only-not-a-real-secret" });
+    const port = await listenEphemeral(server as unknown as ReturnType<typeof createServer>);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        ...RSSHUB_HEALTH_DISABLED,
+        ...OUTSIDE_MARKET_HOURS,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+        brokerExecutorPort: port
+      });
+
+      expect(report.ok).toBe(true);
+      expect(report.findings.some((finding) => finding.code.startsWith("broker-executor-health."))).toBe(false);
+    } finally {
+      await closeServer(server as unknown as ReturnType<typeof createServer>);
+      db.close();
+    }
+  });
+
+  it("fails when the port answers but the process behind it is not broker-executor", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, service: "platform-app" }));
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        ...RSSHUB_HEALTH_DISABLED,
+        ...OUTSIDE_MARKET_HOURS,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+        brokerExecutorPort: port
+      });
+
+      expect(report.ok).toBe(false);
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "broker-executor-health.unexpected_body", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("fails when broker-executor answers with a non-200 status", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(503, { "content-type": "text/plain" });
+      res.end("unavailable");
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_DISABLED,
+        ...RSSHUB_HEALTH_DISABLED,
+        ...OUTSIDE_MARKET_HOURS,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+        brokerExecutorPort: port
+      });
+
+      expect(report.ok).toBe(false);
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "broker-executor-health.unexpected_status", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("warns, but does not fail, when nothing is listening (dev machine), naming the real installer", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
+      ...OUTSIDE_MARKET_HOURS,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
+    });
+
+    expect(report.ok).toBe(true);
+    const finding = report.findings.find((entry) => entry.code === "broker-executor-health.unreachable");
+    expect(finding?.severity).toBe("warn");
+    expect(finding?.message).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+    expect(finding?.message).toContain("BROKER_EXECUTOR_SHARED_SECRET");
+  });
+});
+
+// Round-4 finding I5: daily-backup has no port and writes no run_log row -
+// the only observable proof it worked is the backup file it produces.
+describe("daily-backup-health check (round-4 finding I5)", () => {
+  // Wednesday 2026-07-29 12:00 Asia/Shanghai, i.e. after that morning's 05:30
+  // run would have fired.
+  const NOW_MS = Date.parse("2026-07-29T04:00:00.000Z");
+
+  function backupSnapshot(runtimeRoot: string, extra: Record<string, unknown> = {}) {
+    return {
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs: NOW_MS,
+      runtimeRoot,
+      ...extra
+    };
+  }
+
+  // Produces the backup file by running the REAL producer (runBackup), so the
+  // name the doctor looks for is the name the daemon actually writes - not a
+  // second guess at its date format.
+  function seedRealBackup(runtimeRoot: string, whenMs: number): void {
+    const dbDir = makeTempDir("alphaloop-doctor-backup-src-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+    const result = runBackup({
+      dbPath,
+      dest: join(runtimeRoot, "backups"),
+      retentionDays: 3650,
+      now: new Date(whenMs)
+    });
+    expect(result.ok).toBe(true);
+  }
+
+  it("reports nothing when the newest backup is from today", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    seedRealBackup(runtimeRoot, NOW_MS);
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("daily-backup-health."))).toBe(false);
+  });
+
+  it("reports nothing when the newest backup is yesterday's (before today's 05:30 run)", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    seedRealBackup(runtimeRoot, NOW_MS - 24 * 60 * 60_000);
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.findings.some((finding) => finding.code.startsWith("daily-backup-health."))).toBe(false);
+  });
+
+  it("fails when the newest backup is two days old - at least one scheduled run was missed", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    seedRealBackup(runtimeRoot, NOW_MS - 2 * 24 * 60 * 60_000);
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(false);
+    const finding = report.findings.find((entry) => entry.code === "daily-backup-health.stale");
+    expect(finding?.severity).toBe("error");
+    expect(finding?.message).toContain("trading-2026-07-27.sqlite");
+  });
+
+  it("warns, without failing, when the daemon is installed but has never produced a backup", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "daily-backup-health.never_ran", severity: "warn" })
+    ]));
+  });
+
+  it("stays silent on a machine where the daily-backup daemon is not installed at all", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot, {
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.map((row) => (
+        row.label === "com.alphaloop.daily-backup" ? { ...row, loadedDomains: [], state: null } : row
+      ))
+    }));
+
+    expect(report.findings.some((finding) => finding.code.startsWith("daily-backup-health."))).toBe(false);
+  });
+});
+
+// Round-4 finding I5: the official-paper poll and pnl jobs were the other two
+// daemons with no probe. Neither binds a port nor writes run_log; each proves
+// itself by the official_paper_snapshots row it writes under its own `reason`.
+describe("official-paper-health check (round-4 finding I5)", () => {
+  // Tuesday 2026-07-28 12:00 America/New_York: 150 minutes past the open (so
+  // the hourly poll is judgeable) and an hour past the 10:00 pnl run.
+  const MIDDAY_ET = Date.parse("2026-07-28T16:00:00.000Z");
+
+  // Writes the row through the REAL producer (official-paper-monitor.mjs's
+  // own saveSnapshot), so the `reason` values and column names the doctor
+  // queries are the ones the daemon actually writes.
+  function seedSnapshot(dbPath: string, reason: string, fetchedAt: string): void {
+    const db = openTradingDatabase(dbPath);
+    try {
+      saveSnapshot(db, {
+        fetchedAt,
+        primaryAsset: { net_assets: 100000, total_cash: 50000 },
+        positions: []
+      }, reason, "__shared__");
+    } finally {
+      db.close();
+    }
+  }
+
+  function paperSnapshot(dbPath: string, extra: Record<string, unknown> = {}) {
+    return {
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs: MIDDAY_ET,
+      dbPath,
+      ...extra
+    };
+  }
+
+  function freshDbPath(): string {
+    const dbPath = join(makeTempDir("alphaloop-doctor-paper-db-"), "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+    return dbPath;
+  }
+
+  it("fails when the hourly poll has produced nothing for over two hours mid-session", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", new Date(MIDDAY_ET - 3 * 60 * 60_000).toISOString());
+    seedSnapshot(dbPath, "post_open_pnl", new Date(MIDDAY_ET - 2 * 60 * 60_000).toISOString());
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.poll.stale", severity: "error" })
+    ]));
+    expect(report.findings.some((finding) => finding.code === "official-paper-health.pnl.stale")).toBe(false);
+  });
+
+  it("reports nothing when both jobs have written recent rows", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", new Date(MIDDAY_ET - 30 * 60_000).toISOString());
+    seedSnapshot(dbPath, "post_open_pnl", new Date(MIDDAY_ET - 2 * 60 * 60_000).toISOString());
+    // The pnl job also renders this file; see the report_missing case below.
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-repo-");
+    mkdirSync(join(repoRoot, "reports", "official-paper"), { recursive: true });
+    writeFileSync(
+      join(repoRoot, "reports", "official-paper", `${new Date(MIDDAY_ET - 2 * 60 * 60_000).toISOString().slice(0, 10)}-post-open.md`),
+      "# 官方模拟盘\n"
+    );
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("fails when yesterday's pnl row is the newest one an hour after today's run was due", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", new Date(MIDDAY_ET - 30 * 60_000).toISOString());
+    seedSnapshot(dbPath, "post_open_pnl", new Date(MIDDAY_ET - 26 * 60 * 60_000).toISOString());
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.pnl.stale", severity: "error" })
+    ]));
+  });
+
+  it("fails when the pnl job wrote its snapshot but never produced the report file", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", new Date(MIDDAY_ET - 30 * 60_000).toISOString());
+    seedSnapshot(dbPath, "post_open_pnl", new Date(MIDDAY_ET - 2 * 60 * 60_000).toISOString());
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-repo-");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.pnl.report_missing", severity: "error" })
+    ]));
+  });
+
+  it("warns, without failing, when the daemons are installed but have never written a row", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(freshDbPath()));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.poll.never_ran", severity: "warn" }),
+      expect.objectContaining({ code: "official-paper-health.pnl.never_ran", severity: "warn" })
+    ]));
+  });
+
+  it("says nothing outside US regular market hours, when both jobs legitimately skip every tick", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", "2026-07-01T14:00:00.000Z");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, {
+      ...OUTSIDE_MARKET_HOURS
+    }));
+
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("says nothing in the first two hours of the session, when yesterday's row is still the newest one legitimately", async () => {
+    const dbPath = freshDbPath();
+    seedSnapshot(dbPath, "hourly_poll", "2026-07-27T18:00:00.000Z");
+    seedSnapshot(dbPath, "post_open_pnl", "2026-07-27T14:00:00.000Z");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, {
+      // 2026-07-28 10:00 America/New_York - 30 minutes past the open.
+      nowMs: Date.parse("2026-07-28T14:00:00.000Z")
+    }));
+
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("stays silent on a machine where neither official-paper daemon is installed", async () => {
+    const dbPath = freshDbPath();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, {
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.map((row) => (
+        row.label.startsWith("com.openclaw.trading.official-paper.")
+          ? { ...row, loadedDomains: [], state: null }
+          : row
+      ))
+    }));
+
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+});
+
+// Round-4 finding I5 (b): the doctor used to open the live trading database
+// through openTradingDatabase, which runs migrate() - a health check able to
+// change the schema of the database it is inspecting, and to CREATE it from
+// nothing on a machine where no service had ever run.
+describe("the health probes never write to the trading database (round-4 finding I5b)", () => {
+  it("leaves the schema version, the file bytes and every table untouched", async () => {
+    const dir = makeTempDir("alphaloop-doctor-readonly-");
+    const dbPath = join(dir, "trading.sqlite");
+    const seed = openTradingDatabase(dbPath);
+    recordJobRun(seed, {
+      job: "market-alerts",
+      startedAt: new Date(Date.parse("2026-07-11T11:50:00.000Z")).toISOString(),
+      ok: true
+    });
+    // Deliberately roll the schema version BACKWARDS. If anything in the
+    // doctor still called migrate(), this row would be silently upgraded
+    // again and the assertion below would catch it.
+    seed.exec("PRAGMA user_version = 1;");
+    const versionBefore = seed.prepare("PRAGMA user_version").get() as { user_version: number };
+    seed.close();
+
+    const before = statSync(dbPath);
+
+    await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
+      ...OUTSIDE_MARKET_HOURS,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      runtimeRoot: dir,
+      dbPath
+    });
+
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    const versionAfter = check.prepare("PRAGMA user_version").get() as { user_version: number };
+    check.close();
+
+    expect(versionAfter.user_version).toBe(versionBefore.user_version);
+    expect(versionBefore.user_version).toBe(1);
+    expect(statSync(dbPath).size).toBe(before.size);
+    expect(statSync(dbPath).mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it("does not create the trading database on a machine where nothing has ever run", async () => {
+    const dir = makeTempDir("alphaloop-doctor-nodb-");
+    const dbPath = join(dir, "trading.sqlite");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_DISABLED,
+      ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
+      ...OUTSIDE_MARKET_HOURS,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      dbPath
+    });
+
+    expect(existsSync(dbPath)).toBe(false);
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "alerts-poller-health.db_missing", severity: "warn" })
+    ]));
+  });
+});
+
 describe("failure isolation across checks (task H2 fix round)", () => {
   it("keeps every other check's findings intact, plus one error finding for the thrower, when a single check throws", async () => {
     // A crafted "malicious" runner result whose `job` getter throws - this
@@ -1127,6 +1962,7 @@ describe("failure isolation across checks (task H2 fix round)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
         label: job.label,
         expectedDomain: job.domain,
@@ -1167,6 +2003,7 @@ describe("control-persona check (v2 persona deployment fix)", () => {
       ...HEALTHY_LISTENERS,
       ...PLATFORM_APP_HEALTH_DISABLED,
       ...RSSHUB_HEALTH_DISABLED,
+      ...BROKER_EXECUTOR_HEALTH_DISABLED,
       launchdJobs: ALL_LAUNCHD_JOBS_LOADED
     };
   }

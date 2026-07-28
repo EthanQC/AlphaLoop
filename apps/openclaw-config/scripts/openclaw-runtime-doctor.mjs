@@ -24,7 +24,11 @@ const snapshot = {
   // itself sees.
   launchdJobs: readLaunchdJobStates(),
   runtimeRoot,
-  dbPath
+  dbPath,
+  // Round-4 finding I5: official-paper-health checks that the pnl job's
+  // markdown report actually landed under `<repo>/reports/official-paper/`,
+  // which is outside runtimeRoot - so the analyzer needs the repo root too.
+  repoRoot
 };
 
 // `launchdJobs` is already scoped to exactly the labels this repo owns (it is

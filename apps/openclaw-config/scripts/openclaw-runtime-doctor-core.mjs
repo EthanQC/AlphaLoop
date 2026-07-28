@@ -1,14 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
-import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { formatLocalDate, parseBackupFileDate } from "./backup-trading-data.mjs";
 import { readLaunchdOwnership } from "./install-launchd-ownership.mjs";
 import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
 import { newsEngineHealthStats } from "./news-store.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
-import { isUsRegularMarketHours } from "./trading-schedule.mjs";
+import { getZonedParts, isUsRegularMarketHours } from "./trading-schedule.mjs";
 
 // The command that actually installs each domain's jobs. Round-3 finding F2:
 // the old hint named `pnpm launchd:install-backup-alerts` for every missing
@@ -53,6 +54,82 @@ function buildRequiredLaunchdJobs(rows = readLaunchdOwnership()) {
   return jobs.map((job) => (slugCounts.get(job.slug) > 1 ? { ...job, slug: job.label } : job));
 }
 
+// Finding I5 (round-4): "loaded" is not "working". Every label in the
+// ownership manifest gets an entry here answering two questions the manifest
+// itself cannot:
+//
+//   residency - what `launchctl print`'s `state` line is ALLOWED to say.
+//               "resident" = KeepAlive=true in install-system-daemons.sh's
+//               write_plist call (gateway / broker-executor / platform-app /
+//               cron-runner): `state = running` is the only healthy answer,
+//               anything else means the service is down or crash-throttled.
+//               "periodic" = KeepAlive=false + a StartInterval/
+//               StartCalendarInterval (market-alerts / daily-backup /
+//               official-paper poll+pnl) or RunAtLoad-once
+//               (com.alphaloop.rsshub, see its plist template): `state = not
+//               running` BETWEEN runs is the normal steady state and must
+//               never be reported as a fault - what matters for these is the
+//               exit code of the last run.
+//
+//   probe     - the independent observation that proves the service is doing
+//               its job, not just that launchd holds a record for it. Named
+//               here (and printed in the no_health_contract finding) so a
+//               label added to the manifest without a real probe fails
+//               loudly instead of silently inheriting a check that proves
+//               nothing.
+//
+// Measured, not assumed: `launchctl print` on the mini (2026-07-28,
+// read-only) returns `state = running` + a `pid` for platform-app /
+// cron-runner / gateway / broker-executor, and `state = not running` +
+// `last exit code = 0` for market-alerts / daily-backup / official-paper
+// poll+pnl - with `last exit code = 1` for com.alphaloop.rsshub, which is a
+// genuine failure (its body is `docker start rsshub`) that the pre-I5 doctor
+// reported as perfectly healthy.
+//
+// This table is a second list of labels, which the header above rightly
+// warns about - so it is not allowed to drift silently: checkLaunchdJobs
+// emits `launchd-jobs.<slug>.no_health_contract` (error) for any required
+// label missing from it, and the test suite asserts its key set equals the
+// manifest's system+user rows exactly.
+export const LAUNCHD_SERVICE_HEALTH = {
+  "ai.openclaw.system.gateway": {
+    residency: "resident",
+    probe: "gateway-listeners（18789 上恰好一个监听进程）"
+  },
+  "com.openclaw.system.trading.broker-executor": {
+    residency: "resident",
+    probe: "broker-executor-health（127.0.0.1:4312/health 返回 200 且 service=broker-executor）"
+  },
+  "com.alphaloop.platform-app": {
+    residency: "resident",
+    probe: "platform-app-health（127.0.0.1:4314/health 返回 200 且 service=platform-app）"
+  },
+  "com.openclaw.trading.cron-runner": {
+    residency: "resident",
+    probe: "runner-listeners（18792 上恰好一个监听进程）"
+  },
+  "com.alphaloop.market-alerts": {
+    residency: "periodic",
+    probe: "alerts-poller-health（run_log 里 market-alerts 的心跳与连续失败数）"
+  },
+  "com.alphaloop.daily-backup": {
+    residency: "periodic",
+    probe: "daily-backup-health（runtime/backups 里最新 trading-<日期>.sqlite 的日期戳）"
+  },
+  "com.openclaw.trading.official-paper.poll": {
+    residency: "periodic",
+    probe: "official-paper-health（official_paper_snapshots 里 reason=hourly_poll 的最新一行）"
+  },
+  "com.openclaw.trading.official-paper.pnl": {
+    residency: "periodic",
+    probe: "official-paper-health（reason=post_open_pnl 的最新一行 + 对应的 reports/official-paper/<日期>-post-open.md）"
+  },
+  "com.alphaloop.rsshub": {
+    residency: "periodic",
+    probe: "rsshub-health（127.0.0.1:1200 容器探活）"
+  }
+};
+
 // Strips the shared reverse-DNS prefixes so a finding code reads
 // `launchd-jobs.platform-app.not_loaded` rather than
 // `launchd-jobs.com.alphaloop.platform-app.not_loaded`. Longest prefix first:
@@ -83,30 +160,47 @@ function launchdJobSlug(label) {
 // invisible to a probe that only looks where the label is supposed to be. It
 // is also the state a machine sits in between running the retire step and the
 // install step of the deploy runbook.
+// Round-4 finding I5: this used to return only `state`, and nothing ever
+// asserted on it - so eight bootstrapped-but-crash-looping daemons produced
+// zero findings. It now returns the whole runtime picture `launchctl print`
+// already hands us for free in the SAME call: `last exit code`, `last exit
+// reason`, `pid`, `runs`, and the job's own `stderr path`. The stderr path
+// especially: naming the log file in a finding by reading it back out of
+// launchd means the doctor can never point at a stale path a later installer
+// change moved, which a hardcoded per-label table here inevitably would.
 export function readLaunchdJobStates(requiredJobs = REQUIRED_LAUNCHD_JOBS, launchctl = runLaunchctl) {
   const userLabels = readUserDomainLaunchdLabels(launchctl);
   const uid = process.getuid?.();
   return requiredJobs.map((job) => {
     const loadedDomains = [];
-    let userState = null;
-    let systemState = null;
+    let userDetail = null;
+    let systemDetail = null;
 
     if (userLabels.has(job.label)) {
       loadedDomains.push("user");
-      userState = uid === undefined ? "unknown" : readLaunchdJobState(`gui/${uid}/${job.label}`, launchctl);
+      userDetail = uid === undefined
+        ? { state: "unknown", lastExitCode: null, lastExitReason: null, pid: null, runs: null, stderrPath: null }
+        : readLaunchdJobDetail(`gui/${uid}/${job.label}`, launchctl);
     }
-    systemState = readLaunchdJobState(`system/${job.label}`, launchctl);
-    if (systemState !== null) {
+    systemDetail = readLaunchdJobDetail(`system/${job.label}`, launchctl);
+    if (systemDetail !== null) {
       loadedDomains.push("system");
     }
+
+    // Prefer the detail from the domain that is supposed to own the job, so
+    // a correctly installed machine reports the state that matters.
+    const detail = (job.domain === "system" ? systemDetail ?? userDetail : userDetail ?? systemDetail) ?? null;
 
     return {
       label: job.label,
       expectedDomain: job.domain,
       loadedDomains,
-      // Prefer the state from the domain that is supposed to own the job, so
-      // a correctly installed machine reports the state that matters.
-      state: (job.domain === "system" ? systemState ?? userState : userState ?? systemState) ?? null
+      state: detail?.state ?? null,
+      lastExitCode: detail?.lastExitCode ?? null,
+      lastExitReason: detail?.lastExitReason ?? null,
+      pid: detail?.pid ?? null,
+      runs: detail?.runs ?? null,
+      stderrPath: detail?.stderrPath ?? null
     };
   });
 }
@@ -126,16 +220,132 @@ function readUserDomainLaunchdLabels(launchctl) {
   );
 }
 
-// Returns the `state = ...` value when the job exists in that domain, `null`
-// when it does not - so "exists" and "is currently executing" stay
-// distinguishable (a periodic job between runs is legitimately loaded and not
-// running, which must not be reported as missing).
-function readLaunchdJobState(target, launchctl) {
+// Returns the job's runtime detail when it exists in that domain, `null` when
+// it does not - so "exists" and "is currently executing" stay distinguishable
+// (a periodic job between runs is legitimately loaded and not running, which
+// must not be reported as missing).
+//
+// `last exit code` is deliberately allowed to be ABSENT rather than defaulted
+// to 0: measured on the mini, a job whose last termination was by SIGNAL
+// (platform-app, `launchctl list` status -15) prints no `last exit code` line
+// at all, and locally a jetsam kill prints `last exit reason = JETSAM_...`
+// instead. Defaulting the missing line to 0 would invent a clean exit that
+// launchd never claimed.
+function readLaunchdJobDetail(target, launchctl) {
   const output = launchctl(["print", target]);
   if (output === null) {
     return null;
   }
-  return String(output).match(/^\s*state\s*=\s*(.+?)\s*$/mu)?.[1] ?? "unknown";
+  const text = String(output);
+  return {
+    // `state` keeps the pre-I5 loose fallback so this cannot report LESS than
+    // it used to on a launchctl that indents differently; every field added
+    // by I5 is strict-only (see readLaunchdPrintField).
+    state: readLaunchdPrintField(text, "state", { fallbackToLoose: true }) ?? "unknown",
+    lastExitCode: toFiniteNumber(readLaunchdPrintField(text, "last exit code")),
+    lastExitReason: readLaunchdPrintField(text, "last exit reason"),
+    pid: toFiniteNumber(readLaunchdPrintField(text, "pid")),
+    runs: toFiniteNumber(readLaunchdPrintField(text, "runs")),
+    stderrPath: readLaunchdPrintField(text, "stderr path")
+  };
+}
+
+// `launchctl print` indents the job dict's own keys with exactly ONE tab and
+// every nested dict's keys with two or more - verified against ~400 real jobs
+// on this laptop and against the AlphaLoop labels on the mini. Anchoring on
+// that single tab is what keeps `state` from picking up the `state = active`
+// lines inside the nested coalition/endpoint dicts, which a looser `^\s*state`
+// would also match.
+//
+// The loose fallback is opt-in per field, and only `state` opts in - that
+// preserves exactly the behaviour of the pre-I5 probe (whose only pattern was
+// the loose one, and which still returned the right answer because the
+// top-level line always comes first in the output). The new fields do NOT opt
+// in: a nested `pid` with no top-level one would otherwise be reported as the
+// job's pid, i.e. an observation nothing actually made.
+function readLaunchdPrintField(text, key, { fallbackToLoose = false } = {}) {
+  const strict = text.match(new RegExp(`^\\t${key} = (.*)$`, "mu"));
+  if (strict) {
+    return strict[1].trim();
+  }
+  if (!fallbackToLoose) {
+    return null;
+  }
+  return text.match(new RegExp(`^\\s*${key}\\s*=\\s*(.+?)\\s*$`, "mu"))?.[1] ?? null;
+}
+
+// `(never exited)` - launchd's own wording for "this job has never
+// terminated" - is not a number and must stay `null` rather than becoming
+// NaN or a fabricated 0.
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// Round-4 finding I5 (b): every db-backed check here used to call
+// openTradingDatabase, which runs `migrate(db)` - i.e. a HEALTH CHECK could
+// migrate the schema of the live trading database, and on a machine that had
+// never run anything it CREATED runtime/trading.sqlite from scratch and then
+// reported on the empty database it had just made. A doctor must observe the
+// system, not change it.
+//
+// This opens the same file `readOnly: true`, which SQLite enforces at the
+// engine level (an INSERT on this handle fails with "attempt to write a
+// readonly database"), and refuses to open a path that does not exist rather
+// than creating it. Verified on this Node build (v25.8.1, node:sqlite): the
+// read-only handle reads a WAL database written by another process, blocks
+// writes, and throws `unable to open database file` for a missing path.
+//
+// Honest limit, not fixable from here: reading a WAL database still makes
+// SQLite materialise the `-shm`/`-wal` sidecar files if they are absent
+// (they exist permanently on the mini, where the services hold the database
+// open). That is inherent to every WAL reader; the database file itself, its
+// schema and its rows are untouched.
+const DOCTOR_DB_MISSING = "DOCTOR_DB_MISSING";
+
+function openTradingDatabaseReadOnly(dbPath) {
+  if (!existsSync(dbPath)) {
+    const missing = new Error(`交易数据库文件不存在：${dbPath}`);
+    missing.code = DOCTOR_DB_MISSING;
+    throw missing;
+  }
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  db.exec("PRAGMA busy_timeout = 5000;");
+  return db;
+}
+
+// Runs `read(db)` against a read-only handle and turns every failure into a
+// finding instead of a throw. The open itself is lazy in node:sqlite (a
+// corrupt file opens fine and fails on first query), so the QUERY has to be
+// inside the same try as the open - otherwise a garbage trading.sqlite would
+// escape as an unhandled throw and only be caught by the outer per-check
+// isolation, losing the specific `db_unreachable` code an operator greps for.
+function withReadOnlyTradingDb(dbPath, codePrefix, subject, read) {
+  let db;
+  try {
+    db = openTradingDatabaseReadOnly(dbPath);
+    return read(db);
+  } catch (dbError) {
+    if (dbError?.code === DOCTOR_DB_MISSING) {
+      // A machine where nothing has ever opened the trading database. Not an
+      // error: the doctor used to CREATE the file here, which manufactured
+      // the very "everything is fine, the table is just empty" answer it then
+      // reported.
+      return [warn(
+        `${codePrefix}.db_missing`,
+        `交易数据库尚未创建（${dbPath}），无法检查${subject}。部署机器上这说明所有服务都还没跑过；开发机上属正常。`
+      )];
+    }
+    return [error(
+      `${codePrefix}.db_unreachable`,
+      `无法以只读方式读取交易数据库以检查${subject}：${describeError(dbError)}`
+    )];
+  } finally {
+    db?.close();
+  }
 }
 
 // `null` on a non-zero exit, which for `launchctl print` IS the answer ("no
@@ -230,6 +440,9 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot) },
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
     { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
+    { name: "broker-executor-health", run: () => checkBrokerExecutorHealth(snapshot) },
+    { name: "daily-backup-health", run: () => checkDailyBackupHealth(snapshot, nowMs) },
+    { name: "official-paper-health", run: () => checkOfficialPaperHealth(snapshot, nowMs) },
     { name: "rsshub-health", run: () => checkRsshubHealth(snapshot) },
     { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) },
     { name: "control-persona", run: () => checkControlPersona(snapshot) }
@@ -425,9 +638,125 @@ function checkLaunchdJobs(snapshot) {
             + `（见 install-launchd-ownership.txt）。请执行 ${install} 完成迁移。`
       ));
     }
+
+    // Round-4 finding I5: the domain checks above answer "is a record for
+    // this label loaded". They are reported alongside, never instead of, the
+    // runtime state below - a job in the wrong domain that is ALSO
+    // crash-looping is two separate problems, and hiding the second until
+    // the first is fixed is how a machine passes an acceptance gate while
+    // every service on it is dead.
+    findings.push(...checkLaunchdJobRuntime(job, row));
   }
 
   return findings;
+}
+
+// Round-4 finding I5, the whole point of it: `state` was collected by the
+// probe and printed in the CLI snapshot, but NO check ever read it - so a
+// machine with all eight labels bootstrapped and every one of them reporting
+// `state = not running` / `last exit code = 1` produced zero launchd
+// findings and passed the deploy runbook's acceptance step.
+//
+// What counts as broken depends on the service, which is why
+// LAUNCHD_SERVICE_HEALTH exists (see its own comment): `state = not running`
+// is a fault for a KeepAlive daemon and the ordinary steady state for a
+// scheduled one, so a single uniform assertion would either miss the first
+// or false-alarm on the second, every five minutes, forever.
+function checkLaunchdJobRuntime(job, row) {
+  const contract = LAUNCHD_SERVICE_HEALTH[job.label];
+  if (!contract) {
+    return [error(
+      `launchd-jobs.${job.slug}.no_health_contract`,
+      `${job.label} 出现在 install-launchd-ownership.txt 里，但 doctor 的 LAUNCHD_SERVICE_HEALTH 没有它的健康定义，`
+        + `因此只能判断它"有没有被 launchd 记住"，无法判断它是否真的在工作。`
+        + `请在 openclaw-runtime-doctor-core.mjs 的 LAUNCHD_SERVICE_HEALTH 里补上它的 residency 与探针。`
+    )];
+  }
+
+  if (row.state === null || row.state === undefined) {
+    // Not loaded anywhere (already reported above), or a snapshot from a
+    // caller that predates this field. Either way there is no state to judge.
+    return [];
+  }
+
+  const state = String(row.state);
+  const exitCode = toFiniteNumber(row.lastExitCode);
+  const failedExit = exitCode !== null && exitCode !== 0;
+  const findings = [];
+  const where = describeLaunchdExit(row);
+  const logs = row.stderrPath ? `错误日志：${row.stderrPath}。` : "";
+  const install = LAUNCHD_INSTALL_COMMAND[job.domain];
+
+  if (state === "unknown") {
+    findings.push(warn(
+      `launchd-jobs.${job.slug}.state_unknown`,
+      `launchctl 认得 ${job.label}，但它的输出里没有 state 字段，无法判断它是否在运行（${contract.probe} 仍是判断它是否真的在工作的依据）。`
+    ));
+  } else if (contract.residency === "resident") {
+    if (state !== "running") {
+      const kickstart = job.domain === "system"
+        ? `sudo launchctl kickstart -k system/${job.label}`
+        : `launchctl kickstart -k gui/$(id -u)/${job.label}`;
+      findings.push(error(
+        `launchd-jobs.${job.slug}.not_running`,
+        `launchd 任务 ${job.label} 已加载但当前没有在运行（state = ${state}${where}）——它是常驻服务（KeepAlive），`
+          + `"已加载"不等于"在工作"。${logs}排查后可用 ${kickstart} 重启，或重跑 ${install}。`
+      ));
+    } else if (failedExit) {
+      findings.push(warn(
+        `launchd-jobs.${job.slug}.restarted_after_failure`,
+        `launchd 任务 ${job.label} 现在在运行，但它上一次退出是失败的（${where.replace(/^，/u, "")}）——KeepAlive 把它拉起来了，`
+          + `说明它至少崩过一次。${logs}`
+      ));
+    }
+  } else if (failedExit) {
+    findings.push(error(
+      `launchd-jobs.${job.slug}.last_run_failed`,
+      `launchd 任务 ${job.label} 最近一次运行以非零码退出（${where.replace(/^，/u, "")}）——它是周期任务，`
+        + `"state = not running" 本身正常，但上一次执行确实失败了。${logs}`
+    ));
+  }
+
+  return findings;
+}
+
+// Renders whatever launchd actually told us about the last termination.
+// Nothing here is defaulted: a job with no `last exit code` line (measured on
+// the mini: platform-app, killed by SIGTERM) says so instead of being
+// reported as a clean exit.
+function describeLaunchdExit(row) {
+  const parts = [];
+  const exitCode = toFiniteNumber(row.lastExitCode);
+  if (exitCode !== null) {
+    parts.push(`last exit code = ${exitCode}`);
+  }
+  if (row.lastExitReason) {
+    parts.push(`last exit reason = ${row.lastExitReason}`);
+  }
+  if (exitCode === null && !row.lastExitReason) {
+    parts.push("launchctl 未给出退出码");
+  }
+  const runs = toFiniteNumber(row.runs);
+  if (runs !== null) {
+    parts.push(`runs = ${runs}`);
+  }
+  const pid = toFiniteNumber(row.pid);
+  if (pid !== null) {
+    parts.push(`pid = ${pid}`);
+  }
+  return parts.length > 0 ? `，${parts.join("，")}` : "";
+}
+
+// Whether launchd currently holds this label in ANY domain, per the same
+// snapshot rows checkLaunchdJobs reads. The artifact/row-freshness probes
+// below gate on this: "runtime/backups has no backup from the last two days"
+// only means something on a machine where com.alphaloop.daily-backup is
+// actually installed - on a dev box it would be a permanent false alarm, and
+// the `not_loaded` warning already covers that case honestly.
+function isLaunchdJobLoaded(snapshot, label) {
+  const row = (Array.isArray(snapshot.launchdJobs) ? snapshot.launchdJobs : [])
+    .find((entry) => String(entry?.label) === label);
+  return Array.isArray(row?.loadedDomains) && row.loadedDomains.length > 0;
 }
 
 function describeDomains(domains) {
@@ -510,6 +839,291 @@ async function checkPlatformAppHealth(snapshot) {
   }
 
   return [];
+}
+
+// Round-4 finding I5 - "broker-executor-health" check. broker-executor was
+// one of the four daemons with NO health probe at all: the doctor knew only
+// that launchd held its label, which stayed true while the process
+// crash-looped. It is a KeepAlive HTTP service like platform-app, so
+// "working" has the same observable meaning - its own /health route answers
+// over loopback - and this check is deliberately the same shape as
+// checkPlatformAppHealth rather than a second dialect.
+//
+// Port mirrors apps/broker-executor/src/index.ts's own
+// `process.env.BROKER_EXECUTOR_PORT ?? 4312`. The route is served before any
+// authentication (server.ts's first branch), so this needs no shared secret
+// and never sees order data.
+//
+// Severity split matches platform-app's: unreachable is a `warn` (a dev
+// machine legitimately does not run it), while a response that ARRIVES but
+// is wrong is an `error` - the process is up and broken, which is exactly
+// the state "loaded" could never distinguish.
+const BROKER_EXECUTOR_HEALTH_DEFAULT_PORT = 4312;
+const BROKER_EXECUTOR_HEALTH_TIMEOUT_MS = 1500;
+
+async function checkBrokerExecutorHealth(snapshot) {
+  const port = Number(
+    snapshot.brokerExecutorPort ?? process.env.BROKER_EXECUTOR_PORT ?? BROKER_EXECUTOR_HEALTH_DEFAULT_PORT
+  );
+  const url = `http://127.0.0.1:${port}/health`;
+  const timeoutMs = Number(snapshot.brokerExecutorHealthTimeoutMs ?? BROKER_EXECUTOR_HEALTH_TIMEOUT_MS);
+  const fetchImpl = typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch;
+
+  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    response = await fetchImpl(url, { signal: controller.signal });
+  } catch (fetchError) {
+    return [warn(
+      "broker-executor-health.unreachable",
+      `broker-executor 健康检查不可达（${url}）：${describeError(fetchError)}。开发机上没起这个服务是正常的；`
+        + `部署机器上请跑 ${LAUNCHD_INSTALL_COMMAND.system} 安装 com.openclaw.system.trading.broker-executor（系统域 daemon），`
+        + `并确认 BROKER_EXECUTOR_SHARED_SECRET 已配置——缺这个环境变量时进程会在绑定端口前就退出，而 launchd 里仍然显示"已加载"。`
+    )];
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    return [error(
+      "broker-executor-health.unexpected_status",
+      `broker-executor 健康检查返回非预期状态码（${url}）：HTTP ${response.status} ${response.statusText}。进程在跑但可能已经异常，请检查 broker-executor 日志。`
+    )];
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch (parseError) {
+    return [error(
+      "broker-executor-health.unexpected_body",
+      `broker-executor 健康检查响应无法解析为 JSON（${url}）：${describeError(parseError)}。`
+    )];
+  }
+
+  if (!body || body.ok !== true || body.service !== "broker-executor") {
+    return [error(
+      "broker-executor-health.unexpected_body",
+      `broker-executor 健康检查响应内容不符合预期（${url}），期望 {"ok":true,"service":"broker-executor"}，实际收到：${JSON.stringify(body)}。`
+    )];
+  }
+
+  return [];
+}
+
+// Round-4 finding I5 - "daily-backup-health" check. daily-backup is the
+// second of the four unprobed daemons, and unlike the KeepAlive services it
+// has no port and writes no run_log row: the only thing that proves it did
+// its job is the ARTIFACT it produces, `runtime/backups/trading-<日期>.sqlite`
+// (see backup-trading-data.mjs's runBackup). So "working" here means "the
+// newest backup file is dated today or yesterday".
+//
+// The date comes from parseBackupFileDate/formatLocalDate imported from that
+// same producer module rather than a second copy of its file-name pattern
+// and time zone - a doctor that parsed the file name slightly differently
+// from the writer would silently read every backup as missing.
+//
+// Threshold rationale, chosen so it can NEVER false-alarm on timing: the job
+// runs at 05:30 local daily (install-system-daemons.sh's
+// SCHEDULE_DAILY_BACKUP). At 05:29 the newest backup is legitimately
+// yesterday's, so a one-day gap is normal all day long; two days means at
+// least one scheduled run was missed with a further full day of slack on top.
+// Hence `>= 2` and not `>= 1`. A machine that has never produced a backup at
+// all is a `warn`, not an error - a freshly installed daemon really has
+// nothing yet, and its first run lands within a day.
+const DAILY_BACKUP_STALE_DAYS = 2;
+const DAILY_BACKUP_TIMEZONE = "Asia/Shanghai";
+
+function checkDailyBackupHealth(snapshot, nowMs) {
+  if (!snapshot.runtimeRoot || !isLaunchdJobLoaded(snapshot, "com.alphaloop.daily-backup")) {
+    return [];
+  }
+
+  const backupsDir = join(snapshot.runtimeRoot, "backups");
+  const stamps = existsSync(backupsDir)
+    ? readdirSync(backupsDir)
+      .filter((name) => name.startsWith("trading-"))
+      .map((name) => parseBackupFileDate(name))
+      .filter(Boolean)
+      .sort()
+    : [];
+  const newest = stamps.at(-1) ?? null;
+
+  if (!newest) {
+    return [warn(
+      "daily-backup-health.never_ran",
+      `com.alphaloop.daily-backup 已加载，但 ${backupsDir} 里没有任何 trading-<日期>.sqlite 备份——这个任务从未成功产出过。`
+        + `可以手动跑一次 pnpm backup:daily 看它报什么错。`
+    )];
+  }
+
+  const todayStamp = formatLocalDate(new Date(nowMs), DAILY_BACKUP_TIMEZONE);
+  const ageDays = Math.round(
+    (Date.parse(`${todayStamp}T00:00:00Z`) - Date.parse(`${newest}T00:00:00Z`)) / 86_400_000
+  );
+  if (Number.isFinite(ageDays) && ageDays >= DAILY_BACKUP_STALE_DAYS) {
+    return [error(
+      "daily-backup-health.stale",
+      `每日备份已经 ${ageDays} 天没有产出：${backupsDir} 里最新的一份是 trading-${newest}.sqlite，今天是 ${todayStamp}。`
+        + `com.alphaloop.daily-backup 每天 05:30 跑一次，隔两天就说明至少漏了一次。请看 logs/daily-backup.err.log，或手动跑 pnpm backup:daily 复现。`
+    )];
+  }
+
+  return [];
+}
+
+// Round-4 finding I5 - "official-paper-health" check, covering the last two
+// unprobed daemons (com.openclaw.trading.official-paper.poll and .pnl).
+// Neither writes run_log and neither binds a port; what each one produces is
+// a ROW in official_paper_snapshots tagged with its own `reason` (see
+// official-paper-monitor.mjs's saveSnapshot call sites: "hourly_poll" for the
+// poll job, "post_open_pnl" for the pnl job). So "working" = "a row carrying
+// my reason exists, and it is recent".
+//
+// Both jobs fire on the clock but no-op outside their window (the plists run
+// them hourly; the scripts' own shouldRunOfficialPaperHourlyPoll /
+// shouldRunOfficialPaperPnlReport return false and print `{"skipped":true}`),
+// so freshness is only judgeable DURING US regular market hours - and only
+// once enough of the session has elapsed that a run was actually due:
+//
+//   poll - hourly from 09:30 ET. Judged from 2 hours after the open, by which
+//          point the 09:30 and 10:30 runs have both come and gone, so a
+//          newest row older than 2 hours means two consecutive misses. Before
+//          then the newest row is legitimately yesterday's and judging it
+//          would fire every single morning.
+//   pnl  - only ever acts at 10:00 ET. Judged from 11:00 ET, when today's run
+//          is an hour past due; the row must then be under 24h old, which is
+//          false exactly when today's 10:00 run did not happen (yesterday's
+//          is 25h+ old by 11:00, and Friday's is 73h+ old by Monday 11:00).
+//
+// Outside those windows this check reports nothing rather than guessing - the
+// launchd exit-code assertion above is what covers these two jobs at other
+// hours.
+const OFFICIAL_PAPER_POLL_STALE_MS = 2 * 60 * 60_000;
+const OFFICIAL_PAPER_POLL_JUDGE_AFTER_MINUTES = 120;
+const OFFICIAL_PAPER_PNL_STALE_MS = 24 * 60 * 60_000;
+const OFFICIAL_PAPER_PNL_JUDGE_FROM_HOUR = 11;
+// Mirrors trading-schedule.mjs's own NEW_YORK_TIMEZONE (not exported there);
+// same "mirror the constant with a comment, don't import the module graph"
+// rule the platform-app/rsshub checks already follow.
+const NEW_YORK_TIMEZONE = "America/New_York";
+
+function checkOfficialPaperHealth(snapshot, nowMs) {
+  const pollLoaded = isLaunchdJobLoaded(snapshot, "com.openclaw.trading.official-paper.poll");
+  const pnlLoaded = isLaunchdJobLoaded(snapshot, "com.openclaw.trading.official-paper.pnl");
+  if (!snapshot.dbPath || (!pollLoaded && !pnlLoaded)) {
+    return [];
+  }
+
+  let marketHours;
+  try {
+    marketHours = isUsRegularMarketHours(new Date(nowMs));
+  } catch (calendarError) {
+    // Same failure mode checkStaleHeartbeatMarketHours already guards
+    // against: trading-schedule.mjs throws for any year missing from its
+    // hardcoded NYSE calendar. Say we could not judge; never claim health
+    // that was not observed.
+    const year = describeError(calendarError).match(/year (\d{4})/u)?.[1] ?? "当前";
+    return [warn(
+      "official-paper-health.calendar_uncovered",
+      `无法判断当前是否处于交易时段（交易日历未覆盖 ${year} 年），因此没有检查官方模拟盘轮询/收支任务的新鲜度。请更新 trading-schedule.mjs 的交易日历。`
+    )];
+  }
+
+  if (!marketHours) {
+    return [];
+  }
+
+  const parts = getZonedParts(new Date(nowMs), NEW_YORK_TIMEZONE);
+  const minutesSinceOpen = parts.hour * 60 + parts.minute - (9 * 60 + 30);
+  const judgePoll = pollLoaded && minutesSinceOpen >= OFFICIAL_PAPER_POLL_JUDGE_AFTER_MINUTES;
+  const judgePnl = pnlLoaded && parts.hour >= OFFICIAL_PAPER_PNL_JUDGE_FROM_HOUR;
+  if (!judgePoll && !judgePnl) {
+    return [];
+  }
+
+  return withReadOnlyTradingDb(snapshot.dbPath, "official-paper-health", "官方模拟盘轮询/收支任务", (db) => {
+    const findings = [];
+    if (judgePoll) {
+      findings.push(...checkOfficialPaperReason(db, nowMs, {
+        reason: "hourly_poll",
+        code: "poll",
+        job: "com.openclaw.trading.official-paper.poll",
+        description: "官方模拟盘每小时轮询",
+        staleMs: OFFICIAL_PAPER_POLL_STALE_MS,
+        staleText: "2 小时"
+      }));
+    }
+    if (judgePnl) {
+      const pnlFindings = checkOfficialPaperReason(db, nowMs, {
+        reason: "post_open_pnl",
+        code: "pnl",
+        job: "com.openclaw.trading.official-paper.pnl",
+        description: "官方模拟盘开盘后收支报告",
+        staleMs: OFFICIAL_PAPER_PNL_STALE_MS,
+        staleText: "24 小时"
+      });
+      findings.push(...pnlFindings);
+      if (pnlFindings.length === 0 && snapshot.repoRoot) {
+        findings.push(...checkOfficialPaperPnlArtifact(db, snapshot.repoRoot));
+      }
+    }
+    return findings;
+  });
+}
+
+function checkOfficialPaperReason(db, nowMs, options) {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS row_count, MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = ?`)
+    .get(options.reason);
+
+  if (Number(row?.row_count ?? 0) === 0) {
+    return [warn(
+      `official-paper-health.${options.code}.never_ran`,
+      `${options.job} 已加载，但 official_paper_snapshots 里没有任何 reason=${options.reason} 的记录——${options.description}从未成功写入过数据。`
+        + `请检查长桥凭据与该任务的错误日志。`
+    )];
+  }
+
+  const latest = row?.latest ? String(row.latest) : null;
+  const latestMs = latest ? Date.parse(latest) : Number.NaN;
+  // A non-empty table whose MAX(fetched_at) is unusable counts as stale, for
+  // the same reason checkNewsEngineHealth treats an all-NULL timestamp column
+  // that way: "we cannot prove freshness" must never pass as "fresh".
+  if (!Number.isFinite(latestMs) || Number(nowMs) - latestMs > options.staleMs) {
+    return [error(
+      `official-paper-health.${options.code}.stale`,
+      `${options.description}已经超过${options.staleText}没有新记录（当前处于美股常规交易时段，最近一次 reason=${options.reason} 的 fetched_at=${latest ?? "未知"}）。`
+        + `${options.job} 很可能正在失败——请看它的错误日志。`
+    )];
+  }
+
+  return [];
+}
+
+// The pnl job writes its snapshot row FIRST and renders
+// reports/official-paper/<日期>-post-open.md afterwards (official-paper-
+// monitor.mjs's sendPnlReport), so a fresh row with no matching markdown is
+// exactly the half-finished run a row-only probe would call healthy. The date
+// is derived the way the producer derives it: `fetchedAt.slice(0, 10)`.
+function checkOfficialPaperPnlArtifact(db, repoRoot) {
+  const row = db
+    .prepare(`SELECT MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = 'post_open_pnl'`)
+    .get();
+  const latest = row?.latest ? String(row.latest) : null;
+  if (!latest) {
+    return [];
+  }
+  const markdownPath = join(repoRoot, "reports", "official-paper", `${latest.slice(0, 10)}-post-open.md`);
+  if (existsSync(markdownPath)) {
+    return [];
+  }
+  return [error(
+    "official-paper-health.pnl.report_missing",
+    `官方模拟盘收支任务写入了 ${latest} 的快照，但对应的报告文件不存在（${markdownPath}）——这一次运行只完成了一半，`
+      + `报告渲染或投递环节失败了。请看 runtime/launchd/com.openclaw.trading.official-paper.pnl.err.log。`
+  )];
 }
 
 // Phase 4 Task 8 (news engine deployment wiring) - "rsshub-health" check:
@@ -607,17 +1221,7 @@ function checkNewsEngineHealth(snapshot, nowMs) {
     return [];
   }
 
-  let db;
-  try {
-    db = openTradingDatabase(snapshot.dbPath);
-  } catch (openError) {
-    return [error(
-      "news-engine-health.db_unreachable",
-      `无法打开交易数据库以检查新闻引擎状态：${describeError(openError)}`
-    )];
-  }
-
-  try {
+  return withReadOnlyTradingDb(snapshot.dbPath, "news-engine-health", "新闻引擎状态", (db) => {
     const stats = newsEngineHealthStats(db);
     if (stats.eventCount === 0) {
       return [];
@@ -633,9 +1237,7 @@ function checkNewsEngineHealth(snapshot, nowMs) {
     }
 
     return [];
-  } finally {
-    db.close();
-  }
+  });
 }
 
 // task H2 (Phase 2.5 hardening) - "alerts-poller-health" check, covering two
@@ -673,39 +1275,28 @@ function checkAlertsPollerHealth(snapshot, nowMs) {
     return findings;
   }
 
-  let db;
-  try {
-    db = openTradingDatabase(snapshot.dbPath);
-  } catch (openError) {
-    findings.push(error(
-      "alerts-poller-health.db_unreachable",
-      `无法打开交易数据库以检查提醒器 run_log：${describeError(openError)}`
-    ));
-    return findings;
-  }
-
-  try {
+  findings.push(...withReadOnlyTradingDb(snapshot.dbPath, "alerts-poller-health", "提醒器 run_log", (db) => {
+    const dbFindings = [];
     const lastRun = lastRunAt(db, CRON_JOB_MARKET_ALERTS);
     if (lastRun === null) {
-      findings.push(warn("alerts-poller-health.never_ran", "提醒器从未运行过（run_log 中没有 market-alerts 记录）。"));
+      dbFindings.push(warn("alerts-poller-health.never_ran", "提醒器从未运行过（run_log 中没有 market-alerts 记录）。"));
     } else {
       const lastRunMs = Date.parse(lastRun);
       const isStale = Number.isFinite(lastRunMs) && nowMs - lastRunMs > ALERTS_STALE_HEARTBEAT_MS;
       if (isStale) {
-        findings.push(...checkStaleHeartbeatMarketHours(lastRun, nowMs));
+        dbFindings.push(...checkStaleHeartbeatMarketHours(lastRun, nowMs));
       }
     }
 
     const consecutiveFailures = consecutiveFailureCount(db, CRON_JOB_MARKET_ALERTS);
     if (consecutiveFailures >= ALERTS_CONSECUTIVE_FAILURE_THRESHOLD) {
-      findings.push(error(
+      dbFindings.push(error(
         "alerts-poller-health.consecutive_failures",
         `提醒器连续失败 ${consecutiveFailures} 次（阈值 ${ALERTS_CONSECUTIVE_FAILURE_THRESHOLD}）。`
       ));
     }
-  } finally {
-    db.close();
-  }
+    return dbFindings;
+  }));
 
   return findings;
 }
