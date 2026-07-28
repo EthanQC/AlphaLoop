@@ -341,17 +341,25 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
  * What this run leaves behind for a human: the state file and the stdout JSON
  * envelope.
  *
- * 2026-07-28 (R4, I13). `groupFallback` is the ONE signal that a 公共资产
- * shipped but the circle's group chat never got it: with FEISHU_GROUP_CHAT_ID
- * unset, the delivery layer sends the public card to the deployment's default
- * target instead and says so (notifications.ts resolveReportDeliveryTarget).
- * `delivery.sent` is TRUE on that path, so the success branch above logged a
+ * 2026-07-28 (R4, I13). `groupFallback` is the ONE signal that the circle's
+ * group chat never got a 公共资产: with FEISHU_GROUP_CHAT_ID unset, the
+ * delivery layer used to send the public card to the deployment's default
+ * target instead and say so (notifications.ts resolveReportDeliveryTarget).
+ * `delivery.sent` was TRUE on that path, so the success branch above logged a
  * clean {delivered:true} and the fallback survived only inside the JSON blob in
  * stock_analysis_runs.delivery - retrievable by querying sqlite, invisible to
  * anyone reading the run. Its sibling did the opposite all along:
  * scheduled-report.mjs writes both fields into the state file AND the stdout
  * envelope, so 日报/周报 said it while 个股分析 did not. Both now report the
  * same fact in the same two places.
+ *
+ * 2026-07-29 (J2). That fallback is gone: an unconfigured FEISHU_GROUP_CHAT_ID
+ * is now a REFUSAL, because "sent it to one person's DM instead" is a wrong
+ * audience dressed as a success. So `delivery.sent` is FALSE whenever
+ * `groupFallback` is true, and the envelope carries `deliveryReason` alongside.
+ * Nothing here changed - both fields are still copied into both sinks - but the
+ * fact they now report is "the card was not sent" rather than "the card went
+ * somewhere else".
  *
  * `groupFallback` is written unconditionally (false when the group DID get it),
  * because an absent key cannot be told apart from an older build that never

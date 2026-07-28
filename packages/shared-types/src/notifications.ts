@@ -155,10 +155,11 @@ export interface ReportDeliveryPayload {
    * Which Feishu channel this report belongs in (2026-07-12 requirements §4).
    *
    *   "group" - 公共通知：日报/周报的发布卡 goes to the circle's group chat
-   *             (`FEISHU_GROUP_CHAT_ID`). With no group configured the card
-   *             still ships, to the global DM/notify target, and the result
-   *             says so (`groupFallback`) instead of pretending it reached the
-   *             group.
+   *             (`FEISHU_GROUP_CHAT_ID`). With no group configured the card is
+   *             NOT sent: it used to fall back to the global DM/notify target,
+   *             which on a deployment like the mini means a 公共资产 landing in
+   *             one person's private chat under a `sent: true` result. The
+   *             result now carries `sent: false` plus `groupFallback`.
    *   "dm" (default) - 个人通道：个人页摘要、提醒、审批、复盘。
    *
    * NOT a privacy signal. `audience: "dm"` says "this is not the group's
@@ -234,9 +235,15 @@ export interface ReportDeliveryResult {
   deliveries: ReportDeliveryEntry[];
   /**
    * The payload asked for the group (`audience: "group"`) but this deployment
-   * has no `FEISHU_GROUP_CHAT_ID`, so the card went to the DM/global target.
-   * Set alongside `groupFallbackReason` so the run log records WHY the public
-   * card was not public rather than showing a clean delivery.
+   * has no `FEISHU_GROUP_CHAT_ID`, so the circle did not get the card.
+   *
+   * The name is older than the behavior: until 2026-07-29 this meant "we sent
+   * it somewhere else instead" and rode along on a `sent: true` result. It now
+   * always accompanies `sent: false` - the card is not sent at all, because the
+   * somewhere-else was one person's DM. The field is kept because it is still
+   * the signal both producers record (scheduled-report.mjs and
+   * stock-analysis.mjs write it into the state file and the stdout envelope),
+   * and it still answers the same question: did the circle get this or not?
    */
   groupFallback?: boolean;
   groupFallbackReason?: string;
@@ -465,6 +472,27 @@ export async function deliverOperationalAlertToFeishu(
       reason: `Feishu operational alert delivery failed: ${sanitizeNotificationError(error)}`,
       deliveries: []
     };
+  }
+}
+
+/**
+ * The deployment's global Feishu target, or null if nothing is configured.
+ *
+ * Wrapped in try/catch because resolveFeishuAppTarget touches sqlite and the
+ * filesystem, and alert delivery must degrade rather than throw.
+ *
+ * Callers: operational ALERTS only. Report delivery deliberately does not use
+ * this - see resolveReportDeliveryTarget. An alert is addressed to whoever runs
+ * the deployment, so "the global target" is the right answer for it; a
+ * circle-public report is addressed to the circle, and answering that with the
+ * operator's DM is how 日报/周报/个股分析 all ended up in one person's private
+ * chat while reporting success.
+ */
+function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
+  try {
+    return resolveFeishuAppTarget();
+  } catch {
+    return null;
   }
 }
 
@@ -798,30 +826,28 @@ async function deliverReportViaAppCredentials(
   scope: DeliverableReportScope
 ): Promise<ReportDeliveryResult> {
   const resolved = resolveReportDeliveryTarget(scope);
-  if (!resolved) {
+  if (!resolved.ok) {
     // An owner-private report always resolves (its own ownerOpenId), so the
-    // ONLY way to land here is a circle-public report on a deployment where
-    // FEISHU_GROUP_CHAT_ID is unset AND no global target resolves either -
-    // the deploy target's shape today. Logged as well as returned: this is a
-    // configuration gap, not a transient send failure, and it must not depend
-    // on the caller choosing to print `reason`.
-    const reason = "No Feishu report target could be resolved for a circle-public report: FEISHU_GROUP_CHAT_ID is unset and no fallback target (FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID / stored target) resolved either. Nothing was sent. Set FEISHU_GROUP_CHAT_ID to the 圈子群 chat id, or DM the bot once to seed the stored target.";
-    console.error(`notifications: ${reason} (report: ${payload.title})`);
+    // ONLY way to land here is a circle-public report on a deployment with no
+    // FEISHU_GROUP_CHAT_ID - which IS the deploy target's shape today (the
+    // mini has no such variable and one stored open_id target), and used to be
+    // the branch that quietly DM'd the operator instead of refusing.
+    //
+    // Logged as well as returned: this is a configuration gap, not a transient
+    // send failure, and making it visible must not depend on the caller
+    // choosing to print `reason`. `groupFallback` is still set so the two
+    // producers that record it (scheduled-report.mjs, stock-analysis.mjs) keep
+    // naming the circle in their state file and stdout envelope - it now sits
+    // beside `sent: false` rather than dissenting from `sent: true`.
+    console.error(`notifications: ${resolved.reason} (report: ${payload.title})`);
     return {
       sent: false,
       target: "none",
-      reason,
+      reason: resolved.reason,
+      groupFallback: true,
+      groupFallbackReason: resolved.groupFallbackReason,
       deliveries: []
     };
-  }
-
-  if (resolved.groupFallback) {
-    // The case that actually occurs on the deploy target: FEISHU_GROUP_CHAT_ID
-    // unset, but a stored notification target resolves, so the public card
-    // ships to a DM and the circle never sees it. `groupFallback` alone lives
-    // or dies by the caller printing it; this line makes the misconfiguration
-    // visible in the job's own stderr either way.
-    console.error(`notifications: ${resolved.groupFallbackReason ?? "FEISHU_GROUP_CHAT_ID is not configured."} (report: ${payload.title})`);
   }
 
   const target = resolved.target;
@@ -839,9 +865,6 @@ async function deliverReportViaAppCredentials(
     // user-plugin branch above, so a failure still tells the caller where it
     // tried; `sent` is the only success signal.
     target: entryTarget,
-    ...(resolved.groupFallback
-      ? { groupFallback: true, groupFallbackReason: resolved.groupFallbackReason }
-      : {}),
     deliveries: [{
       kind: "summary",
       title: payload.title,
@@ -1227,11 +1250,9 @@ function refuseNonPublicOnSharedChatChannel(
   };
 }
 
-interface ResolvedReportTarget {
-  target: FeishuAppTarget;
-  groupFallback?: boolean;
-  groupFallbackReason?: string;
-}
+type ReportTargetResolution =
+  | { ok: true; target: FeishuAppTarget }
+  | { ok: false; reason: string; groupFallbackReason: string };
 
 /**
  * Who gets this report card (§4 群/单聊分工), decided from the DECLARED scope
@@ -1239,11 +1260,10 @@ interface ResolvedReportTarget {
  * be set:
  *
  *   1. `owner-private` - that member's own DM. Nothing can override it, so
- *      private content can never be routed into the shared group.
+ *      private content can never be routed into the shared group. Always
+ *      resolves; `scope.ownerOpenId` is the target.
  *   2. `circle-public` + `FEISHU_GROUP_CHAT_ID` - the circle's group chat.
- *   3. `circle-public` with no group configured - the card still ships, to
- *      whatever the global target is, and the caller is told (groupFallback)
- *      so the run log shows a public report that did not reach the group.
+ *   3. `circle-public` with no group configured - REFUSED. Nothing is sent.
  *
  * There is no fourth case. Until 2026-07-28 R3 an undeclared payload fell
  * through to the global notify/ops target here, and that branch is what sent
@@ -1252,12 +1272,40 @@ interface ResolvedReportTarget {
  * upstream, so the only two things that reach this function are the two the
  * type admits.
  *
- * Wrapped in try/catch because resolveFeishuAppTarget touches sqlite and the
- * filesystem, and report delivery must degrade rather than throw.
+ * WHY (3) IS A REFUSAL AND NOT A FALLBACK (2026-07-29, J2)
+ * -------------------------------------------------------
+ * It used to ship the card to whatever `resolveFeishuAppTarget()` returned and
+ * report `sent: true` with a `groupFallback` flag attached. Measured against
+ * the deploy target's real shape that is not a degraded delivery, it is a
+ * delivery to the wrong audience that looks like a success: the mini has no
+ * FEISHU_GROUP_CHAT_ID and exactly one stored target -
+ * `notification_targets` row `feishu | open_id | ou_77f84d19d… |
+ * openclaw-allowFrom`, seeded from the single ou_ entry in
+ * `~/.openclaw/credentials/feishu-main-allowFrom.json` - so 日报, 周报 and
+ * 个股分析 all took this branch and all landed in one person's DM while the
+ * run log recorded a clean send. `groupFallback` was the only dissent, and a
+ * flag on a `sent: true` result is exactly the shape of a warning that can
+ * never fail a gate.
+ *
+ * A circle-public report therefore goes to the circle's group or nowhere. Any
+ * other destination is a guess about who the circle is, and both ways of
+ * guessing wrong are silent: publish to the wrong room, or "publish" to one
+ * person and call it done.
+ *
+ * Rejected alternative: keep the fallback when the resolved global target is a
+ * `chat_id` (group-shaped) and refuse only for an `open_id` (a DM). Feishu p2p
+ * conversations have chat_ids too, so `chat_id` does not actually mean "a
+ * room the circle is in" - it would have narrowed the bug without closing it.
+ *
+ * The refusal costs a deployment nothing it cannot fix with the one-line
+ * remedy the message names, and `resolveFeishuAppTarget()` is no longer called
+ * from this path at all - which also drops a side effect, since its
+ * allowlist-discovery branch WRITES the discovered target back to sqlite.
  */
-function resolveReportDeliveryTarget(scope: DeliverableReportScope): ResolvedReportTarget | null {
+function resolveReportDeliveryTarget(scope: DeliverableReportScope): ReportTargetResolution {
   if (scope.kind === "owner-private") {
     return {
+      ok: true,
       target: {
         targetType: "open_id",
         targetId: scope.ownerOpenId,
@@ -1269,6 +1317,7 @@ function resolveReportDeliveryTarget(scope: DeliverableReportScope): ResolvedRep
   const groupChatId = process.env.FEISHU_GROUP_CHAT_ID?.trim();
   if (groupChatId) {
     return {
+      ok: true,
       target: {
         targetType: "chat_id",
         targetId: groupChatId,
@@ -1277,24 +1326,16 @@ function resolveReportDeliveryTarget(scope: DeliverableReportScope): ResolvedRep
     };
   }
 
-  const fallback = tryResolveGlobalFeishuTarget();
-  if (!fallback) {
-    return null;
-  }
-
   return {
-    target: fallback,
-    groupFallback: true,
-    groupFallbackReason: `未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标（${fallback.targetType === "chat_id" ? "会话" : "单聊"}，来源 ${fallback.source}），群里本次没有收到发布卡。`
+    ok: false,
+    reason:
+      "Refused: this is a circle-public report (§4 公共通知) and FEISHU_GROUP_CHAT_ID is not set, so there " +
+      "is no circle to publish to. Nothing was sent - delivering it to the global notify/stored target " +
+      "would put a 公共资产 in one person's DM and report success. Set FEISHU_GROUP_CHAT_ID to the 圈子群 " +
+      "chat id (oc_…) and re-run.",
+    groupFallbackReason:
+      "未配置 FEISHU_GROUP_CHAT_ID，公共报告卡没有发出（本次不再改发默认单聊，以免公共内容只进了某一个人的私聊却记成投递成功）。请把圈子群的 chat id 配到 FEISHU_GROUP_CHAT_ID 后重跑。"
   };
-}
-
-function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
-  try {
-    return resolveFeishuAppTarget();
-  } catch {
-    return null;
-  }
 }
 
 // deliverReportViaFallback can throw (sendFallbackNotification rejects a

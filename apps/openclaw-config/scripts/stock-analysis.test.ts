@@ -1457,13 +1457,20 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
     expect(sends[0]!.receiveId).toBe("oc_public_group");
   });
 
-  // 2026-07-28 (R4, I13). On the fallback path `delivery.sent` is TRUE, so the
+  // 2026-07-28 (R4, I13). On the fallback path `delivery.sent` was TRUE, so the
   // producer took its success branch and logged {delivered:true, ...} with
   // `groupFallback`/`groupFallbackReason` never read - the one signal that a
   // 公共资产 went to one person's DM instead of the circle survived only inside
   // the JSON blob in stock_analysis_runs.delivery. Its sibling
   // (scheduled-report.mjs) wrote both into the state file and the envelope all
   // along.
+  //
+  // 2026-07-29 (J2). The fallback itself is gone - an unconfigured
+  // FEISHU_GROUP_CHAT_ID is a refusal now, since DMing a 公共资产 to the
+  // operator and returning sent:true is a wrong audience dressed as a success.
+  // The preconditions below therefore assert the OPPOSITE of what they used to;
+  // what this case is actually about - both fields reaching both sinks - is
+  // unchanged, which is why it is updated rather than deleted.
   //
   // The `delivery` fed to the producer's summarizer here is NOT hand-written:
   // it is what the REAL delivery layer returns for the REAL batch payload on a
@@ -1489,11 +1496,12 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
 
     const delivery = await notifications.deliverReportToFeishu(asDeliveryPayload(realBatchPayload()));
 
-    // Preconditions, measured rather than assumed: the public card really did
-    // ship, really did go to one person, and the group really did not get it.
-    expect(delivery.sent).toBe(true);
+    // Preconditions, measured rather than assumed: the card was NOT sent, the
+    // group did not get it, and - the point of the refusal - neither did the
+    // operator's DM. Not one outbound message.
+    expect(delivery.sent).toBe(false);
     expect(delivery.groupFallback).toBe(true);
-    expect(sends).toEqual(["ou_global_member"]);
+    expect(sends).toEqual([]);
 
     const { state, envelope } = stockAnalysis.buildStockAnalysisRunSummary({
       delivery,
@@ -1505,15 +1513,16 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       pdfPath: undefined
     });
 
-    // stdout envelope: "delivered" is still true, and now it no longer stands
-    // alone claiming an unqualified success.
-    expect(envelope.delivered).toBe(true);
+    // stdout envelope: "delivered" is false, and the two fields say which
+    // audience was missed rather than leaving a bare failure.
+    expect(envelope.delivered).toBe(false);
     expect(envelope.groupFallback).toBe(true);
     expect(envelope.groupFallbackReason).toContain("FEISHU_GROUP_CHAT_ID");
+    expect(envelope.deliveryReason).toContain("FEISHU_GROUP_CHAT_ID");
     // State file: the same two fields, same names as scheduled-report.mjs's.
     expect(state.groupFallback).toBe(true);
     expect(state.groupFallbackReason).toBe(delivery.groupFallbackReason);
-    expect(state.groupFallbackReason).toContain("群里本次没有收到发布卡");
+    expect(state.groupFallbackReason).toContain("公共报告卡没有发出");
   });
 
   it("records groupFallback:false with no reason when the card did reach the group", async () => {

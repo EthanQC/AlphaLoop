@@ -232,8 +232,11 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // No `openId`, `audience: "group"`: 日报/周报 are 公共通知 (requirements §4 -
   // 群: 公共报告发布卡), not owner-scoped, so the card goes to the circle's
   // group chat (FEISHU_GROUP_CHAT_ID). With no group configured the delivery
-  // layer still ships the card to the global target and reports
-  // `groupFallback`, which is recorded below rather than swallowed.
+  // layer REFUSES (2026-07-29, J2) rather than shipping the card to the global
+  // target: that target is one person's DM on this deployment, and delivering a
+  // 公共资产 there under `sent: true` is a wrong audience dressed as a success.
+  // The refusal arrives as `sent:false` + `groupFallback`, both recorded below
+  // rather than swallowed.
   // `reportKind`/`reportDate` are what let the card carry the 查看完整报告
   // button back to /daily/<date> (§1.1).
   const result = await deliverReportToFeishu({

@@ -993,6 +993,10 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
   // every chapter, deliberately bypassing shouldSendFullReportChapters() - a
   // live daily run pushed 10 Feishu messages. One card, one link.
   it("delivers ONE interactive card with a platform deep link, not the summary plus every chapter", async () => {
+    // FEISHU_GROUP_CHAT_ID, not FEISHU_NOTIFY_OPEN_ID: a circle-public report
+    // goes to the circle or nowhere (J2). This case is about the CARD, so it
+    // has to be addressed somewhere the card can actually be delivered.
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_circle_group";
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
     process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
     const calls = stubFetch(okFeishu());
@@ -1006,12 +1010,13 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     });
 
     expect(result.sent).toBe(true);
-    expect(result.target).toBe("feishu-app-open-id");
+    expect(result.target).toBe("feishu-app-chat-id");
 
     const sends = messageCalls(calls);
     expect(sends).toHaveLength(1);
-    expect(sends[0]!.url).toContain("receive_id_type=open_id");
-    expect(sends[0]!.body.receive_id).toBe("ou_global_member");
+    expect(sends[0]!.url).toContain("receive_id_type=chat_id");
+    // The group, even though a global DM target is also configured.
+    expect(sends[0]!.body.receive_id).toBe("oc_circle_group");
     expect(sends[0]!.headers.authorization).toBe("Bearer t-token-report");
     expect(sends[0]!.body.msg_type).toBe("interactive");
 
@@ -1041,7 +1046,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
   });
 
   it("sends a button-free card that points at the platform in prose when no base url is configured", async () => {
-    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_circle_group";
     delete process.env.PLATFORM_PUBLIC_BASE_URL;
     const calls = stubFetch(okFeishu());
 
@@ -1078,10 +1083,13 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(sends[0]!.body.receive_id).toBe("ou_owner_specific");
   });
 
-  it("returns a structured not-delivered result - never throws - when no target resolves", async () => {
-    // Isolate BOTH target sources resolveFeishuAppTarget can still reach with
-    // no FEISHU_NOTIFY_* set: the repo's sqlite notification_targets row
-    // (derived from cwd) and ~/.openclaw/credentials (derived from $HOME).
+  it("returns a structured not-delivered result - never throws - when nothing at all is configured", async () => {
+    // Isolate the two target sources a deployment could still be carrying: the
+    // repo's sqlite notification_targets row (derived from cwd) and
+    // ~/.openclaw/credentials (derived from $HOME). Since J2 the circle-public
+    // refusal no longer consults either, so this now proves something slightly
+    // different and still worth pinning: the refusal is reached without
+    // touching sqlite or $HOME, so a broken runtime cannot turn it into a throw.
     tempDir = mkdtempSync(join(tmpdir(), "notifications-no-target-"));
     process.env.HOME = tempDir;
     process.chdir(tempDir);
@@ -1095,13 +1103,13 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
 
     expect(result.sent).toBe(false);
     expect(result.target).toBe("none");
-    expect(result.reason).toMatch(/FEISHU_NOTIFY_OPEN_ID/);
+    expect(result.reason).toMatch(/FEISHU_GROUP_CHAT_ID/);
     expect(result.deliveries).toEqual([]);
     expect(calls).toHaveLength(0);
   });
 
   it("surfaces the Feishu error message on a non-zero code without leaking the tenant token", async () => {
-    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_bad";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_bad_chat";
     stubFetch((url) => url.includes("tenant_access_token")
       ? { body: { code: 0, tenant_access_token: "secret-token-x", expire: 7200 } }
       : { status: 400, body: { code: 230001, msg: "invalid receive_id" } });
@@ -1146,7 +1154,15 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(sends[0]!.body.receive_id).toBe("oc_public_group");
   });
 
-  it("falls back to the DM target and says why when no group chat id is configured", async () => {
+  // J2 (2026-07-29). This case used to assert the OPPOSITE - that the card
+  // "falls back to the DM target and says why". Measured against the deploy
+  // target's real shape, that fallback is not a degraded delivery: the mini has
+  // no FEISHU_GROUP_CHAT_ID and one stored target (notification_targets row
+  // `feishu | open_id | ou_77f84d19d… | openclaw-allowFrom`), so 日报, 周报 and
+  // 个股分析 all took this branch into one person's DM while the run log
+  // recorded sent:true with a groupFallback flag a caller may simply drop.
+  // A circle-public report now goes to the circle or nowhere.
+  it("refuses a circle-public report when no group chat id is configured, even though a DM target resolves", async () => {
     delete process.env.FEISHU_GROUP_CHAT_ID;
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
     const calls = stubFetch(okFeishu());
@@ -1159,14 +1175,41 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
       reportDate: "2026-07-26"
     });
 
-    expect(result.sent).toBe(true);
-    expect(result.target).toBe("feishu-app-open-id");
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    // Still reported, so the two producers that record it keep naming the
+    // circle - it now sits beside sent:false instead of dissenting from
+    // sent:true.
     expect(result.groupFallback).toBe(true);
     expect(result.groupFallbackReason).toContain("FEISHU_GROUP_CHAT_ID");
+    // Actionable: the reason names the one variable that fixes it.
+    expect(result.reason).toContain("FEISHU_GROUP_CHAT_ID");
+    expect(result.deliveries).toEqual([]);
 
+    // The point of the refusal: nothing reached the DM. Not one HTTP call.
+    expect(messageCalls(calls)).toHaveLength(0);
+  });
+
+  it("still delivers an owner-private report to its owner when no group chat id is configured", async () => {
+    // The refusal above must not have taken personal reports with it: an
+    // owner-private report resolves from its own scope and never needed a group.
+    delete process.env.FEISHU_GROUP_CHAT_ID;
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      openId: "ou_owner_specific",
+      reportKind: "personal-daily",
+      reportDate: "2026-07-26"
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+    expect(result.groupFallback).toBeFalsy();
     const sends = messageCalls(calls);
     expect(sends).toHaveLength(1);
-    expect(sends[0]!.body.receive_id).toBe("ou_global_member");
+    expect(sends[0]!.body.receive_id).toBe("ou_owner_specific");
   });
 
   it("keeps an owner-scoped report in that owner's DM even when a group chat id is configured", async () => {
@@ -1472,7 +1515,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
   });
 
   it("stays at one message for a long report - no chapter fan-out to fall back to", async () => {
-    process.env.FEISHU_NOTIFY_CHAT_ID = "oc_group_chat";
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_group_chat";
     const calls = stubFetch(okFeishu());
     const longSection = ["## 1. 今日结论", "", "段落一".repeat(400), "", "段落二".repeat(400)].join("\n");
 
@@ -1648,6 +1691,7 @@ describe("deliverOperationalAlertToFeishu (operational alerts are not reports)",
   // ORIGINAL damage is still there: the body is summarized into a card and
   // every load-bearing line disappears.
   it("is the reason an alert must NOT go through the report path (which drops the body)", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_ops_group";
     process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
     const calls = stubFetch(okFeishu);
 
