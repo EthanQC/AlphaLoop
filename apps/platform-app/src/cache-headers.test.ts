@@ -27,10 +27,28 @@ import { createPlatformServer } from "./server.js";
  *  2. the route list is DERIVED FROM THE SERVER'S OWN DISPATCH, not kept by
  *     hand here. `server.ts`'s dispatch chain is parsed for the route handlers
  *     it calls, each handler is resolved to its module, and each module is
- *     parsed for the path literals it matches on. A new route module, or a new
- *     top-level path inside an existing module, fails this file until a probe
- *     for it is added - which is exactly the failure mode that produced N1 (B1
- *     made /reports viewer-dependent and nobody remembered the opt-in).
+ *     parsed for the path literals it matches on.
+ *
+ * What (2) catches, stated so it can be checked against what the code below
+ * actually does (defect G4-a, 2026-07-28 - the previous wording promised more
+ * than the parser delivered: it only complained when a module produced ZERO
+ * literals, so `pathname.startsWith("/y/")` added next to an existing
+ * `pathname === "/x"` would have slipped through unprobed):
+ *
+ *   - a route module dispatch() calls that has no probe -> fails;
+ *   - a new path literal inside an existing module -> fails, when the literal
+ *     is compared against `url.pathname`, against a `segments[i]`, against a
+ *     local assigned straight from a `segments[i]`, or is a key of an object
+ *     literal that one of those indexes / `Object.hasOwn`s / `in`s;
+ *   - ANY OTHER way of deciding a route from the path -> also fails, not
+ *     because the parser understands it but because `assertPathUsesAreParsable`
+ *     rejects every `pathname` / `segments[i]` usage that is not one of the
+ *     recognised forms. A regex test, a `switch`, `.match()`, a two-hop
+ *     variable: all of them stop the file with "teach the parser about it".
+ *
+ * What it does NOT catch: a route handler that dispatch() reaches through
+ * something other than a `./routes/...` import, and a path literal a module
+ * never mentions (one supplied by a helper in another file).
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -46,9 +64,22 @@ const FALLBACK_MODULE = "(dispatch fallback)";
 // Enumeration: what routes does the server actually serve?
 // ---------------------------------------------------------------------------
 
-/** Reads a source file under apps/platform-app/src. */
+/**
+ * Reads a source file under apps/platform-app/src with its comments removed, so
+ * that a `pathname` mentioned in prose is never mistaken for a routing decision.
+ *
+ * Only LINE-LEADING comments are stripped, deliberately. A general
+ * comment-stripping regex eats code: `/^\/z\//u.test(url.pathname)` contains
+ * `\//` - two adjacent slashes - and a naive `//`-to-end-of-line rule deletes
+ * the rest of that line, silently hiding a route match (observed while testing
+ * this very guard). A comment that starts a line cannot be a regex literal or a
+ * string, so this direction can only ever leave too much in, and leaving too
+ * much in merely trips the "unrecognised usage" check, loudly.
+ */
 function readSource(relative: string): string {
-  return readFileSync(join(HERE, relative), "utf8");
+  return readFileSync(join(HERE, relative), "utf8")
+    .replace(/^[ \t]*\/\*[\s\S]*?\*\//gmu, "")
+    .replace(/^[ \t]*\/\/[^\n]*/gmu, "");
 }
 
 /**
@@ -74,14 +105,21 @@ function dispatchedModules(): string[] {
     }
   }
 
+  // Every function dispatch() calls that came from a ./routes/ import counts,
+  // whatever it is named - naming is a convention, and this file must not go
+  // blind the day somebody dispatches `serveWhatever(...)`. The handle*Route
+  // convention is additionally enforced: one of those that CANNOT be resolved
+  // to a routes/ module is a parser failure, not something to skip.
   const modules: string[] = [];
-  for (const match of body.matchAll(/\b(handle[A-Za-z]*Route)\s*\(/gu)) {
-    const handler = match[1] as string;
-    const specifier = imports.get(handler);
-    expect(
-      specifier,
-      `server.ts dispatches ${handler}(...) but this test cannot resolve it to a routes/ module - teach the parser about it rather than skipping it`
-    ).toBeDefined();
+  for (const match of body.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/gu)) {
+    const callee = match[1] as string;
+    const specifier = imports.get(callee);
+    if (/^handle[A-Za-z]*Route$/u.test(callee)) {
+      expect(
+        specifier,
+        `server.ts dispatches ${callee}(...) but this test cannot resolve it to a routes/ module - teach the parser about it rather than skipping it`
+      ).toBeDefined();
+    }
     if (specifier && !modules.includes(specifier)) {
       modules.push(specifier);
     }
@@ -132,35 +170,122 @@ function objectLiteralKeys(source: string, name: string): string[] {
 }
 
 /**
- * The path literals one route module matches on: everything compared against
- * `url.pathname` or a `segments[i]`, plus the keys of any object literal the
- * module indexes with a `segments[i]` (reports.ts's READING_PATH_SEGMENTS) or
- * probes with `Object.hasOwn` (personal.ts's PERSONAL_KINDS).
+ * Locals a module assigns STRAIGHT from a path segment, e.g. personal.ts's
+ * `const kind = segments[0] as string;` or stock.ts's
+ * `const symbol = normalizeStockSymbol(segments[1] as string);`. One hop only:
+ * whatever such a local is later compared against is a path literal too, and
+ * without this the comparison is invisible (it never mentions `segments`).
  */
-function claimedTokens(relative: string): string[] {
-  const source = readSource(relative);
-  const tokens = new Set<string>();
+function pathDerivedLocals(source: string): string[] {
+  const names = new Set<string>();
+  for (const match of source.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:[A-Za-z_$][\w$.]*\(\s*)?segments\[\d+\]/gu
+  )) {
+    names.add(match[1] as string);
+  }
+  return [...names];
+}
 
-  for (const match of source.matchAll(/pathname\s*(?:===|!==)\s*"([^"]*)"/gu)) {
-    const segment = (match[1] as string).split("/").filter(Boolean)[0];
-    tokens.add(segment ?? ROOT_TOKEN);
+/**
+ * Every way this parser knows how to read a path decision out of one module.
+ * `assertPathUsesAreParsable` below rejects anything that is NOT one of these,
+ * which is what makes the file header's promise true: an unrecognised form is
+ * an error, never a silent zero contribution.
+ *
+ * Each entry is anchored at the `pathname` / `segments[i]` occurrence itself;
+ * `before` is the text immediately preceding it.
+ */
+const RECOGNISED_PATHNAME_USES: RegExp[] = [
+  /^pathname\.split\(/u,
+  /^pathname\s*(?:===|!==)\s*"/u,
+  /^pathname\.(?:startsWith|endsWith)\(\s*"/u
+];
+const RECOGNISED_SEGMENT_USES: RegExp[] = [
+  /^segments\[\d+\]\s*(?:===|!==)\s*(?:"|[A-Za-z_$])/u,
+  /^segments\[\d+\]\s*(?:as\s+string\s*)?[),;\]]/u,
+  /^segments\[\d+\]\s*(?:as\s+string\s*)?\s+in\s+[A-Za-z_$]/u
+];
+
+/**
+ * Fails with file:line for any `pathname` / `segments[i]` usage the extractor
+ * does not understand. This is the tripwire the previous version of this file
+ * lacked: its only defence was "a module contributed zero literals", so a new
+ * matching style beside an existing recognised one contributed nothing and
+ * nobody noticed.
+ */
+function assertPathUsesAreParsable(relative: string, source: string): void {
+  const unrecognised: string[] = [];
+  const lineOf = (index: number): number => source.slice(0, index).split("\n").length;
+
+  for (const match of source.matchAll(/\bpathname\b|\bsegments\[\d+\]/gu)) {
+    const index = match.index ?? 0;
+    const here = source.slice(index);
+    const before = source.slice(Math.max(0, index - 24), index);
+    const isPathname = (match[0] as string) === "pathname";
+    const recognised = isPathname
+      ? RECOGNISED_PATHNAME_USES.some((pattern) => pattern.test(here))
+      : RECOGNISED_SEGMENT_USES.some((pattern) => pattern.test(here)) ||
+        // `READING_PATH_SEGMENTS[segments[0] as string]` - the object-index form.
+        /[A-Za-z_$][\w$]*\s*\[\s*$/u.test(before);
+    // A `switch` on the path is a matching form this parser cannot read, and it
+    // ends in `)` like a harmless value use, so it is rejected explicitly.
+    const isSwitchSubject = /\bswitch\s*\(\s*(?:url\.)?$/u.test(before);
+    if (!recognised || isSwitchSubject) {
+      unrecognised.push(`${relative}:${lineOf(index)} -> ${here.split("\n")[0]?.trim() ?? ""}`);
+    }
   }
 
-  for (const match of source.matchAll(
-    /segments\[\d+\]\s*(?:===|!==)\s*(?:"([^"]*)"|([A-Za-z_$][\w$]*))/gu
-  )) {
-    if (match[1] !== undefined) {
-      tokens.add(match[1]);
-      continue;
-    }
-    const identifier = match[2] as string;
-    const value = stringConst(source, identifier);
-    expect(
-      value,
-      `${relative} compares a path segment against \`${identifier}\`, which this test cannot resolve to a string - teach the parser about it rather than skipping it`
-    ).toBeDefined();
-    if (value !== undefined) {
-      tokens.add(value);
+  expect(
+    unrecognised,
+    "these decide a route from the path in a way this file cannot read, so it cannot tell whether they are probed - teach the parser about them rather than leaving them unprobed"
+  ).toEqual([]);
+}
+
+/**
+ * The path literals one route module matches on: everything compared against
+ * `url.pathname`, a `segments[i]`, or a local assigned from one, plus the keys
+ * of any object literal the module indexes with a `segments[i]`
+ * (reports.ts's READING_PATH_SEGMENTS) or probes with `Object.hasOwn` /  `in`
+ * (personal.ts's PERSONAL_KINDS).
+ */
+function claimedTokens(relative: string): string[] {
+  return tokensFromSource(relative, readSource(relative));
+}
+
+function tokensFromSource(relative: string, source: string): string[] {
+  assertPathUsesAreParsable(relative, source);
+  const tokens = new Set<string>();
+
+  const addPath = (value: string): void => {
+    const segment = value.split("/").filter(Boolean)[0];
+    tokens.add(segment ?? ROOT_TOKEN);
+  };
+
+  for (const match of source.matchAll(/pathname\s*(?:===|!==)\s*"([^"]*)"/gu)) {
+    addPath(match[1] as string);
+  }
+  for (const match of source.matchAll(/pathname\.(?:startsWith|endsWith)\(\s*"([^"]*)"/gu)) {
+    addPath(match[1] as string);
+  }
+
+  const comparedAgainst = ["segments\\[\\d+\\]", ...pathDerivedLocals(source).map((name) => `\\b${name}\\b`)];
+  for (const subject of comparedAgainst) {
+    for (const match of source.matchAll(
+      new RegExp(`${subject}\\s*(?:as\\s+string\\s*)?(?:===|!==)\\s*(?:"([^"]*)"|([A-Za-z_$][\\w$]*))`, "gu")
+    )) {
+      if (match[1] !== undefined) {
+        tokens.add(match[1]);
+        continue;
+      }
+      const identifier = match[2] as string;
+      const value = stringConst(source, identifier);
+      expect(
+        value,
+        `${relative} compares a path segment against \`${identifier}\`, which this test cannot resolve to a string - teach the parser about it rather than skipping it`
+      ).toBeDefined();
+      if (value !== undefined) {
+        tokens.add(value);
+      }
     }
   }
 
@@ -170,6 +295,11 @@ function claimedTokens(relative: string): string[] {
     }
   }
   for (const match of source.matchAll(/Object\.hasOwn\(\s*([A-Za-z_$][\w$]*)\s*,/gu)) {
+    for (const key of objectLiteralKeys(source, match[1] as string)) {
+      tokens.add(key);
+    }
+  }
+  for (const match of source.matchAll(/\bin\s+([A-Z][A-Z_0-9]*)\b/gu)) {
     for (const key of objectLiteralKeys(source, match[1] as string)) {
       tokens.add(key);
     }
@@ -251,6 +381,10 @@ const PROBES: Probe[] = [
   { module: "routes/stock.ts", method: "GET", path: "/stock/AAPL.US", expectStatus: 200 },
   { module: "routes/strategy.ts", method: "GET", path: "/strategy", expectStatus: 200 },
   { module: "routes/member-card.ts", method: "GET", path: `/member/${OTHER_MEMBER_ID}`, expectStatus: 404 },
+  // The v7 migration sentinel member-card.ts 404s before it even looks the id
+  // up. Found by the strengthened enumeration (G4-a): the module special-cases
+  // this path and nothing here had ever asked it for one.
+  { module: "routes/member-card.ts", method: "GET", path: "/member/__legacy_system__", expectStatus: 404 },
   { module: "routes/proposal.ts", method: "GET", path: "/proposal/prop1", expectStatus: 404 },
   { module: "routes/research.ts", method: "GET", path: "/research/rt1", expectStatus: 404 }
 ];
@@ -425,5 +559,59 @@ describe("cache headers on every route the server dispatches", () => {
       }
     }
     expect(fellThrough, "these probes never reached their route module, so they proved nothing").toEqual([]);
+  });
+});
+
+/**
+ * The enumeration's own guard (G4-a). Route source text IS this parser's input
+ * domain, so exercising it with source is not the fixture dishonesty this round
+ * is about - but the cases below are still kept honest by being verified
+ * against the real modules first: each was reproduced by temporarily editing
+ * routes/news.ts and routes/personal.ts and watching the file above go red,
+ * then reduced to the snippet here so it stays red forever without a
+ * production edit.
+ *
+ * Without these, "the enumeration is strict" is a claim about code that nothing
+ * ever runs against a counter-example - which is how the old version came to
+ * promise a strictness it did not have.
+ */
+describe("the route enumeration refuses what it cannot read", () => {
+  const RECOGNISED = `const segments = url.pathname.split("/").filter((s) => s.length > 0);
+    if (url.pathname === "/news") { return true; }`;
+
+  it("sees a new top-level path added beside an existing recognised one", () => {
+    const tokens = tokensFromSource(
+      "probe.ts",
+      `${RECOGNISED}\n    if (url.pathname.startsWith("/y/")) { return true; }`
+    );
+    expect(tokens).toContain("y");
+    expect(tokens).toContain("news");
+  });
+
+  it("sees a literal compared against a local assigned from a segment", () => {
+    const tokens = tokensFromSource(
+      "probe.ts",
+      `${RECOGNISED}\n    const kind = segments[0] as string;\n    if (kind === "zzz") { return true; }`
+    );
+    expect(tokens).toContain("zzz");
+  });
+
+  it("refuses a regex match on the path rather than contributing nothing", () => {
+    expect(() =>
+      tokensFromSource("probe.ts", `${RECOGNISED}\n    if (/^\\/z\\//u.test(url.pathname)) { return true; }`)
+    ).toThrow(/unrecognised usage|cannot read/iu);
+  });
+
+  it("refuses a switch on a path segment rather than contributing nothing", () => {
+    expect(() =>
+      tokensFromSource("probe.ts", `${RECOGNISED}\n    switch (segments[0]) { case "zzz": return true; }`)
+    ).toThrow(/unrecognised usage|cannot read/iu);
+  });
+
+  it("does not eat a line of routing code while stripping comments", () => {
+    // The regex literal ends in `\//`, two adjacent slashes: a naive
+    // comment-stripper deletes the rest of the line and the usage vanishes.
+    const source = readSource("routes/news.ts");
+    expect(source).toContain('url.pathname !== "/news"');
   });
 });
