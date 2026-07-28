@@ -70,6 +70,12 @@ export interface ReportConclusion {
  * member but cannot name their Feishu id says `owner-unresolved` WITH the
  * reason, and delivery fails closed - it never degrades into "send it
  * somewhere".
+ *
+ * A `visibility` OUTSIDE this union fails closed too (2026-07-28 R4, C12):
+ * refused on every channel, loudly, never read as public. That matters because
+ * these strings are written by hand in .mjs producers that `tsc` never sees -
+ * this union constrains nothing at their call sites, so the value is checked
+ * where it is consumed (`classifyReportScope`) instead.
  */
 export type ReportScope =
   /**
@@ -945,12 +951,87 @@ type ReportScopeDecision =
 type DeliverableReportScope = Exclude<ReportScopeDecision, { kind: "undeliverable" }>;
 
 /**
+ * Every visibility a producer may declare, mapped to the text an operator is
+ * shown when a payload declares something else.
+ *
+ * `Record<ReportScope["visibility"], string>` is the whole point: adding a
+ * member to `ReportScope` without adding it here is a COMPILE ERROR, so the
+ * accepted-values list an operator reads can never drift from the values
+ * delivery actually accepts. Together with the exhaustive `switch` in
+ * `classifyReportScope` (whose default branch takes `never`), a new
+ * `ReportScope` member cannot be added without deciding, in both places, how
+ * it routes and how it is described.
+ */
+const REPORT_SCOPE_VISIBILITY_HELP: Record<ReportScope["visibility"], string> = {
+  "circle-public": '{visibility:"circle-public"}（圈子公开，可进群发布卡）',
+  "owner-private": '{visibility:"owner-private", ownerOpenId}（归属某位成员，只发 TA 的单聊）',
+  "owner-unresolved": '{visibility:"owner-unresolved", reason}（归属某位成员但无法定位收件人，不投递）'
+};
+
+/**
+ * A `scope` whose `visibility` is not one of `ReportScope`'s members - a typo,
+ * a value from a newer producer than this build, or a `scope` that is not even
+ * an object. UNDELIVERABLE, and loudly (2026-07-28 R4, C12).
+ *
+ * This branch used to fall out of the bottom of `classifyReportScope` as
+ * `{kind: "circle-public"}` - the MOST permissive verdict of the three. Measured
+ * against a built dist with real `deliverReportToFeishu`, a stubbed fetch and
+ * FEISHU_GROUP_CHAT_ID set, a 模拟盘收支变化 body declaring
+ * `{visibility: "owner_private", ownerOpenId}` (one underscore for one hyphen)
+ * published 「QQQ.US：数量 1，成本 663.88 USD」 to the circle's group chat and
+ * returned `sent: true`. An unrecognized value is precisely the case where the
+ * delivery layer knows LEAST about who may read the body, so it must be the most
+ * conservative outcome, not the least.
+ *
+ * `scope: never` is the compile-time half: it only typechecks while every
+ * `ReportScope` member has its own `case` above, so a new member added to the
+ * union breaks the build here instead of silently inheriting this refusal.
+ *
+ * The `console.error` is deliberate, and it is the only one in this module.
+ * Every other `undeliverable` is a legitimate state of the DATA that the
+ * producer is expected to report (official-paper-monitor prints its
+ * owner-unresolved reason, stock-analysis exits non-zero). This one is a DEFECT
+ * IN THE PRODUCER that no compiler will ever catch - every report producer is a
+ * plain .mjs outside `pnpm typecheck`, and official-paper-monitor.mjs writes
+ * these visibility strings by hand - so it must reach the runner's stderr even
+ * if the caller drops the result on the floor.
+ *
+ * Only the `visibility` value is echoed back, never the rest of the scope or
+ * the body: this refusal is read by whoever operates the run, and the payload
+ * it is refusing may be exactly the owner-private content that must not spread.
+ */
+function refuseUnrecognizedVisibility(
+  payload: ReportDeliveryPayload,
+  scope: never
+): ReportScopeDecision {
+  const raw = (scope as { visibility?: unknown } | null | undefined)?.visibility;
+  const declared = raw === undefined
+    ? "（scope 上没有 visibility 字段）"
+    : JSON.stringify(raw)?.slice(0, 80) ?? String(raw).slice(0, 80);
+  const reason = [
+    `报告「${payload.title}」的 scope.visibility 是 ${declared}，不是可识别的可见范围，因此不投递。`,
+    "无法识别的声明恰恰是最不该猜的情况——按公开处理会把可能归属某位成员的内容发进群，",
+    "所以一律拒绝。请在生产方改成以下之一：",
+    Object.values(REPORT_SCOPE_VISIBILITY_HELP).join("；"),
+    "。"
+  ].join("");
+
+  console.error(
+    `[notifications] REFUSED report delivery: unrecognized scope.visibility ${declared} on 「${payload.title}」. ${reason}`
+  );
+
+  return { kind: "undeliverable", reason };
+}
+
+/**
  * Read the producer's declaration off the payload (see `ReportScope`).
  *
  * Precedence, and why:
  *   1. `scope` - the declaration. Nothing overrides it; a `scope` that
  *      disagrees with `openId` is a contradiction the delivery layer refuses
  *      instead of picking a winner, because either choice could be the leak.
+ *      A `scope` whose `visibility` is not a member of `ReportScope` is
+ *      refused too (`refuseUnrecognizedVisibility`) - never read as public.
  *   2. `openId` with no `scope` - the legacy signal, read as owner-private to
  *      that member. Every pre-2026-07-28 owner-scoped caller (personal-page
  *      cards) works unchanged.
@@ -967,40 +1048,50 @@ function classifyReportScope(payload: ReportDeliveryPayload): ReportScopeDecisio
   const scope = payload.scope;
 
   if (scope) {
-    if (scope.visibility === "owner-unresolved") {
-      return {
-        kind: "undeliverable",
-        reason: [
-          `报告「${payload.title}」声明为单一成员私有，但生产方无法确定归属成员，因此不投递：${scope.reason}`,
-          "（内容仍在平台上按归属做了访问控制；把它发给默认目标会把某个成员的账户内容给错人。）"
-        ].join("")
-      };
-    }
-
-    if (scope.visibility === "owner-private") {
-      const ownerOpenId = scope.ownerOpenId?.trim() ?? "";
-      if (ownerOpenId === "") {
+    // A switch, not an if-chain, and every member has its own `case`: the
+    // default branch below narrows `scope` to `never` only while that stays
+    // true, which is what forces a future ReportScope member to be routed here
+    // rather than inheriting whichever branch happens to be last (2026-07-28
+    // R4, C12 - "whichever branch happens to be last" was circle-public).
+    switch (scope.visibility) {
+      case "owner-unresolved":
         return {
           kind: "undeliverable",
-          reason: `报告「${payload.title}」声明为单一成员私有（scope.visibility="owner-private"），但 ownerOpenId 为空，没有可投递的对象。请改用 {visibility:"owner-unresolved", reason} 说明原因，或补上该成员的飞书 open_id。`
+          reason: [
+            `报告「${payload.title}」声明为单一成员私有，但生产方无法确定归属成员，因此不投递：${scope.reason}`,
+            "（内容仍在平台上按归属做了访问控制；把它发给默认目标会把某个成员的账户内容给错人。）"
+          ].join("")
         };
-      }
-      if (routingOpenId !== "" && routingOpenId !== ownerOpenId) {
-        return {
-          kind: "undeliverable",
-          reason: `报告「${payload.title}」自相矛盾：scope 声明归属 ${ownerOpenId}，payload.openId 却指向 ${routingOpenId}。两者都可能是正确的收件人，投递任何一方都可能把私有内容发错人，因此拒绝。`
-        };
-      }
-      return { kind: "owner-private", ownerOpenId };
-    }
 
-    if (routingOpenId !== "") {
-      return {
-        kind: "undeliverable",
-        reason: `报告「${payload.title}」自相矛盾：scope 声明为圈子公开（circle-public），却又用 payload.openId 指定了单个成员 ${routingOpenId}。公开卡不该定向发给一个人，定向卡也不该按公开处理，因此拒绝。`
-      };
+      case "owner-private": {
+        const ownerOpenId = scope.ownerOpenId?.trim() ?? "";
+        if (ownerOpenId === "") {
+          return {
+            kind: "undeliverable",
+            reason: `报告「${payload.title}」声明为单一成员私有（scope.visibility="owner-private"），但 ownerOpenId 为空，没有可投递的对象。请改用 {visibility:"owner-unresolved", reason} 说明原因，或补上该成员的飞书 open_id。`
+          };
+        }
+        if (routingOpenId !== "" && routingOpenId !== ownerOpenId) {
+          return {
+            kind: "undeliverable",
+            reason: `报告「${payload.title}」自相矛盾：scope 声明归属 ${ownerOpenId}，payload.openId 却指向 ${routingOpenId}。两者都可能是正确的收件人，投递任何一方都可能把私有内容发错人，因此拒绝。`
+          };
+        }
+        return { kind: "owner-private", ownerOpenId };
+      }
+
+      case "circle-public":
+        if (routingOpenId !== "") {
+          return {
+            kind: "undeliverable",
+            reason: `报告「${payload.title}」自相矛盾：scope 声明为圈子公开（circle-public），却又用 payload.openId 指定了单个成员 ${routingOpenId}。公开卡不该定向发给一个人，定向卡也不该按公开处理，因此拒绝。`
+          };
+        }
+        return { kind: "circle-public" };
+
+      default:
+        return refuseUnrecognizedVisibility(payload, scope);
     }
-    return { kind: "circle-public" };
   }
 
   if (routingOpenId !== "") {

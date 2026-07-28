@@ -16,7 +16,8 @@ import {
   shouldSendFullReportChapters,
   updateInteractiveCard,
   type CardTransport,
-  type InteractiveCard
+  type InteractiveCard,
+  type ReportScope
 } from "./notifications.js";
 
 describe("report delivery policy", () => {
@@ -1320,6 +1321,94 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(result.sent).toBe(false);
     expect(result.reason).toMatch(/owner-unresolved/);
     expect(calls).toHaveLength(0);
+  });
+
+  // 2026-07-28 (R4, C12 CRITICAL). The privacy guard's default used to be
+  // fail-OPEN: `visibility` was matched against two members and everything else
+  // fell out of the bottom as circle-public - the MOST permissive verdict - and
+  // was published to FEISHU_GROUP_CHAT_ID with `sent: true`. One underscore for
+  // one hyphen was enough, and the producers that write these strings by hand
+  // (official-paper-monitor.mjs) are .mjs that `tsc` never checks.
+  //
+  // The body here is the 模拟盘收支变化 shape from the R2 leak capture, holding
+  // line included, so a regression re-publishes exactly the content that leak
+  // was about.
+  const PAPER_PNL_MARKDOWN = [
+    "# OpenClaw 模拟盘收支变化 2026-07-28",
+    "",
+    "窗口：2026-07-27 20:00 - 2026-07-28 20:00（北京时间）",
+    "",
+    "## 1. 今日结论",
+    "",
+    "- 持仓：QQQ.US：数量 1，成本 663.88 USD。"
+  ].join("\n");
+
+  it("refuses an unrecognized scope.visibility instead of publishing it to the group", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+    const errors: string[] = [];
+    const realError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+
+    let result;
+    try {
+      result = await deliverReportToFeishu({
+        title: "OpenClaw 模拟盘收支变化 2026-07-28",
+        markdown: PAPER_PNL_MARKDOWN,
+        // One underscore instead of one hyphen - the typo a .mjs producer can
+        // make today with nothing to stop it.
+        scope: { visibility: "owner_private", ownerOpenId: "ou_paper_owner" } as unknown as ReportScope,
+        audience: "dm",
+        reportKind: "official-paper",
+        reportDate: "2026-07-28"
+      });
+    } finally {
+      console.error = realError;
+    }
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.deliveries).toEqual([]);
+    // Nothing was attempted at all - not even a tenant token - so the holdings
+    // line cannot have reached the group chat or anywhere else.
+    expect(calls).toHaveLength(0);
+    // Loud, not silent: an operator sees it even if the producer drops the
+    // result, which is the difference between this and a legitimate
+    // undeliverable. It names the rejected value and every accepted form.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("owner_private");
+    expect(errors[0]).toContain("circle-public");
+    expect(errors[0]).toContain("owner-unresolved");
+    expect(result.reason).toContain("owner_private");
+    expect(result.reason).toContain("ownerOpenId");
+    // The refusal never echoes the body it refused.
+    expect(result.reason).not.toContain("663.88");
+    expect(errors[0]).not.toContain("663.88");
+  });
+
+  it("refuses a scope object that carries no visibility at all rather than defaulting it", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    const calls = stubFetch(okFeishu());
+    const realError = console.error;
+    console.error = () => {};
+
+    let result;
+    try {
+      result = await deliverReportToFeishu({
+        title: "OpenClaw 模拟盘收支变化 2026-07-28",
+        markdown: PAPER_PNL_MARKDOWN,
+        scope: {} as unknown as ReportScope
+      });
+    } finally {
+      console.error = realError;
+    }
+
+    expect(result.sent).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(result.reason).toContain("visibility");
   });
 
   it("stays at one message for a long report - no chapter fan-out to fall back to", async () => {
