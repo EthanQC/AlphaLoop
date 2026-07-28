@@ -1179,3 +1179,50 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });
+
+// 2026-07-28 (spec drift A3). The scheduled run handed deliverReportToFeishu
+// only {title, markdown, markdownPath, pdfPath}. That was harmless while a
+// report was delivered as summary-plus-chapters, but the payload is now a
+// conclusion card whose ONLY route to the full text is the deep link built from
+// reportKind + reportDate - so with those absent the reader got a card with no
+// way to reach the analysis. The payload is the contract that decides this, so
+// it is built by a named function and asserted directly.
+describe("stock-analysis Feishu delivery payload (spec drift A3)", () => {
+  it("names the stock-analysis platform page and the batch date so the card gets a deep link", () => {
+    const payload = stockAnalysis.buildStockAnalysisDeliveryPayload({
+      label: "2026-07-28",
+      markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83。",
+      markdownPath: "/tmp/reports/2026-07-28.md",
+      pdfPath: "/tmp/reports/2026-07-28.pdf"
+    });
+
+    expect(payload.reportKind).toBe("stock-analysis");
+    expect(payload.reportDate).toBe("2026-07-28");
+    expect(payload.title).toBe("OpenClaw 个股分析 2026-07-28");
+    expect(payload.markdown).toContain("AAPL.US：支撑位 276.83。");
+  });
+
+  it("produces a card carrying both the batch conclusion and a working deep link", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+    try {
+      const card = notifications.buildReportConclusionCard(stockAnalysis.buildStockAnalysisDeliveryPayload({
+        label: "2026-07-28",
+        markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83；阻力位 312.51。",
+        markdownPath: "/tmp/reports/2026-07-28.md",
+        pdfPath: "/tmp/reports/2026-07-28.pdf"
+      }));
+
+      expect(card.url).toEqual({ text: "查看完整报告", href: "https://reports.qingverse.com/stock-analysis/2026-07-28" });
+      expect(card.lines.join("\n")).toContain("AAPL.US：支撑位 276.83；阻力位 312.51。");
+      expect(card.lines.join("\n")).not.toContain("未指定平台页面");
+    } finally {
+      if (previousBaseUrl === undefined) {
+        delete process.env.PLATFORM_PUBLIC_BASE_URL;
+      } else {
+        process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
+      }
+    }
+  });
+});

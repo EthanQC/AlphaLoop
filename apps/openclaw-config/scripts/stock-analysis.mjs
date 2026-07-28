@@ -296,12 +296,12 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
     throw new Error(`个股分析质量校验失败：${numericCheck.failures.join(", ")}`);
   }
 
-  const delivery = await deliverReportToFeishu({
-    title: `OpenClaw 个股分析 ${label}`,
+  const delivery = await deliverReportToFeishu(buildStockAnalysisDeliveryPayload({
+    label,
     markdown,
     markdownPath,
     pdfPath
-  });
+  }));
   // 2026-07-26: a failed Feishu delivery must NOT discard a successfully
   // generated analysis. This used to throw BEFORE the stock_analysis_runs
   // insert, so an undeliverable report also lost the markdown path, the run
@@ -326,6 +326,37 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
 
   writeState({ lastRunAt: generatedAt, lastRunId: runId, symbols: deliveredSymbols });
   console.log(JSON.stringify({ delivered: delivery.sent, runId, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath, ...(delivery.sent ? {} : { deliveryReason: delivery.reason }) }, null, 2));
+}
+
+/**
+ * The Feishu delivery payload for one stock-analysis batch.
+ *
+ * 2026-07-28 (spec drift A3). This call site passed only title/markdown/paths.
+ * That lost nothing while a report was delivered as a summary plus every
+ * chapter, but a report is now ONE conclusion card and the deep link built from
+ * `reportKind` + `reportDate` is the reader's only route to the full analysis -
+ * so without them the card arrived with no way to reach the report at all.
+ * `stock-analysis` + the batch date is exactly the /stock-analysis/<date>
+ * reading page the platform router serves (deep-links.ts).
+ *
+ * Audience is left at the default (单聊/DM): the batch card is not a 公共通知
+ * like the daily/weekly publication card, and it carries no per-owner `openId`
+ * because a batch covers the shared target list rather than one member.
+ *
+ * Extracted as a named function so the payload - the thing that actually
+ * decides whether the reader can reach the report - has a direct test, instead
+ * of being an object literal buried in a path that needs live Longbridge data
+ * to reach.
+ */
+export function buildStockAnalysisDeliveryPayload({ label, markdown, markdownPath, pdfPath }) {
+  return {
+    title: `OpenClaw 个股分析 ${label}`,
+    markdown,
+    markdownPath,
+    pdfPath,
+    reportKind: "stock-analysis",
+    reportDate: label
+  };
 }
 
 // Task H7 (2026-07-14 legacy audit): one bad target (delisted/suspended

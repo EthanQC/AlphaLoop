@@ -159,12 +159,14 @@ async function sendPnlReport(db, forceRun = false) {
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
   await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
-  const delivery = await deliverReportToFeishu({
-    title: `OpenClaw 模拟盘收支变化 ${label}`,
+  const delivery = await deliverReportToFeishu(buildPnlDeliveryPayload({
+    current: snapshot,
+    previousDay,
+    previousWeek,
     markdown,
     markdownPath,
     pdfPath
-  });
+  }));
   // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
   // already persisted by this point, so a Feishu delivery failure must not
   // throw the whole run away. deliverReportToFeishu returns {sent:false,
@@ -333,6 +335,80 @@ export function buildStrategyReflection(snapshot) {
 
 function countDegradedPositions(positions) {
   return (positions ?? []).filter((position) => position?.priceSource && position.priceSource !== "live").length;
+}
+
+/**
+ * The Feishu delivery payload for the post-open PnL report.
+ *
+ * 2026-07-28 (spec drift A3). This call site passed only title/markdown/paths,
+ * which was survivable while a report was delivered as a summary plus every
+ * chapter. It is not survivable now that a report is ONE conclusion card built
+ * from bullet lines: the 收支变化表 is a markdown TABLE, and the card's bullet
+ * extractor only reads "- " lines, so the numbers this whole report exists to
+ * deliver never reached the reader.
+ *
+ * Two deliberate decisions:
+ *
+ *   - `audience: "dm"`. /official-paper is owner-private, so the account's
+ *     balances must never be routed to the circle's group chat. It is the
+ *     current default, stated explicitly so a future change of default cannot
+ *     silently publish these numbers.
+ *   - no `reportKind`. There is no /official-paper deep-link page in
+ *     deep-links.ts to point at, so the card ships button-free and says so
+ *     ("本次报告未指定平台页面"), instead of blaming an unconfigured base url
+ *     for a link that was never available. The numbers therefore have to travel
+ *     IN the card, which is what `conclusion` is for.
+ *
+ * A missing comparison snapshot is DISCLOSED, never computed as a 0 change -
+ * "no baseline exists" and "nothing moved" are different facts, and only one of
+ * them is true here.
+ */
+export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, markdown, markdownPath, pdfPath }) {
+  const label = current.fetchedAt.slice(0, 10);
+  const currentAsset = summarizeAsset(current);
+  const degradedCount = countDegradedPositions(current.positions);
+  const reflection = buildStrategyReflection(current);
+
+  const bullets = [
+    renderComparisonBullet("跟前一日", currentAsset, previousDay),
+    renderComparisonBullet("跟上一周最后一个交易日", currentAsset, previousWeek),
+    renderPositionsBullet(current, degradedCount),
+    `反思：${reflection.summary}（动作：${reflection.action}）`
+  ];
+
+  return {
+    title: `OpenClaw 模拟盘收支变化 ${label}`,
+    markdown,
+    markdownPath,
+    pdfPath,
+    audience: "dm",
+    conclusion: {
+      headline: `净资产 ${formatMoney(currentAsset.netAssets)}，现金 ${formatMoney(currentAsset.totalCash)}，持仓估值 ${formatMoney(currentAsset.marketValue)}`,
+      bullets
+    }
+  };
+}
+
+function renderComparisonBullet(label, currentAsset, baseSnapshot) {
+  if (!baseSnapshot) {
+    return `${label}：无可比快照，本次不计算变化。`;
+  }
+  const base = summarizeAsset(baseSnapshot);
+  return `${label}：净资产 ${formatDelta(currentAsset.netAssets - base.netAssets)}，现金 ${formatDelta(currentAsset.totalCash - base.totalCash)}`;
+}
+
+function renderPositionsBullet(snapshot, degradedCount) {
+  const positions = snapshot.positions ?? [];
+  if (positions.length === 0) {
+    return "持仓：当前无持仓。";
+  }
+  const listed = positions.slice(0, 3).map((position) => `${position.symbol}×${position.quantity}`).join("、");
+  const more = positions.length > 3 ? `等 ${positions.length} 个标的` : "";
+  // Never let a cost/zero fallback price pass as a real market valuation.
+  const degraded = degradedCount > 0
+    ? `；其中 ${degradedCount} 个标的估值降级（行情读取失败，按成本价或 0 代替，非真实市价）`
+    : "";
+  return `持仓：${listed}${more}${degraded}。`;
 }
 
 export function renderPnlReport(current, previousDay, previousWeek) {

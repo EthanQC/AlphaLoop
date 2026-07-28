@@ -385,3 +385,93 @@ describe("official-paper-monitor.mjs CLI entry: unknown command -> JSON envelope
     expect(parsed.error).toMatch(/poll\|pnl\|snapshot/);
   });
 });
+
+// 2026-07-28 (spec drift A3). sendPnlReport handed deliverReportToFeishu only
+// {title, markdown, markdownPath, pdfPath}. Under the one-card delivery path
+// that produced a card with neither the numbers nor a link: the 收支变化表 is a
+// markdown TABLE, and the bullet extractor only picks up "- " lines, so the
+// whole point of the report - net assets and what changed - never reached the
+// reader. There is no /official-paper deep-link page to fall back on either
+// (and it is being made owner-private), so the payload carries the numbers in
+// its own conclusion and states plainly that there is no link.
+describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
+  function pnlPayload(overrides: {
+    current?: Record<string, unknown>;
+    previousDay?: Record<string, unknown> | null;
+    previousWeek?: Record<string, unknown> | null;
+  } = {}) {
+    const current = overrides.current ?? buildSnapshot({ primaryAsset: { net_assets: "1200", total_cash: "140" } });
+    return officialPaperMonitor.buildPnlDeliveryPayload({
+      current,
+      previousDay: overrides.previousDay === undefined
+        ? buildSnapshot({ fetchedAt: "2026-06-30T14:00:00.000Z", primaryAsset: { net_assets: "1000", total_cash: "200" } })
+        : overrides.previousDay,
+      previousWeek: overrides.previousWeek === undefined ? null : overrides.previousWeek,
+      markdown: officialPaperMonitor.renderPnlReport(current, null, null),
+      markdownPath: "/tmp/reports/2026-07-01-post-open.md",
+      pdfPath: "/tmp/reports/2026-07-01-post-open.pdf"
+    });
+  }
+
+  it("keeps the PnL card in the owner's DM and out of the shared group", () => {
+    const payload = pnlPayload();
+
+    // /official-paper is owner-private: the account's balances must never be
+    // routed to the circle's group chat.
+    expect(payload.audience).toBe("dm");
+  });
+
+  it("carries the numbers the markdown table hides from the card", () => {
+    const payload = pnlPayload();
+    const text = [payload.conclusion.headline, ...payload.conclusion.bullets].join("\n");
+
+    expect(text).toContain("1200.00 USD");
+    expect(text).toContain("140.00 USD");
+    // 1200 - 1000 = +200 net assets, 140 - 200 = -60 cash.
+    expect(text).toContain("+200.00 USD");
+    expect(text).toContain("-60.00 USD");
+  });
+
+  it("discloses a missing comparison snapshot instead of reporting a 0 change", () => {
+    const payload = pnlPayload({ previousDay: null, previousWeek: null });
+    const bullets = payload.conclusion.bullets.join("\n");
+
+    expect(bullets).toContain("无可比快照");
+    // A computed 0 here would be a fabrication: no baseline exists.
+    expect(bullets).not.toContain("+0.00 USD");
+  });
+
+  it("discloses a degraded valuation rather than presenting a fallback price as a real one", () => {
+    const payload = pnlPayload({
+      current: buildSnapshot({
+        primaryAsset: { net_assets: "1200", total_cash: "140" },
+        positions: [{ symbol: "NVDA.US", quantity: 10, costPrice: 100, priceSource: "cost", price: 100 }],
+        quotes: []
+      })
+    });
+
+    expect(payload.conclusion.bullets.join("\n")).toContain("估值降级");
+  });
+
+  it("says no platform page holds this report - it must not blame the base url", async () => {
+    const notifications = await import("../../../packages/shared-types/dist/index.js");
+    const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+    try {
+      const card = notifications.buildReportConclusionCard(pnlPayload());
+
+      expect(card.url).toBeUndefined();
+      const text = card.lines.join("\n");
+      expect(text).toContain("未指定平台页面");
+      expect(text).not.toContain("PLATFORM_PUBLIC_BASE_URL");
+      // The reader still gets the substance.
+      expect(text).toContain("1200.00 USD");
+    } finally {
+      if (previousBaseUrl === undefined) {
+        delete process.env.PLATFORM_PUBLIC_BASE_URL;
+      } else {
+        process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
+      }
+    }
+  });
+});
