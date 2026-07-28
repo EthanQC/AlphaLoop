@@ -453,19 +453,25 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     expect(payload.conclusion.bullets.join("\n")).toContain("估值降级");
   });
 
-  it("says no platform page holds this report - it must not blame the base url", async () => {
+  // 2026-07-28 (R1). The card shipped button-free because `official-paper` was
+  // missing from DeepLinkKind, and that omission was then cited as proof that
+  // no such page existed. /official-paper/<date> has always been served
+  // (routes/reports.ts) and is now owner-gated, so the button is back.
+  //
+  // Asserted on the JSON Feishu actually parses, not on our own InteractiveCard
+  // type: a card 1.0 `url` inside a schema-2.0 payload passed every type-level
+  // test in this repo once already while the live API rejected it outright.
+  async function pnlCardJson(baseUrl: string | undefined) {
     const notifications = await import("../../../packages/shared-types/dist/index.js");
     const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
-    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+    if (baseUrl === undefined) {
+      delete process.env.PLATFORM_PUBLIC_BASE_URL;
+    } else {
+      process.env.PLATFORM_PUBLIC_BASE_URL = baseUrl;
+    }
     try {
       const card = notifications.buildReportConclusionCard(pnlPayload());
-
-      expect(card.url).toBeUndefined();
-      const text = card.lines.join("\n");
-      expect(text).toContain("未指定平台页面");
-      expect(text).not.toContain("PLATFORM_PUBLIC_BASE_URL");
-      // The reader still gets the substance.
-      expect(text).toContain("1200.00 USD");
+      return { card, payload: notifications.buildFeishuCardPayload(card) as Record<string, unknown> };
     } finally {
       if (previousBaseUrl === undefined) {
         delete process.env.PLATFORM_PUBLIC_BASE_URL;
@@ -473,5 +479,44 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
         process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
       }
     }
+  }
+
+  it("links the card at the owner-gated /official-paper page for this snapshot's date", async () => {
+    const { card, payload } = await pnlCardJson("https://reports.qingverse.com");
+
+    // The date is the snapshot's own fetchedAt day - the key routes/reports.ts
+    // matches - not today's date and not a guessed id.
+    expect(card.url).toEqual({
+      text: "查看完整报告",
+      href: "https://reports.qingverse.com/official-paper/2026-07-01"
+    });
+    const elements = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
+    expect(elements).toContainEqual({
+      tag: "button",
+      text: { tag: "plain_text", content: "查看完整报告" },
+      type: "default",
+      behaviors: [{
+        type: "open_url",
+        default_url: "https://reports.qingverse.com/official-paper/2026-07-01",
+        pc_url: "https://reports.qingverse.com/official-paper/2026-07-01",
+        ios_url: "https://reports.qingverse.com/official-paper/2026-07-01",
+        android_url: "https://reports.qingverse.com/official-paper/2026-07-01"
+      }]
+    });
+    // The link is the full text, not a replacement for the conclusion: the
+    // 收支变化表 is a markdown TABLE the bullet extractor cannot read.
+    expect(card.lines.join("\n")).toContain("1200.00 USD");
+    expect(card.lines.join("\n")).not.toContain("未指定平台页面");
+  });
+
+  it("blames the missing base url - not a missing page - when the deployment has no public origin", async () => {
+    const { card } = await pnlCardJson(undefined);
+
+    expect(card.url).toBeUndefined();
+    const text = card.lines.join("\n");
+    expect(text).toContain("PLATFORM_PUBLIC_BASE_URL");
+    expect(text).not.toContain("未指定平台页面");
+    // The reader still gets the substance.
+    expect(text).toContain("1200.00 USD");
   });
 });

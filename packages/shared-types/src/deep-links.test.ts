@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { buildDeepLink, type DeepLinkKind } from "./deep-links.js";
@@ -32,6 +35,7 @@ describe("buildDeepLink", () => {
     ["daily", "2026-07-28", "/daily/2026-07-28"],
     ["weekly", "2026-07-26", "/weekly/2026-07-26"],
     ["stock-analysis", "rep_123", "/stock-analysis/rep_123"],
+    ["official-paper", "2026-07-28", "/official-paper/2026-07-28"],
     ["stock", "700.HK", "/stock/700.HK"],
     ["proposal", "prop_x", "/proposal/prop_x"],
     ["research", "res_9", "/research/res_9"],
@@ -83,5 +87,54 @@ describe("buildDeepLink", () => {
 
   it("throws on a blank id instead of building a link to a listing page", () => {
     expect(() => buildDeepLink("daily", "  ")).toThrow(/deep link id/iu);
+  });
+});
+
+// 2026-07-28 (spec drift R1). The PnL card shipped without a button because
+// `official-paper` was missing from DeepLinkKind, and the missing kind was then
+// cited as proof that no such page existed - circular reasoning that cost the
+// report its link for as long as nobody checked the router.
+//
+// So this reads the ROUTER'S OWN table rather than a list retyped here: a kind
+// that only this repo's tests believe in is exactly the drift deep-links.ts
+// exists to prevent. `READING_PATH_SEGMENTS` in routes/reports.ts is the map the
+// live server dispatches on (`/<segment>/<id>`), so every key in it must have a
+// buildDeepLink kind whose path is that same segment.
+describe("deep link kinds vs the platform router's own path table", () => {
+  const previousBaseUrl = process.env[BASE_URL_ENV];
+
+  beforeEach(() => {
+    process.env[BASE_URL_ENV] = PRODUCTION_BASE_URL;
+  });
+
+  afterEach(() => {
+    if (previousBaseUrl === undefined) {
+      delete process.env[BASE_URL_ENV];
+    } else {
+      process.env[BASE_URL_ENV] = previousBaseUrl;
+    }
+  });
+
+  const routerSource = readFileSync(
+    fileURLToPath(new URL("../../../apps/platform-app/src/routes/reports.ts", import.meta.url)),
+    "utf8"
+  );
+
+  function readingPathSegments(): string[] {
+    const table = /const READING_PATH_SEGMENTS[^{]*\{([^}]*)\}/u.exec(routerSource);
+    if (!table) {
+      throw new Error("READING_PATH_SEGMENTS not found in routes/reports.ts - the cross-check cannot run.");
+    }
+    return [...(table[1] ?? "").matchAll(/^\s*"?([a-z-]+)"?\s*:/gmu)].map((match) => match[1] as string);
+  }
+
+  it("finds the segments in the router (guards against the regex silently matching nothing)", () => {
+    expect(readingPathSegments()).toEqual(["daily", "weekly", "stock-analysis", "official-paper"]);
+  });
+
+  it.each(readingPathSegments())("serves /%s/<id>, so buildDeepLink knows that kind", (segment) => {
+    expect(buildDeepLink(segment as DeepLinkKind, "2026-07-28")).toBe(
+      `${PRODUCTION_BASE_URL}/${segment}/2026-07-28`
+    );
   });
 });

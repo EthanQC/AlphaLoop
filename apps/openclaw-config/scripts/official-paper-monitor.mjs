@@ -353,11 +353,14 @@ function countDegradedPositions(positions) {
  *     balances must never be routed to the circle's group chat. It is the
  *     current default, stated explicitly so a future change of default cannot
  *     silently publish these numbers.
- *   - no `reportKind`. There is no /official-paper deep-link page in
- *     deep-links.ts to point at, so the card ships button-free and says so
- *     ("本次报告未指定平台页面"), instead of blaming an unconfigured base url
- *     for a link that was never available. The numbers therefore have to travel
- *     IN the card, which is what `conclusion` is for.
+ *   - `reportKind: "official-paper"`. 2026-07-28 (R1): this used to be omitted
+ *     on the grounds that "there is no /official-paper deep-link page", which
+ *     was circular - the page has always been served (routes/reports.ts
+ *     READING_PATH_SEGMENTS) and is now owner-gated (403 for anyone who is not
+ *     the snapshot's attributed owner, with no existence leak). The card gets
+ *     its 查看完整报告 button back. The numbers still travel IN the card too,
+ *     because the 收支变化表 is a markdown TABLE the bullet extractor cannot
+ *     read - a link is the full text, not a substitute for the conclusion.
  *
  * A missing comparison snapshot is DISCLOSED, never computed as a 0 change -
  * "no baseline exists" and "nothing moved" are different facts, and only one of
@@ -382,6 +385,12 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
     markdownPath,
     pdfPath,
     audience: "dm",
+    // `label` is `fetchedAt.slice(0, 10)` - the exact same string the writer
+    // used for the filename and the exact key routes/reports.ts matches
+    // (`substr(fetched_at, 1, 10)`), so the link cannot land on a date the
+    // page does not have.
+    reportKind: "official-paper",
+    reportDate: label,
     conclusion: {
       headline: `净资产 ${formatMoney(currentAsset.netAssets)}，现金 ${formatMoney(currentAsset.totalCash)}，持仓估值 ${formatMoney(currentAsset.marketValue)}`,
       bullets

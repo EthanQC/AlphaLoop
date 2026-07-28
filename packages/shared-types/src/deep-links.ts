@@ -27,6 +27,7 @@ export type DeepLinkKind =
   | "daily"
   | "weekly"
   | "stock-analysis"
+  | "official-paper"
   | "stock"
   | "proposal"
   | "research"
@@ -38,13 +39,22 @@ export type DeepLinkKind =
 /**
  * kind -> `[prefix, suffix]` around the encoded id. Mirrors the router:
  * `READING_PATH_SEGMENTS` in routes/reports.ts (daily / weekly /
- * stock-analysis), routes/stock.ts, routes/proposal.ts, routes/research.ts,
- * routes/review.ts, routes/member-card.ts, and the owner-only `/me` routes.
+ * stock-analysis / official-paper), routes/stock.ts, routes/proposal.ts,
+ * routes/research.ts, routes/review.ts, routes/member-card.ts, and the
+ * owner-only `/me` routes.
+ *
+ * `official-paper` is owner-gated (routes/reports.ts
+ * `refusedOwnerScopedReport`: 403 for anyone who is not the snapshot's
+ * attributed owner, decided before the file is looked up so the response
+ * never reveals which dates exist). Linking to it is therefore safe in a
+ * card that already went to that owner's own DM - and only there, which is
+ * what the ReportScope marker in notifications.ts enforces.
  */
 const PATH_SHAPES: Record<DeepLinkKind, readonly [string, string]> = {
   daily: ["/daily/", ""],
   weekly: ["/weekly/", ""],
   "stock-analysis": ["/stock-analysis/", ""],
+  "official-paper": ["/official-paper/", ""],
   stock: ["/stock/", ""],
   proposal: ["/proposal/", ""],
   research: ["/research/", ""],
