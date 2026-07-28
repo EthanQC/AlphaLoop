@@ -13,7 +13,7 @@
 // each active member gets their OWN page as one card, addressed to their own
 // open_id, carrying a /daily/<date>/me deep link - and a member the delivery
 // cannot reach is disclosed with a reason rather than silently dropped.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -296,5 +296,208 @@ describe("summarizePersonalPage", () => {
     const conclusion = scheduledReport.summarizePersonalPage("# 我的个人页 · 日报 2026-07-28\n");
 
     expect(conclusion).toEqual({ headline: "", bullets: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C4 (2026-07-28 adversarial review): personal-page DMs had no idempotency and
+// one member's failure re-spammed everybody.
+//
+// deliverReport called deliverPersonalPageCards unconditionally; the per-member
+// loop consulted no prior-delivery record - {delivered, skipped, failed} was
+// persisted to report-delivery-state.json by updateState and then never READ by
+// anything. And any member in `failed` set process.exitCode = 1, which marks the
+// whole cron run failed, so the runner retried it - and the default `run` action
+// re-does prepare + deliver, handing every member who already got their card a
+// second copy of it.
+// ---------------------------------------------------------------------------
+describe("C4: personal-page delivery is idempotent per (kind, date, owner)", () => {
+  it("does not re-send to a member who already has this window's card", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const { payloads, deliver } = capturingDeliver();
+
+    const result = await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: [{ ownerId: "member_a", messageId: "om_earlier_run" }],
+      deliver
+    });
+
+    // member_a was NOT contacted again; member_b, who never got one, was.
+    expect(payloads.map((payload) => payload.openId)).toEqual(["ou_beta"]);
+
+    // ...and member_a still appears as "has their card", so the record stays
+    // complete and the NEXT run keeps skipping them.
+    const delivered = result.delivered as Array<{ ownerId: string; reused?: boolean; messageId?: string }>;
+    expect(delivered.map((entry) => entry.ownerId).sort()).toEqual(["member_a", "member_b"]);
+    const carried = delivered.find((entry) => entry.ownerId === "member_a");
+    expect(carried?.reused).toBe(true);
+    expect(carried?.messageId).toBe("om_earlier_run");
+    expect(delivered.find((entry) => entry.ownerId === "member_b")?.reused).toBeUndefined();
+    expect(result.failed).toEqual([]);
+  });
+
+  it("re-running the whole delivery sends nothing a second time (the actual re-spam scenario)", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const first = capturingDeliver();
+    const firstResult = await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      deliver: first.deliver
+    });
+    expect(first.payloads).toHaveLength(2);
+
+    // Feed the first run's own record back in, exactly as the state file does.
+    const second = capturingDeliver();
+    const secondResult = await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: firstResult.delivered,
+      deliver: second.deliver
+    });
+
+    expect(second.payloads).toEqual([]);
+    expect(secondResult.delivered.map((entry: { ownerId: string }) => entry.ownerId).sort()).toEqual([
+      "member_a",
+      "member_b"
+    ]);
+    expect(secondResult.failed).toEqual([]);
+  });
+
+  it("retries only the member who failed, leaving the one who succeeded alone", async () => {
+    const db = makeDb();
+    seedTwoOwners(db);
+    const first = capturingDeliver({ ou_alpha: { sent: false, reason: "invalid receive_id" } });
+    const firstResult = await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      deliver: first.deliver
+    });
+    expect(firstResult.failed.map((entry: { ownerId: string }) => entry.ownerId)).toEqual(["member_a"]);
+
+    const second = capturingDeliver();
+    await scheduledReport.deliverPersonalPageCards({
+      db,
+      reportKind: "daily",
+      date: DATE,
+      previouslyDelivered: firstResult.delivered,
+      deliver: second.deliver
+    });
+
+    expect(second.payloads.map((payload) => payload.openId)).toEqual(["ou_alpha"]);
+  });
+});
+
+describe("C4: the idempotency key is (kind, date, ownerId)", () => {
+  const state = {
+    "daily:2026-07-28": {
+      personalCards: {
+        delivered: [{ ownerId: "member_a", messageId: "om_a" }, { ownerId: "member_b" }],
+        skipped: [{ ownerId: "member_c", reason: "未绑定飞书" }],
+        failed: [{ ownerId: "member_d", reason: "boom" }]
+      }
+    },
+    "weekly:2026-07-28": { personalCards: { delivered: [{ ownerId: "member_b" }], skipped: [], failed: [] } }
+  };
+
+  it("reads back exactly the owners already delivered for that one window", () => {
+    expect(scheduledReport.readDeliveredPersonalCards(state, "daily", "2026-07-28")).toEqual([
+      { ownerId: "member_a", messageId: "om_a" },
+      { ownerId: "member_b" }
+    ]);
+  });
+
+  it("does not let a delivered DAILY card suppress the WEEKLY card of the same member and date", () => {
+    expect(
+      scheduledReport.readDeliveredPersonalCards(state, "weekly", "2026-07-28").map((entry) => entry.ownerId)
+    ).toEqual(["member_b"]);
+  });
+
+  it("does not let one date suppress another", () => {
+    expect(scheduledReport.readDeliveredPersonalCards(state, "daily", "2026-07-27")).toEqual([]);
+  });
+
+  it("treats a skipped or failed member as NOT delivered, so the next run retries them", () => {
+    const owners = scheduledReport
+      .readDeliveredPersonalCards(state, "daily", "2026-07-28")
+      .map((entry: { ownerId: string }) => entry.ownerId);
+    expect(owners).not.toContain("member_c");
+    expect(owners).not.toContain("member_d");
+  });
+
+  it("returns an empty list for a missing/garbled state entry instead of throwing", () => {
+    expect(scheduledReport.readDeliveredPersonalCards(undefined, "daily", DATE)).toEqual([]);
+    expect(scheduledReport.readDeliveredPersonalCards({}, "daily", DATE)).toEqual([]);
+    expect(scheduledReport.readDeliveredPersonalCards({ "daily:2026-07-28": {} }, "daily", DATE)).toEqual([]);
+    expect(
+      scheduledReport.readDeliveredPersonalCards({ "daily:2026-07-28": { personalCards: { delivered: "nope" } } }, "daily", DATE)
+    ).toEqual([]);
+    // A record with no ownerId cannot suppress anybody.
+    expect(
+      scheduledReport.readDeliveredPersonalCards(
+        { "daily:2026-07-28": { personalCards: { delivered: [{ messageId: "om_x" }] } } },
+        "daily",
+        DATE
+      )
+    ).toEqual([]);
+  });
+});
+
+describe("C4: a single member's card failure does not force a full-run retry", () => {
+  it("keeps the run's exit code at 0 when only personal cards failed, and says so", () => {
+    const outcome = scheduledReport.summarizeRunOutcome({
+      reportSent: true,
+      personalCards: { delivered: [{ ownerId: "member_b" }], skipped: [], failed: [{ ownerId: "member_a", reason: "boom" }] }
+    });
+
+    // Non-zero would mark the cron run failed, and the runner's default action
+    // re-does prepare + deliver - which is what re-spammed everybody.
+    expect(outcome.exitCode).toBe(0);
+    // Not silent: the incompleteness and the failing owner are both reported.
+    expect(outcome.personalCardsComplete).toBe(false);
+    expect(outcome.personalCardFailures).toEqual([{ ownerId: "member_a", reason: "boom" }]);
+  });
+
+  it("still fails the run when the PUBLIC report itself was not delivered", () => {
+    const outcome = scheduledReport.summarizeRunOutcome({
+      reportSent: false,
+      personalCards: { delivered: [], skipped: [], failed: [] }
+    });
+    expect(outcome.exitCode).toBe(1);
+  });
+
+  it("reports a fully-successful run as complete", () => {
+    const outcome = scheduledReport.summarizeRunOutcome({
+      reportSent: true,
+      personalCards: { delivered: [{ ownerId: "member_a" }], skipped: [{ ownerId: "member_c", reason: "未绑定" }], failed: [] }
+    });
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.personalCardsComplete).toBe(true);
+    expect(outcome.personalCardFailures).toEqual([]);
+  });
+});
+
+// deliverReport drives real Longbridge/Feishu and is not exported, so the wiring
+// of the three pieces above is pinned at the source level. Without it each piece
+// could be individually correct while nothing called them - which is precisely
+// the shape of the defect (updateState already WROTE personalCards; no reader
+// existed).
+describe("C4: deliverReport actually uses the idempotency record and the outcome decision", () => {
+  const source = readFileSync(new URL("./scheduled-report.mjs", import.meta.url), "utf8");
+
+  it("reads the prior delivery record out of the state file and passes it to the card loop", () => {
+    expect(source).toMatch(/readDeliveredPersonalCards\(\s*readState\(\)/u);
+    expect(source).toMatch(/previouslyDelivered/u);
+  });
+
+  it("sets process.exitCode only from summarizeRunOutcome, never from personalCards.failed", () => {
+    expect(source).toContain("summarizeRunOutcome");
+    expect(source).not.toMatch(/personalCards\.failed\.length\s*>\s*0\s*\)\s*\{\s*\n\s*process\.exitCode\s*=\s*1/u);
   });
 });

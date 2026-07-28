@@ -248,7 +248,16 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // misconfiguration must not also cost every member the page that carries
   // their own holdings and strategy (which Task 4 removed from the public
   // body, so this is the ONLY channel that delivers it).
-  const personalCards = await deliverPersonalPageCards({ db, reportKind, date: info.label });
+  //
+  // C4: idempotent per (kind, date, owner). The state file already recorded who
+  // received their card; until now nothing read it back, so any retry of this
+  // window re-sent every member's card. `previouslyDelivered` is that record.
+  const personalCards = await deliverPersonalPageCards({
+    db,
+    reportKind,
+    date: info.label,
+    previouslyDelivered: readDeliveredPersonalCards(readState(), reportKind, info.label)
+  });
   if (personalCards.failed.length > 0 || personalCards.skipped.length > 0) {
     console.error(JSON.stringify({
       personalCards: { failed: personalCards.failed, skipped: personalCards.skipped },
@@ -299,6 +308,8 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     return;
   }
 
+  const outcome = summarizeRunOutcome({ reportSent: true, personalCards });
+
   updateState(info, {
     deliveredAt: new Date().toISOString(),
     path: reportPath,
@@ -309,7 +320,17 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
     groupFallback: result.groupFallback ?? false,
     ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
+    // The `delivered` list here is what the NEXT run reads back as its
+    // idempotency record (see readDeliveredPersonalCards) - it carries every
+    // member who has this window's card, including the ones this run skipped
+    // because an earlier attempt had already sent theirs.
     personalCards,
+    personalCardsComplete: outcome.personalCardsComplete,
+    // Named per-member so a partial personal delivery is auditable from the
+    // state file alone, without diffing two runs' stderr.
+    ...(outcome.personalCardsComplete
+      ? { personalCardsFailedAt: undefined, personalCardFailures: undefined }
+      : { personalCardsFailedAt: new Date().toISOString(), personalCardFailures: outcome.personalCardFailures }),
     // Clear any failure recorded by an earlier attempt at this same window
     // (updateState merges into the existing entry; undefined drops the key).
     deliveryFailedAt: undefined,
@@ -328,17 +349,31 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     groupFallback: result.groupFallback ?? false,
     ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
     personalCards: summarizePersonalCardOutcome(personalCards),
+    // C4: reported on the SUCCESS line too, so "the report shipped" can never
+    // be read as "and everybody got their page". The failing owners were
+    // already printed to stderr above and are persisted in the state file.
+    personalCardsComplete: outcome.personalCardsComplete,
+    ...(outcome.personalCardsComplete ? {} : { personalCardFailures: outcome.personalCardFailures }),
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
     path: reportPath,
     pdfPath
   }, null, 2));
 
-  // A member who did not get their page IS a failed delivery, even though the
-  // public card went out - the run must not report success for it. A member
-  // with no Feishu account bound is a configuration fact, not a failure, so it
-  // is disclosed above without failing the run.
-  if (personalCards.failed.length > 0) {
-    process.exitCode = 1;
+  // C4: only the PUBLIC report's delivery decides the exit code. This used to
+  // be `if (personalCards.failed.length > 0) process.exitCode = 1`, which
+  // marked the whole cron run failed over one unreachable member DM - and the
+  // runner's retry re-runs prepare + deliver, so it re-rendered the report and
+  // (before the idempotency record above) handed a duplicate card to every
+  // member who already had theirs. The failure is per-member, so the remedy is
+  // per-member: the next scheduled run retries exactly the members still
+  // missing a card, and until then the gap is disclosed in stdout, stderr and
+  // the state file rather than hidden.
+  //
+  // Assigned only when non-zero: writing a literal 0 here would CLEAR a failure
+  // any other part of the run had already recorded, which is the one way this
+  // line could turn a broken run into a reported-successful one.
+  if (outcome.exitCode !== 0) {
+    process.exitCode = outcome.exitCode;
   }
 }
 
@@ -363,14 +398,30 @@ const PERSONAL_CARD_MAX_LINE_CHARS = 160;
  * never improvised.
  *
  * Per-member outcomes are collected, never thrown:
- *   - `delivered` - the card was sent.
+ *   - `delivered` - the member HAS this window's card. Entries carried over
+ *                   from an earlier attempt are marked `reused: true`; the list
+ *                   is therefore the complete "who has it" record, which is
+ *                   what makes it safe to persist and read straight back.
  *   - `skipped`   - the member has no Feishu account bound; disclosed with the
  *                   reason, since their page still exists on the platform.
  *   - `failed`    - the page is missing, or Feishu rejected the card.
  *
- * @param {{db: object, reportKind: 'daily'|'weekly', date: string, deliver?: Function}} input
+ * C4 (2026-07-28 review): `previouslyDelivered` is the idempotency record -
+ * the (kind, date, ownerId) triples that already got their card, read out of
+ * report-delivery-state.json by readDeliveredPersonalCards. This loop used to
+ * consult NOTHING: updateState wrote {delivered, skipped, failed} for every run
+ * and no code path ever read it back, so a retry of the window re-sent the card
+ * to every member who already had it.
+ *
+ * @param {{db: object, reportKind: 'daily'|'weekly', date: string, previouslyDelivered?: Array<{ownerId: string, messageId?: string}>, deliver?: Function}} input
  */
-export async function deliverPersonalPageCards({ db, reportKind, date, deliver = deliverReportToFeishu } = {}) {
+export async function deliverPersonalPageCards({
+  db,
+  reportKind,
+  date,
+  previouslyDelivered = [],
+  deliver = deliverReportToFeishu
+} = {}) {
   if (!db) {
     throw new Error("deliverPersonalPageCards requires a db handle.");
   }
@@ -389,7 +440,29 @@ export async function deliverPersonalPageCards({ db, reportKind, date, deliver =
     SELECT markdown FROM personal_pages WHERE owner_id = ? AND kind = ? AND date = ?
   `);
 
+  // Owner -> the record of the earlier successful send. Kept whole (not just as
+  // a Set of ids) so the carried-over entry can preserve its original
+  // messageId: the state file must keep pointing at the message the member
+  // actually received, not lose it on the retry that skipped them.
+  const alreadyDelivered = new Map();
+  for (const entry of Array.isArray(previouslyDelivered) ? previouslyDelivered : []) {
+    const ownerId = typeof entry?.ownerId === "string" ? entry.ownerId.trim() : "";
+    if (ownerId !== "") {
+      alreadyDelivered.set(ownerId, entry);
+    }
+  }
+
   for (const member of new MemberRepository(db).listActive()) {
+    // Idempotency, keyed on (reportKind, date, member.id) - the window is
+    // already fixed by this call's own arguments, so membership in this map IS
+    // the triple. Carried over rather than dropped, so the record stays
+    // complete for the run after this one.
+    const prior = alreadyDelivered.get(member.id);
+    if (prior) {
+      delivered.push({ ...prior, ownerId: member.id, reused: true });
+      continue;
+    }
+
     const row = selectPage.get(member.id, reportKind, date);
     const markdown = row ? String(row.markdown ?? "") : "";
     if (markdown.trim() === "") {
@@ -510,8 +583,65 @@ function truncateCardLine(text) {
 function summarizePersonalCardOutcome(personalCards) {
   return {
     delivered: personalCards.delivered.length,
+    reused: personalCards.delivered.filter((entry) => entry.reused).length,
     skipped: personalCards.skipped.length,
     failed: personalCards.failed.length
+  };
+}
+
+/**
+ * C4: the idempotency record, read out of report-delivery-state.json.
+ *
+ * The state file is keyed `${kind}:${label}`, so the (kind, date) half of the
+ * key is the entry lookup and `ownerId` is the third component. Only entries
+ * under `personalCards.delivered` count - a `skipped` (no Feishu binding) or
+ * `failed` member has NOT got their card and must be retried, which is the
+ * whole point of retrying at all.
+ *
+ * Total-function on purpose: a missing, half-written or hand-edited state file
+ * yields `[]`, i.e. "nobody has their card yet". Erring that way costs at worst
+ * one duplicate card; erring the other way (treating garbage as "delivered")
+ * would silently deny a member their page forever.
+ *
+ * @param {Record<string, unknown>|undefined} state
+ * @param {'daily'|'weekly'} kind
+ * @param {string} date
+ * @returns {Array<{ownerId: string, messageId?: string}>}
+ */
+export function readDeliveredPersonalCards(state, kind, date) {
+  const entry = state && typeof state === "object" ? state[`${kind}:${date}`] : null;
+  const delivered = entry && typeof entry === "object" ? entry.personalCards?.delivered : null;
+  if (!Array.isArray(delivered)) {
+    return [];
+  }
+  return delivered.filter((record) => typeof record?.ownerId === "string" && record.ownerId.trim() !== "");
+}
+
+/**
+ * C4: what the run's exit code should be, and whether the personal half is
+ * complete.
+ *
+ * This used to be `if (personalCards.failed.length > 0) process.exitCode = 1`.
+ * A non-zero exit marks the whole cron run failed, and the cron-runner's
+ * default `run` action re-does prepare + deliver - so one member's unreachable
+ * DM cost a full re-render of the report AND (before the idempotency record
+ * above) a duplicate card for every member who had already received theirs.
+ *
+ * Only the PUBLIC report's delivery decides the exit code now. A failed
+ * personal card is still surfaced - `personalCardsComplete: false` plus the
+ * failing owners, printed to stderr and persisted in the state file - because a
+ * silent success is worse than a loud partial. What it no longer does is trigger
+ * a blind whole-run retry: the failure is per-member, so the fix is per-member
+ * (the next scheduled run retries exactly the members still missing a card).
+ *
+ * @param {{reportSent: boolean, personalCards: {delivered: object[], skipped: object[], failed: object[]}}} input
+ */
+export function summarizeRunOutcome({ reportSent, personalCards } = {}) {
+  const failures = Array.isArray(personalCards?.failed) ? personalCards.failed : [];
+  return {
+    exitCode: reportSent ? 0 : 1,
+    personalCardsComplete: failures.length === 0,
+    personalCardFailures: failures
   };
 }
 
@@ -2023,13 +2153,22 @@ function addDays(label, days) {
   return date.toISOString().slice(0, 10);
 }
 
-function updateState(info, patch) {
-  let state = {};
+// C4: the state file is now READ, not only written - readDeliveredPersonalCards
+// needs it to know which members already have this window's card. A missing or
+// unparsable file is an empty state, never a crash: the file is runtime
+// bookkeeping, and losing it must degrade to "send the cards" rather than kill
+// the run.
+function readState() {
   try {
-    state = JSON.parse(readFileSync(statePath, "utf8"));
+    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    state = {};
+    return {};
   }
+}
+
+function updateState(info, patch) {
+  const state = readState();
 
   const key = `${info.kind}:${info.label}`;
   state[key] = {
