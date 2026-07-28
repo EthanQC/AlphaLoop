@@ -5,11 +5,29 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { formatLocalDate, parseBackupFileDate } from "./backup-trading-data.mjs";
+import { judgeDeployLedger, readDeployLedger, REQUIRED_DEPLOY_STEPS } from "./deploy-ledger.mjs";
 import { readLaunchdOwnership } from "./install-launchd-ownership.mjs";
 import { consecutiveFailureCount, lastRunAt } from "./job-run-log.mjs";
+import {
+  describeLaunchdExit,
+  judgeLaunchdRuntime,
+  LAUNCHD_SERVICE_HEALTH,
+  parseLaunchdPrint,
+  RESIDENT_CRASH_LOOP_RUNS,
+  toFiniteNumber
+} from "./launchd-health.mjs";
 import { newsEngineHealthStats } from "./news-store.mjs";
+import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { getZonedParts, isUsRegularMarketHours } from "./trading-schedule.mjs";
+
+// Round 6 moved the residency contract and the judgement built on it into
+// launchd-health.mjs so install-system-daemons.sh can run the SAME check before
+// it archives a service's fallback (finding S3e: it used to verify with
+// `launchctl print`, which proves registration, not work). Re-exported here
+// because this module is the published surface the suite and the CLI read it
+// from.
+export { LAUNCHD_SERVICE_HEALTH, RESIDENT_CRASH_LOOP_RUNS };
 
 // The command that actually installs each domain's jobs. Round-3 finding F2:
 // the old hint named `pnpm launchd:install-backup-alerts` for every missing
@@ -53,82 +71,6 @@ function buildRequiredLaunchdJobs(rows = readLaunchdOwnership()) {
   }
   return jobs.map((job) => (slugCounts.get(job.slug) > 1 ? { ...job, slug: job.label } : job));
 }
-
-// Finding I5 (round-4): "loaded" is not "working". Every label in the
-// ownership manifest gets an entry here answering two questions the manifest
-// itself cannot:
-//
-//   residency - what `launchctl print`'s `state` line is ALLOWED to say.
-//               "resident" = KeepAlive=true in install-system-daemons.sh's
-//               write_plist call (gateway / broker-executor / platform-app /
-//               cron-runner): `state = running` is the only healthy answer,
-//               anything else means the service is down or crash-throttled.
-//               "periodic" = KeepAlive=false + a StartInterval/
-//               StartCalendarInterval (market-alerts / daily-backup /
-//               official-paper poll+pnl) or RunAtLoad-once
-//               (com.alphaloop.rsshub, see its plist template): `state = not
-//               running` BETWEEN runs is the normal steady state and must
-//               never be reported as a fault - what matters for these is the
-//               exit code of the last run.
-//
-//   probe     - the independent observation that proves the service is doing
-//               its job, not just that launchd holds a record for it. Named
-//               here (and printed in the no_health_contract finding) so a
-//               label added to the manifest without a real probe fails
-//               loudly instead of silently inheriting a check that proves
-//               nothing.
-//
-// Measured, not assumed: `launchctl print` on the mini (2026-07-28,
-// read-only) returns `state = running` + a `pid` for platform-app /
-// cron-runner / gateway / broker-executor, and `state = not running` +
-// `last exit code = 0` for market-alerts / daily-backup / official-paper
-// poll+pnl - with `last exit code = 1` for com.alphaloop.rsshub, which is a
-// genuine failure (its body is `docker start rsshub`) that the pre-I5 doctor
-// reported as perfectly healthy.
-//
-// This table is a second list of labels, which the header above rightly
-// warns about - so it is not allowed to drift silently: checkLaunchdJobs
-// emits `launchd-jobs.<slug>.no_health_contract` (error) for any required
-// label missing from it, and the test suite asserts its key set equals the
-// manifest's system+user rows exactly.
-export const LAUNCHD_SERVICE_HEALTH = {
-  "ai.openclaw.system.gateway": {
-    residency: "resident",
-    probe: "gateway-listeners（18789 上恰好一个监听进程）"
-  },
-  "com.openclaw.system.trading.broker-executor": {
-    residency: "resident",
-    probe: "broker-executor-health（127.0.0.1:4312/health 返回 200 且 service=broker-executor）"
-  },
-  "com.alphaloop.platform-app": {
-    residency: "resident",
-    probe: "platform-app-health（127.0.0.1:4314/health 返回 200 且 service=platform-app）"
-  },
-  "com.openclaw.trading.cron-runner": {
-    residency: "resident",
-    probe: "runner-listeners（18792 上恰好一个监听进程）"
-  },
-  "com.alphaloop.market-alerts": {
-    residency: "periodic",
-    probe: "alerts-poller-health（run_log 里 market-alerts 的心跳与连续失败数）"
-  },
-  "com.alphaloop.daily-backup": {
-    residency: "periodic",
-    probe: "daily-backup-health（runtime/backups 里最新 trading-<日期>.sqlite 的日期戳）"
-  },
-  "com.openclaw.trading.official-paper.poll": {
-    residency: "periodic",
-    probe: "official-paper-health（official_paper_snapshots 里 reason=hourly_poll 的最新一行）"
-  },
-  "com.openclaw.trading.official-paper.pnl": {
-    residency: "periodic",
-    probe: "official-paper-health（reason=post_open_pnl 的最新一行 + 对应的 reports/official-paper/<日期>-post-open.md）"
-  },
-  "com.alphaloop.rsshub": {
-    residency: "periodic",
-    probe: "rsshub-health（127.0.0.1:1200 容器探活）"
-  }
-};
 
 // Strips the shared reverse-DNS prefixes so a finding code reads
 // `launchd-jobs.platform-app.not_loaded` rather than
@@ -179,7 +121,15 @@ export function readLaunchdJobStates(requiredJobs = REQUIRED_LAUNCHD_JOBS, launc
     if (userLabels.has(job.label)) {
       loadedDomains.push("user");
       userDetail = uid === undefined
-        ? { state: "unknown", lastExitCode: null, lastExitReason: null, pid: null, runs: null, stderrPath: null }
+        ? {
+          state: "unknown",
+          lastExitCode: null,
+          lastExitReason: null,
+          lastTerminatingSignal: null,
+          pid: null,
+          runs: null,
+          stderrPath: null
+        }
         : readLaunchdJobDetail(`gui/${uid}/${job.label}`, launchctl);
     }
     systemDetail = readLaunchdJobDetail(`system/${job.label}`, launchctl);
@@ -198,6 +148,10 @@ export function readLaunchdJobStates(requiredJobs = REQUIRED_LAUNCHD_JOBS, launc
       state: detail?.state ?? null,
       lastExitCode: detail?.lastExitCode ?? null,
       lastExitReason: detail?.lastExitReason ?? null,
+      // Round-6 finding S3c: the line launchd prints INSTEAD of `last exit
+      // code` when the job died on a signal. Carried through the snapshot so
+      // the runtime judgement can see it at all.
+      lastTerminatingSignal: detail?.lastTerminatingSignal ?? null,
       pid: detail?.pid ?? null,
       runs: detail?.runs ?? null,
       stderrPath: detail?.stderrPath ?? null
@@ -225,64 +179,17 @@ function readUserDomainLaunchdLabels(launchctl) {
 // (a periodic job between runs is legitimately loaded and not running, which
 // must not be reported as missing).
 //
-// `last exit code` is deliberately allowed to be ABSENT rather than defaulted
-// to 0: measured on the mini, a job whose last termination was by SIGNAL
-// (platform-app, `launchctl list` status -15) prints no `last exit code` line
-// at all, and locally a jetsam kill prints `last exit reason = JETSAM_...`
-// instead. Defaulting the missing line to 0 would invent a clean exit that
-// launchd never claimed.
+// The parsing itself lives in launchd-health.mjs (round 6), because
+// install-system-daemons.sh now runs the same reader over the same output
+// before it archives anything. `last exit code` is deliberately allowed to be
+// ABSENT rather than defaulted to 0, and a signal death is read out of
+// `last terminating signal` - see that module for both measurements.
 function readLaunchdJobDetail(target, launchctl) {
   const output = launchctl(["print", target]);
   if (output === null) {
     return null;
   }
-  const text = String(output);
-  return {
-    // `state` keeps the pre-I5 loose fallback so this cannot report LESS than
-    // it used to on a launchctl that indents differently; every field added
-    // by I5 is strict-only (see readLaunchdPrintField).
-    state: readLaunchdPrintField(text, "state", { fallbackToLoose: true }) ?? "unknown",
-    lastExitCode: toFiniteNumber(readLaunchdPrintField(text, "last exit code")),
-    lastExitReason: readLaunchdPrintField(text, "last exit reason"),
-    pid: toFiniteNumber(readLaunchdPrintField(text, "pid")),
-    runs: toFiniteNumber(readLaunchdPrintField(text, "runs")),
-    stderrPath: readLaunchdPrintField(text, "stderr path")
-  };
-}
-
-// `launchctl print` indents the job dict's own keys with exactly ONE tab and
-// every nested dict's keys with two or more - verified against ~400 real jobs
-// on this laptop and against the AlphaLoop labels on the mini. Anchoring on
-// that single tab is what keeps `state` from picking up the `state = active`
-// lines inside the nested coalition/endpoint dicts, which a looser `^\s*state`
-// would also match.
-//
-// The loose fallback is opt-in per field, and only `state` opts in - that
-// preserves exactly the behaviour of the pre-I5 probe (whose only pattern was
-// the loose one, and which still returned the right answer because the
-// top-level line always comes first in the output). The new fields do NOT opt
-// in: a nested `pid` with no top-level one would otherwise be reported as the
-// job's pid, i.e. an observation nothing actually made.
-function readLaunchdPrintField(text, key, { fallbackToLoose = false } = {}) {
-  const strict = text.match(new RegExp(`^\\t${key} = (.*)$`, "mu"));
-  if (strict) {
-    return strict[1].trim();
-  }
-  if (!fallbackToLoose) {
-    return null;
-  }
-  return text.match(new RegExp(`^\\s*${key}\\s*=\\s*(.+?)\\s*$`, "mu"))?.[1] ?? null;
-}
-
-// `(never exited)` - launchd's own wording for "this job has never
-// terminated" - is not a number and must stay `null` rather than becoming
-// NaN or a fabricated 0.
-function toFiniteNumber(value) {
-  if (value === null || value === undefined || String(value).trim() === "") {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseLaunchdPrint(output);
 }
 
 // Round-4 finding I5 (b): every db-backed check here used to call
@@ -445,7 +352,17 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "official-paper-health", run: () => checkOfficialPaperHealth(snapshot, nowMs) },
     { name: "rsshub-health", run: () => checkRsshubHealth(snapshot) },
     { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) },
-    { name: "control-persona", run: () => checkControlPersona(snapshot) }
+    { name: "control-persona", run: () => checkControlPersona(snapshot) },
+    // Round 6 - the deploy path's own four checks. The first two are about the
+    // deploy that produced this machine (did every step succeed, is the code
+    // here the code that was pushed); the last two are about product surfaces
+    // that no launchd probe can see (the five report cron jobs, and where a
+    // report card actually lands).
+    { name: "deploy-ledger", run: () => checkDeployLedger(snapshot) },
+    { name: "deploy-checkout", run: () => checkDeployCheckout(snapshot) },
+    { name: "launchd-plists", run: () => checkStrayUserPlists(snapshot) },
+    { name: "openclaw-cron", run: () => checkOpenClawCronJobs(snapshot) },
+    { name: "notification-routing", run: () => checkNotificationRouting(snapshot) }
   ];
 
   const findings = await runChecksFailureIsolated(checks);
@@ -619,9 +536,28 @@ function checkLaunchdJobs(snapshot) {
     const domainLabel = job.domain === "system" ? "系统域 /Library/LaunchDaemons" : "用户域 ~/Library/LaunchAgents";
 
     if (loadedIn.length === 0) {
-      findings.push(warn(
+      // Round-6 finding S3a - the reason this gate could not fail.
+      //
+      // "Installed nowhere" used to be a warn unconditionally, with the
+      // reasoning "a dev machine legitimately runs none of these". That
+      // reasoning is about the MACHINE, not about the check - and it was applied
+      // to every machine. Measured: four labels held in no domain at all,
+      // installers exiting 1 and saying so, and this gate answering ok=true,
+      // exit 0.
+      //
+      // So the severity now follows the machine, exactly like the loopback
+      // probes' does (see probeSeverityFor). On a box that has ever deployed -
+      // it has a deploy ledger, or some of these labels ARE loaded, or a plist
+      // for one of them is sitting on disk - "this service is installed
+      // nowhere" is a deployment that did not finish, not a dev-box default.
+      const severity = deployTargetSeverityFor(snapshot);
+      findings.push(severity(
         `launchd-jobs.${job.slug}.not_loaded`,
-        `launchd 任务 ${job.label} 未加载（${domainLabel} 与另一个域都没有命中）。部署机器上请执行 ${install} 安装；开发机上可以忽略。`
+        `launchd 任务 ${job.label} 未加载（${domainLabel} 与另一个域都没有命中）。`
+          + (severity === error
+            ? `这台机器已经部署过（${describeDeployFootprint(snapshot)}），所以这不是"开发机没装"，`
+              + `而是这个服务此刻【一个都没在跑】。请执行 ${install}，并按它打印的失败原因修到它自己退出 0 为止。`
+            : `部署机器上请执行 ${install} 安装；这台机器没有任何部署痕迹，开发机上可以忽略。`)
       ));
       continue;
     }
@@ -658,21 +594,34 @@ function checkLaunchdJobs(snapshot) {
 // findings and passed the deploy runbook's acceptance step.
 //
 // What counts as broken depends on the service, which is why
-// LAUNCHD_SERVICE_HEALTH exists (see its own comment): `state = not running`
-// is a fault for a KeepAlive daemon and the ordinary steady state for a
-// scheduled one, so a single uniform assertion would either miss the first
-// or false-alarm on the second, every five minutes, forever.
-// See the crash_looping branch below for where this number comes from.
-const RESIDENT_CRASH_LOOP_RUNS = 20;
-
+// LAUNCHD_SERVICE_HEALTH exists: `state = not running` is a fault for a
+// KeepAlive daemon and the ordinary steady state for a scheduled one, so a
+// single uniform assertion would either miss the first or false-alarm on the
+// second, every five minutes, forever.
+//
+// Round 6: the judgement itself moved to launchd-health.mjs and is now shared
+// verbatim with install-system-daemons.sh, which runs it before it will archive
+// a service's fallback. This function only maps a verdict to a finding. Two of
+// those verdicts changed there, both measured:
+//
+//   · a resident daemon at runs >= 20 is a crash loop WHATEVER launchd says
+//     about the last termination. `runs` resets on re-bootstrap (measured), so
+//     it cannot accumulate across deploys, and the old rule - which required a
+//     non-zero `last exit code` - was unreachable for a signal-killed daemon,
+//     the shape the mini's platform-app prints right now.
+//   · a signal death is read out of `last terminating signal`, which is the
+//     line launchd prints INSTEAD of `last exit code`. SIGTERM/SIGKILL are
+//     excluded: those are what launchd itself sends on bootout and
+//     `kickstart -k`, i.e. what the installer does to every daemon on every
+//     run.
 function checkLaunchdJobRuntime(job, row) {
   const contract = LAUNCHD_SERVICE_HEALTH[job.label];
   if (!contract) {
     return [error(
       `launchd-jobs.${job.slug}.no_health_contract`,
-      `${job.label} 出现在 install-launchd-ownership.txt 里，但 doctor 的 LAUNCHD_SERVICE_HEALTH 没有它的健康定义，`
+      `${job.label} 出现在 install-launchd-ownership.txt 里，但 LAUNCHD_SERVICE_HEALTH 没有它的健康定义，`
         + `因此只能判断它"有没有被 launchd 记住"，无法判断它是否真的在工作。`
-        + `请在 openclaw-runtime-doctor-core.mjs 的 LAUNCHD_SERVICE_HEALTH 里补上它的 residency 与探针。`
+        + `请在 launchd-health.mjs 的 LAUNCHD_SERVICE_HEALTH 里补上它的 residency 与探针。`
     )];
   }
 
@@ -682,99 +631,48 @@ function checkLaunchdJobRuntime(job, row) {
     return [];
   }
 
-  const state = String(row.state);
-  const exitCode = toFiniteNumber(row.lastExitCode);
-  const failedExit = exitCode !== null && exitCode !== 0;
-  const findings = [];
-  const where = describeLaunchdExit(row);
+  const verdict = judgeLaunchdRuntime(job.label, row, contract);
+  const where = verdict.evidence;
   const logs = row.stderrPath ? `错误日志：${row.stderrPath}。` : "";
   const install = LAUNCHD_INSTALL_COMMAND[job.domain];
+  const kickstart = job.domain === "system"
+    ? `sudo launchctl kickstart -k system/${job.label}`
+    : `launchctl kickstart -k gui/$(id -u)/${job.label}`;
 
-  if (state === "unknown") {
-    findings.push(warn(
-      `launchd-jobs.${job.slug}.state_unknown`,
-      `launchctl 认得 ${job.label}，但它的输出里没有 state 字段，无法判断它是否在运行（${contract.probe} 仍是判断它是否真的在工作的依据）。`
-    ));
-  } else if (contract.residency === "resident") {
-    if (state !== "running") {
-      const kickstart = job.domain === "system"
-        ? `sudo launchctl kickstart -k system/${job.label}`
-        : `launchctl kickstart -k gui/$(id -u)/${job.label}`;
-      findings.push(error(
+  switch (verdict.status) {
+    case "state_unknown":
+      return [warn(
+        `launchd-jobs.${job.slug}.state_unknown`,
+        `launchctl 认得 ${job.label}，但它的输出里没有 state 字段，无法判断它是否在运行（${contract.probe} 仍是判断它是否真的在工作的依据）。`
+      )];
+    case "not_running":
+      return [error(
         `launchd-jobs.${job.slug}.not_running`,
-        `launchd 任务 ${job.label} 已加载但当前没有在运行（state = ${state}${where}）——它是常驻服务（KeepAlive），`
+        `launchd 任务 ${job.label} 已加载但当前没有在运行（state = ${verdict.state}${where}）——它是常驻服务（KeepAlive），`
           + `"已加载"不等于"在工作"。${logs}排查后可用 ${kickstart} 重启，或重跑 ${install}。`
-      ));
-    } else if (failedExit) {
-      // Round-5 finding D2, second half. `state = running` + a failed last exit
-      // is BOTH "it crashed once last month and has been up since" and "it is
-      // crash-looping and I sampled it 200ms after the latest relaunch". The
-      // loopback probes above are the primary discriminator (a looping service
-      // refuses connections almost all of the time, since launchd throttles
-      // KeepAlive relaunches to ~10s apart). `runs` is the backstop for a
-      // sample that lands inside an up-window.
-      //
-      // The threshold is CHOSEN, not derived: a resident daemon accumulates a
-      // run only by dying. Read-only on the mini while writing this, the four
-      // resident services report runs = 2 (platform-app), 2 (broker-executor),
-      // 10 (cron-runner) and 10 (gateway); the two that print a `last exit
-      // code` line at all print 0, and the other two were last killed by a
-      // signal so they print none - i.e. none of them would reach this branch
-      // regardless of the threshold. 20 therefore sits clear of the highest
-      // healthy value observed on the real target while catching the 918 of
-      // the reported case by two orders of magnitude.
-      const runs = toFiniteNumber(row.runs);
-      if (runs !== null && runs >= RESIDENT_CRASH_LOOP_RUNS) {
-        findings.push(error(
-          `launchd-jobs.${job.slug}.crash_looping`,
-          `launchd 任务 ${job.label} 在反复崩溃重启（${where.replace(/^，/u, "")}）——它是常驻服务，正常情况下 runs 应该停在个位数，`
-            + `而现在已经重启 ${runs} 次且最近一次退出仍是失败。此刻 state = running 只是 launchd 刚把它拉起来的瞬间，不代表它可用。`
-            + `${logs}`
-        ));
-      } else {
-        findings.push(warn(
-          `launchd-jobs.${job.slug}.restarted_after_failure`,
-          `launchd 任务 ${job.label} 现在在运行，但它上一次退出是失败的（${where.replace(/^，/u, "")}）——KeepAlive 把它拉起来了，`
-            + `说明它至少崩过一次。${logs}`
-        ));
-      }
-    }
-  } else if (failedExit) {
-    findings.push(error(
-      `launchd-jobs.${job.slug}.last_run_failed`,
-      `launchd 任务 ${job.label} 最近一次运行以非零码退出（${where.replace(/^，/u, "")}）——它是周期任务，`
-        + `"state = not running" 本身正常，但上一次执行确实失败了。${logs}`
-    ));
+      )];
+    case "crash_looping":
+      return [error(
+        `launchd-jobs.${job.slug}.crash_looping`,
+        `launchd 任务 ${job.label} 在反复崩溃重启（${where.replace(/^，/u, "")}）——它是常驻服务，而 runs 只在它死掉时才增加，`
+          + `且每次重新 bootstrap 都会清零，所以 ${verdict.runs} 次意味着自上次安装以来它已经死了 ${verdict.runs - 1} 次。`
+          + `此刻 state = running 只是 launchd 刚把它拉起来的瞬间，不代表它可用。${logs}`
+      )];
+    case "restarted_after_failure":
+      return [warn(
+        `launchd-jobs.${job.slug}.restarted_after_failure`,
+        `launchd 任务 ${job.label} 现在在运行，但它上一次退出是异常的（${where.replace(/^，/u, "")}）——KeepAlive 把它拉起来了，`
+          + `说明它至少崩过一次。${logs}`
+      )];
+    case "last_run_failed":
+      return [error(
+        `launchd-jobs.${job.slug}.last_run_failed`,
+        `launchd 任务 ${job.label} 最近一次运行异常退出（${where.replace(/^，/u, "")}）——它是周期任务，`
+          + `"state = not running" 本身正常，但上一次执行确实失败了。${logs}`
+      )];
+    default:
+      return [];
   }
-
-  return findings;
-}
-
-// Renders whatever launchd actually told us about the last termination.
-// Nothing here is defaulted: a job with no `last exit code` line (measured on
-// the mini: platform-app, killed by SIGTERM) says so instead of being
-// reported as a clean exit.
-function describeLaunchdExit(row) {
-  const parts = [];
-  const exitCode = toFiniteNumber(row.lastExitCode);
-  if (exitCode !== null) {
-    parts.push(`last exit code = ${exitCode}`);
-  }
-  if (row.lastExitReason) {
-    parts.push(`last exit reason = ${row.lastExitReason}`);
-  }
-  if (exitCode === null && !row.lastExitReason) {
-    parts.push("launchctl 未给出退出码");
-  }
-  const runs = toFiniteNumber(row.runs);
-  if (runs !== null) {
-    parts.push(`runs = ${runs}`);
-  }
-  const pid = toFiniteNumber(row.pid);
-  if (pid !== null) {
-    parts.push(`pid = ${pid}`);
-  }
-  return parts.length > 0 ? `，${parts.join("，")}` : "";
 }
 
 // Whether launchd currently holds this label in ANY domain, per the same
@@ -816,6 +714,286 @@ function isLaunchdJobLoaded(snapshot, label) {
 // cannot drift apart again.
 function probeSeverityFor(snapshot, label) {
   return isLaunchdJobLoaded(snapshot, label) ? error : warn;
+}
+
+// Round-6 finding S3a. The same "severity is a property of the MACHINE"
+// reasoning as probeSeverityFor, for the questions that are about the machine
+// as a whole rather than one label: has anything ever been deployed here?
+//
+// Three independent signals, any one of which is enough. None of them is true
+// of a developer's laptop, and each of them is true of a machine that ran the
+// installers even once:
+//
+//   1. a deploy ledger exists (deploy.sh or install-system-daemons.sh wrote a
+//      receipt here);
+//   2. at least one of the manifest's labels is loaded in some launchd domain;
+//   3. a plist for one of the manifest's labels is sitting in
+//      /Library/LaunchDaemons or ~/Library/LaunchAgents.
+//
+// Signal 3 matters on its own: after a failed install the plists are on disk
+// and nothing is loaded, which is precisely the state the old unconditional
+// `warn` was blindest to.
+export function deployFootprint(snapshot) {
+  const reasons = [];
+
+  if (readLedgerEntries(snapshot).length > 0) {
+    reasons.push("这台机器上有部署收据（runtime/deploy/steps.jsonl）");
+  }
+
+  const rows = Array.isArray(snapshot.launchdJobs) ? snapshot.launchdJobs : [];
+  const loaded = rows.filter((row) => Array.isArray(row?.loadedDomains) && row.loadedDomains.length > 0);
+  if (loaded.length > 0) {
+    reasons.push(`${loaded.length} 个受管标签当前已加载在 launchd 里`);
+  }
+
+  const plists = snapshot.launchdPlists ?? {};
+  const managed = new Set(REQUIRED_LAUNCHD_JOBS.map((job) => job.label));
+  const onDisk = [
+    ...(Array.isArray(plists.system) ? plists.system : []),
+    ...(Array.isArray(plists.user) ? plists.user : [])
+  ].filter((label) => managed.has(String(label)));
+  if (onDisk.length > 0) {
+    reasons.push(`磁盘上已经有 ${onDisk.length} 个受管标签的 plist`);
+  }
+
+  return { deployed: reasons.length > 0, reasons };
+}
+
+function deployTargetSeverityFor(snapshot) {
+  return deployFootprint(snapshot).deployed ? error : warn;
+}
+
+function describeDeployFootprint(snapshot) {
+  return deployFootprint(snapshot).reasons.join("；") || "无部署痕迹";
+}
+
+// The ledger, from wherever the caller supplies it: an explicit array (tests,
+// and any future caller that has already read it) or the real file under the
+// runtime root. Reading is failure-tolerant by construction - see
+// readDeployLedger - so a corrupt line degrades to "fewer receipts", never to
+// a throw inside a health check.
+function readLedgerEntries(snapshot) {
+  if (Array.isArray(snapshot.deployLedger)) {
+    return snapshot.deployLedger;
+  }
+  if (!snapshot.runtimeRoot) {
+    return [];
+  }
+  return readDeployLedger(snapshot.runtimeRoot);
+}
+
+// Round-6, the mechanism check: "a step of this deploy failed" is a fact that
+// has to survive until the gate runs, because every one of round 5's confirmed
+// criticals was a failure that had already been printed, loudly, minutes
+// earlier - and the gate looked only at what it could still observe.
+//
+// See deploy-ledger.mjs's judgeDeployLedger for the severity split and why
+// missing/stale receipts are reported without being called failures.
+function checkDeployLedger(snapshot) {
+  const entries = readLedgerEntries(snapshot);
+  const verdict = judgeDeployLedger(entries, { head: snapshot.gitHead ?? null });
+  if (!verdict.deployed) {
+    // No receipts at all. On a machine with a deploy footprint this is worth
+    // saying (the runbook was followed by hand, or predates the ledger); on a
+    // dev box it is simply the normal state and nothing is reported.
+    if (!deployFootprint(snapshot).deployed) {
+      return [];
+    }
+    return [warn(
+      "deploy-ledger.absent",
+      `这台机器有部署痕迹，但没有任何部署收据（${join(String(snapshot.runtimeRoot ?? "runtime"), "deploy", "steps.jsonl")} 不存在）。`
+        + `照 README 的 0→8 一步步手敲也会是这个结果——用 zsh apps/openclaw-config/scripts/deploy.sh 跑一遍，`
+        + `每一步的退出码就会被记下来，这道门也才拦得住"某一步失败了但没人发现"。`
+    )];
+  }
+
+  const findings = [];
+  for (const step of verdict.failedSteps) {
+    findings.push(error(
+      `deploy-ledger.step_${step.step}_failed`,
+      `部署第 ${step.step} 步（${step.title}）以退出码 ${step.exitCode} 失败，时间 ${step.finishedAt ?? "未知"}，commit ${step.head ?? "未知"}。`
+        + `失败之后没有任何一条成功记录覆盖它，所以这台机器现在是"部署到一半"的状态。`
+        + `请照那一步自己打印的原因修掉再重跑：DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${step.step} zsh apps/openclaw-config/scripts/deploy.sh`
+    ));
+  }
+  if (verdict.missingSteps.length > 0) {
+    findings.push(warn(
+      "deploy-ledger.incomplete",
+      `以下部署步骤没有留下收据，无法确认它们跑过：${verdict.missingSteps.map((step) => `第 ${step.step} 步（${step.title}）`).join("、")}。`
+        + `"没有证据"不等于"失败"——但也不等于做过。用 zsh apps/openclaw-config/scripts/deploy.sh 跑完整流程可以把它们补齐。`
+    ));
+  }
+  if (verdict.staleSteps.length > 0) {
+    findings.push(warn(
+      "deploy-ledger.stale",
+      `以下步骤上一次成功是在别的 commit 上跑的（当前检出 ${snapshot.gitHead ?? "未知"}）：`
+        + `${verdict.staleSteps.map((step) => `第 ${step.step} 步 @ ${step.head}`).join("、")}。代码换了就要重跑。`
+    ));
+  }
+  return findings;
+}
+
+// Round-6 finding S3b: `git pull --ff-only` aborting is the one failure that
+// makes every LATER step meaningless - they all run, they all succeed, and they
+// all run the old code. Measured: a single dirty tracked file on the deploy
+// machine was enough, and steps 1-8 then ran to completion on the previous
+// commit with a green gate at the end.
+//
+// This asks git directly rather than trusting the ledger, so it also catches
+// the machine that was never deployed through deploy.sh at all.
+function checkDeployCheckout(snapshot) {
+  const git = snapshot.git;
+  if (!git || !git.head) {
+    return [];
+  }
+  const findings = [];
+  // "Behind" and "not identical" are different facts, and only the first is a
+  // deploy failure. Measured by running this CLI on the machine the code is
+  // WRITTEN on: HEAD there is ahead of origin/main by design, and an
+  // equality test alone reported that as "this is not the code you pushed".
+  const behind = Number.isFinite(git.behind) ? git.behind : null;
+  const ahead = Number.isFinite(git.ahead) ? git.ahead : null;
+  if (behind !== null && behind > 0) {
+    findings.push(error(
+      "deploy-checkout.behind_origin",
+      `这台机器的检出停在 ${git.head}，而 origin/main 是 ${git.remoteHead}，落后 ${behind} 个提交`
+        + `${ahead ? `（同时还领先 ${ahead} 个，历史已经分叉）` : ""}——`
+        + `也就是说这里跑的不是你 push 的代码。部署第 0 步（git pull --ff-only）没有真正完成。`
+        + `${git.dirtyFiles?.length ? `工作区还有本地改动挡着：${git.dirtyFiles.slice(0, 5).join("、")}。` : ""}`
+    ));
+  } else if (ahead !== null && ahead > 0) {
+    findings.push(warn(
+      "deploy-checkout.ahead_of_origin",
+      `这台机器的检出（${git.head}）领先 origin/main（${git.remoteHead}）${ahead} 个提交。`
+        + `写代码的那台机器上这是正常的；部署机上出现就说明有人在它上面直接改了东西。`
+    ));
+  } else if (git.dirtyFiles?.length) {
+    findings.push(warn(
+      "deploy-checkout.dirty",
+      `工作区有已跟踪文件的本地改动（${git.dirtyFiles.slice(0, 5).join("、")}），下一次 git pull --ff-only 会因此中止。`
+    ));
+  }
+  return findings;
+}
+
+// Round-6 finding S3d. install-system-daemons.sh archives a user-level plist
+// only after its daemon is verified up, and reports the ones it had to keep -
+// but "reported and exited 1" was invisible to this gate, and the consequence
+// is not visible in the launchd job table either: the agent has been booted
+// out, so nothing is loaded twice RIGHT NOW. It is at the next login that
+// launchd bootstraps every plist in ~/Library/LaunchAgents and the machine ends
+// up running both copies of six services on one database and one port.
+//
+// So this looks at the DISK, which is where that future is already decided.
+function checkStrayUserPlists(snapshot) {
+  const onDisk = new Set((snapshot.launchdPlists?.user ?? []).map(String));
+  const stray = REQUIRED_LAUNCHD_JOBS
+    .filter((job) => job.domain === "system" && onDisk.has(job.label))
+    .map((job) => job.label);
+  if (stray.length === 0) {
+    return [];
+  }
+  return [error(
+    "launchd-plists.stray_user_copy",
+    `${stray.length} 个系统域标签在 ~/Library/LaunchAgents 里还留着用户级 plist：${stray.join("、")}。`
+      + `现在它们没有加载，所以 launchd 任务表看不出问题；但下次登录时 launchd 会把它们全部 bootstrap 起来，`
+      + `于是同一个服务同时跑两份，抢同一个端口和同一份 trading.sqlite。`
+      + `这通常是 install-system-daemons.sh 归档失败留下的（它绝不删除，只会原地保留并报错）。`
+      + `修法：sudo chown -R "$(id -un)":staff ~/Library/LaunchAgents.disabled 之后重跑 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh。`
+  )];
+}
+
+// Round-6 finding S3g. The five report pipelines ARE the product, and they are
+// dispatched by openclaw cron, not by launchd - so none of the thirteen checks
+// this doctor had could see whether a single one of them existed. Measured:
+// `openclaw cron add` failing (GatewayTransportError/ECONNREFUSED) left zero of
+// five jobs installed and the gate still went green.
+//
+// `snapshot.openclawCron` is what the CLI got out of `openclaw cron list
+// --json`; see openclaw-runtime-doctor.mjs for how it is collected and why the
+// query is bounded.
+function checkOpenClawCronJobs(snapshot) {
+  const expected = buildManagedOpenClawCronJobs(snapshot.repoRoot ?? process.cwd()).map((job) => job.name);
+  const registry = snapshot.openclawCron;
+  if (!registry) {
+    return [];
+  }
+
+  if (!registry.ok) {
+    const severity = deployTargetSeverityFor(snapshot);
+    return [severity(
+      "openclaw-cron.unreadable",
+      `无法读取 openclaw cron 任务表：${registry.error ?? "未知错误"}。`
+        + (severity === error
+          ? `这台机器已经部署过（${describeDeployFootprint(snapshot)}），日报/周报/个股分析这 5 条流水线全靠 openclaw cron 派发，`
+            + `读不到就等于无法确认它们是否存在。gateway 没起来时最常见——先确认 ai.openclaw.system.gateway 在跑，再重跑 pnpm openclaw:cron:install。`
+          : `开发机上没有配 gateway 凭据是正常的。`)
+    )];
+  }
+
+  const installed = new Set((registry.names ?? []).map(String));
+  const missing = expected.filter((name) => !installed.has(name));
+  if (missing.length === 0) {
+    return [];
+  }
+  return [error(
+    "openclaw-cron.jobs_missing",
+    `openclaw cron 里缺 ${missing.length}/${expected.length} 个报告类任务：${missing.join("、")}。`
+      + `这 5 条任务就是日报、周报和个股分析本身——少一条就是那条流水线在这台机器上根本不会触发。`
+      + `请重跑 pnpm openclaw:cron:install，并确认它这次以退出码 0 结束。`
+  )];
+}
+
+// Round-6 finding S3h: every public report card can be delivered "successfully"
+// into one person's DM, with no link back to the platform, and nothing in this
+// doctor ever asked. On the deploy target both variables below are currently
+// unset (verified read-only; their values are never read or printed here - only
+// whether they are configured).
+//
+// The snapshot deliberately carries BOOLEANS only, because this CLI prints its
+// whole snapshot as JSON and a chat id is a credential-adjacent identifier.
+function checkNotificationRouting(snapshot) {
+  const routing = snapshot.notificationRouting;
+  if (!routing) {
+    return [];
+  }
+  const findings = [];
+  const severity = deployTargetSeverityFor(snapshot);
+
+  if (!routing.groupChatIdConfigured) {
+    findings.push(severity(
+      "notification-routing.no_group_chat",
+      `FEISHU_GROUP_CHAT_ID 没有配置。圈子公共报告（日报/周报/个股分析）因此`
+        + (routing.fallbackTargetConfigured
+          ? `会改投默认单聊——群里一张卡都收不到，而投递结果仍然是"已发送"。`
+          // Honest about what was and was not checked: resolveFeishuAppTarget
+          // also consults a target stored in the trading database and can
+          // WRITE one back (storeFeishuTarget), so this doctor does not call
+          // it - observing must not change what is being observed.
+          : `很可能根本发不出去：这里检查的两个兜底环境变量（FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID）也都没配。`
+            + `另外还有一个"存在库里的默认目标"，doctor 不去解析它——那个解析函数在找到目标时会回写数据库，而体检不该改动被体检的系统。`)
+        + `请在 .env.local 里把它设成圈子群的 chat id。`
+    ));
+  }
+
+  if (!routing.publicBaseUrlConfigured) {
+    findings.push(severity(
+      "notification-routing.no_public_base_url",
+      `PLATFORM_PUBLIC_BASE_URL 没有配置。报告卡的正文在平台上，卡片上那个按钮就是唯一入口——`
+        + `没有这个变量，卡片发出去也点不进任何页面。请设成对外可达的地址（mini 上是 cloudflared 那条）。`
+    ));
+  }
+
+  if (routing.lastDeliveryGroupFallback) {
+    findings.push(error(
+      "notification-routing.last_delivery_fell_back",
+      `最近一次报告投递（${routing.lastDeliveryLabel ?? "未知窗口"}，${routing.lastDeliveryAt ?? "时间未知"}）是"群改单聊"的降级投递：`
+        + `${routing.lastDeliveryReason ?? "报告投递状态里记着 groupFallback=true"}。`
+        + `也就是说圈子里没有人在群里看到那张卡。`
+    ));
+  }
+
+  return findings;
 }
 
 // Appended to an unreachable-probe message when launchd IS holding the label:

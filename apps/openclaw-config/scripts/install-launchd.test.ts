@@ -24,12 +24,13 @@
 // worthless. This file already lives in vitest.config.ts's serial lane, which
 // is where subprocess-spawning suites belong.
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
+import * as doctor from "./openclaw-runtime-doctor-core.mjs";
 import { readLaunchdOwnership, launchdLabelsWithScope, userLevelLabelsToRetire } from "./install-launchd-ownership.mjs";
 import { SYSTEM_DAEMON_SUPERSEDING } from "./launchd-agent-archive.mjs";
 
@@ -73,6 +74,29 @@ interface LaunchctlStubOptions {
   failBootstrapDomain?: "any" | "system";
   /** Labels seeded into the disabled database, to inject the wedge of C3. */
   disabledLabels?: string[];
+  /**
+   * Round-6 finding S3e. Labels whose `print` answers the way a daemon that
+   * bootstrapped and then DIED answers: `state = not running` with a non-zero
+   * `last exit code`, exactly the shape the mini's rsshub agent prints today.
+   * `bootstrap` still succeeds for them and `print` still exits 0 - which is
+   * precisely why an installer that verified with `print`'s exit code called
+   * them loaded.
+   */
+  deadOnArrivalLabels?: string[];
+  /**
+   * Round-6 finding S3c. A resident daemon sampled just after launchd relaunched
+   * it, whose last death was by SIGNAL: `state = running`, a high `runs`, and NO
+   * `last exit code` line at all - the shape com.alphaloop.platform-app prints on
+   * the mini right now (measured: `last terminating signal = Terminated: 15`;
+   * the signal here is SIGSEGV, reproduced locally on a throwaway label).
+   */
+  signalCrashLoopLabels?: string[];
+  /**
+   * Round-6 finding S3f. A user-level agent that is STILL loaded after
+   * `launchctl bootout` - the case the installer used to warn about and then
+   * carry on regardless, bootstrapping the daemon next to it.
+   */
+  surviveBootoutLabels?: string[];
 }
 
 /**
@@ -97,10 +121,25 @@ interface LaunchctlStubOptions {
 function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStubOptions): void {
   const loadedDir = join(options.stateDir, "loaded");
   const disabledDir = join(options.stateDir, "disabled");
+  const deadDir = join(options.stateDir, "dead");
+  const loopDir = join(options.stateDir, "signalloop");
+  const stickyDir = join(options.stateDir, "sticky");
   mkdirSync(loadedDir, { recursive: true });
   mkdirSync(disabledDir, { recursive: true });
+  mkdirSync(deadDir, { recursive: true });
+  mkdirSync(loopDir, { recursive: true });
+  mkdirSync(stickyDir, { recursive: true });
   for (const label of options.disabledLabels ?? []) {
     writeFileSync(join(disabledDir, `system_${label}`), "");
+  }
+  for (const label of options.deadOnArrivalLabels ?? []) {
+    writeFileSync(join(deadDir, label), "");
+  }
+  for (const label of options.signalCrashLoopLabels ?? []) {
+    writeFileSync(join(loopDir, label), "");
+  }
+  for (const label of options.surviveBootoutLabels ?? []) {
+    writeFileSync(join(stickyDir, label), "");
   }
 
   const domainGuard = options.failBootstrapDomain === "system" ? ' && [ "$dom" = "system" ]' : "";
@@ -114,9 +153,25 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     `S="${options.stateDir}"`,
     'key() { printf "%s" "$1" | tr / _; }',
     'case "$1" in',
+    // Round 6: `print` answers with a real launchctl payload, not just an exit
+    // code. The installer now judges the daemon on what this says (see
+    // launchd-health.mjs), so a stub that printed nothing would model a
+    // launchctl no version of macOS ships - and would make every verification
+    // trivially pass or trivially fail. Field spellings and the single-tab
+    // indent are copied from the mini's own output.
     '  print)',
-    '    [ -f "$S/loaded/$(key "$2")" ] && exit 0',
-    "    exit 113 ;;",
+    '    [ -f "$S/loaded/$(key "$2")" ] || exit 113',
+    '    lbl="${2##*/}"',
+    '    printf "%s = {\n" "$2"',
+    '    if [ -f "$S/dead/$lbl" ]; then',
+    '      printf "\tstate = not running\n\truns = 1\n\tlast exit code = 1\n"',
+    '    elif [ -f "$S/signalloop/$lbl" ]; then',
+    '      printf "\tstate = running\n\truns = 918\n\tpid = 4242\n\tlast terminating signal = Segmentation fault: 11\n"',
+    '    else',
+    '      printf "\tstate = running\n\truns = 2\n\tpid = 4242\n"',
+    '    fi',
+    '    printf "\tstderr path = /tmp/%s.err.log\n}\n" "$lbl"',
+    "    exit 0 ;;",
     '  enable) rm -f "$S/disabled/$(key "$2")"; exit 0 ;;',
     '  disable) touch "$S/disabled/$(key "$2")"; exit 0 ;;',
     // Both spellings launchctl(1) accepts, because the installers use both:
@@ -126,6 +181,9 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     '    tgt="$2"',
     '    case "$3" in *.plist) tgt="$2/$(basename "$3" .plist)" ;; esac',
     '    [ -f "$S/loaded/$(key "$tgt")" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
+    // S3f: a "sticky" label reports success and stays loaded, which is what a
+    // wedged agent does - bootout returns 0 and the job is still there.
+    '    case "$tgt" in gui/*) [ -f "$S/sticky/${tgt##*/}" ] && exit 0 ;; esac',
     '    rm -f "$S/loaded/$(key "$tgt")"; exit 0 ;;',
     "  bootstrap)",
     '    lbl="$(basename "$3" .plist)"',
@@ -205,7 +263,12 @@ function makeFakeMachine(prefix: string, stub: Omit<LaunchctlStubOptions, "state
   // node install and refuses to install when it cannot find one, so the fake
   // machine has to actually have it (this is the branch a real mini takes).
   writeStub(join(nodeBinDir, "pnpm"), join(home, "pnpm-calls.log"));
-  writeStub(join(nodeBinDir, "node"), join(home, "node-calls.log"));
+  // A REAL node, not a stub: round 6 made the installer run
+  // launchd-health.mjs to decide whether a daemon actually came up, and a
+  // stub node that logs its arguments and exits 0 would answer "healthy" for
+  // a machine where nothing runs - i.e. it would re-create, inside the test
+  // harness, the exact defect the check exists to close.
+  symlinkSync(process.execPath, join(nodeBinDir, "node"));
 
   return {
     home,
@@ -223,7 +286,12 @@ function makeFakeMachine(prefix: string, stub: Omit<LaunchctlStubOptions, "state
       TARGET_HOME: home,
       SYSTEM_DIR: systemDir,
       LAUNCHCTL: join(stubBinDir, "launchctl"),
-      BOOTSTRAP_SETTLE_SECONDS: "0"
+      BOOTSTRAP_SETTLE_SECONDS: "0",
+      VERIFY_SETTLE_SECONDS: "0",
+      // Deploy receipts go to the fake machine's own runtime tree. Without
+      // this the real installer would append to the repo's runtime/, which is
+      // what test/runtime-write-guard.ts exists to stop.
+      DEPLOY_RUNTIME_ROOT: join(home, "runtime")
     }
   };
 }
@@ -805,13 +873,13 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(output).toContain("com.alphaloop.platform-app");
       expect(output).toContain("Bootstrap failed: 5: Input/output error");
       // Names how many are up, so "it failed" is never read as "nothing runs".
-      expect(output).toMatch(/7 of 8 ARE loaded/u);
+      expect(output).toMatch(/7 of 8 ARE running/u);
       // Round-5 D1/D4: the failed service's own fallback is put back, and the
       // operator is told not to reach for the installer that used to delete it.
       expect(output).toMatch(/DO NOT run 'pnpm launchd:install-user' as a workaround/u);
       expect(output).toMatch(/re-run converges rather than repeating/u);
       // The failure summary must not claim the label came up.
-      expect(output).toMatch(/com\.alphaloop\.platform-app {2}egress=direct {2}NOT LOADED/u);
+      expect(output).toMatch(/com\.alphaloop\.platform-app {2}egress=direct {2}NOT RUNNING/u);
     });
 
     it("converges when the operator fixes the cause and re-runs", () => {
@@ -849,7 +917,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       const stdout = runSystemDaemons(machine);
 
       expect(loadedSystemLabels(machine)).toEqual([...SYSTEM_LABELS].sort());
-      expect(stdout).toContain("com.alphaloop.daily-backup  egress=direct  loaded");
+      expect(stdout).toContain("com.alphaloop.daily-backup  egress=direct  running");
 
       // The ordering itself, not just the outcome: enable must precede
       // bootstrap for the label, or the disabled entry is still there when
@@ -1165,5 +1233,419 @@ describe("one owner per launchd label across ALL four installers (Task 9)", () =
       expect(existsSync(join(machine.agentsDir, `${label}.plist`))).toBe(true);
     }
     expect(readFileSync(machine.launchctlLog, "utf8")).not.toContain("com.qingverse.");
+  });
+});
+
+// ===========================================================================
+// Round 6 (2026-07-29): FAILURE MUST BECOME A RED LIGHT.
+//
+// Round 5 confirmed five criticals that were all one shape - something in the
+// deploy path failed, said so, exited non-zero, and the acceptance gate still
+// answered ok=true / exit 0. The suites below inject each of those failures
+// into the REAL scripts and assert on the two things a controller actually
+// reads: the installer's exit code, and the gate's verdict computed from what
+// that installer left behind.
+//
+// Nothing here mocks the analyzer. `analyzeOpenClawRuntimeSnapshot` is given a
+// snapshot whose `runtimeRoot` is the sandbox machine's own runtime tree, so it
+// reads the deploy receipts the real installer really wrote.
+// ===========================================================================
+describe("round 6: a deploy-path failure cannot end in a green gate", () => {
+  /** The gate's answer for a machine, from the receipts the installers left. */
+  async function gateVerdict(machine: FakeMachine, extra: Record<string, unknown> = {}) {
+    // A baseline where everything OUTSIDE the deploy path is healthy, so that
+    // `ok === false` in a scenario below can only be the injected failure.
+    // The two listener counts and the persona file are the checks that would
+    // otherwise fail on any sandbox; the loopback probes are left to fail,
+    // which on a machine holding none of these labels is a warn by design.
+    const personaPath = join(machine.home, "control-AGENTS.md");
+    if (!existsSync(personaPath)) {
+      writeFileSync(personaPath, "# 控制人设（沙箱占位）\n");
+    }
+    return doctor.analyzeOpenClawRuntimeSnapshot({
+      runtimeRoot: join(machine.home, "runtime"),
+      gatewayListeners: [{ command: "node", pid: 4001 }],
+      cronRunnerListeners: [{ command: "node", pid: 4002 }],
+      controlWorkspaceAgentsPath: personaPath,
+      fetchImpl: async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1 (sandbox: no such service here)");
+      },
+      launchdJobs: [],
+      launchdPlists: { system: launchDaemonLabels(machine), user: launchAgentLabels(machine) },
+      ...extra
+    });
+  }
+
+  function codesOf(analysis: { findings: Array<{ code: string; severity: string }> }, severity?: string): string[] {
+    return analysis.findings.filter((f) => !severity || f.severity === severity).map((f) => f.code);
+  }
+
+  it("S3e: a daemon that bootstraps and is DEAD ON ARRIVAL fails the install and keeps its fallback", () => {
+    // The exact measured shape: `bootstrap` succeeds, `launchctl print` exits 0
+    // (so the pre-round-6 check passed), and the job reports state = not
+    // running with a non-zero last exit. Three labels, one resident and one
+    // periodic, because the residency contract judges them differently.
+    const machine = makeFakeMachine("alphaloop-r6-doa-", {
+      deadOnArrivalLabels: [
+        "com.alphaloop.platform-app",
+        "com.openclaw.system.trading.broker-executor",
+        "com.alphaloop.market-alerts"
+      ]
+    });
+    seedRunningUserAgents(machine, ["com.alphaloop.platform-app", "com.alphaloop.market-alerts"]);
+
+    const { status, output } = runSystemDaemonsExpectingFailure(machine);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/FAILED - 3 of 8 daemons did not come up/u);
+    expect(output).toMatch(/com\.alphaloop\.platform-app: bootstrapped but NOT RUNNING/u);
+    expect(output).toMatch(/com\.alphaloop\.market-alerts: its first run under launchd failed/u);
+    expect(output).toMatch(/last exit code = 1/u);
+    // The whole point: their fallbacks are NOT archived, and the run does not
+    // print them as installed.
+    expect(launchAgentLabels(machine)).toEqual(
+      expect.arrayContaining(["com.alphaloop.market-alerts", "com.alphaloop.platform-app"])
+    );
+    expect(output).toMatch(/com\.alphaloop\.platform-app {2}egress=direct {2}NOT RUNNING/u);
+    // ...and the five healthy ones still went in: per-label, not all-or-nothing.
+    expect(output).toMatch(/com\.alphaloop\.daily-backup {2}egress=direct {2}running/u);
+  });
+
+  it("S3f: a user agent that survives bootout stops that service's handover instead of racing it", () => {
+    const machine = makeFakeMachine("alphaloop-r6-sticky-", {
+      surviveBootoutLabels: ["com.alphaloop.platform-app"]
+    });
+    seedRunningUserAgents(machine, ["com.alphaloop.platform-app"]);
+
+    const { status, output } = runSystemDaemonsExpectingFailure(machine);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/is STILL loaded after bootout/u);
+    expect(output).toMatch(/refusing to bootstrap the daemon because both copies would then run/u);
+    // The daemon was never bootstrapped, so the machine keeps exactly one copy
+    // of platform-app running - the old one.
+    expect(loadedSystemLabels(machine)).not.toContain("com.alphaloop.platform-app");
+    expect(loadedUserLabels(machine)).toContain("com.alphaloop.platform-app");
+    expect(existsSync(join(machine.agentsDir, "com.alphaloop.platform-app.plist"))).toBe(true);
+  });
+
+  it("S3d: an unwritable archive leaves plists on disk, and the gate now calls that out", async () => {
+    const machine = makeFakeMachine("alphaloop-r6-archive-");
+    seedRunningUserAgents(machine, ["com.alphaloop.market-alerts", "com.alphaloop.daily-backup"]);
+    // The mini's real shape: ~/Library/LaunchAgents.disabled exists but cannot
+    // be written by this user (left root-owned by a pre-M7 sudo run). A
+    // read-only directory reproduces that without needing root here.
+    const disabled = join(machine.home, "Library", "LaunchAgents.disabled");
+    mkdirSync(disabled, { recursive: true });
+    chmodSync(disabled, 0o555);
+    try {
+      const { status, output } = runSystemDaemonsExpectingFailure(machine);
+      expect(status).toBe(1);
+      expect(output).toMatch(/could not be archived/u);
+      expect(launchAgentLabels(machine)).toEqual(
+        expect.arrayContaining(["com.alphaloop.daily-backup", "com.alphaloop.market-alerts"])
+      );
+
+      // Pre-round-6 this is where the gate said "fine": the agents are booted
+      // out, so nothing is loaded twice RIGHT NOW - the double ownership only
+      // materialises at the next login. The check therefore looks at the disk.
+      const analysis = await gateVerdict(machine);
+      expect(analysis.ok).toBe(false);
+      expect(codesOf(analysis, "error")).toContain("launchd-plists.stray_user_copy");
+      expect(analysis.findings.find((f) => f.code === "launchd-plists.stray_user_copy")?.message)
+        .toMatch(/下次登录时 launchd 会把它们全部 bootstrap 起来/u);
+    } finally {
+      chmodSync(disabled, 0o755);
+    }
+  });
+
+  it("S3g: `openclaw cron add` failing installs zero jobs, says so, and leaves a failed receipt", async () => {
+    const machine = makeFakeMachine("alphaloop-r6-cron-");
+    // A gateway that is not answering, which is what the real failure looks
+    // like: the CLI's own GatewayTransportError on every call.
+    writeFileSync(
+      join(machine.stubBinDir, "openclaw"),
+      `#!/bin/sh\necho "$@" >> "${machine.openclawLog}"\n`
+        + 'if [ "$1" = "gateway" ]; then exit 0; fi\n'
+        + 'echo "GatewayTransportError: connect ECONNREFUSED 127.0.0.1:18789" >&2\nexit 1\n'
+    );
+    chmodSync(join(machine.stubBinDir, "openclaw"), 0o755);
+
+    let status = 0;
+    let output = "";
+    try {
+      output = execFileSync(process.execPath, [cronInstallScript], {
+        env: { ...machine.env, OPENCLAW_CRON_RETRY_BASE_MS: "1" },
+        encoding: "utf8",
+        stdio: "pipe"
+      });
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      status = failure.status ?? 0;
+      output = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
+    }
+
+    expect(status).toBe(1);
+    // Not a raw stack trace: it used to die on the FIRST job with an uncaught
+    // exception, so the operator never learned how many of the five existed.
+    expect(output).not.toMatch(/at execOpenClaw|node:internal/u);
+    expect(output).toMatch(/FAILED —— 5\/5 个报告类 cron 任务没有装上/u);
+    expect(output).toMatch(/日报、周报、个股分析在这台机器上【完全不会触发】/u);
+    expect(output).toMatch(/GatewayTransportError/u);
+
+    // And the gate can see it minutes later, which is what nothing could before.
+    const analysis = await gateVerdict(machine);
+    expect(analysis.ok).toBe(false);
+    expect(codesOf(analysis, "error")).toContain("deploy-ledger.step_5_failed");
+  });
+
+  it("S3a: labels installed NOWHERE fail the gate on a machine that has deployed", async () => {
+    const machine = makeFakeMachine("alphaloop-r6-nowhere-");
+    // The footprint: plists on disk, nothing loaded. That is what a machine
+    // looks like right after an installer failed - and it used to be a warn.
+    const analysis = await gateVerdict(machine, {
+      launchdJobs: SYSTEM_LABELS.map((label) => ({ label, expectedDomain: "system", loadedDomains: [], state: null })),
+      launchdPlists: { system: [...SYSTEM_LABELS], user: [] }
+    });
+
+    expect(analysis.ok).toBe(false);
+    const notLoaded = analysis.findings.filter((f) => f.code.endsWith(".not_loaded"));
+    expect(notLoaded.length).toBe(SYSTEM_LABELS.length);
+    expect(notLoaded.every((f) => f.severity === "error")).toBe(true);
+    expect(notLoaded[0]?.message).toMatch(/这台机器已经部署过/u);
+  });
+
+  it("S3a: the same labels on a machine with NO deploy footprint stay a warning", async () => {
+    const machine = makeFakeMachine("alphaloop-r6-devbox-");
+    const analysis = await gateVerdict(machine, {
+      launchdJobs: SYSTEM_LABELS.map((label) => ({ label, expectedDomain: "system", loadedDomains: [], state: null })),
+      launchdPlists: { system: [], user: [] }
+    });
+
+    const notLoaded = analysis.findings.filter((f) => f.code.endsWith(".not_loaded"));
+    expect(notLoaded.length).toBe(SYSTEM_LABELS.length);
+    expect(notLoaded.every((f) => f.severity === "warn")).toBe(true);
+    // A developer's laptop must still pass: this is the reason the old check
+    // was a warn, and it is preserved rather than traded away.
+    expect(analysis.ok).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Round 6, finding S3b: THE RUNBOOK IS NOW A PROGRAM (deploy.sh).
+//
+// README's steps 0-8 were a plain command sequence - no `&&`, no `set -e`, no
+// guard. Measured against the pre-round-6 runbook: making step 0 fail let steps
+// 1-8 run to completion against the OLD checkout and finish green. These cases
+// run the REAL deploy.sh with a failure injected at one step and assert the two
+// properties that were missing: NOTHING after the failed step runs, and the
+// gate can still see the failure afterwards.
+//
+// Every command deploy.sh invokes is stubbed EXCEPT the ledger writer, which is
+// the real node running the real deploy-ledger.mjs - the receipts these tests
+// read back are the ones production would write.
+// ===========================================================================
+describe("round 6: deploy.sh stops at the first failed step", () => {
+  const deployScript = fileURLToPath(new URL("./deploy.sh", import.meta.url));
+
+  interface Runbook {
+    root: string;
+    runtimeRoot: string;
+    callLog: string;
+    env: NodeJS.ProcessEnv;
+  }
+
+  function makeRunbook(prefix: string, failures: Record<string, string> = {}): Runbook {
+    const root = makeTempDir(prefix);
+    const binDir = join(root, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const callLog = join(root, "calls.log");
+
+    // Each stub logs what it was asked to do and honours one injection env
+    // var. `$1` is enough to identify the subcommand for all of them.
+    const stub = (name: string, body: string) => {
+      writeFileSync(join(binDir, name), `#!/bin/sh\necho "${name} $@" >> "${callLog}"\n${body}\nexit 0\n`);
+      chmodSync(join(binDir, name), 0o755);
+    };
+
+    stub("git", [
+      'if [ "$1" = "-C" ]; then shift 2; fi',
+      'case "$1" in',
+      '  status) [ "$FAIL_GIT_DIRTY" = "1" ] && echo " M README.md"; exit 0 ;;',
+      '  pull) if [ "$FAIL_GIT_PULL" = "1" ]; then echo "error: Your local changes would be overwritten" >&2; exit 1; fi; echo "Already up to date." ;;',
+      '  rev-parse) echo "cafe123" ;;',
+      "esac"
+    ].join("\n"));
+    stub("pnpm", 'if [ "$FAIL_PNPM_SCRIPT" = "$1" ]; then echo "pnpm $1 failed" >&2; exit 1; fi');
+    stub("node", 'if [ "$FAIL_NODE" = "1" ]; then echo "node script failed" >&2; exit 1; fi');
+    stub("sudo", 'if [ "$FAIL_SUDO" = "1" ]; then echo "install-system-daemons: FAILED - 3 of 8 daemons did not come up" >&2; exit 1; fi');
+    // Stands in for the login shell of step 7 (`zsh -lc "docker start ..."`).
+    stub("loginshell", 'if [ "$FAIL_DOCKER" = "1" ]; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi');
+
+    return {
+      root,
+      runtimeRoot: join(root, "runtime"),
+      callLog,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        REPO_ROOT: root,
+        DEPLOY_RUNTIME_ROOT: join(root, "runtime"),
+        DEPLOY_SUDO: join(binDir, "sudo"),
+        DEPLOY_LOGIN_SHELL: join(binDir, "loginshell"),
+        // The ledger writer is deliberately NOT stubbed.
+        DEPLOY_NODE: process.execPath,
+        DEPLOY_ACK_GATEWAY_RESTART: "yes",
+        ...failures
+      }
+    };
+  }
+
+  function runDeploy(runbook: Runbook): { status: number; output: string } {
+    try {
+      const stdout = execFileSync("zsh", [deployScript], { env: runbook.env, encoding: "utf8", stdio: "pipe" });
+      return { status: 0, output: stdout };
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      if (typeof failure.status !== "number") {
+        throw error;
+      }
+      return { status: failure.status, output: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+    }
+  }
+
+  function receipts(runbook: Runbook): Array<{ step: number; exitCode: number }> {
+    const path = join(runbook.runtimeRoot, "deploy", "steps.jsonl");
+    if (!existsSync(path)) {
+      return [];
+    }
+    return readFileSync(path, "utf8").split(/\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  }
+
+  function calls(runbook: Runbook): string {
+    return existsSync(runbook.callLog) ? readFileSync(runbook.callLog, "utf8") : "";
+  }
+
+  async function gateFromLedger(runbook: Runbook, head = "cafe123") {
+    return doctor.analyzeOpenClawRuntimeSnapshot({
+      runtimeRoot: runbook.runtimeRoot,
+      gitHead: head,
+      gatewayListeners: [{ command: "node", pid: 1 }],
+      cronRunnerListeners: [{ command: "node", pid: 2 }],
+      controlWorkspaceAgentsPath: writePersona(runbook.root),
+      fetchImpl: async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1 (sandbox)");
+      },
+      launchdJobs: [],
+      launchdPlists: { system: [], user: [] }
+    });
+  }
+
+  function writePersona(root: string): string {
+    const path = join(root, "control-AGENTS.md");
+    writeFileSync(path, "# 控制人设（沙箱占位）\n");
+    return path;
+  }
+
+  it("a failed step 0 stops the deploy - steps 1-8 never run - and the gate goes red", async () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-step0-", { FAIL_GIT_PULL: "1" });
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/部署在第 0 步（拉取新代码）失败，后面的步骤【一步都没有执行】/u);
+    // The measured pre-round-6 behaviour, now impossible: pnpm build, the
+    // installers and the doctor all ran on the old checkout after this failure.
+    expect(calls(runbook)).not.toMatch(/pnpm install|pnpm build|pnpm openclaw:runtime:doctor/u);
+    expect(receipts(runbook)).toEqual([expect.objectContaining({ step: 0, exitCode: 1 })]);
+
+    const analysis = await gateFromLedger(runbook);
+    expect(analysis.ok).toBe(false);
+    expect(analysis.findings.map((f) => f.code)).toContain("deploy-ledger.step_0_failed");
+    expect(analysis.findings.find((f) => f.code === "deploy-ledger.step_0_failed")?.message)
+      .toMatch(/DEPLOY_FROM_STEP=0/u);
+  });
+
+  it("a dirty tracked file is caught BEFORE git is asked to pull, with the file named", () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-dirty-", { FAIL_GIT_DIRTY: "1" });
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/工作区有已跟踪文件的本地改动/u);
+    expect(output).toMatch(/README\.md/u);
+    expect(calls(runbook)).not.toMatch(/git fetch/u);
+  });
+
+  it("a failed step 3 stops steps 4-8, so nothing retires the fallbacks it kept", async () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-step3-", { FAIL_SUDO: "1" });
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/第 3 步（安装系统 daemon）失败/u);
+    // Round-5 D1 was exactly this sequence: step 3 kept a fallback, step 4 then
+    // removed it. Step 4 does not run at all now.
+    expect(calls(runbook)).not.toMatch(/pnpm launchd:install-user/u);
+    expect(calls(runbook)).not.toMatch(/pnpm openclaw:cron:install/u);
+    expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3]);
+
+    const analysis = await gateFromLedger(runbook);
+    expect(analysis.ok).toBe(false);
+    expect(analysis.findings.map((f) => f.code)).toContain("deploy-ledger.step_3_failed");
+  });
+
+  it("a failed step 5 (zero cron jobs) is still a red gate even though the daemons are fine", async () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-step5-", { FAIL_PNPM_SCRIPT: "openclaw:cron:install" });
+
+    const { status } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3, 4, 5]);
+    const analysis = await gateFromLedger(runbook);
+    expect(analysis.ok).toBe(false);
+    expect(analysis.findings.map((f) => f.code)).toContain("deploy-ledger.step_5_failed");
+  });
+
+  it("a clean run records all nine steps and the gate finds nothing to say about the deploy", async () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-ok-");
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(0);
+    expect(output).toMatch(/0-8 全部通过/u);
+    expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(receipts(runbook).every((entry) => entry.exitCode === 0)).toBe(true);
+
+    const analysis = await gateFromLedger(runbook);
+    expect(analysis.findings.filter((f) => f.code.startsWith("deploy-ledger."))).toEqual([]);
+  });
+
+  it("refuses to start at all until the gateway-restart warning is acknowledged", () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-ack-");
+    delete runbook.env.DEPLOY_ACK_GATEWAY_RESTART;
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(2);
+    // The warning itself, and the fact that stopping here costs nothing.
+    expect(output).toMatch(/18789/u);
+    expect(output).toMatch(/个人的 OpenClaw 全部 agent/u);
+    expect(output).toMatch(/codex/u);
+    expect(output).toMatch(/什么都还没做/u);
+    expect(calls(runbook)).toBe("");
+    expect(receipts(runbook)).toEqual([]);
+  });
+
+  it("resumes from the step the operator fixed without re-running the ones before it", () => {
+    const runbook = makeRunbook("alphaloop-r6-runbook-resume-");
+    runbook.env.DEPLOY_FROM_STEP = "4";
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(0);
+    expect(output).toMatch(/第 0 步 拉取新代码：按 DEPLOY_FROM_STEP=4 跳过/u);
+    expect(calls(runbook)).not.toMatch(/git pull/u);
+    expect(receipts(runbook).map((entry) => entry.step)).toEqual([4, 5, 6, 7, 8]);
   });
 });

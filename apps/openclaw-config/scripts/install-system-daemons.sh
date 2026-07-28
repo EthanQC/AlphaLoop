@@ -49,7 +49,12 @@ if [ -z "${TARGET_HOME:-}" ]; then
 fi
 TARGET_UID="$(id -u "${TARGET_USER}")"
 TARGET_GID="$(id -g "${TARGET_USER}")"
-NODE_BIN="${TARGET_HOME}/.local/node-v24/bin/node"
+# Overridable for the same reason PNPM_BIN is: this path is BAKED INTO three
+# plists (gateway, cron-runner, official-paper poll+pnl), so a machine whose
+# node lives elsewhere would get three daemons that bootstrap fine and then
+# fail with ENOENT forever. Round 6 also runs it (see verify_daemon below), so
+# it has to be a real node, not a name that happens to be there.
+NODE_BIN="${NODE_BIN:-${TARGET_HOME}/.local/node-v24/bin/node}"
 OPENCLAW_ENTRY="${TARGET_HOME}/.local/node-v24/lib/node_modules/openclaw/dist/index.js"
 PATH_ENV="${TARGET_HOME}/.local/node-v24/bin:${TARGET_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 OPENCLAW_PROXY_URL="${OPENCLAW_PROXY_URL:-http://127.0.0.1:7897}"
@@ -134,7 +139,17 @@ fi
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 SYSTEM_DIR="${SYSTEM_DIR:-/Library/LaunchDaemons}"
 BOOTSTRAP_SETTLE_SECONDS="${BOOTSTRAP_SETTLE_SECONDS:-2}"
+# Round-6 finding S3e: how long a daemon has to stay alive after bootstrap
+# before this script is willing to call the handover done and archive the old
+# user-level copy. See verify_daemon() for exactly what that does and does not
+# prove.
+VERIFY_SETTLE_SECONDS="${VERIFY_SETTLE_SECONDS:-3}"
 OWNERSHIP_FILE="${OWNERSHIP_FILE:-${SCRIPT_DIR}/install-launchd-ownership.txt}"
+HEALTH_CHECKER="${HEALTH_CHECKER:-${SCRIPT_DIR}/launchd-health.mjs}"
+DEPLOY_LEDGER="${DEPLOY_LEDGER:-${SCRIPT_DIR}/deploy-ledger.mjs}"
+DEPLOY_RUNTIME_ROOT="${DEPLOY_RUNTIME_ROOT:-${REPO_ROOT}/runtime}"
+DEPLOY_ATTEMPT_ID="${DEPLOY_ATTEMPT_ID:-install-system-daemons-$(date +%Y%m%d-%H%M%S)-$$}"
+INSTALL_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 LOG_DIR="${TARGET_HOME}/.openclaw/system-logs"
 OPENCLAW_LOG_DIR="${TARGET_HOME}/.openclaw/logs"
@@ -160,6 +175,58 @@ if [ ! -f "${OWNERSHIP_FILE}" ]; then
   echo "install-system-daemons: ownership manifest not found at ${OWNERSHIP_FILE}" >&2
   exit 1
 fi
+
+# Round 6: this script's own exit code becomes a deploy-ledger receipt for
+# runbook step 3, so the acceptance gate (step 8) can fail on "step 3 said it
+# failed" instead of only on whatever it can still observe minutes later. See
+# deploy-ledger.mjs's header for the five confirmed cases that motivated it.
+#
+# Bookkeeping never changes the outcome: every call here is `|| true`, and a
+# ledger that cannot be written is reported by the doctor as a missing receipt
+# rather than pretended away.
+#
+# Not covered: the two refusals above (running as root, TARGET_USER does not
+# exist) exit before this point and leave no receipt. They also change nothing
+# on the machine, and `deploy.sh` records step 3's exit code itself whichever
+# way this script exits.
+INSTALL_RESULT_RECORDED=""
+record_install_result() {
+  [ -z "${PRINT_CONFIG_ONLY:-}" ] || return 0
+  [ -z "${INSTALL_RESULT_RECORDED}" ] || return 0
+  INSTALL_RESULT_RECORDED=1
+  [ -x "${NODE_BIN}" ] || return 0
+  [ -f "${DEPLOY_LEDGER}" ] || return 0
+  "${NODE_BIN}" "${DEPLOY_LEDGER}" record \
+    --runtime-root "${DEPLOY_RUNTIME_ROOT}" \
+    --attempt "${DEPLOY_ATTEMPT_ID}" \
+    --step 3 \
+    --exit "$1" \
+    --head "$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    --started-at "${INSTALL_STARTED_AT}" \
+    --detail "install-system-daemons.sh" >/dev/null 2>&1 || true
+  # Under sudo the ledger would end up root-owned inside the operator's own
+  # repo, and the next unprivileged step could not append to it - the same
+  # class of bug finding D3 fixed for the log directories.
+  if [ "$(id -u)" -eq 0 ]; then
+    chown -R "${TARGET_USER}:${TARGET_GID}" "${DEPLOY_RUNTIME_ROOT}/deploy" 2>/dev/null || true
+  fi
+  return 0
+}
+
+cleanup_tmp_dir() {
+  if [ -n "${TMP_DIR:-}" ]; then
+    rm -rf "${TMP_DIR}"
+  fi
+  return 0
+}
+
+on_exit() {
+  # Same zsh caveat as verify_daemon's: `status` is read-only there.
+  local exit_status=$?
+  record_install_result "${exit_status}"
+  cleanup_tmp_dir
+  return 0
+}
 
 # openclaw-cron-runner.mjs reads PNPM_BIN to spawn `pnpm ...` for each cron
 # job. Resolve it at install time and fail loudly if it cannot be found -
@@ -193,12 +260,40 @@ daemon_uses_proxy() {
 # as the thing to run before the real `sudo` invocation, because every value
 # below is derived rather than typed and getting TARGET_USER wrong installs
 # eight daemons pointing at a home directory that isn't yours.
+#
+# ⚠ WHAT THIS SCRIPT INTERRUPTS THAT IS NOT OURS (round 6).
+#
+# The handover loop below boots out and re-bootstraps ai.openclaw.system.gateway
+# like any other label. On the deploy target that gateway is not a private
+# AlphaLoop service: measured read-only on the mini (2026-07-28/29) it is the
+# SOLE listener on 18789 (one node process, on 127.0.0.1 and [::1] both), the
+# operator's own ~/.openclaw/openclaw.json configures 185 agents with a
+# workspace against that same port, ~/.openclaw/agents holds 187 directories,
+# and at the time of writing the gateway process had a live codex session as a
+# descendant. Restarting it stops the operator's personal agents too.
+#
+# Printed in the preflight (below) and again before the handover loop, because
+# the whole point of the preflight is that it is what an operator runs BEFORE
+# committing to the sudo run.
+print_gateway_warning() {
+  echo "" >&2
+  echo "⚠ 这个脚本会重启 ai.openclaw.system.gateway。" >&2
+  echo "  只读实测（mini，2026-07-28/29）：18789 上只有它一个监听进程；操作者自己的" >&2
+  echo "  ~/.openclaw/openclaw.json 里配了 185 个带 workspace 的 agent、~/.openclaw/agents" >&2
+  echo "  下有 187 个目录，全都由这一个 gateway 提供服务；写这段话时它底下还挂着一个活着的" >&2
+  echo "  codex 子进程。也就是说：跑这一步 = 你个人正在跑的 agent 会话会被打断。" >&2
+  echo "  跑之前请先确认没有正在跑的会话、把重要结果落盘，并挑一个你自己不用 agent 的时间窗口。" >&2
+  echo "" >&2
+}
+
 if [ -n "${PRINT_CONFIG_ONLY:-}" ]; then
+  print_gateway_warning
   echo "target_user=${TARGET_USER}"
   echo "target_home=${TARGET_HOME}"
   echo "repo_root=${REPO_ROOT}"
   echo "system_dir=${SYSTEM_DIR}"
   echo "pnpm_bin=${PNPM_BIN}"
+  echo "node_bin=${NODE_BIN}"
   echo "gateway_port=${GATEWAY_PORT}"
   echo "proxy_url=${OPENCLAW_PROXY_URL}"
   echo "proxy_labels=${OPENCLAW_PROXY_LABELS}"
@@ -223,6 +318,25 @@ if [ "${SYSTEM_DIR}" = "/Library/LaunchDaemons" ] && [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Same rule as PNPM_BIN, and for a stronger reason: NODE_BIN is written into
+# three of the eight plists AND is what runs the health check that decides
+# whether a service's fallback may be archived. A missing node used to produce
+# three daemons that load and then ENOENT on every run; from round 6 it would
+# additionally make every verification unrunnable.
+if [ ! -x "${NODE_BIN}" ]; then
+  echo "install-system-daemons: ${NODE_BIN} is not an executable node." >&2
+  echo "install-system-daemons: three of the daemons run node by this exact path, so installing them now" >&2
+  echo "install-system-daemons: would produce services that load and then fail every run with ENOENT." >&2
+  echo "install-system-daemons: install node there for ${TARGET_USER}, or pass NODE_BIN=/path/to/node." >&2
+  exit 1
+fi
+if [ ! -f "${HEALTH_CHECKER}" ]; then
+  echo "install-system-daemons: health checker not found at ${HEALTH_CHECKER}." >&2
+  echo "install-system-daemons: without it this script could only prove daemons are REGISTERED, not that they" >&2
+  echo "install-system-daemons: are running - which is the exact check finding S3e added. Refusing to run." >&2
+  exit 1
+fi
+
 # Past this point the script does write. The staging directory is created here
 # rather than at the top so the two exits above leave the machine untouched,
 # and the trap removes it on every path out - including the manifest-drift
@@ -242,12 +356,11 @@ fi
 # with the conventional 128+signo status so a caller still sees "killed by a
 # signal" rather than a fabricated clean exit.
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/install-system-daemons.XXXXXX")"
-cleanup_tmp_dir() { rm -rf "${TMP_DIR}"; }
-trap 'cleanup_tmp_dir' EXIT
-trap 'cleanup_tmp_dir; trap - INT; kill -INT $$' INT
-trap 'cleanup_tmp_dir; exit 143' TERM
-trap 'cleanup_tmp_dir; exit 129' HUP
-trap 'cleanup_tmp_dir; exit 131' QUIT
+trap 'on_exit' EXIT
+trap 'record_install_result 130; cleanup_tmp_dir; trap - INT; kill -INT $$' INT
+trap 'record_install_result 143; cleanup_tmp_dir; exit 143' TERM
+trap 'record_install_result 129; cleanup_tmp_dir; exit 129' HUP
+trap 'record_install_result 131; cleanup_tmp_dir; exit 131' QUIT
 
 # Round-5 finding D3: `mkdir -p a/b/c` creates a, a/b AND a/b/c, but only the
 # five leaf paths below were ever chowned back. Under `sudo` on a machine where
@@ -638,10 +751,14 @@ done
 # The loop is therefore per SERVICE, not per phase, and it is a transaction:
 #
 #   1. STOP   the user-level copies of THIS service only (and remember which
-#             ones were actually running).
+#             ones were actually running). A copy that survives bootout fails
+#             this service HERE - see stop_user_agent.
 #   2. START  its daemon: bootout, drain, enable, bootstrap, kickstart.
-#   3. VERIFY by asking launchd (`launchctl print system/<label>`), never by
-#             trusting bootstrap's exit code.
+#   3. VERIFY what the job is DOING (verify_daemon, via launchd-health.mjs -
+#             the doctor's own residency contract), never by trusting
+#             bootstrap's exit code and never by treating a `launchctl print`
+#             hit as proof the service came up. Round-6 finding S3e: three
+#             daemons that were dead on arrival used to pass this step.
 #   4a. up    -> archive that service's user plists (a MOVE into
 #               ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/,
 #               never a delete), and only that service's.
@@ -653,11 +770,18 @@ done
 # gap - the old copy must stop before the new one starts, or two copies race on
 # the same trading database and the same port. What is true: the gap belongs to
 # ONE service, the other seven keep running through it, no service is ever
-# running twice, a service whose daemon fails to come up is left running the
-# same copy it was running before this script started, and re-running from the
-# top converges (every step is idempotent; each daemon is enabled and booted
+# running twice, a service whose daemon does not come up HEALTHY is left running
+# the same copy it was running before this script started, and re-running from
+# the top converges (every step is idempotent; each daemon is enabled and booted
 # out before it is bootstrapped).
+#
+# What is NOT promised, and is not knowable from launchd: that a daemon this
+# script reports as running is doing its job. Step 8 of the runbook
+# (`pnpm openclaw:runtime:doctor`) is the gate for that, and this script's own
+# exit code is written to the deploy ledger so that gate cannot ignore it.
 # ---------------------------------------------------------------------------
+
+print_gateway_warning
 
 # Which daemon replaces a given user-level label. For the eight system labels
 # the daemon has the same name; these two rows are the only places where the
@@ -739,15 +863,30 @@ EOF
 # the three `grep -c` counters in the summary), each defensible for its own
 # reason. No count is quoted this time on purpose: a number in a comment is a
 # claim that rots on the next edit, which is exactly how the false one got here.
+# Round-6 finding S3f. This used to print a warning about a label that survived
+# bootout, `return 0` with NOTHING on stdout, and let the caller carry on -
+# so the loop bootstrapped the daemon anyway, archived the plist, and the run
+# summary was clean at exit 0, while README:119 claimed "no service ever runs
+# twice". Two copies of broker-executor on one trading database is the exact
+# race install-launchd-ownership.txt exists to prevent.
+#
+# It now records the label in a per-service file that the caller reads. The
+# caller refuses to bootstrap that service's daemon at all: with the old copy
+# still holding the port/database, starting the new one is the collision, and
+# the machine is strictly better off running only the old copy until a human
+# looks.
 stop_user_agent() {
   local user_label="$1"
+  local system_label="${2:-}"
   if ! "${LAUNCHCTL}" print "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1; then
     return 0
   fi
   "${LAUNCHCTL}" bootout "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1 || true
   if "${LAUNCHCTL}" print "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1; then
-    echo "install-system-daemons: warning: gui/${TARGET_UID}/${user_label} is STILL loaded after bootout." >&2
-    echo "install-system-daemons: warning: it may race the daemon of the same name; stop it by hand." >&2
+    echo "install-system-daemons: ERROR: gui/${TARGET_UID}/${user_label} is STILL loaded after bootout." >&2
+    if [ -n "${system_label}" ]; then
+      printf "%s\n" "${user_label}" >> "${TMP_DIR}/still-loaded.${system_label}"
+    fi
     return 0
   fi
   printf "%s\n" "${user_label}"
@@ -797,6 +936,44 @@ ${stopped}
 EOF
 }
 
+# --- 3. verify by asking launchd what the job is DOING, not whether it exists.
+#
+# Round-6 finding S3e. This step used to be `launchctl print system/<label>` and
+# nothing else, i.e. proof of REGISTRATION. Measured 2026-07-29 by running the
+# PREVIOUS version of this script (extracted from HEAD) and this one against the
+# same sandboxed root and the same launchctl stub, with platform-app,
+# broker-executor and market-alerts injected to bootstrap successfully and then
+# be dead on arrival (state = not running, last exit code = 1): the previous
+# version exited 0, printed every label as `loaded`, and archived both
+# user-level fallbacks; this one exits 1, prints them as NOT RUNNING, and leaves
+# the fallbacks on disk. The doctor learned "loaded is not working" in round
+# 4; this is the same knowledge, from the same module (launchd-health.mjs), so
+# the two can never disagree about what a healthy daemon looks like.
+#
+# What a pass here proves: the daemon was still alive VERIFY_SETTLE_SECONDS
+# after bootstrap and launchd has recorded no abnormal termination for it (for
+# a periodic job: its RunAtLoad run did not fail). What it does NOT prove: that
+# the service works. Nothing launchd knows can prove that - the doctor's
+# loopback probes are what do, which is why step 8 is still the gate.
+verify_daemon() {
+  local label="$1"
+  # NOT named `status`: that is a read-only special parameter in zsh (an alias
+  # for $?), and this script's shebang is zsh - assigning to it aborted the run
+  # with "read-only variable: status" before any daemon was verified.
+  local printed verdict verify_status
+  printed="$("${LAUNCHCTL}" print "system/${label}" 2>/dev/null || true)"
+  verify_status=0
+  verdict="$(printf "%s" "${printed}" | "${NODE_BIN}" "${HEALTH_CHECKER}" verify "${label}")" || verify_status=$?
+  if [ "${verify_status}" -eq 0 ]; then
+    return 0
+  fi
+  if [ -z "${verdict}" ]; then
+    verdict="${label}: could not run ${HEALTH_CHECKER} with ${NODE_BIN} (exit ${verify_status})"
+  fi
+  VERIFY_REASON="${verdict}"
+  return 1
+}
+
 while IFS= read -r system_label; do
   [ -n "${system_label}" ] || continue
   system_plist="${SYSTEM_DIR}/${system_label}.plist"
@@ -805,11 +982,21 @@ while IFS= read -r system_label; do
   stopped_agents=""
   while IFS= read -r user_label; do
     [ -n "${user_label}" ] || continue
-    stopped_agents="${stopped_agents}$(stop_user_agent "${user_label}")
+    stopped_agents="${stopped_agents}$(stop_user_agent "${user_label}" "${system_label}")
 "
   done <<EOF
 $(user_labels_for "${system_label}")
 EOF
+
+  # A user-level copy that survived bootout means this service is STILL RUNNING
+  # under the old plist. Bootstrapping the daemon now would put two owners on
+  # one port and one database - so this service is failed here, before anything
+  # irreversible, and the machine keeps running the copy it already had.
+  if [ -s "${TMP_DIR}/still-loaded.${system_label}" ]; then
+    record_failure "${system_label}" "user-level $(tr '\n' ' ' < "${TMP_DIR}/still-loaded.${system_label}")is STILL loaded after bootout; refusing to bootstrap the daemon because both copies would then run on the same port/database. Stop it by hand (launchctl bootout gui/${TARGET_UID}/<label>) and re-run."
+    restore_user_agents "${stopped_agents}"
+    continue
+  fi
 
   # --- 2. bring the daemon up ---------------------------------------------
   "${LAUNCHCTL}" bootout "system/${system_label}" >/dev/null 2>&1 || true
@@ -854,9 +1041,11 @@ EOF
     echo "install-system-daemons: warning: bootstrap succeeded and RunAtLoad started it; checking the job table." >&2
   fi
 
-  # --- 3. verify by asking launchd, not by trusting an exit code -----------
-  if ! "${LAUNCHCTL}" print "system/${system_label}" >/dev/null 2>&1; then
-    record_failure "${system_label}" "bootstrap reported success but launchctl print system/${system_label} cannot find the job"
+  # --- 3. verify (see verify_daemon above) --------------------------------
+  sleep "${VERIFY_SETTLE_SECONDS}"
+  VERIFY_REASON=""
+  if ! verify_daemon "${system_label}"; then
+    record_failure "${system_label}" "${VERIFY_REASON}"
     restore_user_agents "${stopped_agents}"
     continue
   fi
@@ -889,10 +1078,13 @@ EOF
 echo "Installed system daemons under ${SYSTEM_DIR} (running as ${TARGET_USER}):"
 while IFS= read -r installed_label; do
   [ -n "${installed_label}" ] || continue
+  # Round-6 finding S3e: the word here used to be "loaded", which was true of a
+  # dead daemon too. LOADED_LABELS now only carries labels that passed
+  # verify_daemon, so the word can honestly be "running".
   if label_is_loaded "${installed_label}"; then
-    state="loaded"
+    state="running"
   else
-    state="NOT LOADED"
+    state="NOT RUNNING"
   fi
   if daemon_uses_proxy "${installed_label}"; then
     echo "  ${installed_label}  egress=proxy(${OPENCLAW_PROXY_URL})  ${state}"
@@ -915,7 +1107,7 @@ if [ -n "${FAILED_LABELS}" ]; then
   echo "" >&2
   echo "install-system-daemons: FAILED - ${failed_count} of ${total_count} daemons did not come up:" >&2
   printf "%s" "${FAILURE_DETAIL}" >&2
-  echo "install-system-daemons: ${loaded_count} of ${total_count} ARE loaded; the machine is not idle." >&2
+  echo "install-system-daemons: ${loaded_count} of ${total_count} ARE running; the machine is not idle." >&2
   if [ -n "${RESTORED_AGENTS}" ]; then
     echo "install-system-daemons: the old user-level copy of each failed service was started again," >&2
     echo "install-system-daemons: so those services are running the same code they were before this run:" >&2

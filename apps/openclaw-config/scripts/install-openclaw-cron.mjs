@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
+import { newDeployAttemptId, recordDeployStep } from "./deploy-ledger.mjs";
 import { userLevelLabelsToRetire } from "./install-launchd-ownership.mjs";
 import { retireUserLevelAgents, reportRetireResult } from "./launchd-agent-archive.mjs";
 import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mjs";
@@ -11,59 +12,125 @@ import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mj
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const jobs = buildManagedOpenClawCronJobs(repoRoot);
 const uid = process.getuid?.();
+const startedAt = new Date().toISOString();
 
 // Both, always - `||` here would short-circuit the second one.
 const keptReportSchedules = retireLegacyLaunchdReportSchedules();
 const keptDaemonAgents = retireUserLevelDaemonAgents();
 const keptUserAgents = keptReportSchedules || keptDaemonAgents;
 
+// Round-6 finding S3g. This loop used to let the first `openclaw cron add`
+// failure escape as an uncaught exception: a raw stack trace, exit 1, and -
+// because the throw happened on the FIRST job - zero of the five installed,
+// with no statement anywhere of how many had made it. The five report
+// pipelines (日报 / 周报 / 个股分析) are the product; "none of them exist on
+// this machine" has to be said in words, and it has to be said even when the
+// failure hits job three of five.
+const installed = [];
+const failed = [];
 for (const job of jobs) {
-  removeExistingJob(job.name);
-  const output = execOpenClaw([
-    "cron",
-    "add",
-    "--name",
-    job.name,
-    "--description",
-    job.description,
-    "--cron",
-    job.cron,
-    "--tz",
-    job.timezone,
-    "--agent",
-    job.agent,
-    "--session",
-    job.session,
-    "--system-event",
-    job.systemEvent,
-    "--wake",
-    job.wake,
-    "--expect-final",
-    "--timeout-seconds",
-    String(job.timeoutSeconds),
-    "--json"
-  ]);
-  const created = parseJson(output);
-  console.log(JSON.stringify({
-    installed: true,
-    name: job.name,
-    id: created?.id ?? created?.job?.id ?? null,
-    cron: job.cron,
-    timezone: job.timezone
-  }, null, 2));
+  try {
+    removeExistingJob(job.name);
+    const created = parseJson(execOpenClaw([
+      "cron",
+      "add",
+      "--name",
+      job.name,
+      "--description",
+      job.description,
+      "--cron",
+      job.cron,
+      "--tz",
+      job.timezone,
+      "--agent",
+      job.agent,
+      "--session",
+      job.session,
+      "--system-event",
+      job.systemEvent,
+      "--wake",
+      job.wake,
+      "--expect-final",
+      "--timeout-seconds",
+      String(job.timeoutSeconds),
+      "--json"
+    ]));
+    installed.push(job.name);
+    console.log(JSON.stringify({
+      installed: true,
+      name: job.name,
+      id: created?.id ?? created?.job?.id ?? null,
+      cron: job.cron,
+      timezone: job.timezone
+    }, null, 2));
+  } catch (error) {
+    failed.push({ name: job.name, reason: describeCliError(error) });
+    console.log(JSON.stringify({ installed: false, name: job.name, reason: describeCliError(error) }, null, 2));
+  }
 }
 
 // Round-5 finding D1: reported AFTER the cron jobs are installed, and as a
 // non-zero exit rather than a silent line, because "a user-level LaunchAgent
 // had to be kept" means a system daemon is down - the machine is half
 // migrated, and the operator has to know that before treating this step as
-// done. The 5 cron jobs above ARE installed either way; nothing here is
-// rolled back.
+// done. Nothing here is rolled back.
 if (keptUserAgents) {
-  console.error("install-openclaw-cron: 上面的 5 个 openclaw cron 任务已经装好了，但这台机器仍处于「迁移了一半」的状态：");
+  console.error(`install-openclaw-cron: ${installed.length}/${jobs.length} 个 openclaw cron 任务已经装好，但这台机器仍处于「迁移了一半」的状态：`);
   console.error("install-openclaw-cron: 有用户级 LaunchAgent 被有意保留，因为接管它的系统 daemon 当前没有加载。");
   console.error("install-openclaw-cron: 先修好 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh，再重跑本命令。");
   process.exitCode = 1;
+}
+
+if (failed.length > 0) {
+  console.error("");
+  console.error(`install-openclaw-cron: FAILED —— ${failed.length}/${jobs.length} 个报告类 cron 任务没有装上：`);
+  for (const entry of failed) {
+    console.error(`  ${entry.name}`);
+    console.error(`      ${entry.reason}`);
+  }
+  if (installed.length === 0) {
+    console.error("install-openclaw-cron: 一个都没装上。日报、周报、个股分析在这台机器上【完全不会触发】。");
+  } else {
+    console.error(`install-openclaw-cron: 装上的是：${installed.join("、")}。其余那几条流水线不会触发。`);
+  }
+  console.error("install-openclaw-cron: 最常见的原因是 gateway 没在跑（GatewayTransportError / ECONNREFUSED）——");
+  console.error("install-openclaw-cron: 先确认 ai.openclaw.system.gateway 起来了（第 3 步），再原样重跑本命令。");
+  process.exitCode = 1;
+}
+
+// The gate has to be able to see this outcome later, not only in this
+// terminal: see deploy-ledger.mjs's header. Bookkeeping never changes the
+// exit code.
+recordDeployStep({
+  // DEPLOY_RUNTIME_ROOT is the same test seam install-system-daemons.sh and
+  // deploy.sh use: the suite runs this real installer end to end, and a test
+  // that appended to the repo's own runtime/ would be exactly the class of
+  // write test/runtime-write-guard.ts exists to stop.
+  runtimeRoot: process.env.DEPLOY_RUNTIME_ROOT ?? join(repoRoot, "runtime"),
+  attempt: process.env.DEPLOY_ATTEMPT_ID ?? newDeployAttemptId(),
+  step: 5,
+  exitCode: process.exitCode ?? 0,
+  head: readHead(),
+  startedAt,
+  detail: `installed ${installed.length}/${jobs.length} openclaw cron jobs`
+});
+
+function describeCliError(error) {
+  const stderr = String(error?.stderr ?? "").trim();
+  const first = stderr.split(/\r?\n/u).find((line) => line.trim().length > 0);
+  return first ?? String(error?.message ?? error);
+}
+
+function readHead() {
+  try {
+    return execFileSync("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000
+    }).trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // Task 9 (2026-07-28 spec-drift remediation): this installer used to write
@@ -131,6 +198,13 @@ function removeExistingJob(name) {
   execOpenClaw(["cron", "rm", String(id), "--json"]);
 }
 
+// Retry seam. The backoff is real (a gateway that has just been restarted by
+// step 3 takes a moment to accept connections), but four attempts at 1/2/3
+// seconds each, on both the `cron show` and the `cron add` of all five jobs,
+// is over a minute of sleeping before a genuinely-down gateway is reported -
+// which is also more than a test can wait. Production default unchanged.
+const RETRY_BASE_MS = Number(process.env.OPENCLAW_CRON_RETRY_BASE_MS ?? 1000);
+
 function execOpenClaw(args) {
   let lastError;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -146,7 +220,7 @@ function execOpenClaw(args) {
       if (!/GatewayTransportError|ECONNREFUSED|abnormal closure/iu.test(stderr) || attempt === 4) {
         throw error;
       }
-      sleepSync(1000 * attempt);
+      sleepSync(RETRY_BASE_MS * attempt);
     }
   }
   throw lastError;

@@ -12,7 +12,10 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
+- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent。
+- `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
+- `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
 - `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没加载时干脆不动，见下面「谁拥有哪个标签」）。
 - `scripts/launchd-agent-archive.mjs`：上面那条规则的唯一实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它。
 - `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
@@ -113,7 +116,13 @@ pnpm launchd:install-user
 
 1. **谁都不删除。** 退役 = 移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`，三个脚本用同一个归档目录。归档目录建不出来（mini 上它是早期 sudo 运行留下的 `root staff`）时，plist 原地保留并报错退出，不会退化成删除。
 2. **接管者没起来就不动它。** 对 system/retired 标签，node 安装器先问 `launchctl print system/<接管它的 daemon>`；没加载就说明这份用户级副本正是机器现在跑的那份，于是原地不动、打印 `keptLaunchAgent` 并以退出码 1 结束。
-3. **shell 安装器按服务逐个交接。** 停旧 → 起新 → `launchctl print` 确认 → 才归档；起不来就把刚停掉的 agent 立刻 `bootstrap gui/<uid>` 回去。所以单个服务的停机窗口是「一次 bootout + settle」（默认 2 秒，本机实测最坏 2.1 秒），其余服务不受影响，任何服务都不会同时跑两份。
+3. **shell 安装器按服务逐个交接。** 停旧 → 起新 → **确认它真的在跑** → 才归档；起不来就把刚停掉的 agent 立刻 `bootstrap gui/<uid>` 回去。所以单个服务的停机窗口是「一次 bootout + settle」（默认 2 秒，本机实测最坏 2.1 秒），其余服务不受影响，任何服务都不会同时跑两份。
+
+   第三步在 2026-07-29 之前是 `launchctl print system/<label>` 的退出码，而那只能证明**注册过**。实测（真实安装脚本 + 沙箱 root + launchctl stub）：platform-app / broker-executor / market-alerts 三个 daemon bootstrap 成功、`print` 退出 0，但 job 报 `state = not running` + `last exit code = 1`——脚本把 8 个标签全部打印成 `loaded`、把每一份用户级 plist 都归档掉、退出 0。现在它调 `launchd-health.mjs`（doctor 的同一份 residency 契约）：常驻服务必须 `state = running`，周期任务的首次运行不能异常退出，`runs ≥ 20` 直接判崩溃重启循环。不满足 → 不归档、把旧 agent 立刻拉回来、以退出码 1 汇总，并把这次失败写进部署收据。
+
+   这**不能**证明服务在正常工作——launchd 知道的任何东西都证明不了。它证明的是"daemon 活过了 settle 窗口，且 launchd 没有记录到异常终止"。真正的工作证明是 doctor 的回环探针，所以第 8 步仍然是验收门。
+
+4. **用户级副本 bootout 之后还活着 → 这个服务这次不交接。** 以前这里只打印一句 warning 然后照常 bootstrap daemon，结果就是两份一起跑、抢同一个端口和同一份 `trading.sqlite`（而 README 那句"任何服务都不会同时跑两份"因此是假的）。现在它把该服务判为失败、根本不 bootstrap，机器继续只跑旧的那一份。
 
 （这也修正了旧版这里写的「中途中断也不会留下两个实例」之外那半句：第 4 轮的 Phase A/B/C 注释曾声称「随时中断都安全，机器任何时刻要么跑旧的要么跑新的」。实测不是——Phase A 一次性停掉全部 9 个标签，Phase B 才带着 settle 逐个拉起，最后一个标签整段时间既没有旧的也没有新的。用会给每次调用打时间戳的 launchctl stub 分别跑旧版和新版：旧版最坏单服务窗口 17.1 秒（official-paper.poll），新版 2.1 秒。另测在第 1.5 / 4 / 9 秒 SIGTERM 打断新版：每次都恰好只有 1 个标签处于交接中间态，其余标签要么跑着旧的、要么跑着新的，且没有残留临时目录。）
 
@@ -146,6 +155,24 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 安装结束时脚本会逐行打印每个 daemon 的 `egress=proxy(...)` / `egress=direct`，可以当场核对。
 
+### 部署收据（`runtime/deploy/steps.jsonl`）
+
+第 5 轮确认的五个 critical 是同一个形状：某一步失败了、打印了、非零退出了，而验收门仍然 `ok=true` 退出 0。原因是验收门只看得见"此刻能观测到的机器状态"，没有任何东西把「二十秒前某一步失败了」带到它面前。
+
+`deploy.sh`（每一步）和 `install-system-daemons.sh`（它自己那一步，因为操作者确实会单独手跑它）各写一行 JSON：`{attempt, step, key, exitCode, head, startedAt, finishedAt, host, user}`。doctor 的 `deploy-ledger` 检查项按**步**判定（不是按 attempt），因为手工重跑单步是合法用法：
+
+- 某一步最新的收据是非零退出 → **error**。
+- 某一步根本没有收据 → warn。「没有证据」不等于「失败」——照着 README 一条条手敲就是这个结果。
+- 某一步最近一次成功是在别的 commit 上跑的 → warn，代码换了要重跑。
+
+记账永远不改变部署本身的退出码：写不进去时只会少一条收据，doctor 把它报成 warn，不会假装它成功过。
+
+### ⚠ 第 3 步会打断操作者自己的 agent
+
+`ai.openclaw.system.gateway` 在 mini 上不是 AlphaLoop 专用的。只读实测（2026-07-28/29）：18789 上只有它一个监听进程；`~/.openclaw/openclaw.json` 里配了 185 个带 workspace 的 agent、`~/.openclaw/agents` 下有 187 个目录；写这段话时 gateway 进程（pid 21802）底下挂着 `node` 27714 → 一个活着的 `codex` 子进程。重启它 = 打断操作者个人正在跑的会话，且子进程不会自己回来。
+
+`deploy.sh` 在**什么都还没做之前**打印这段警告并要求 `DEPLOY_ACK_GATEWAY_RESTART=yes`（或 `--ack-gateway-restart`）才继续；`install-system-daemons.sh` 在 `PRINT_CONFIG_ONLY` 干跑和真正交接之前各打印一次。
+
 ### doctor 的 launchd 检查
 
 `pnpm openclaw:runtime:doctor` 按 ownership 清单逐个探测，**分域询问**：
@@ -158,8 +185,11 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 三种结果：
 
 - 在应属的域里加载 → 不报告（`state` 仍会出现在 snapshot 里供人工核对）。
-- 两个域都没有 → warn `launchd-jobs.<name>.not_loaded`，并点名**该域对应的**安装命令（system → `sudo zsh .../install-system-daemons.sh`，user → `pnpm launchd:install-backup-alerts`）。
+- 两个域都没有 → `launchd-jobs.<name>.not_loaded`，并点名**该域对应的**安装命令（system → `sudo zsh .../install-system-daemons.sh`，user → `pnpm launchd:install-backup-alerts`）。**严重级取决于机器**：这台机器有部署痕迹（有部署收据、或已经有别的受管标签处于加载状态、或磁盘上已经有受管标签的 plist）→ **error**；完全没有部署痕迹的开发机 → warn。
+
+  这条以前是无条件 warn，理由写的是"开发机本来就一个都不装"。那个理由说的是**机器**，却被套在了**检查项**上，于是对每台机器都成立——第 5 轮实测：四个标签一个域都没装、安装脚本各自退出 1 并明说了，这道门仍然 `ok=true` 退出 0。
 - 加载在错误的域、或两个域同时加载 → **error** `launchd-jobs.<name>.wrong_domain`。这正是 ownership 清单要防的"一个标签两个 owner"（两个 broker-executor 抢同一个交易数据库），任何开发机都不会误入这个状态。
+- 磁盘上还留着系统域标签的用户级 plist（此刻没加载）→ **error** `launchd-plists.stray_user_copy`。任务表里看不出问题，但下次登录 launchd 会把它们全部 bootstrap 起来。
 
 ### 回环探针的严重级取决于 launchd 怎么说（第 5 轮 D2）
 
@@ -171,7 +201,10 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 这条是补上第 8 步「过不了才怪」的窟窿。实测：把 platform-app 做成崩溃重启循环、在 launchd 刚把它拉起来的瞬间采样（`state = running`、`last exit code = 1`、`runs = 918`），`/health` 连接被拒，改之前 `analyzeOpenClawRuntimeSnapshot` 返回 `ok=true`、doctor 退出 0、零条 error；broker-executor、gateway 各自单独测同样如此。
 
-同一批还补了常驻服务的崩溃重启循环判定：`state = running` + 上次退出非零时，`runs ≥ 20` 报 `launchd-jobs.<name>.crash_looping`（error），低于阈值仍是原来的 `restarted_after_failure`（warn，"崩过一次但现在好着"）。20 这个阈值是**选的不是测出来的**：常驻 daemon 只有死掉才会累加 `runs`，而 mini 上那四个常驻服务只读实测是 platform-app 2、broker-executor 2、cron-runner 10、gateway 10，其中打印了 `last exit code` 的两个都是 0、另外两个上次是被信号杀死所以根本没这一行——也就是说不管阈值取多少它们都进不了这个分支。真正的判据是探针，这个阈值只是兜住「采样恰好落在两次崩溃之间的存活窗口」。
+同一批还补了常驻服务的崩溃重启循环判定。2026-07-29 又改了两处，都是因为原来的写法对**真实机器现在打印的形状**不可达：
+
+- **`runs ≥ 20` 单独成立**（`launchd-jobs.<name>.crash_looping`，error），不再要求"上次退出码非零"。原来整个分支挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**——mini 上的 platform-app 此刻就是这样（只有 `last terminating signal = Terminated: 15`）。阈值仍然是选的，但依据更硬了：本机实测 `runs` 是**按加载计数、不是按生命周期**（同一个标签 `bootout` + `bootstrap` 之后 runs 从 3 回到 1），所以它累计不到部署次数上去；一次健康安装留下的是 runs = 2（RunAtLoad 一次 + `kickstart -k` 一次），正好对上 mini 上 platform-app 和 broker-executor 的实测值。
+- **信号也算异常终止**，但 SIGTERM（15）和 SIGKILL（9）除外：那正是 `launchctl bootout` 和 `kickstart -k` 发的信号，也就是安装脚本每次都对每个 daemon 做的事；把它们算成崩溃，等于每次健康安装都报八条崩溃。`last exit reason`（比如 jetsam）也算异常。低于阈值的异常终止仍是 `restarted_after_failure`（warn）。
 
 ### platform-app（Phase 3 多成员 Web 平台）
 

@@ -5,12 +5,14 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { createBrokerExecutorServer } from "../../broker-executor/dist/server.js";
 import { openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { runBackup } from "./backup-trading-data.mjs";
 import { recordJobRun } from "./job-run-log.mjs";
+import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
 import { saveSnapshot } from "./official-paper-monitor.mjs";
 
 const doctor = await import("./openclaw-runtime-doctor-core.mjs");
@@ -104,6 +106,31 @@ const ALL_LAUNCHD_JOBS_LOADED = doctor.REQUIRED_LAUNCHD_JOBS.map((job) => {
 const launchdJobsWithout = (...labels: string[]) => ALL_LAUNCHD_JOBS_LOADED.map((row) => (labels.includes(row.label)
   ? { ...row, loadedDomains: [], state: null, lastExitCode: null, lastExitReason: null, pid: null, runs: null }
   : row));
+
+/**
+ * A machine where NONE of these labels is installed - which is what "an
+ * ordinary dev laptop" actually looks like.
+ *
+ * Round-6 finding S3a made this distinction load-bearing, and doing so exposed
+ * a fixture that had been describing the wrong machine. The
+ * "warns on a dev box" cases below used `launchdJobsWithout(oneLabel)`, i.e.
+ * EIGHT AlphaLoop daemons loaded and one absent, and called that "a machine
+ * that never installed it". No dev laptop is in that state; a deploy machine
+ * with one service missing is. Now that "installed nowhere" is an error on a
+ * machine with a deploy footprint, those cases have to say which machine they
+ * mean - so they say it with this.
+ */
+const NO_LAUNCHD_JOBS_LOADED = doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+  label: job.label,
+  expectedDomain: job.domain,
+  loadedDomains: [] as string[],
+  state: null,
+  lastExitCode: null,
+  lastExitReason: null,
+  pid: null,
+  runs: null,
+  stderrPath: null
+}));
 
 // Round-4 finding I5: official-paper-health and daily-backup-health read the
 // clock (the first only speaks during US regular market hours; the second
@@ -1261,7 +1288,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
       ...HEALTHY_LISTENERS,
       ...RSSHUB_HEALTH_STUBBED_OK,
       ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
-      launchdJobs: launchdJobsWithout("com.alphaloop.platform-app"),
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED,
       platformAppPort: freedPort,
       platformAppHealthTimeoutMs: 500
     });
@@ -1314,7 +1341,7 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       ...CONTROL_PERSONA_HEALTHY,
       ...HEALTHY_LISTENERS,
-      launchdJobs: launchdJobsWithout("com.alphaloop.platform-app", "com.openclaw.system.trading.broker-executor", "com.alphaloop.rsshub"),
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED,
       fetchImpl: () => {
         throw new Error("boom - injected network failure");
       }
@@ -1469,7 +1496,7 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
       ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
       // A machine where com.alphaloop.rsshub was never installed: nothing has
       // claimed responsibility for that container, so nothing is broken yet.
-      launchdJobs: launchdJobsWithout("com.alphaloop.rsshub"),
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED,
       rsshubBaseUrl: `http://127.0.0.1:${freedPort}`,
       rsshubHealthTimeoutMs: 500
     });
@@ -1800,7 +1827,7 @@ describe("broker-executor-health check (round-4 finding I5)", () => {
       ...PLATFORM_APP_HEALTH_STUBBED_OK,
       ...RSSHUB_HEALTH_STUBBED_OK,
       ...OUTSIDE_MARKET_HOURS,
-      launchdJobs: launchdJobsWithout("com.openclaw.system.trading.broker-executor"),
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED,
       brokerExecutorPort: freedPort,
       brokerExecutorHealthTimeoutMs: 500
     });
@@ -2264,5 +2291,253 @@ describe("control-persona check (v2 persona deployment fix)", () => {
 
     expect(report.ok).toBe(true);
     expect(report.findings.some((finding) => finding.code.startsWith("control-persona."))).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Round 6 (2026-07-29): the checks that close the "failure did not become a red
+// light" class. Each case is written from a MEASURED shape - the mini's own
+// `launchctl print` output, the deploy target's own unset variables - and each
+// asserts on `ok`, because `ok` is what runbook step 8 turns into an exit code.
+// ===========================================================================
+describe("round 6 - deploy-path checks", () => {
+  const persona = () => {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-r6-persona-"));
+    const path = join(dir, "AGENTS.md");
+    writeFileSync(path, "# 控制人设\n");
+    return path;
+  };
+
+  const baseline = (extra: Record<string, unknown> = {}) => ({
+    ...HEALTHY_LISTENERS,
+    controlWorkspaceAgentsPath: persona(),
+    launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+    fetchImpl: async (url: string) => new Response(
+      JSON.stringify({ ok: true, service: url.includes("4312") ? "broker-executor" : "platform-app" }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    ),
+    ...extra
+  });
+
+  describe("S3c: a resident daemon killed by a SIGNAL", () => {
+    // The shape the mini's com.alphaloop.platform-app prints RIGHT NOW: a job
+    // whose last termination was by signal prints NO `last exit code` line at
+    // all, it prints `last terminating signal` instead. The old rule keyed the
+    // entire crash-detection branch off a non-zero `last exit code`, so this
+    // whole family of deaths was invisible.
+    const signalKilled = (overrides: Record<string, unknown>) => ALL_LAUNCHD_JOBS_LOADED.map((row) => (
+      row.label === "com.alphaloop.platform-app" ? { ...row, ...overrides } : row
+    ));
+
+    it("reports a crash loop even though launchd printed no exit code", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        launchdJobs: signalKilled({
+          state: "running",
+          lastExitCode: null,
+          lastTerminatingSignal: "Segmentation fault: 11",
+          runs: 918,
+          pid: 4242
+        })
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "launchd-jobs.platform-app.crash_looping");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/Segmentation fault: 11/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("does NOT cry crash for the SIGTERM the installer itself sends", async () => {
+      // `launchctl kickstart -k` - which install-system-daemons.sh runs against
+      // every daemon on every run - terminates the job with SIGTERM and leaves
+      // exactly this record. Counting it would make every healthy install
+      // report eight crashes. Measured on the mini: platform-app prints
+      // `last terminating signal = Terminated: 15`, state = running, runs = 2.
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        launchdJobs: signalKilled({
+          state: "running",
+          lastExitCode: null,
+          lastTerminatingSignal: "Terminated: 15",
+          runs: 2,
+          pid: 4242
+        })
+      }));
+
+      expect(analysis.findings.filter((f) => f.code.startsWith("launchd-jobs.platform-app."))).toEqual([]);
+      expect(analysis.ok).toBe(true);
+    });
+
+    it("still reports a signal death that is not an orderly stop, below the loop threshold", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        launchdJobs: signalKilled({
+          state: "running",
+          lastExitCode: null,
+          lastTerminatingSignal: "Abort trap: 6",
+          runs: 3,
+          pid: 4242
+        })
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "launchd-jobs.platform-app.restarted_after_failure");
+      expect(finding?.severity).toBe("warn");
+      expect(finding?.message).toMatch(/Abort trap: 6/u);
+    });
+  });
+
+  describe("S3g: the five report cron jobs", () => {
+    it("fails the gate when openclaw cron holds none of them", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        openclawCron: { ok: true, names: ["some-unrelated-personal-job"] }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "openclaw-cron.jobs_missing");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/缺 5\/5 个报告类任务/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("passes when all five are registered", async () => {
+      const names = buildManagedOpenClawCronJobs(
+        fileURLToPath(new URL("../../..", import.meta.url))
+      ).map((job) => job.name);
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        openclawCron: { ok: true, names }
+      }));
+
+      expect(analysis.findings.filter((f) => f.code.startsWith("openclaw-cron."))).toEqual([]);
+    });
+
+    it("an unreadable cron registry is an error on a deployed machine and a warn on a dev box", async () => {
+      const deployed = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        openclawCron: { ok: false, error: "GatewayTransportError: connect ECONNREFUSED 127.0.0.1:18789", names: [] }
+      }));
+      expect(deployed.findings.find((f) => f.code === "openclaw-cron.unreadable")?.severity).toBe("error");
+
+      const devBox = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+          label: job.label,
+          expectedDomain: job.domain,
+          loadedDomains: [],
+          state: null
+        })),
+        launchdPlists: { system: [], user: [] },
+        openclawCron: { ok: false, error: "gateway cron.list requires credentials", names: [] }
+      }));
+      expect(devBox.findings.find((f) => f.code === "openclaw-cron.unreadable")?.severity).toBe("warn");
+    });
+  });
+
+  describe("S3h: where a public report card actually lands", () => {
+    it("fails the gate when FEISHU_GROUP_CHAT_ID and PLATFORM_PUBLIC_BASE_URL are unset", async () => {
+      // The deploy target's shape today (verified read-only; the values, when
+      // set, are never read or printed by this check - only their presence).
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        notificationRouting: {
+          groupChatIdConfigured: false,
+          publicBaseUrlConfigured: false,
+          fallbackTargetConfigured: true,
+          lastDeliveryGroupFallback: false
+        }
+      }));
+
+      const codes = analysis.findings.filter((f) => f.severity === "error").map((f) => f.code);
+      expect(codes).toContain("notification-routing.no_group_chat");
+      expect(codes).toContain("notification-routing.no_public_base_url");
+      expect(analysis.findings.find((f) => f.code === "notification-routing.no_group_chat")?.message)
+        .toMatch(/改投默认单聊/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("reports a delivery that actually fell back to a DM", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        notificationRouting: {
+          groupChatIdConfigured: true,
+          publicBaseUrlConfigured: true,
+          fallbackTargetConfigured: true,
+          lastDeliveryGroupFallback: true,
+          lastDeliveryLabel: "daily:2026-07-28",
+          lastDeliveryAt: "2026-07-28T12:00:00.000Z",
+          lastDeliveryReason: "未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标"
+        }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "notification-routing.last_delivery_fell_back");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/daily:2026-07-28/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("says nothing when routing is configured and the last delivery reached the group", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        notificationRouting: {
+          groupChatIdConfigured: true,
+          publicBaseUrlConfigured: true,
+          fallbackTargetConfigured: true,
+          lastDeliveryGroupFallback: false
+        }
+      }));
+
+      expect(analysis.findings.filter((f) => f.code.startsWith("notification-routing."))).toEqual([]);
+    });
+  });
+
+  describe("S3b: is this checkout the code that was pushed", () => {
+    it("fails the gate when HEAD is behind origin/main", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        git: { head: "14b1202", remoteHead: "a4e39c1", behind: 43, dirtyFiles: ["README.md"] }
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-checkout.behind_origin");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/落后 43 个提交/u);
+      expect(finding?.message).toMatch(/README\.md/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("only warns about a dirty tree when the commit itself is current", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        git: { head: "a4e39c1", remoteHead: "a4e39c1", behind: 0, dirtyFiles: ["README.md"] }
+      }));
+
+      expect(analysis.findings.find((f) => f.code === "deploy-checkout.dirty")?.severity).toBe("warn");
+      expect(analysis.ok).toBe(true);
+    });
+  });
+
+  describe("the deploy ledger", () => {
+    it("turns a failed step into an error, and a re-run of that step clears it", async () => {
+      const failed = [
+        { attempt: "a1", step: 3, key: "install-system-daemons", exitCode: 1, head: "a4e39c1", finishedAt: "2026-07-29T01:00:00Z" }
+      ];
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: failed,
+        gitHead: "a4e39c1"
+      }));
+      expect(analysis.findings.find((f) => f.code === "deploy-ledger.step_3_failed")?.severity).toBe("error");
+      expect(analysis.ok).toBe(false);
+
+      const fixed = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: [
+          ...failed,
+          { attempt: "a2", step: 3, key: "install-system-daemons", exitCode: 0, head: "a4e39c1", finishedAt: "2026-07-29T01:10:00Z" }
+        ],
+        gitHead: "a4e39c1"
+      }));
+      expect(fixed.findings.filter((f) => f.code === "deploy-ledger.step_3_failed")).toEqual([]);
+    });
+
+    it("says nothing at all on a machine that has never deployed", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        launchdJobs: doctor.REQUIRED_LAUNCHD_JOBS.map((job) => ({
+          label: job.label,
+          expectedDomain: job.domain,
+          loadedDomains: [],
+          state: null
+        })),
+        launchdPlists: { system: [], user: [] },
+        deployLedger: []
+      }));
+
+      expect(analysis.findings.filter((f) => f.code.startsWith("deploy-ledger."))).toEqual([]);
+    });
   });
 });

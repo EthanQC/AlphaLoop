@@ -3,6 +3,8 @@ import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { describeVerdictForInstaller, isHandoverHealthy, judgeLaunchdRuntime, parseLaunchdPrint } from "./launchd-health.mjs";
+
 // Round-5 finding D1 (2026-07-28 spec-drift remediation, deploy path).
 //
 // WHAT WENT WRONG
@@ -34,9 +36,11 @@ import { join } from "node:path";
 //      ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/, the same
 //      archive install-system-daemons.sh uses, and can be bootstrapped back.
 //   2. A label whose service was taken over by a system daemon is only
-//      retired once that daemon answers `launchctl print system/<label>`.
-//      If it does not, the user-level copy is left completely alone - not
-//      booted out, not moved - because it is what the machine is running.
+//      retired once that daemon is verified RUNNING (round 6: not merely
+//      "answers `launchctl print`" - a daemon that bootstrapped and died
+//      answers that too; see defaultDaemonVerdict). If it is not, the
+//      user-level copy is left completely alone - not booted out, not moved -
+//      because it is what the machine is running.
 //   3. If the archive itself cannot be written (the mini's
 //      ~/Library/LaunchAgents.disabled is `root staff` from a pre-M7 sudo run,
 //      so an unprivileged process cannot create anything under it), the plist
@@ -78,18 +82,48 @@ function defaultLaunchctl(args) {
 }
 
 /**
+ * Round-6 finding S3e, second half.
+ *
+ * Rule 2 of this module's header used to read "only retired once that daemon
+ * answers `launchctl print system/<label>`" - i.e. the same registration-is-not
+ * -work mistake install-system-daemons.sh made. A daemon that bootstrapped and
+ * died answers `print` with exit 0, so these two installers would have archived
+ * the fallback of a service that is not running, minutes after the shell
+ * installer had deliberately kept it.
+ *
+ * Same judgement, same module, as the shell installer and the doctor.
+ */
+function defaultDaemonVerdict(label) {
+  let output;
+  try {
+    output = execFileSync("launchctl", ["print", `system/${label}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch {
+    return judgeLaunchdRuntime(label, null);
+  }
+  return judgeLaunchdRuntime(label, parseLaunchdPrint(output));
+}
+
+/**
  * Retires user-level LaunchAgents.
  *
  * @param {object} options
  * @param {string[]} options.labels                labels to consider, in order
  * @param {boolean} [options.requireReplacementDaemon]
- *   true  - a label is only retired once `launchctl print system/<daemon>`
- *           succeeds for the daemon that replaces it (the D1 rule);
+ *   true  - a label is only retired once the daemon that replaces it is
+ *           verified RUNNING (the D1 rule, tightened by round-6 S3e from
+ *           "answers `launchctl print`" to "passes the residency contract");
  *   false - for labels nothing replaces (legacy trading jobs, the report
  *           schedules the openclaw cron channel took over): stop and archive.
  * @param {string} [options.home]                  defaults to the real $HOME
  * @param {number|undefined} [options.uid]
  * @param {(args: string[]) => number} [options.launchctl] exit status of `launchctl <args>`
+ * @param {(label: string) => {status: string}} [options.daemonVerdict]
+ *   how "is the replacement daemon actually up" is answered; defaults to
+ *   running `launchctl print system/<label>` and judging it with the same
+ *   contract install-system-daemons.sh and the doctor use.
  * @param {Date} [options.now]
  * @returns {{archived: object[], kept: object[]}}
  */
@@ -99,6 +133,7 @@ export function retireUserLevelAgents({
   home = homedir(),
   uid = process.getuid?.(),
   launchctl = defaultLaunchctl,
+  daemonVerdict = defaultDaemonVerdict,
   now = new Date()
 }) {
   const launchAgentsDir = join(home, "Library", "LaunchAgents");
@@ -130,17 +165,21 @@ export function retireUserLevelAgents({
     const replacement = systemDaemonReplacing(label);
 
     if (requireReplacementDaemon) {
-      // Ask launchd, not the filesystem: a plist sitting in
-      // /Library/LaunchDaemons proves an installer ran, not that the daemon
-      // came up. This is the same question install-system-daemons.sh asks
-      // before it archives anything, asked again here because the two run
-      // minutes apart and the answer can have changed in between.
-      if (launchctl(["print", `system/${replacement}`]) !== 0) {
+      // Ask launchd what the daemon is DOING, not the filesystem and not just
+      // whether a record exists: a plist in /Library/LaunchDaemons proves an
+      // installer ran, and a successful `launchctl print` proves the label is
+      // registered. Neither proves the service came up. This is the same
+      // question install-system-daemons.sh asks before it archives anything,
+      // asked again here because the two run minutes apart and the answer can
+      // have changed in between.
+      const verdict = daemonVerdict(replacement);
+      if (!isHandoverHealthy(verdict)) {
         if (plistExists) {
           kept.push({
             label,
             plistPath,
-            reason: `system/${replacement} 未加载：这台机器当前跑的就是这份用户级副本，删掉它会让该服务彻底停摆`
+            reason: `system/${replacement} 没有正常运行（${describeVerdictForInstaller(replacement, verdict)}）：`
+              + `这台机器当前跑的就是这份用户级副本，删掉它会让该服务彻底停摆`
               + `（其中 cron-runner / official-paper.poll / official-paper.pnl 三个标签在仓库里没有任何模板，删了无法重建）。`
               + `请先修好 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh 再重跑本命令。`
           });

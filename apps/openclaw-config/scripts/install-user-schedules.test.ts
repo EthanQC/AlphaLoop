@@ -35,8 +35,18 @@ interface Machine {
 /**
  * launchctl stub. The installer asks it exactly two things, and both are
  * modelled the way launchctl(1) answers them:
- *   print system/<label>   exit 0 when that daemon is loaded, 113 when it is not
+ *   print system/<label>   exit 0 AND the job's runtime block when that daemon
+ *                          is loaded, 113 when it is not
  *   bootout gui/<uid> <plist>   exit 0
+ *
+ * Round-6 finding S3e: `print` has to actually PRINT. This installer no longer
+ * retires a fallback on the strength of `print` exiting 0 - a daemon that
+ * bootstrapped and then died answers that too - it reads the state out of the
+ * output and judges it (launchd-agent-archive.mjs -> launchd-health.mjs). A
+ * stub that answered with an exit code and an empty body would be modelling a
+ * launchctl that does not exist, and would make every one of these cases pass
+ * or fail for the wrong reason. Field spellings and the single-tab indent are
+ * copied from the mini's own output.
  */
 function makeMachine(prefix: string, loadedDaemons: string[]): Machine {
   const home = mkdtempSync(join(tmpdir(), prefix));
@@ -52,7 +62,12 @@ function makeMachine(prefix: string, loadedDaemons: string[]): Machine {
   writeFileSync(stub, [
     "#!/bin/sh",
     'if [ "$1" = "print" ]; then',
-    `  case "$2" in system/*) [ -f "${loadedDir}/\${2#system/}" ] && exit 0 ;; esac`,
+    `  case "$2" in system/*)`,
+    `    if [ -f "${loadedDir}/\${2#system/}" ]; then`,
+    `      printf "%s = {\\n\\tstate = running\\n\\truns = 2\\n\\tpid = 4242\\n}\\n" "$2"`,
+    "      exit 0",
+    "    fi ;;",
+    "  esac",
     "  exit 113",
     "fi",
     "exit 0",

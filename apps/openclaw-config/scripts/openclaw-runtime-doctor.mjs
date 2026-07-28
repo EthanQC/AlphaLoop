@@ -5,12 +5,18 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
+import { loadLocalEnv, resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
 import { analyzeOpenClawRuntimeSnapshot, readLaunchdJobStates } from "./openclaw-runtime-doctor-core.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime", "openclaw-cron-runner");
 const { runtimeRoot, dbPath } = resolveRuntimePaths(repoRoot);
+// The daemons read .env.local through this exact function (loadLocalEnv is
+// memoised per file, so this call also mirrors their view of it); process.env
+// wins where both are set, matching how a launchd EnvironmentVariables entry
+// would beat the file.
+const localEnv = { ...loadLocalEnv(repoRoot), ...process.env };
+const gitCheckout = readGitCheckout();
 
 const snapshot = {
   gatewayListeners: readListeners("18789"),
@@ -28,7 +34,19 @@ const snapshot = {
   // Round-4 finding I5: official-paper-health checks that the pnl job's
   // markdown report actually landed under `<repo>/reports/official-paper/`,
   // which is outside runtimeRoot - so the analyzer needs the repo root too.
-  repoRoot
+  repoRoot,
+  // Round 6 -----------------------------------------------------------------
+  // Which plists EXIST, as opposed to which labels are loaded. A stray
+  // user-level plist for a system-owned label is invisible to the job table
+  // (nothing is loaded twice yet) and decides what happens at the next login.
+  launchdPlists: {
+    system: plistLabelsIn("/Library/LaunchDaemons"),
+    user: plistLabelsIn(join(homedir(), "Library", "LaunchAgents"))
+  },
+  git: gitCheckout,
+  gitHead: gitCheckout.head,
+  openclawCron: readOpenClawCronJobs(),
+  notificationRouting: readNotificationRouting()
 };
 
 // `launchdJobs` is already scoped to exactly the labels this repo owns (it is
@@ -137,6 +155,156 @@ function tryExec(command, args) {
   } catch (error) {
     return String(error?.stdout ?? "");
   }
+}
+
+/** Labels of the `<label>.plist` files in one directory; [] when unreadable. */
+function plistLabelsIn(dir) {
+  try {
+    return readdirSync(dir)
+      .filter((name) => name.endsWith(".plist"))
+      .map((name) => name.replace(/\.plist$/u, ""))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Round-6 finding S3b. Is this checkout the code that was pushed?
+ *
+ * `origin/main` is read from the local ref only - no fetch, no network. The
+ * doctor observes; refreshing the remote ref would be changing the repository
+ * it is reporting on, and a stale ref can only ever make this check quieter,
+ * never noisier.
+ */
+function readGitCheckout() {
+  const head = gitOutput(["rev-parse", "--short", "HEAD"]);
+  if (!head) {
+    return { head: null, remoteHead: null, behind: null, ahead: null, dirtyFiles: [] };
+  }
+  const remoteHead = gitOutput(["rev-parse", "--short", "origin/main"]);
+  const behindText = remoteHead ? gitOutput(["rev-list", "--count", "HEAD..origin/main"]) : null;
+  const aheadText = remoteHead ? gitOutput(["rev-list", "--count", "origin/main..HEAD"]) : null;
+  const dirty = gitOutput(["status", "--porcelain", "--untracked-files=no"]) ?? "";
+  return {
+    head,
+    remoteHead,
+    behind: behindText === null ? null : Number(behindText),
+    ahead: aheadText === null ? null : Number(aheadText),
+    // Everything after the status code, NOT `slice(3)`: gitOutput trims the
+    // whole payload, which eats the leading space of `git status --porcelain`'s
+    // first line only - so a fixed offset dropped one character from exactly
+    // one filename. Caught by running this CLI for real: it reported
+    // "EADME.md".
+    dirtyFiles: dirty
+      .split(/\r?\n/u)
+      .map((line) => line.trim().split(/\s+/u).slice(1).join(" "))
+      .filter(Boolean)
+  };
+}
+
+function gitOutput(args) {
+  try {
+    return execFileSync("git", ["-C", repoRoot, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Round-6 finding S3g. The five report pipelines live in the openclaw cron
+ * channel, so the only honest way to ask whether they exist is to ask that
+ * channel. `--json` is the CLI's own machine-readable mode; the shape varies
+ * between versions, so every plausible envelope is unwrapped rather than
+ * assuming one.
+ *
+ * Bounded: a `timeout` so a wedged gateway cannot hang the acceptance gate, and
+ * a read-only subcommand so this never changes what it is reporting on.
+ */
+function readOpenClawCronJobs() {
+  let output;
+  try {
+    output = execFileSync("openclaw", ["cron", "list", "--json"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 20_000
+    });
+  } catch (error) {
+    const stderr = String(error?.stderr ?? "").trim();
+    return { ok: false, error: stderr.split(/\r?\n/u)[0] || String(error?.message ?? error), names: [] };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(output || "[]"));
+  } catch (parseError) {
+    return { ok: false, error: `openclaw cron list --json 的输出不是 JSON：${parseError.message}`, names: [] };
+  }
+
+  const list = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.jobs)
+      ? parsed.jobs
+      : Array.isArray(parsed?.data)
+        ? parsed.data
+        : [];
+  return { ok: true, names: list.map((job) => String(job?.name ?? job?.id ?? "")).filter(Boolean) };
+}
+
+/**
+ * Round-6 finding S3h. Where does a public report card actually land?
+ *
+ * BOOLEANS ONLY. This snapshot is printed verbatim as JSON, and a Feishu chat
+ * id is a credential-adjacent identifier; the check needs to know whether the
+ * routing is configured, never what it is configured to.
+ *
+ * The env names mirror packages/shared-types/src/notifications.ts's own
+ * resolveReportDeliveryTarget (FEISHU_GROUP_CHAT_ID first, then the global
+ * fallback) and the deep-link base url the report cards use.
+ * `report-delivery-state.json` is scheduled-report.mjs's own delivery record -
+ * read as a plain file rather than by importing that module, which touches the
+ * runtime tree at import time.
+ */
+function readNotificationRouting() {
+  const configured = (name) => String(localEnv[name] ?? "").trim().length > 0;
+  const routing = {
+    groupChatIdConfigured: configured("FEISHU_GROUP_CHAT_ID"),
+    publicBaseUrlConfigured: configured("PLATFORM_PUBLIC_BASE_URL"),
+    fallbackTargetConfigured: configured("FEISHU_NOTIFY_CHAT_ID") || configured("FEISHU_NOTIFY_OPEN_ID"),
+    lastDeliveryGroupFallback: false,
+    lastDeliveryLabel: null,
+    lastDeliveryAt: null,
+    lastDeliveryReason: null
+  };
+
+  const statePath = join(runtimeRoot, "report-delivery-state.json");
+  if (!existsSync(statePath)) {
+    return routing;
+  }
+  let state;
+  try {
+    state = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch {
+    return routing;
+  }
+  const newest = Object.entries(state && typeof state === "object" ? state : {})
+    .filter(([, entry]) => entry && typeof entry === "object" && entry.deliveredAt)
+    .sort(([, left], [, right]) => String(right.deliveredAt).localeCompare(String(left.deliveredAt)))
+    .at(0);
+  if (!newest) {
+    return routing;
+  }
+  const [key, entry] = newest;
+  routing.lastDeliveryGroupFallback = entry.groupFallback === true;
+  routing.lastDeliveryLabel = key;
+  routing.lastDeliveryAt = String(entry.deliveredAt);
+  routing.lastDeliveryReason = entry.groupFallbackReason ? String(entry.groupFallbackReason) : null;
+  return routing;
 }
 
 function tail(value) {
