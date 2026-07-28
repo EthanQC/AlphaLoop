@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { readLaunchdOwnership, launchdLabelsWithScope, userLevelLabelsToRetire } from "./install-launchd-ownership.mjs";
+import { SYSTEM_DAEMON_SUPERSEDING } from "./launchd-agent-archive.mjs";
 
 const scriptPath = fileURLToPath(new URL("./install-launchd.sh", import.meta.url));
 const systemDaemonsScript = fileURLToPath(new URL("./install-system-daemons.sh", import.meta.url));
@@ -63,6 +64,13 @@ interface LaunchctlStubOptions {
   stateDir: string;
   /** Label whose `bootstrap` fails, to inject the partial failure of C2. */
   failBootstrapLabel?: string;
+  /**
+   * Which domain that injected failure applies to. "any" (the default) models a
+   * plist launchd rejects wherever it is loaded from; "system" models a daemon
+   * that cannot start while the old user-level agent is still perfectly
+   * loadable - the case round 5's restore step exists for.
+   */
+  failBootstrapDomain?: "any" | "system";
   /** Labels seeded into the disabled database, to inject the wedge of C3. */
   disabledLabels?: string[];
 }
@@ -95,8 +103,9 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     writeFileSync(join(disabledDir, `system_${label}`), "");
   }
 
+  const domainGuard = options.failBootstrapDomain === "system" ? ' && [ "$dom" = "system" ]' : "";
   const failLine = options.failBootstrapLabel
-    ? `    if [ "$lbl" = "${options.failBootstrapLabel}" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi`
+    ? `    if [ "$lbl" = "${options.failBootstrapLabel}" ]${domainGuard}; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi`
     : "    :";
 
   const contents = [
@@ -110,15 +119,23 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     "    exit 113 ;;",
     '  enable) rm -f "$S/disabled/$(key "$2")"; exit 0 ;;',
     '  disable) touch "$S/disabled/$(key "$2")"; exit 0 ;;',
+    // Both spellings launchctl(1) accepts, because the installers use both:
+    // `bootout <domain>/<label>` (the daemons) and `bootout <domain> <plist>`
+    // (the node installers, and the gui restore path).
     "  bootout)",
-    '    [ -f "$S/loaded/$(key "$2")" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
-    '    rm -f "$S/loaded/$(key "$2")"; exit 0 ;;',
+    '    tgt="$2"',
+    '    case "$3" in *.plist) tgt="$2/$(basename "$3" .plist)" ;; esac',
+    '    [ -f "$S/loaded/$(key "$tgt")" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
+    '    rm -f "$S/loaded/$(key "$tgt")"; exit 0 ;;',
     "  bootstrap)",
     '    lbl="$(basename "$3" .plist)"',
     '    [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }',
-    '    if [ -f "$S/disabled/$(key "system/$lbl")" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi',
+    // The domain is an argument, not an assumption: `bootstrap gui/<uid> <plist>`
+    // (the restore path) must load the job in the USER domain, not the system one.
+    '    case "$2" in gui/*) dom="$2" ;; *) dom="system" ;; esac',
+    '    if [ -f "$S/disabled/$(key "$dom/$lbl")" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi',
     failLine,
-    '    touch "$S/loaded/$(key "system/$lbl")"; exit 0 ;;',
+    '    touch "$S/loaded/$(key "$dom/$lbl")"; exit 0 ;;',
     "  kickstart)",
     '    [ -f "$S/loaded/$(key "$3")" ] || { echo "Could not find service" >&2; exit 113; }',
     "    exit 0 ;;",
@@ -215,6 +232,23 @@ function runSystemDaemons(machine: FakeMachine, shell: "bash" | "zsh" = "bash"):
   return execFileSync(shell, [systemDaemonsScript], { env: machine.env, encoding: "utf8" });
 }
 
+/**
+ * Marks user-level agents as currently LOADED in the stub's job table, i.e. the
+ * machine is really running the old copy right now. Round 5: the installer no
+ * longer boots out a label blindly - it asks `launchctl print gui/<uid>/<label>`
+ * first - so a test that wants to observe the handover has to model a machine
+ * where there is something to hand over.
+ */
+function seedRunningUserAgents(machine: FakeMachine, labels: string[]): void {
+  seedLegacyUserAgents(machine, labels);
+  const uid = process.getuid?.();
+  const loadedDir = join(machine.stateDir, "loaded");
+  mkdirSync(loadedDir, { recursive: true });
+  for (const label of labels) {
+    writeFileSync(join(loadedDir, `gui_${uid}_${label}`), "");
+  }
+}
+
 function seedLegacyUserAgents(machine: FakeMachine, labels: string[]): void {
   mkdirSync(machine.agentsDir, { recursive: true });
   for (const label of labels) {
@@ -260,6 +294,27 @@ function loadedSystemLabels(machine: FakeMachine): string[] {
 function backupDirs(machine: FakeMachine): string[] {
   const parent = join(machine.home, "Library", "LaunchAgents.disabled");
   return existsSync(parent) ? readdirSync(parent).sort() : [];
+}
+
+/** Every plist inside every archive directory, whichever installer put it there. */
+function archivedLabels(machine: FakeMachine): string[] {
+  const parent = join(machine.home, "Library", "LaunchAgents.disabled");
+  if (!existsSync(parent)) {
+    return [];
+  }
+  return readdirSync(parent).flatMap((dir) => plistLabelsIn(join(parent, dir))).sort();
+}
+
+/** What the stub launchd is running in the USER domain. */
+function loadedUserLabels(machine: FakeMachine): string[] {
+  const loadedDir = join(machine.stateDir, "loaded");
+  if (!existsSync(loadedDir)) {
+    return [];
+  }
+  return readdirSync(loadedDir)
+    .filter((name) => name.startsWith("gui_"))
+    .map((name) => name.replace(/^gui_\d+_/u, ""))
+    .sort();
 }
 
 /** Runs the installer expecting a non-zero exit, and returns what it printed. */
@@ -411,6 +466,9 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
 describe("install-system-daemons.sh (Task 9: unattended services survive a login-window reboot)", () => {
   it("writes every unattended service to /Library/LaunchDaemons with UserName and RunAtLoad, and nothing to ~/Library/LaunchAgents", () => {
     const machine = makeFakeMachine("alphaloop-daemons-");
+    // Running the old user-level copy of every label, which is the machine the
+    // bootout assertions below are about.
+    seedRunningUserAgents(machine, SYSTEM_LABELS);
     const stdout = runSystemDaemons(machine);
 
     expect(launchDaemonLabels(machine).sort()).toEqual([...SYSTEM_LABELS].sort());
@@ -748,8 +806,10 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(output).toContain("Bootstrap failed: 5: Input/output error");
       // Names how many are up, so "it failed" is never read as "nothing runs".
       expect(output).toMatch(/7 of 8 ARE loaded/u);
-      expect(output).toContain("were deliberately LEFT in");
-      expect(output).toMatch(/nothing about this run blocks a re-run/u);
+      // Round-5 D1/D4: the failed service's own fallback is put back, and the
+      // operator is told not to reach for the installer that used to delete it.
+      expect(output).toMatch(/DO NOT run 'pnpm launchd:install-user' as a workaround/u);
+      expect(output).toMatch(/re-run converges rather than repeating/u);
       // The failure summary must not claim the label came up.
       expect(output).toMatch(/com\.alphaloop\.platform-app {2}egress=direct {2}NOT LOADED/u);
     });
@@ -877,10 +937,24 @@ describe("one owner per launchd label across ALL four installers (Task 9)", () =
   // domains". No single installer's suite can see that, so this one runs the
   // real binaries of all four - in both orders, because the dangerous order is
   // the one where a user-level installer runs AFTER the daemons are up.
-  function runUserSideInstallers(machine: FakeMachine): void {
+  // Round-5 D1: the two node installers now exit 1 when they deliberately KEEP
+  // a user-level agent whose replacement daemon is down (the "user installers
+  // run first" order below is exactly that state). The exit code is the point
+  // of that change, so it is recorded rather than allowed to abort the test.
+  function runUserSideInstallers(machine: FakeMachine): number[] {
     execFileSync("zsh", [scriptPath], { env: machine.env, encoding: "utf8" });
-    execFileSync(process.execPath, [userSchedulesScript], { env: machine.env, encoding: "utf8" });
-    execFileSync(process.execPath, [cronInstallScript], { env: machine.env, encoding: "utf8" });
+    return [userSchedulesScript, cronInstallScript].map((script) => {
+      try {
+        execFileSync(process.execPath, [script], { env: machine.env, encoding: "utf8", stdio: "pipe" });
+        return 0;
+      } catch (error) {
+        const failure = error as { status?: number };
+        if (typeof failure.status !== "number") {
+          throw error;
+        }
+        return failure.status;
+      }
+    });
   }
 
   function expectSingleOwner(machine: FakeMachine): void {
@@ -905,8 +979,19 @@ describe("one owner per launchd label across ALL four installers (Task 9)", () =
 
   it("holds when the user-level installers run first and the daemons last", () => {
     const machine = makeFakeMachine("alphaloop-order-user-first-");
-    seedLegacyUserAgents(machine, [...SYSTEM_LABELS, ...RETIRED_LABELS]);
-    runUserSideInstallers(machine);
+    seedRunningUserAgents(machine, [...SYSTEM_LABELS, ...RETIRED_LABELS]);
+
+    const exits = runUserSideInstallers(machine);
+
+    // Round-5 D1: run in THIS order, no daemon exists yet, so the user-level
+    // copies are what the machine is running. Both installers must refuse to
+    // remove them - and say so with a non-zero exit - rather than leaving the
+    // machine running nothing until step 3 gets its turn.
+    expect(exits).toEqual([1, 1]);
+    // Every system/retired agent is still there (nothing was destroyed), plus
+    // the one label install-launchd.sh legitimately installs in this step.
+    expect(new Set(launchAgentLabels(machine))).toEqual(new Set([...SYSTEM_LABELS, ...RETIRED_LABELS, ...USER_LABELS]));
+
     runSystemDaemons(machine);
     expectSingleOwner(machine);
   });
@@ -917,6 +1002,151 @@ describe("one owner per launchd label across ALL four installers (Task 9)", () =
     runSystemDaemons(machine);
     runUserSideInstallers(machine);
     expectSingleOwner(machine);
+  });
+
+  // ---------------------------------------------------------------------
+  // Round-5 finding D1, the defect this whole round was restructured around.
+  // Everything above runs the four installers on a machine where every daemon
+  // bootstraps fine - which is why nothing here noticed that the runbook's
+  // step 4 deleted, unrecoverably, the fallback step 3 had just preserved.
+  // ---------------------------------------------------------------------
+  describe("a fallback that step 3 kept survives steps 4 and 5", () => {
+    const DOWN = "com.alphaloop.market-alerts";
+
+    function halfMigratedMachine(prefix: string): FakeMachine {
+      const machine = makeFakeMachine(prefix, { failBootstrapLabel: DOWN });
+      seedRunningUserAgents(machine, [...SYSTEM_LABELS, ...RETIRED_LABELS]);
+      const { status } = runSystemDaemonsExpectingFailure(machine);
+      expect(status).not.toBe(0);
+      // Precondition: step 3 kept exactly the failed service's agent.
+      expect(launchAgentLabels(machine)).toEqual([DOWN]);
+      return machine;
+    }
+
+    it("pnpm launchd:install-user leaves it alone and exits non-zero", () => {
+      const machine = halfMigratedMachine("alphaloop-d1-step4-");
+
+      let status = 0;
+      try {
+        execFileSync(process.execPath, [userSchedulesScript], { env: machine.env, encoding: "utf8", stdio: "pipe" });
+      } catch (error) {
+        status = (error as { status?: number }).status ?? -1;
+      }
+
+      // This is the assertion that fails against the pre-round-5 installer:
+      // it removed the plist with rmSync and exited 0.
+      expect(launchAgentLabels(machine)).toEqual([DOWN]);
+      expect(status).toBe(1);
+    });
+
+    it("pnpm openclaw:cron:install leaves it alone too, and still installs its cron jobs", () => {
+      const machine = halfMigratedMachine("alphaloop-d1-step5-");
+
+      let status = 0;
+      try {
+        execFileSync(process.execPath, [cronInstallScript], { env: machine.env, encoding: "utf8", stdio: "pipe" });
+      } catch (error) {
+        status = (error as { status?: number }).status ?? -1;
+      }
+
+      expect(launchAgentLabels(machine)).toEqual([DOWN]);
+      expect(status).toBe(1);
+      // The cron half of that installer is unaffected by the retire half.
+      expect(readFileSync(machine.openclawLog, "utf8")).toContain("cron add");
+    });
+
+    it("retires it normally once the daemon is fixed and step 3 re-run", () => {
+      const machine = halfMigratedMachine("alphaloop-d1-converge-");
+      writeLaunchctlStub(join(machine.stubBinDir, "launchctl"), machine.launchctlLog, { stateDir: machine.stateDir });
+
+      runSystemDaemons(machine);
+      execFileSync(process.execPath, [userSchedulesScript], { env: machine.env, encoding: "utf8" });
+
+      expect(launchAgentLabels(machine)).toEqual([]);
+      expect(loadedSystemLabels(machine)).toEqual([...SYSTEM_LABELS].sort());
+      // Archived, not deleted - and in the SAME place install-system-daemons.sh
+      // uses, so there is one directory to look in.
+      expect(archivedLabels(machine)).toContain(DOWN);
+    });
+
+    it("puts the stopped user agent back rather than waiting for the next login", () => {
+      const machine = makeFakeMachine("alphaloop-d1-restore-", {
+        failBootstrapLabel: DOWN,
+        failBootstrapDomain: "system"
+      });
+      seedRunningUserAgents(machine, [...SYSTEM_LABELS, ...RETIRED_LABELS]);
+
+      const { output } = runSystemDaemonsExpectingFailure(machine);
+
+      // Round-5 D4: the old code stopped the agent in phase A and, on failure,
+      // told the operator it would come back "at the next login" - which on a
+      // headless machine after a reboot is never.
+      expect(output).toMatch(/running again from/u);
+      expect(loadedUserLabels(machine)).toContain(DOWN);
+    });
+
+    it("never deletes a plist it cannot archive", () => {
+      const machine = makeFakeMachine("alphaloop-d1-archive-ro-");
+      seedRunningUserAgents(machine, SYSTEM_LABELS);
+      const archiveParent = join(machine.home, "Library", "LaunchAgents.disabled");
+      mkdirSync(archiveParent, { recursive: true });
+      chmodSync(archiveParent, 0o500);
+
+      const { status, output } = runSystemDaemonsExpectingFailure(machine);
+      let userStatus = 0;
+      try {
+        execFileSync(process.execPath, [userSchedulesScript], { env: machine.env, encoding: "utf8", stdio: "pipe" });
+      } catch (error) {
+        userStatus = (error as { status?: number }).status ?? -1;
+      }
+      chmodSync(archiveParent, 0o700);
+
+      expect(status).toBe(1);
+      expect(userStatus).toBe(1);
+      expect(output).toMatch(/could not be archived/u);
+      // Every daemon is up, but nothing was thrown away to get there.
+      expect(loadedSystemLabels(machine)).toEqual([...SYSTEM_LABELS].sort());
+      expect(launchAgentLabels(machine).sort()).toEqual([...SYSTEM_LABELS].sort());
+    });
+  });
+
+  it("still stops and archives a retired label that no daemon replaces", () => {
+    // The per-service loop only reaches a user label through the daemon that
+    // supersedes it, so a future `retired` row with no replacement could have
+    // fallen through it silently. It is handled by its own pass - which needs
+    // a manifest to exercise, since today's only retired row does map to a
+    // daemon. Same override seam as OBSOLETE_SYSTEM_LABELS / SYSTEM_DIR.
+    const machine = makeFakeMachine("alphaloop-orphan-retired-");
+    const orphan = "com.openclaw.trading.legacy-orphan";
+    const manifest = join(machine.home, "ownership-with-orphan.txt");
+    writeFileSync(
+      manifest,
+      `${readFileSync(fileURLToPath(new URL("./install-launchd-ownership.txt", import.meta.url)), "utf8")}\nretired  ${orphan}\n`
+    );
+    seedRunningUserAgents(machine, [orphan]);
+
+    execFileSync("bash", [systemDaemonsScript], {
+      env: { ...machine.env, OWNERSHIP_FILE: manifest },
+      encoding: "utf8"
+    });
+
+    expect(launchAgentLabels(machine)).toEqual([]);
+    expect(archivedLabels(machine)).toEqual([orphan]);
+    expect(loadedUserLabels(machine)).toEqual([]);
+  });
+
+  it("agrees with the node installers about which daemon replaces which user label", () => {
+    // install-system-daemons.sh archives a plist on the strength of a daemon
+    // being up; the node installers refuse to touch that same plist while it is
+    // down. If the two disagreed about WHICH daemon that is, one of them would
+    // act on the wrong answer - so the shell case statement and the node map
+    // are compared directly rather than trusted to stay in sync.
+    const shell = readFileSync(systemDaemonsScript, "utf8");
+    for (const [userLabel, daemon] of Object.entries(SYSTEM_DAEMON_SUPERSEDING)) {
+      expect(shell).toMatch(new RegExp(`${userLabel.replace(/\./gu, "\\.")}\\) printf "%s" "${daemon.replace(/\./gu, "\\.")}"`, "u"));
+      // ...and the inverse table the per-service loop iterates.
+      expect(shell).toMatch(new RegExp(`${daemon.replace(/\./gu, "\\.")}\\) printf "%s\\\\n%s\\\\n" "\\$1" "${userLabel.replace(/\./gu, "\\.")}"`, "u"));
+    }
   });
 
   it("leaves the operator's unrelated personal OpenClaw agents untouched", () => {

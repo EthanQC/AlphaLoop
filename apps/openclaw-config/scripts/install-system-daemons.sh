@@ -231,19 +231,78 @@ fi
 # TMPDIR unless it is given one (it goes to the opaque /var/folders/.../T),
 # which both hides the staging directory from an operator debugging a failed
 # run and makes "the preflight creates nothing" untestable.
+#
+# Round-5 finding D6: `trap ... EXIT` alone did NOT cover "every path out", as
+# the previous comment here claimed. Measured on this zsh: sending SIGTERM to a
+# run sleeping in the bootstrap settle left the staging directory behind,
+# because zsh (like bash) runs the EXIT trap only for exits it reaches - an
+# untrapped fatal signal terminates the shell without ever getting there. The
+# three signals an operator can actually deliver (^C, `kill`, closing the ssh
+# session) are therefore trapped explicitly; each cleans up and then re-raises
+# with the conventional 128+signo status so a caller still sees "killed by a
+# signal" rather than a fabricated clean exit.
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/install-system-daemons.XXXXXX")"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+cleanup_tmp_dir() { rm -rf "${TMP_DIR}"; }
+trap 'cleanup_tmp_dir' EXIT
+trap 'cleanup_tmp_dir; trap - INT; kill -INT $$' INT
+trap 'cleanup_tmp_dir; exit 143' TERM
+trap 'cleanup_tmp_dir; exit 129' HUP
+trap 'cleanup_tmp_dir; exit 131' QUIT
 
-mkdir -p "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
+# Round-5 finding D3: `mkdir -p a/b/c` creates a, a/b AND a/b/c, but only the
+# five leaf paths below were ever chowned back. Under `sudo` on a machine where
+# they do not exist yet - a fresh checkout, or a first install for a different
+# TARGET_USER - that left `${TARGET_HOME}/.openclaw` and `${REPO_ROOT}/runtime`
+# owned by root:wheel INSIDE the operator's own home and repo, so the operator
+# could no longer write their own directories and every unprivileged script
+# that touches them (the doctor's runtime probes, backup-trading-data.mjs,
+# the cron runner's result files) failed with EACCES.
+#
+# ensure_dir_owned walks up to the deepest ancestor that already exists,
+# records every level this run is about to CREATE, and chowns exactly those
+# afterwards. Directories that already existed are never chowned, so this can
+# never take ownership of something that was already someone else's.
+ensure_dir_owned() {
+  local dir="$1"
+  local created=""
+  local probe="${dir}"
+  local parent
+  while [ ! -d "${probe}" ]; do
+    created="${probe}
+${created}"
+    parent="$(dirname "${probe}")"
+    if [ "${parent}" = "${probe}" ]; then
+      break
+    fi
+    probe="${parent}"
+  done
+  mkdir -p "${dir}"
+  if [ "$(id -u)" -ne 0 ]; then
+    return 0
+  fi
+  while IFS= read -r new_dir; do
+    [ -n "${new_dir}" ] || continue
+    chown "${TARGET_USER}:${TARGET_GID}" "${new_dir}"
+  done <<EOF
+${created}
+EOF
+}
+
+for owned_dir in "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"; do
+  ensure_dir_owned "${owned_dir}"
+done
 # Only root can hand these to another user; when the operator runs this
 # unprivileged (or under the test harness) the directories are already theirs.
+# -R here (unlike the ancestors above) because a previous root-run daemon may
+# have left root-owned log FILES inside a directory the operator owns.
 if [ "$(id -u)" -eq 0 ]; then
   chown -R "${TARGET_USER}:${TARGET_GID}" \
     "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
   # Not -R: AGENTS_DIR also holds the operator's own personal-OpenClaw agents,
   # and this script has no business rewriting the ownership of plists it did
-  # not create. Only the directory itself, which the mkdir above may have just
-  # created as root inside a home directory that is not root's.
+  # not create. ensure_dir_owned already handled the directory itself when this
+  # run created it; this covers the case where it existed but as root:wheel
+  # from a pre-D3 run of this same script.
   chown "${TARGET_USER}:${TARGET_GID}" "${AGENTS_DIR}"
 fi
 
@@ -252,11 +311,18 @@ fi
 # ~/Library/LaunchAgents.disabled ended up `drwxr-xr-x root staff` inside a
 # `drwx------ qingchang` home, so the operator could not clean up their own
 # archived agents. The parent is chowned here alongside the directory itself.
+#
+# Returns non-zero rather than aborting the run when the directory cannot be
+# created (measured on the mini: ~/Library/LaunchAgents.disabled is currently
+# `drwxr-xr-x root staff`, left by a pre-M7 sudo run, so an unprivileged
+# process cannot create anything inside it). archive_user_agent() turns that
+# into "the plist stays where it is", which is the only safe answer for a
+# label whose plist exists in no other copy.
 ensure_backup_dir() {
   if [ -d "${BACKUP_DIR}" ]; then
     return 0
   fi
-  mkdir -p "${BACKUP_DIR}"
+  mkdir -p "${BACKUP_DIR}" 2>/dev/null || return 1
   if [ "$(id -u)" -eq 0 ]; then
     chown "${TARGET_USER}:${TARGET_GID}" "${BACKUP_PARENT}" "${BACKUP_DIR}"
   fi
@@ -541,41 +607,65 @@ for plist in "${TMP_DIR}"/*.plist; do
 done
 
 # ---------------------------------------------------------------------------
-# Finding C2: the three phases below used to be two, in the wrong order, with
-# no error handling.
+# THE HANDOVER, one service at a time.
 #
-# The old shape was: MOVE every user-level LaunchAgent into a backup directory,
-# then bootstrap the daemons in a `set -e` loop whose bootstrap/enable/kickstart
-# calls were unguarded. One failed bootstrap - the third label of eight, say -
-# aborted the script with the six user agents already gone from
-# ~/Library/LaunchAgents and only two daemons loaded. The machine was then
-# running NEITHER the old copy nor the new one, and re-running produced the
-# same abort at the same label, so it could not converge either.
+# History. Finding C2 (round 4) split what used to be one destructive loop into
+# three phases: A stopped EVERY user-level agent, B bootstrapped the daemons one
+# by one, C archived a user plist only once its replacement was verified loaded.
+# That fixed the "abort halfway and the machine runs nothing" failure, and C's
+# rule - never remove the fallback until its replacement is proven - is kept
+# verbatim below. Two things about that shape were still wrong:
 #
-# The split below separates the two things "retire" used to mean:
+#   Finding D4 (round 5). The header here claimed the result was "safe to
+#   interrupt anywhere: at every point the machine is either running the old
+#   copy or the new one". It was not: phase A stopped all nine user labels up
+#   front and phase B then brought the daemons up one at a time behind a settle
+#   delay, so the LAST label was stopped and not yet replaced for the whole of
+#   phase B. Measured by running the pre-round-5 script against a stub launchctl
+#   that timestamps every call, default 2-second settle: the worst single-service
+#   gap was 17.1s (official-paper.poll) on this laptop; the same measurement of
+#   the loop below gives 2.1s. (Round 4's own report of this defect said 18.1s -
+#   the number moves with machine load; the shape does not.)
 #
-#   Phase A  STOP the running user agents (`launchctl bootout gui/<uid>/...`).
-#            Reversible: the plist stays on disk, so the agent comes back at
-#            the next login and can be bootstrapped by hand right now. This
-#            still happens before any daemon starts, which is what keeps two
-#            broker-executors from ever writing the trading database at once.
-#   Phase B  Bring each daemon up, INDEPENDENTLY. One label failing no longer
-#            stops the other seven from being installed and started.
-#   Phase C  Only now move a user plist out of the way - and only that label's,
-#            and only once its replacement daemon is verified loaded. A daemon
-#            that did not come up leaves its old agent on disk, so the machine
-#            keeps running the old copy of that one service instead of nothing.
+#   Finding D1 (round 5). Phase C's care was undone one runbook step later:
+#   `pnpm launchd:install-user` deleted, with rmSync and no backup, every plist
+#   phase C had deliberately kept. Three of those labels (cron-runner,
+#   official-paper.poll, official-paper.pnl) have no template anywhere in this
+#   repo, so the deletion was unrecoverable. That is fixed in the two node
+#   installers (they now archive, and only once the replacement daemon answers
+#   `launchctl print`), and here by the restore step below.
 #
-# The result is safe to interrupt anywhere: at every point the machine is
-# either running the old copy or the new one, and re-running the script from
-# the top converges (every step is idempotent, and Phase B enables and boots
-# out before it bootstraps).
+# The loop is therefore per SERVICE, not per phase, and it is a transaction:
+#
+#   1. STOP   the user-level copies of THIS service only (and remember which
+#             ones were actually running).
+#   2. START  its daemon: bootout, drain, enable, bootstrap, kickstart.
+#   3. VERIFY by asking launchd (`launchctl print system/<label>`), never by
+#             trusting bootstrap's exit code.
+#   4a. up    -> archive that service's user plists (a MOVE into
+#               ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/,
+#               never a delete), and only that service's.
+#   4b. down  -> put it back: bootstrap the user agents this run stopped, from
+#               the plists it never removed. The fallback resumes now, not at
+#               the next login, and stays on disk for the next attempt.
+#
+# What that does and does not promise. A service cannot be handed over without a
+# gap - the old copy must stop before the new one starts, or two copies race on
+# the same trading database and the same port. What is true: the gap belongs to
+# ONE service, the other seven keep running through it, no service is ever
+# running twice, a service whose daemon fails to come up is left running the
+# same copy it was running before this script started, and re-running from the
+# top converges (every step is idempotent; each daemon is enabled and booted
+# out before it is bootstrapped).
 # ---------------------------------------------------------------------------
 
-# Which daemon must be verified loaded before a given user-level plist may be
-# archived. For the eight system labels the daemon has the same label. These
-# two rows are the only places where the old user-level name and the daemon
-# that replaces it differ.
+# Which daemon replaces a given user-level label. For the eight system labels
+# the daemon has the same name; these two rows are the only places where the
+# old user-level name and the daemon that replaces it differ.
+# Single-sourced with the node installers: launchd-agent-archive.mjs holds the
+# same two rows and install-launchd.test.ts asserts the two agree, because a
+# label this script archives on the strength of a daemon being up must be the
+# same label the node installers refuse to touch while that daemon is down.
 supersedes() {
   case "$1" in
     com.openclaw.trading.broker-executor) printf "%s" "com.openclaw.system.trading.broker-executor" ;;
@@ -584,10 +674,21 @@ supersedes() {
   esac
 }
 
+# The inverse: every user-level label whose service is taken over by this
+# daemon. Its own name always, plus any legacy name that supersedes() maps here.
+user_labels_for() {
+  case "$1" in
+    com.openclaw.system.trading.broker-executor) printf "%s\n%s\n" "$1" "com.openclaw.trading.broker-executor" ;;
+    ai.openclaw.system.gateway) printf "%s\n%s\n" "$1" "ai.openclaw.gateway" ;;
+    *) printf "%s\n" "$1" ;;
+  esac
+}
+
 LOADED_LABELS=""
 FAILED_LABELS=""
 FAILURE_DETAIL=""
 KEPT_AGENTS=""
+RESTORED_AGENTS=""
 
 label_is_loaded() {
   printf "%s\n" "${LOADED_LABELS}" | grep -qxF "$1"
@@ -601,28 +702,116 @@ record_failure() {
 "
 }
 
-# --- Phase A: stop the user-level copies, leave their plists on disk --------
-# `|| true` is correct HERE and only here: bootout of a label that is not
-# loaded (the common case on a second run, and on any machine with no GUI
-# session at all) exits non-zero, and "not loaded" is precisely the state this
-# loop wants. Unlike the bootstrap loop below, there is no outcome to report -
-# the desired end state and the error state are the same state.
-while IFS= read -r label; do
-  [ -n "${label}" ] || continue
-  "${LAUNCHCTL}" bootout "gui/${TARGET_UID}/${label}" >/dev/null 2>&1 || true
-  if "${LAUNCHCTL}" print "gui/${TARGET_UID}/${label}" >/dev/null 2>&1; then
-    echo "install-system-daemons: warning: gui/${TARGET_UID}/${label} is STILL loaded after bootout." >&2
-    echo "install-system-daemons: warning: it may race the daemon of the same name; stop it by hand." >&2
+record_kept() {
+  KEPT_AGENTS="${KEPT_AGENTS}  $1
+      $2
+"
+}
+
+# Every user-level label this script is responsible for retiring must be
+# claimed by one of the daemons it installs, or it would silently never be
+# stopped by the per-service loop below. A "retired" row whose supersedes()
+# maps to no rendered daemon is an ORPHAN: nothing replaces it, so it is
+# stopped and archived on its own after the loop instead of being forgotten.
+ORPHAN_RETIRED_LABELS=""
+while IFS= read -r retired_label; do
+  [ -n "${retired_label}" ] || continue
+  if printf "%s\n" "${EXPECTED_SYSTEM_LABELS}" | grep -qxF "$(supersedes "${retired_label}")"; then
+    continue
   fi
+  ORPHAN_RETIRED_LABELS="${ORPHAN_RETIRED_LABELS}${retired_label}
+"
 done <<EOF
-$(manifest_labels system; manifest_labels retired)
+$(manifest_labels retired)
 ai.openclaw.gateway
 EOF
 
-# --- Phase B: bring up each daemon independently ---------------------------
+# Stops one user-level agent if it is loaded, and echoes its label when it
+# actually stopped something - the caller uses that to know what to put back.
+# `|| true` here because bootout of a label that is not loaded exits non-zero
+# and "not loaded" is the state this wants; the `print` guard above it already
+# answered the only question the exit code could have answered.
+#
+# Round-5 finding D7: the comment that used to sit here claimed this construct
+# was correct "HERE and only here". That was never true - `grep '|| true'` on
+# this file has always returned several live sites (the .env.local read, the
+# pnpm lookup, the obsolete-label bootout/disable, the system-domain bootout,
+# the three `grep -c` counters in the summary), each defensible for its own
+# reason. No count is quoted this time on purpose: a number in a comment is a
+# claim that rots on the next edit, which is exactly how the false one got here.
+stop_user_agent() {
+  local user_label="$1"
+  if ! "${LAUNCHCTL}" print "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1; then
+    return 0
+  fi
+  "${LAUNCHCTL}" bootout "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1 || true
+  if "${LAUNCHCTL}" print "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1; then
+    echo "install-system-daemons: warning: gui/${TARGET_UID}/${user_label} is STILL loaded after bootout." >&2
+    echo "install-system-daemons: warning: it may race the daemon of the same name; stop it by hand." >&2
+    return 0
+  fi
+  printf "%s\n" "${user_label}"
+}
+
+# Moves one user plist into the archive. NEVER deletes: if the archive cannot
+# be created or the move fails, the plist stays exactly where it is and the
+# label is reported as kept. Three of these labels exist in no other copy
+# anywhere, so "could not archive" must mean "did not remove".
+archive_user_agent() {
+  local user_label="$1"
+  local agent_plist="${AGENTS_DIR}/${user_label}.plist"
+  [ -f "${agent_plist}" ] || return 0
+  if ! ensure_backup_dir; then
+    record_kept "${user_label}" "left in ${AGENTS_DIR}: cannot create the archive directory ${BACKUP_DIR} (nothing is ever deleted in its place)"
+    return 0
+  fi
+  if mv "${agent_plist}" "${BACKUP_DIR}/" 2>/dev/null; then
+    echo "Retired user LaunchAgent ${user_label} -> ${BACKUP_DIR}"
+  else
+    record_kept "${user_label}" "left in ${AGENTS_DIR}: moving it to ${BACKUP_DIR} failed (nothing is ever deleted in its place)"
+  fi
+}
+
+# Puts back exactly what this run stopped, from the plist it never removed.
+# Only labels this run actually booted out are restored: bootstrapping an agent
+# that was already down would START something the machine was not running, and
+# on a machine with no GUI session that call cannot succeed anyway.
+restore_user_agents() {
+  local stopped="$1"
+  local user_label agent_plist restore_output
+  while IFS= read -r user_label; do
+    [ -n "${user_label}" ] || continue
+    agent_plist="${AGENTS_DIR}/${user_label}.plist"
+    if [ ! -f "${agent_plist}" ]; then
+      record_kept "${user_label}" "was running before this run, but has no plist in ${AGENTS_DIR} - there is nothing to fall back to"
+      continue
+    fi
+    if restore_output="$("${LAUNCHCTL}" bootstrap "gui/${TARGET_UID}" "${agent_plist}" 2>&1)"; then
+      RESTORED_AGENTS="${RESTORED_AGENTS}  ${user_label} (running again from ${agent_plist})
+"
+    else
+      record_kept "${user_label}" "plist kept at ${agent_plist}, but bootstrapping it back into gui/${TARGET_UID} failed: ${restore_output} - start it by hand with: launchctl bootstrap gui/${TARGET_UID} ${agent_plist}"
+    fi
+  done <<EOF
+${stopped}
+EOF
+}
+
 while IFS= read -r system_label; do
   [ -n "${system_label}" ] || continue
   system_plist="${SYSTEM_DIR}/${system_label}.plist"
+
+  # --- 1. stop the user-level copies of THIS service -----------------------
+  stopped_agents=""
+  while IFS= read -r user_label; do
+    [ -n "${user_label}" ] || continue
+    stopped_agents="${stopped_agents}$(stop_user_agent "${user_label}")
+"
+  done <<EOF
+$(user_labels_for "${system_label}")
+EOF
+
+  # --- 2. bring the daemon up ---------------------------------------------
   "${LAUNCHCTL}" bootout "system/${system_label}" >/dev/null 2>&1 || true
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if ! "${LAUNCHCTL}" print "system/${system_label}" >/dev/null 2>&1; then
@@ -647,11 +836,12 @@ while IFS= read -r system_label; do
     echo "install-system-daemons: warning: launchctl enable system/${system_label} failed: ${enable_output}" >&2
   fi
 
-  # FATAL FOR THIS LABEL, not for the run: record it and keep going, so the
-  # other seven daemons still get installed and started.
+  # FATAL FOR THIS LABEL, not for the run: record it, put this service's own
+  # fallback back, and keep going so the other seven are still installed.
   bootstrap_output=""
   if ! bootstrap_output="$("${LAUNCHCTL}" bootstrap system "${system_plist}" 2>&1)"; then
     record_failure "${system_label}" "launchctl bootstrap system ${system_plist}: ${bootstrap_output}"
+    restore_user_agents "${stopped_agents}"
     continue
   fi
 
@@ -664,37 +854,36 @@ while IFS= read -r system_label; do
     echo "install-system-daemons: warning: bootstrap succeeded and RunAtLoad started it; checking the job table." >&2
   fi
 
-  # The load check, not bootstrap's exit code, is what marks a label up. This
-  # is the claim Phase C is allowed to act on ("its replacement is running"),
-  # so it is answered by asking launchd, not by assuming.
+  # --- 3. verify by asking launchd, not by trusting an exit code -----------
   if ! "${LAUNCHCTL}" print "system/${system_label}" >/dev/null 2>&1; then
     record_failure "${system_label}" "bootstrap reported success but launchctl print system/${system_label} cannot find the job"
+    restore_user_agents "${stopped_agents}"
     continue
   fi
 
   LOADED_LABELS="${LOADED_LABELS}${system_label}
 "
+
+  # --- 4a. up: archive this service's user plists, and only this service's --
+  while IFS= read -r user_label; do
+    [ -n "${user_label}" ] || continue
+    archive_user_agent "${user_label}"
+  done <<EOF
+$(user_labels_for "${system_label}")
+EOF
 done <<EOF
 ${EXPECTED_SYSTEM_LABELS}
 EOF
 
-# --- Phase C: archive each user plist whose replacement is verified up ------
-while IFS= read -r label; do
-  [ -n "${label}" ] || continue
-  agent_plist="${AGENTS_DIR}/${label}.plist"
-  [ -f "${agent_plist}" ] || continue
-  replacement="$(supersedes "${label}")"
-  if ! label_is_loaded "${replacement}"; then
-    KEPT_AGENTS="${KEPT_AGENTS}  ${label} (replacement system/${replacement} is not loaded)
-"
-    continue
-  fi
-  ensure_backup_dir
-  mv "${agent_plist}" "${BACKUP_DIR}/"
-  echo "Retired user LaunchAgent ${label} -> ${BACKUP_DIR}"
+# Retired labels that no daemon replaces: stop them and archive them. Nothing
+# is waiting to take these over, so there is no "up" to wait for - but they are
+# still moved rather than deleted, same as everything else here.
+while IFS= read -r orphan_label; do
+  [ -n "${orphan_label}" ] || continue
+  stop_user_agent "${orphan_label}" >/dev/null
+  archive_user_agent "${orphan_label}"
 done <<EOF
-$(manifest_labels system; manifest_labels retired)
-ai.openclaw.gateway
+${ORPHAN_RETIRED_LABELS}
 EOF
 
 echo "Installed system daemons under ${SYSTEM_DIR} (running as ${TARGET_USER}):"
@@ -716,6 +905,7 @@ EOF
 
 if [ -d "${BACKUP_DIR}" ]; then
   echo "Backed up user launch agents under ${BACKUP_DIR}"
+  echo "  (to fall back to one of them: launchctl bootstrap gui/${TARGET_UID} ${BACKUP_DIR}/<label>.plist)"
 fi
 
 if [ -n "${FAILED_LABELS}" ]; then
@@ -726,16 +916,30 @@ if [ -n "${FAILED_LABELS}" ]; then
   echo "install-system-daemons: FAILED - ${failed_count} of ${total_count} daemons did not come up:" >&2
   printf "%s" "${FAILURE_DETAIL}" >&2
   echo "install-system-daemons: ${loaded_count} of ${total_count} ARE loaded; the machine is not idle." >&2
-  if [ -n "${KEPT_AGENTS}" ]; then
-    echo "install-system-daemons: these user LaunchAgents were deliberately LEFT in ${AGENTS_DIR}," >&2
-    echo "install-system-daemons: so the old copy of each still starts at the next login:" >&2
-    printf "%s" "${KEPT_AGENTS}" >&2
-    echo "install-system-daemons: to start one right now without waiting for a login:" >&2
-    echo "install-system-daemons:   launchctl bootstrap gui/${TARGET_UID} ${AGENTS_DIR}/<label>.plist" >&2
+  if [ -n "${RESTORED_AGENTS}" ]; then
+    echo "install-system-daemons: the old user-level copy of each failed service was started again," >&2
+    echo "install-system-daemons: so those services are running the same code they were before this run:" >&2
+    printf "%s" "${RESTORED_AGENTS}" >&2
   fi
-  echo "install-system-daemons: nothing about this run blocks a re-run - fix the cause and run again:" >&2
+  if [ -n "${KEPT_AGENTS}" ]; then
+    echo "install-system-daemons: these user LaunchAgents were LEFT on disk and need a look:" >&2
+    printf "%s" "${KEPT_AGENTS}" >&2
+  fi
+  echo "install-system-daemons: DO NOT run 'pnpm launchd:install-user' as a workaround: it retires" >&2
+  echo "install-system-daemons: user-level copies, and it refuses to touch any label whose daemon is" >&2
+  echo "install-system-daemons: down - so it cannot clean this up either. Fix the cause and re-run:" >&2
   echo "install-system-daemons:   sudo zsh $0" >&2
   echo "install-system-daemons: every step is idempotent, and each daemon is enabled and booted out" >&2
   echo "install-system-daemons: before it is bootstrapped, so a re-run converges rather than repeating." >&2
+  exit 1
+fi
+
+if [ -n "${KEPT_AGENTS}" ]; then
+  echo "" >&2
+  echo "install-system-daemons: every daemon is loaded, but these user LaunchAgents could not be archived:" >&2
+  printf "%s" "${KEPT_AGENTS}" >&2
+  echo "install-system-daemons: they are still on disk (nothing was deleted). Until they are moved out of" >&2
+  echo "install-system-daemons: ${AGENTS_DIR}, the next login starts a SECOND copy of those services next" >&2
+  echo "install-system-daemons: to the daemon - the doctor reports that as launchd-jobs.<name>.wrong_domain." >&2
   exit 1
 fi
