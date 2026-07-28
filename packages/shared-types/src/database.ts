@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -1010,6 +1010,72 @@ const MIGRATIONS: MigrationStep[] = [
       );
       CREATE INDEX IF NOT EXISTS personal_pages_owner_date_idx ON personal_pages(owner_id, kind, date);
     `);
+  },
+  (db) => {
+    // C1 (2026-07-28 adversarial review of the spec-drift batch): the public
+    // daily/weekly report was printing EVERY member's fills - 「标的 NVDA；方向
+    // 买入；数量 300；参考价格 …」 - into a body every member reads, because
+    // execution_reports (created back in MIGRATIONS[0]) had no owner dimension
+    // for any reader to filter on. Rows are written by broker-executor after
+    // one specific member's proposal fills, so the owner is known at write
+    // time and was simply being thrown away.
+    //
+    // ADD COLUMN, not a table rebuild (same precedent as v6's removed_at and
+    // v13's research_tasks columns): nothing pre-existing changes shape, so a
+    // plain step suffices - no needsForeignKeysOff.
+    //
+    // - NULLABLE with no default, deliberately. SQLite additionally REQUIRES a
+    //   NULL default for an added column carrying a REFERENCES clause, but the
+    //   product reason comes first: every row that already exists predates
+    //   per-member accounts (the shared paper account placed them), so there
+    //   is no honest owner to backfill. Picking one - "the only member", "the
+    //   first member", "the member who owns the newest snapshot" - would
+    //   fabricate an attribution the data does not support, and would ALSO be
+    //   an exposure: a row wrongly stamped for member two becomes readable by
+    //   member two on their own page.
+    // - The BACKFILL DECISION is therefore: leave history unattributed (NULL),
+    //   and make every owner-scoped reader treat NULL as "belongs to nobody,
+    //   publishable to nobody". apps/openclaw-config/scripts/scheduled-report.
+    //   mjs's selectExecutionReports filters `owner_id = ?`, so a NULL row
+    //   reaches neither the public body nor any member's personal page; its
+    //   EXISTENCE is disclosed by count (countUnattributedExecutionReports) so
+    //   the exclusion is visible rather than silent.
+    // - REFERENCES members(id): an owner id that is not a member could never
+    //   be shown to anybody and would only ever be a leak waiting to happen,
+    //   the same argument v16's personal_pages.owner_id FK makes.
+    //
+    // Defensive existence check, same precedent as the v11/v12/v13 steps
+    // above: several of THIS file's own migration tests wind `user_version`
+    // back to an earlier number while leaving table shapes at their latest,
+    // so the step can legitimately meet an execution_reports that already
+    // carries the column. A real v16 database never does. Re-running an ALTER
+    // there would abort the whole migration with "duplicate column name", so
+    // an already-present column is treated as "nothing to add", not an error.
+    // The same check covers the other legacy-fixture shape v13 documented: a
+    // hand-built v6/v7 fixture that never physically created execution_reports
+    // even though MIGRATIONS[0] does in every real database. A missing table
+    // is created directly in its final (v17) shape - equivalent to "there is
+    // nothing to alter" - rather than aborting the chain.
+    const columns = db.prepare(`PRAGMA table_info(execution_reports)`).all() as Array<{ name: unknown }>;
+    if (columns.length === 0) {
+      db.exec(`
+        CREATE TABLE execution_reports (
+          id TEXT PRIMARY KEY,
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+          metadata TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          owner_id TEXT REFERENCES members(id)
+        );
+      `);
+    } else if (!columns.some((column) => String(column.name) === "owner_id")) {
+      db.exec(`ALTER TABLE execution_reports ADD COLUMN owner_id TEXT REFERENCES members(id);`);
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS execution_reports_owner_created_idx
+        ON execution_reports(owner_id, created_at);
+    `);
   }
 ];
 
@@ -1074,20 +1140,36 @@ export class AuditLogRepository {
   }
 }
 
+// v17 (C1): who the report belongs to. `ownerId` is carried here rather than
+// on the `ExecutionReport` domain type because it is a storage-attribution
+// fact, not part of the report's content - and because a row may legitimately
+// have NO owner (see the v17 migration's backfill decision: history that
+// predates per-member accounts stays unattributed instead of being assigned a
+// fabricated owner).
+export type OwnedExecutionReport = ExecutionReport & { ownerId?: string | null };
+
 export class ExecutionReportRepository {
   constructor(private readonly db: DatabaseSync) {}
 
-  save(report: ExecutionReport): void {
+  save(report: OwnedExecutionReport): void {
     this.db
       .prepare(`
         INSERT OR REPLACE INTO execution_reports
-        (id, category, title, body, metadata, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (id, category, title, body, metadata, created_at, owner_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `)
-      .run(report.id, report.category, report.title, report.body, toJson(report.metadata), report.createdAt);
+      .run(
+        report.id,
+        report.category,
+        report.title,
+        report.body,
+        toJson(report.metadata),
+        report.createdAt,
+        report.ownerId ?? null
+      );
   }
 
-  listRecent(limit = 50, categories?: ExecutionReport["category"][]): ExecutionReport[] {
+  listRecent(limit = 50, categories?: ExecutionReport["category"][]): Array<ExecutionReport & { ownerId: string | null }> {
     const rows = categories && categories.length > 0
       ? (this.db
           .prepare(`
@@ -1107,7 +1189,8 @@ export class ExecutionReportRepository {
       title: String(row.title),
       body: String(row.body),
       metadata: fromJson<Record<string, unknown>>(String(row.metadata)) as ExecutionReport["metadata"],
-      createdAt: String(row.created_at)
+      createdAt: String(row.created_at),
+      ownerId: row.owner_id === null || row.owner_id === undefined ? null : String(row.owner_id)
     }));
   }
 }

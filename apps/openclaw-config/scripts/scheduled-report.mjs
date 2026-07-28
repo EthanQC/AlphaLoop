@@ -67,7 +67,11 @@ let reportPdfPath;
 async function prepareReport(reportKind, info) {
   assertOfficialPaperReportEnvironment();
   const db = openTradingDatabase(dbPath);
-  const executionRows = selectExecutionReports(db, info);
+  // C1: `selectExecutionReports(db, info)` used to be called here and its rows
+  // handed to the public renderer. It is now owner-scoped and REQUIRES an
+  // ownerId, and the public body no longer renders execution content at all -
+  // so the public path does not read the table. The owner-scoped read happens
+  // per member inside generatePersonalPages below.
   const marketData = await fetchRequiredReportMarketData(info, reportKind, db);
 
   // Phase 4 Task 6: build + persist this trading day's daily_facts BEFORE
@@ -86,14 +90,8 @@ async function prepareReport(reportKind, info) {
   persistDailyFacts(db, info.label, dailyFacts);
 
   const report = reportKind === "daily"
-    ? renderDailyReport(info, {
-        executionRows,
-        ...marketData
-      })
-    : renderWeeklyReport(info, {
-        executionRows,
-        ...marketData
-      });
+    ? renderDailyReport(info, marketData)
+    : renderWeeklyReport(info, marketData);
 
   assertReportQuality(report, { kind: reportKind });
   writeFileSync(reportPath, `${report}\n`, "utf8");
@@ -515,11 +513,13 @@ function summarizePersonalCardOutcome(personalCards) {
 // report from realistic fixture data and runs isPreparedReportMarkdownComplete
 // against it, so the marker text and the completeness check can never
 // silently diverge again (see that function's own doc comment).
+// C1: `data.executionRows` is no longer READ by either public renderer. The
+// three filter/count lines that used to stand here (trade rows, daily rows,
+// rejected rows) existed only to feed the digest and the 执行边界 counts, both
+// of which were owner data in a public document. Not reading the rows at all
+// is the structural version of the fix: a future edit cannot leak a field the
+// renderer never has in hand.
 export function renderDailyReport(info, data) {
-  const tradeRows = data.executionRows.filter((row) => row.category === "trade");
-  const dailyRows = data.executionRows.filter((row) => row.category === "daily");
-  const rejectedRows = tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`));
-
   return [
     `# OpenClaw 日报 ${info.label}`,
     "",
@@ -531,12 +531,7 @@ export function renderDailyReport(info, data) {
     "",
     "## 1. 今日结论",
     "",
-    ...renderCoreSummary(data, {
-      period: "今日",
-      tradeCount: tradeRows.length,
-      adviceCount: dailyRows.length,
-      rejectedCount: rejectedRows.length
-    }),
+    ...renderCoreSummary(data, { period: "今日" }),
     "",
     "## 2. 信息收集与分类",
     "",
@@ -558,7 +553,7 @@ export function renderDailyReport(info, data) {
     "",
     renderPublicAccountScopeNotice(),
     "",
-    renderExecutionDigest(data.executionRows),
+    renderPublicExecutionScopeNotice(),
     "",
     "## 6. 风险与异常",
     "",
@@ -573,10 +568,9 @@ export function renderDailyReport(info, data) {
   ].join("\n");
 }
 
+// C1: same as renderDailyReport above - the public weekly body no longer reads
+// `data.executionRows` at all.
 export function renderWeeklyReport(info, data) {
-  const tradeRows = data.executionRows.filter((row) => row.category === "trade");
-  const dailyRows = data.executionRows.filter((row) => row.category === "daily");
-
   return [
     `# OpenClaw 周报 ${info.label}`,
     "",
@@ -588,12 +582,7 @@ export function renderWeeklyReport(info, data) {
     "",
     "## 1. 本周结论",
     "",
-    ...renderCoreSummary(data, {
-      period: "本周",
-      tradeCount: tradeRows.length,
-      adviceCount: dailyRows.length,
-      rejectedCount: tradeRows.filter((row) => /rejected|拒绝|not allowed|disabled|未执行|不允许/iu.test(`${row.title}\n${row.body}`)).length
-    }),
+    ...renderCoreSummary(data, { period: "本周" }),
     "",
     "## 2. 市场主线回顾与分类",
     "",
@@ -611,7 +600,7 @@ export function renderWeeklyReport(info, data) {
     "",
     renderPublicAccountScopeNotice(),
     "",
-    renderExecutionDigest(data.executionRows),
+    renderPublicExecutionScopeNotice(),
     "",
     "## 5. 风险与异常",
     "",
@@ -641,7 +630,13 @@ function renderCoreSummary(data, counts) {
     `- 市场信号：${qqqSummary}；新闻主线：${newsSignal.summary}。`,
     `- 宏观信号：${macroSignal}。`,
     `- 操作含义：${newsSignal.action}；新增模拟盘仓位仍必须通过总仓 10% 预算检查。`,
-    `- 执行边界：${counts.period}没有自动提交实盘订单；交易/执行报告 ${counts.tradeCount} 条，其中拒绝或未执行 ${counts.rejectedCount} 条；期权自动化保持禁用。`
+    // C1: this line used to append "交易/执行报告 N 条，其中拒绝或未执行 M 条".
+    // Those counts are derived from execution_reports, i.e. from individual
+    // members' order flow - with a handful of members a count is enough to
+    // reconstruct who did what, so it is owner data too, not an aggregate. The
+    // RULE the line exists to state is public and stays verbatim; the numbers
+    // moved to the owner's own page.
+    `- 执行边界：${counts.period}没有自动提交实盘订单；期权自动化保持禁用；按成员的成交与拒绝笔数只在本人个人页披露。`
   ];
 }
 
@@ -744,37 +739,31 @@ function renderDailyRoutineClassification(data) {
   ].join("\n");
 }
 
-function renderExecutionDigest(rows) {
-  if (rows.length === 0) {
-    return "- 本窗口没有交易执行报告。";
-  }
-
-  const shownRows = rows.slice(-8);
-  const omitted = rows.length - shownRows.length;
-  const header = [
-    `- 本窗口共有 ${rows.length} 条执行记录。`,
-    omitted > 0
-      ? `- 下方只列最近 ${shownRows.length} 条用于人工核对；更早 ${omitted} 条保留在本地数据库的执行报告表。`
-      : "- 下方列出全部记录。"
-  ];
-
+// C1 (2026-07-28 review): renderExecutionDigest USED TO LIVE HERE and expanded
+// the last 8 execution_reports rows into this very body - symbol, side,
+// quantity, reference price, the report id as an "审计索引" - which meant member
+// two reading /daily/<date> saw member one's order flow. Task 4 had already
+// moved the ACCOUNT snapshot out for the same §3.1 reason ("公共日报不含任何个人
+// 持仓与策略内容") and simply missed this second leak.
+//
+// The digest is not deleted, it MOVED: personal-page.mjs's 「本周我的交易 vs
+// 策略一致性回顾」 renders the same fills, owner-scoped, on the owner's own
+// page (spec §3.3). What stays here is the disclosure - the reader is told the
+// detail exists and why they cannot see it, rather than being left to conclude
+// nothing was traded.
+function renderPublicExecutionScopeNotice() {
   return [
-    ...header,
-    ...shownRows.map((row, index) => {
-    const summary = summarizeExecutionRow(row);
-    return [
-    `### 记录 ${index + 1}：${summary.heading}`,
-    "",
-    `- 时间：${formatReportDateTime(row.created_at)}`,
-    `- 类别：${translateReportCategory(row.category)}`,
-    `- 状态：${summary.status}`,
-    `- 摘要：${summary.summary}`,
-    `- 审计索引：执行报告编号 ${row.id}`
-    ].join("\n");
-  })].join("\n\n");
+    "- 成交与执行明细不进入公共报告：每笔成交只属于下单的那一位成员，按 §3.1 只在其本人的个人页呈现。",
+    "- 本节也不发布任何按成员计数的口径（成交笔数、拒绝笔数等）：在小圈子里，计数本身即可反推他人的动作。"
+  ].join("\n");
 }
 
-function summarizeExecutionRow(row) {
+// Kept and exported for the personal page (C2): the same extraction that used
+// to feed the public digest now feeds 「本周我的交易 vs 策略一致性回顾」, where
+// the reader IS the owner of the row. Injected into personal-page.mjs through
+// `helpers` rather than imported, because scheduled-report.mjs imports that
+// module (see its header on the one-directional dependency).
+export function summarizeExecutionRow(row) {
   const text = `${row.title ?? ""}\n${row.body ?? ""}`;
   const symbol = extractSymbol(text) ?? "未标明标的";
   const side = extractSide(text);
@@ -1659,16 +1648,54 @@ function renderQqqSection(quote) {
   return lines.join("\n");
 }
 
-function selectExecutionReports(db, info) {
+/**
+ * C1 (2026-07-28 review): the owner-scoped read of `execution_reports`.
+ *
+ * This used to filter on category and the time window only, and its rows went
+ * straight into the PUBLIC daily/weekly body - so every member read every
+ * other member's fills. There is no such thing as an owner-agnostic caller
+ * for this table any more, so `ownerId` is REQUIRED rather than optional: an
+ * accidental `selectExecutionReports(db, info)` must fail loudly instead of
+ * silently reverting to "everybody's rows".
+ *
+ * `owner_id = ?` also excludes the unattributed (NULL) history v17 deliberately
+ * did not backfill - those rows belong to nobody, so they are publishable to
+ * nobody. Their existence is disclosed by count, see
+ * countUnattributedExecutionReports.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{start: Date, end: Date}} info report window
+ * @param {string} ownerId
+ */
+export function selectExecutionReports(db, info, ownerId) {
+  if (typeof ownerId !== "string" || ownerId.trim() === "") {
+    throw new Error("selectExecutionReports requires an ownerId - execution reports are owner-scoped (schema v17).");
+  }
   return db
     .prepare(`
-      SELECT id, category, title, body, metadata, created_at
+      SELECT id, category, title, body, metadata, created_at, owner_id
       FROM execution_reports
-      WHERE category IN ('trade', 'daily')
+      WHERE category IN ('trade', 'daily') AND owner_id = ?
       ORDER BY created_at ASC
     `)
-    .all()
+    .all(ownerId)
     .filter((row) => isWithinWindow(row.created_at, info));
+}
+
+/**
+ * How many rows inside the window belong to nobody (v17 left pre-existing
+ * history unattributed rather than inventing an owner). Reported so the
+ * exclusion is DISCLOSED on the owner's page instead of looking like "there
+ * were no trades".
+ */
+export function countUnattributedExecutionReports(db, info) {
+  return db
+    .prepare(`
+      SELECT created_at FROM execution_reports
+      WHERE category IN ('trade', 'daily') AND owner_id IS NULL
+    `)
+    .all()
+    .filter((row) => isWithinWindow(row.created_at, info)).length;
 }
 
 

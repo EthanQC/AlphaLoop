@@ -9,6 +9,7 @@ import {
   SCHEMA_VERSION,
   MemberRepository,
   ApiTokenRepository,
+  ExecutionReportRepository,
   ProposalRepository,
   CircuitBreakerRepository,
   OfficialPaperOrderLifecycleRepository,
@@ -3840,8 +3841,12 @@ describe("LoginThrottleRepository", () => {
 });
 
 describe("v16 personal_pages migration (2026-07-28 spec-drift remediation Task 5, 个人页)", () => {
-  it("SCHEMA_VERSION is 16", () => {
-    expect(SCHEMA_VERSION).toBe(16);
+  // SCHEMA_VERSION has since moved on to v17 (execution_reports.owner_id,
+  // 2026-07-28 review defect C1) - this block asserts the v16-specific table
+  // exists and behaves, not any particular version number (same convention as
+  // every describe block above).
+  it("SCHEMA_VERSION is at least 16", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(16);
   });
 
   it("a fresh db lands at v16 with personal_pages present (columns/CHECK/UNIQUE/FK/index)", () => {
@@ -3917,5 +3922,150 @@ describe("v16 personal_pages migration (2026-07-28 spec-drift remediation Task 5
     expect(() => db.prepare(insert).run("pp_3", "mem_v16", "daily", "2026-07-28", "# dup", nowIso())).toThrow(/UNIQUE/iu);
     expect(() => db.prepare(insert).run("pp_4", "nobody", "daily", "2026-07-28", "# ghost", nowIso())).toThrow(/FOREIGN KEY/iu);
     expect(() => db.prepare(insert).run("pp_5", "mem_v16", "monthly", "2026-07-28", "# bad kind", nowIso())).toThrow(/CHECK/iu);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C1 (2026-07-28 adversarial review): execution_reports had NO owner column,
+// so nothing downstream could tell member one's fills from member two's - and
+// the public daily/weekly printed all of them. This block pins the schema half
+// of the fix.
+// ---------------------------------------------------------------------------
+describe("v17 execution_reports.owner_id migration (C1: per-member fills were public)", () => {
+  it("SCHEMA_VERSION is 17", () => {
+    expect(SCHEMA_VERSION).toBe(17);
+  });
+
+  it("a fresh db lands at v17 with a NULLABLE owner_id on execution_reports, FK'd to members and indexed", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const columns = db.prepare("PRAGMA table_info(execution_reports)").all() as Array<
+      { name: string; notnull: number; dflt_value: string | null }
+    >;
+    expect(columns.map((c) => c.name)).toEqual([
+      "id",
+      "category",
+      "title",
+      "body",
+      "metadata",
+      "created_at",
+      "owner_id"
+    ]);
+    // NULLABLE on purpose: a row that predates per-member accounts belongs to
+    // NOBODY, and inventing an owner for it would be a fabrication. The
+    // readers treat NULL as "not publishable to any owner-scoped surface".
+    const ownerColumn = columns.find((c) => c.name === "owner_id");
+    expect(ownerColumn?.notnull).toBe(0);
+    expect(ownerColumn?.dflt_value).toBeNull();
+
+    const foreignKeys = db.prepare("PRAGMA foreign_key_list(execution_reports)").all() as Array<
+      { table: string; from: string; to: string }
+    >;
+    expect(foreignKeys).toHaveLength(1);
+    expect(foreignKeys[0]?.table).toBe("members");
+    expect(foreignKeys[0]?.from).toBe("owner_id");
+    expect(foreignKeys[0]?.to).toBe("id");
+
+    const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+      .map((i) => i.name);
+    expect(indexes).toContain("execution_reports_owner_created_idx");
+  });
+
+  it("leaves every pre-existing row UNATTRIBUTED rather than inventing an owner for it", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v17_only");
+    // Reproduce the deployed v16 shape: execution_reports without owner_id,
+    // carrying two historical rows from the shared paper account era.
+    db.exec(`
+      DROP TABLE execution_reports;
+      CREATE TABLE execution_reports (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO execution_reports (id, category, title, body, metadata, created_at)
+      VALUES ('legacy_1', 'trade', 'NVDA.US 执行报告', '标的 NVDA.US 方向 买入 数量 300', '{}', '2026-07-20T10:00:00.000Z'),
+             ('legacy_2', 'daily', '每日复盘', 'body', '{}', '2026-07-21T10:00:00.000Z');
+      PRAGMA user_version = 16;
+    `);
+    expect(getSchemaVersion(db)).toBe(16);
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    const rows = db
+      .prepare("SELECT id, owner_id FROM execution_reports ORDER BY id")
+      .all() as Array<{ id: string; owner_id: string | null }>;
+    expect(rows).toEqual([
+      { id: "legacy_1", owner_id: null },
+      { id: "legacy_2", owner_id: null }
+    ]);
+    // The single seeded member did NOT become the owner of history they may
+    // never have placed.
+    expect(
+      (db.prepare("SELECT COUNT(*) c FROM execution_reports WHERE owner_id IS NOT NULL").get() as { c: number }).c
+    ).toBe(0);
+  });
+
+  it("is idempotent", () => {
+    const db = memoryDb();
+    migrate(db);
+    migrate(db);
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+
+  it("refuses an execution report attributed to a member who does not exist", () => {
+    const db = memoryDb();
+    migrate(db);
+    db.exec("PRAGMA foreign_keys = ON;");
+    seedMember(db, "mem_v17");
+
+    const insert = `INSERT INTO execution_reports (id, category, title, body, metadata, created_at, owner_id) VALUES (?, ?, ?, ?, '{}', ?, ?)`;
+    db.prepare(insert).run("er_ok", "trade", "t", "b", nowIso(), "mem_v17");
+    db.prepare(insert).run("er_unattributed", "trade", "t", "b", nowIso(), null);
+    expect(() => db.prepare(insert).run("er_ghost", "trade", "t", "b", nowIso(), "nobody")).toThrow(/FOREIGN KEY/iu);
+  });
+
+  it("ExecutionReportRepository stamps the owner it is given and reads it back", () => {
+    const db = memoryDb();
+    migrate(db);
+    seedMember(db, "mem_v17_repo");
+
+    new ExecutionReportRepository(db).save({
+      id: "er_owned",
+      category: "trade",
+      title: "NVDA.US 执行报告",
+      body: "标的 NVDA.US",
+      metadata: {},
+      createdAt: nowIso(),
+      ownerId: "mem_v17_repo"
+    });
+    new ExecutionReportRepository(db).save({
+      id: "er_unowned",
+      category: "daily",
+      title: "复盘",
+      body: "body",
+      metadata: {},
+      createdAt: nowIso()
+    });
+
+    const stored = db
+      .prepare("SELECT id, owner_id FROM execution_reports ORDER BY id")
+      .all() as Array<{ id: string; owner_id: string | null }>;
+    expect(stored).toEqual([
+      { id: "er_owned", owner_id: "mem_v17_repo" },
+      { id: "er_unowned", owner_id: null }
+    ]);
+
+    const listed = new ExecutionReportRepository(db).listRecent(10);
+    expect(listed.find((r) => r.id === "er_owned")?.ownerId).toBe("mem_v17_repo");
+    expect(listed.find((r) => r.id === "er_unowned")?.ownerId).toBeNull();
   });
 });

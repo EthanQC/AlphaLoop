@@ -505,6 +505,15 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         reports.save({
           id: reportId,
           category: "trade",
+          // C1 (2026-07-28 review): stamp the owner at the write. This row
+          // describes ONE member's fill, and until schema v17 it was stored
+          // with no owner at all - which is what let the public daily/weekly
+          // print every member's order flow (nothing downstream had an owner
+          // dimension to filter on, and the attribution is unrecoverable once
+          // the row is written without it). `proposal.ownerId` is the same
+          // server-derived owner the ticket and the lifecycle row already use;
+          // never a request-body ownerId.
+          ownerId: proposal.ownerId,
           title: `${ticket.symbol} 执行报告`,
           body: buildExecutionReportBody(ticket.id, safeResult),
           metadata: {

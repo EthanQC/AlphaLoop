@@ -374,6 +374,37 @@ describe("createBrokerExecutorServer", () => {
       expect(reportCount).toBe(1);
     });
 
+    // C1 (2026-07-28 adversarial review): execution_reports rows are written
+    // HERE, after one specific member's proposal fills - and until v17 they
+    // carried no owner at all, which is why the public daily/weekly could
+    // print every member's fills with no owner dimension to filter on. An
+    // unstamped row is unattributable forever (nothing downstream can recover
+    // who placed it), so the stamp has to happen at the write.
+    it("stamps the execution report with the proposal's owner, so the row is attributable to exactly one member", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      const { fn } = makeCountingExec({ order_id: "ext_owner_1", status: "Filled", executed_price: "100.00" });
+      await startServer({ execFn: fn });
+
+      const approved = createApprovedProposal(db, { quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: approved.id })
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+
+      const reportRow = db
+        .prepare(`SELECT owner_id, category FROM execution_reports WHERE id = ?`)
+        .get(body.reportId) as { owner_id: string | null; category: string };
+      expect(reportRow.category).toBe("trade");
+      expect(reportRow.owner_id).toBe("mem_owner");
+      // No unattributed row may be produced by this path at all.
+      expect(
+        (db.prepare(`SELECT COUNT(*) c FROM execution_reports WHERE owner_id IS NULL`).get() as { c: number }).c
+      ).toBe(0);
+    });
+
     it("idempotent replay: two identical POSTs for the same proposal execute the broker call exactly once (200 both times)", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       const { fn, callCount } = makeCountingExec({ order_id: "ext_replay_1", status: "Filled" });

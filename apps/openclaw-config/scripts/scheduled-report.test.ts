@@ -3,7 +3,13 @@
 // process.argv), which made the module impossible to `import` for testing
 // at all - see the isMainModule guard this task added. This is the first
 // direct test coverage the module has ever had.
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterAll, describe, expect, it } from "vitest";
+
+import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 
 import {
   buildDegradedQuoteSnapshot,
@@ -15,6 +21,18 @@ import {
 import { validateNarrativeNumbers, validateReportMarkdown } from "./report-quality.mjs";
 
 const scheduledReport = await import("./scheduled-report.mjs");
+
+// Temp databases only - runtime/trading.sqlite is never touched by a test.
+const execScopeDirs: string[] = [];
+
+afterAll(() => {
+  while (execScopeDirs.length > 0) {
+    const dir = execScopeDirs.pop();
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 function buildFixtureData() {
   const fetchedAt = "2026-07-14T05:00:00.000Z";
@@ -519,5 +537,161 @@ describe("appendUrlVerificationDisclosure", () => {
 
   it("returns the markdown untouched when there is nothing to disclose", () => {
     expect(scheduledReport.appendUrlVerificationDisclosure("# 报告", null)).toBe("# 报告");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C1 (2026-07-28 adversarial review): Task 4 moved the ACCOUNT snapshot out of
+// the public body but left renderExecutionDigest expanding the last 8
+// execution_reports rows into it, so member two reading /daily/<date> saw
+// member one's order flow ("标的 NVDA；方向 买入；数量 300；参考价格 …"), plus
+// renderCoreSummary's 「- 执行边界」 line publishing per-member trade and
+// rejection counts.
+//
+// These assertions are on the CONTRACT that decides what the group chat sees -
+// the markdown renderDailyReport/renderWeeklyReport actually produce - and the
+// fixture is deliberately adversarial: it hands the renderers exactly the rows
+// the old digest would have printed. A renderer that ignores them passes; a
+// renderer that grows the digest back fails.
+// ---------------------------------------------------------------------------
+function buildDataWithFills() {
+  return {
+    ...buildFixtureData(),
+    executionRows: [
+      {
+        id: "exec_leak_1",
+        category: "trade",
+        title: "AMD.US 执行报告",
+        body: "标的 AMD.US；方向 buy；数量 300；价格 178.42；ticket=tk_member_one",
+        metadata: "{}",
+        created_at: "2026-07-14T10:00:00.000Z",
+        owner_id: "member_one"
+      },
+      {
+        id: "exec_leak_2",
+        category: "trade",
+        title: "META.US 执行报告",
+        body: "标的 META.US；方向 sell；数量 120；价格 250.10；rejected 拒绝",
+        metadata: "{}",
+        created_at: "2026-07-14T11:00:00.000Z",
+        owner_id: "member_two"
+      },
+      {
+        id: "exec_leak_3",
+        category: "daily",
+        title: "每日复盘",
+        body: "标的 GOOG.US；方向 buy；数量 50",
+        metadata: "{}",
+        created_at: "2026-07-14T12:00:00.000Z",
+        owner_id: null
+      }
+    ]
+  };
+}
+
+describe("C1: the public daily/weekly body carries no per-member fills and no execution counts", () => {
+  for (const kind of ["daily", "weekly"] as const) {
+    it(`prints no fill detail from execution_reports in the public ${kind} body`, () => {
+      const window = scheduledReport.resolveReportWindow(kind, "2026-07-14");
+      const markdown = kind === "daily"
+        ? scheduledReport.renderDailyReport(window, buildDataWithFills())
+        : scheduledReport.renderWeeklyReport(window, buildDataWithFills());
+
+      // AMD/META/GOOG appear NOWHERE in buildFixtureData (its own symbols are
+      // QQQ.US and NVDA.US), so any appearance here came from the fills.
+      expect(markdown).not.toContain("AMD.US");
+      expect(markdown).not.toContain("META.US");
+      expect(markdown).not.toContain("GOOG.US");
+      // The digest's own composite fact form, "标的 X；方向 买入；数量 N；参考
+      // 价格 P。" - narrower than a bare 标的 so the legitimately public
+      // 「跟踪标的 QQQ.US」 and 「- 标的：QQQ.US」 (QQQ benchmark) still pass.
+      expect(markdown).not.toMatch(/标的\s+[A-Z]+(?:\.US)?；/u);
+      expect(markdown).not.toContain("方向 买入");
+      expect(markdown).not.toContain("方向 卖出");
+      expect(markdown).not.toMatch(/数量\s*\d/u);
+      expect(markdown).not.toContain("参考价格");
+      // The per-row audit index leaked the execution report id itself.
+      expect(markdown).not.toContain("exec_leak_1");
+      expect(markdown).not.toContain("审计索引");
+      expect(markdown).not.toMatch(/###\s*记录\s*\d/u);
+    });
+
+    it(`publishes no trade/rejection counts in the public ${kind} body`, () => {
+      const window = scheduledReport.resolveReportWindow(kind, "2026-07-14");
+      const markdown = kind === "daily"
+        ? scheduledReport.renderDailyReport(window, buildDataWithFills())
+        : scheduledReport.renderWeeklyReport(window, buildDataWithFills());
+
+      expect(markdown).not.toMatch(/交易\/执行报告\s*\d+\s*条/u);
+      expect(markdown).not.toMatch(/拒绝或未执行\s*\d+\s*条/u);
+      expect(markdown).not.toMatch(/共有\s*\d+\s*条执行记录/u);
+      // The rule the line exists to state is public and must survive.
+      expect(markdown).toContain("没有自动提交实盘订单");
+      expect(markdown).toContain("期权自动化保持禁用");
+    });
+
+    it(`discloses WHY execution detail is absent from the public ${kind} body instead of going silent`, () => {
+      const window = scheduledReport.resolveReportWindow(kind, "2026-07-14");
+      const markdown = kind === "daily"
+        ? scheduledReport.renderDailyReport(window, buildDataWithFills())
+        : scheduledReport.renderWeeklyReport(window, buildDataWithFills());
+
+      expect(markdown).toContain("成交与执行明细不进入公共报告");
+      expect(markdown).toContain("个人页");
+      // Unchanged: the fixture with fills must still pass the whole gate.
+      expect(validateReportMarkdown(markdown, { kind })).toEqual({ ok: true, failures: [] });
+    });
+  }
+});
+
+describe("C1: selectExecutionReports is owner-scoped", () => {
+  function seedExecutionDb() {
+    const dir = mkdtempSync(join(tmpdir(), "alphaloop-exec-scope-"));
+    execScopeDirs.push(dir);
+    const db = openTradingDatabase(join(dir, "trading.sqlite"));
+    for (const id of ["member_one", "member_two"]) {
+      new MemberRepository(db).upsert({
+        id,
+        email: `${id}@example.com`,
+        displayName: id,
+        riskTags: [],
+        stockTags: [],
+        showPerformance: true,
+        status: "active",
+        createdAt: "2026-07-01T00:00:00.000Z"
+      });
+    }
+    const insert = db.prepare(`
+      INSERT INTO execution_reports (id, category, title, body, metadata, created_at, owner_id)
+      VALUES (?, ?, ?, ?, '{}', ?, ?)
+    `);
+    insert.run("er_one", "trade", "NVDA.US 执行报告", "标的 NVDA.US 方向 buy 数量 300", "2026-07-14T10:00:00.000Z", "member_one");
+    insert.run("er_two", "trade", "TSLA.US 执行报告", "标的 TSLA.US 方向 sell 数量 120", "2026-07-14T11:00:00.000Z", "member_two");
+    insert.run("er_legacy", "trade", "QQQ.US 执行报告", "标的 QQQ.US 方向 buy 数量 5", "2026-07-14T12:00:00.000Z", null);
+    insert.run("er_out_of_window", "trade", "NVDA.US 执行报告", "标的 NVDA.US", "2026-06-01T10:00:00.000Z", "member_one");
+    return db;
+  }
+
+  it("returns only the requested owner's rows - never another member's, never an unattributed one", () => {
+    const db = seedExecutionDb();
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+
+    const forOne = scheduledReport.selectExecutionReports(db, window, "member_one");
+    expect(forOne.map((row: { id: string }) => row.id)).toEqual(["er_one"]);
+
+    const forTwo = scheduledReport.selectExecutionReports(db, window, "member_two");
+    expect(forTwo.map((row: { id: string }) => row.id)).toEqual(["er_two"]);
+  });
+
+  it("refuses to run without an owner rather than defaulting to every member's rows", () => {
+    const db = seedExecutionDb();
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    expect(() => scheduledReport.selectExecutionReports(db, window)).toThrow(/ownerId/u);
+  });
+
+  it("counts the unattributed rows separately so their exclusion can be disclosed, not hidden", () => {
+    const db = seedExecutionDb();
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    expect(scheduledReport.countUnattributedExecutionReports(db, window)).toBe(1);
   });
 });
