@@ -267,10 +267,17 @@ describe("composeReviewConfirmCardBody platform deep link (.mjs face)", () => {
     const result = await notifier({ ownerId: OWNER, title: "2026-07 月度复盘已确认", ...body });
 
     expect(result.ok).toBe(true);
+    // Card JSON 2.0: a button is a body element and navigates via an open_url
+    // behavior. This used to assert the 1.0 `{tag:"action"}` module with a
+    // top-level `url`, which the payload's own `schema: "2.0"` never accepted
+    // (spec drift A2, notifications.ts buildFeishuCardPayload).
     const payload = calls[0]?.cardJson as {
-      body: { elements: Array<{ tag: string; actions?: Array<{ tag: string; url?: string }> }> };
+      body: { elements: Array<{ tag: string; behaviors?: Array<{ type: string; default_url?: string }> }> };
     };
-    const action = payload.body.elements.find((element) => element.tag === "action");
-    expect(action?.actions?.[0]?.url).toBe("https://reports.qingverse.com/review/monthly_review_1");
+    const button = payload.body.elements.find((element) => element.tag === "button");
+    expect(button?.behaviors?.[0]).toMatchObject({
+      type: "open_url",
+      default_url: "https://reports.qingverse.com/review/monthly_review_1"
+    });
   });
 });

@@ -170,7 +170,11 @@ describe("buildReportConclusionCard", () => {
     expect(card.url?.href).toBe("https://reports.qingverse.com/stock-analysis/2026-07-28");
   });
 
-  it("ships without a button - and says where the full text lives - when no public base url is configured", () => {
+  // 2026-07-28 (spec drift A2, sibling defect). A missing link had three
+  // different causes and one hard-coded line blaming the deployment's config
+  // for all of them, so a caller that simply forgot reportKind read as "this
+  // deployment has no public address". Each cause now names itself.
+  it("names the missing base url as the reason when the deployment has no public address", () => {
     delete process.env.PLATFORM_PUBLIC_BASE_URL;
 
     const card = buildReportConclusionCard({
@@ -182,13 +186,15 @@ describe("buildReportConclusionCard", () => {
 
     expect(card.url).toBeUndefined();
     const text = card.lines.join("\n");
+    expect(text).toContain("PLATFORM_PUBLIC_BASE_URL");
     expect(text).toContain("请在平台查看全文");
+    expect(text).not.toContain("未指定平台页面");
     // A path with no origin is useless in a Feishu client, and a made-up host
     // would be fabricated data (deep-links.ts, §0.4).
     expect(text).not.toContain("/daily/");
   });
 
-  it("has no button when the caller does not say which page holds the report", () => {
+  it("says the caller named no page - not that the deployment lacks an address - when reportKind is missing", () => {
     process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
 
     const card = buildReportConclusionCard({
@@ -197,7 +203,30 @@ describe("buildReportConclusionCard", () => {
     });
 
     expect(card.url).toBeUndefined();
-    expect(card.lines.join("\n")).toContain("请在平台查看全文");
+    const text = card.lines.join("\n");
+    expect(text).toContain("未指定平台页面");
+    expect(text).toContain("请在平台查看全文");
+    // The base url IS configured here - blaming it would be a lie.
+    expect(text).not.toContain("PLATFORM_PUBLIC_BASE_URL");
+  });
+
+  it("reports a rejected deep-link target instead of pretending the deployment is unconfigured", () => {
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+
+    const card = buildReportConclusionCard({
+      title: "OpenClaw 个股分析 2026-07-28",
+      markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83。",
+      // The .mjs report callers are plain JS: a typo'd kind reaches this at
+      // runtime with no compiler in the way.
+      reportKind: "stock-analysis-typo" as never,
+      reportDate: "2026-07-28"
+    });
+
+    expect(card.url).toBeUndefined();
+    const text = card.lines.join("\n");
+    expect(text).toContain("无法生成报告链接");
+    expect(text).toContain("stock-analysis-typo");
+    expect(text).not.toContain("PLATFORM_PUBLIC_BASE_URL");
   });
 
   it("states the gap honestly when the report yields no summarizable conclusion", () => {
@@ -252,7 +281,55 @@ describe("buildFeishuCardPayload", () => {
     expect(payload.body.elements[1]?.content).toBe("中文正文第二行，带标点。");
   });
 
-  it("renders buttons as an action element with value passthrough for the OpenClaw callback", () => {
+  // 2026-07-28 (spec drift A2). These assert the JSON FEISHU parses, not our
+  // InteractiveCard type, because that abstraction is what let card 1.0 button
+  // syntax live inside a `schema: "2.0"` payload unnoticed: the button carried
+  // a top-level `url`, and the buttons sat in a `{tag:"action"}` module.
+  //
+  // Card JSON 2.0 (open.feishu.cn/document/feishu-cards/card-json-v2-components
+  // /interactive-components/button): the button's field table lists `behaviors`
+  // as 必填 and lists NEITHER `url` NOR `value`; navigation is
+  // `behaviors:[{type:"open_url", default_url, pc_url, ios_url, android_url}]`
+  // and callbacks are `behaviors:[{type:"callback", value:{...}}]`. `url` /
+  // `multi_url` are 1.0 历史属性. The 2.0 breaking-change notes
+  // (.../card-json-v2-breaking-changes-release-notes) remove the 备注/交互
+  // (action) modules and, critically, say unsupported properties are now
+  // REJECTED with an error instead of silently ignored - so the old payload was
+  // not merely a dead button, it risked every card being refused outright.
+  const FEISHU_1_0_ONLY_SYNTAX = ['"tag":"action"', '"url":', '"multi_url"', '"value":'];
+
+  it("expresses a link as a card 2.0 open_url behavior, never the 1.0 url field", () => {
+    const card: InteractiveCard = {
+      title: "详情",
+      lines: ["点击查看完整报告"],
+      url: { text: "查看报告", href: "https://example.com/report/2026-07-12" }
+    };
+
+    const payload = buildFeishuCardPayload(card);
+    const elements = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
+    const button = elements.find((element) => element.tag === "button");
+
+    expect(button).toEqual({
+      tag: "button",
+      text: { tag: "plain_text", content: "查看报告" },
+      type: "default",
+      behaviors: [{
+        type: "open_url",
+        default_url: "https://example.com/report/2026-07-12",
+        pc_url: "https://example.com/report/2026-07-12",
+        ios_url: "https://example.com/report/2026-07-12",
+        android_url: "https://example.com/report/2026-07-12"
+      }]
+    });
+    // The button is a body element in its own right: 2.0 has no action module
+    // to wrap it in.
+    expect(elements.some((element) => element.tag === "action")).toBe(false);
+    for (const syntax of FEISHU_1_0_ONLY_SYNTAX) {
+      expect(JSON.stringify(payload)).not.toContain(syntax);
+    }
+  });
+
+  it("expresses a callback button as a card 2.0 callback behavior carrying the OpenClaw value", () => {
     const card: InteractiveCard = {
       title: "审批",
       lines: ["是否批准这笔交易？"],
@@ -263,25 +340,36 @@ describe("buildFeishuCardPayload", () => {
       ]
     };
 
-    const payload = buildFeishuCardPayload(card) as {
-      body: {
-        elements: Array<{
-          tag: string;
-          actions?: Array<{ tag: string; text: { content: string }; type: string; value: { value: string } }>;
-        }>;
-      };
-    };
+    const payload = buildFeishuCardPayload(card);
+    const elements = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements;
 
-    const actionElement = payload.body.elements.find((element) => element.tag === "action");
-    expect(actionElement).toBeDefined();
-    expect(actionElement?.actions).toEqual([
-      { tag: "button", text: { tag: "plain_text", content: "批准" }, type: "primary", value: { value: "approve:12345" } },
-      { tag: "button", text: { tag: "plain_text", content: "拒绝" }, type: "danger", value: { value: "reject:12345" } },
-      { tag: "button", text: { tag: "plain_text", content: "忽略" }, type: "default", value: { value: "ignore:12345" } }
+    expect(elements.filter((element) => element.tag === "button")).toEqual([
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "批准" },
+        type: "primary",
+        behaviors: [{ type: "callback", value: { value: "approve:12345" } }]
+      },
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "拒绝" },
+        type: "danger",
+        behaviors: [{ type: "callback", value: { value: "reject:12345" } }]
+      },
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "忽略" },
+        type: "default",
+        behaviors: [{ type: "callback", value: { value: "ignore:12345" } }]
+      }
     ]);
+    // The callback payload the approval handler reads is unchanged - it just
+    // travels inside the behavior now instead of a top-level `value`.
+    expect(JSON.stringify(payload)).toContain('"value":{"value":"approve:12345"}');
+    expect(elements.some((element) => element.tag === "action")).toBe(false);
   });
 
-  it("adds an optional url button alongside regular buttons", () => {
+  it("keeps a link button alongside callback buttons, both in 2.0 syntax", () => {
     const card: InteractiveCard = {
       title: "详情",
       lines: ["点击查看完整报告"],
@@ -289,26 +377,17 @@ describe("buildFeishuCardPayload", () => {
       url: { text: "查看报告", href: "https://example.com/report/2026-07-12" }
     };
 
-    const payload = buildFeishuCardPayload(card) as {
-      body: {
-        elements: Array<{
-          tag: string;
-          actions?: Array<{ tag: string; text: { content: string }; url?: string; value?: { value: string } }>;
-        }>;
-      };
-    };
+    const payload = buildFeishuCardPayload(card);
+    const buttons = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements
+      .filter((element) => element.tag === "button");
 
-    const actionElement = payload.body.elements.find((element) => element.tag === "action");
-    expect(actionElement?.actions).toContainEqual({
-      tag: "button",
-      text: { tag: "plain_text", content: "查看报告" },
-      type: "default",
-      url: "https://example.com/report/2026-07-12"
-    });
-    expect(actionElement?.actions).toHaveLength(2);
+    expect(buttons).toHaveLength(2);
+    expect(buttons.every((button) => Array.isArray(button.behaviors))).toBe(true);
+    expect(JSON.stringify(payload)).not.toContain('"tag":"action"');
+    expect(JSON.stringify(payload)).not.toContain('"url":"https');
   });
 
-  it("omits the action element entirely when there are no buttons and no url", () => {
+  it("emits no button element at all when there are no buttons and no url", () => {
     const card: InteractiveCard = {
       title: "纯文本卡片",
       lines: ["没有按钮的卡片"]
@@ -318,7 +397,17 @@ describe("buildFeishuCardPayload", () => {
       body: { elements: Array<{ tag: string }> };
     };
 
+    expect(payload.body.elements.some((element) => element.tag === "button")).toBe(false);
     expect(payload.body.elements.some((element) => element.tag === "action")).toBe(false);
+  });
+
+  it("declares only card 2.0 top-level fields (schema, config.update_multi=true, header, body)", () => {
+    const payload = buildFeishuCardPayload({ title: "标题", lines: ["一行"] }) as Record<string, unknown>;
+
+    expect(Object.keys(payload).sort()).toEqual(["body", "config", "header", "schema"]);
+    expect(payload.schema).toBe("2.0");
+    // JSON 2.0 只支持 update_multi=true (v2 structure doc).
+    expect(payload.config).toEqual({ update_multi: true });
   });
 });
 
@@ -594,7 +683,9 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
       elements: Array<{
         tag: string;
         content?: string;
-        actions?: Array<{ tag: string; text: { tag: string; content: string }; type?: string; url?: string }>;
+        text?: { tag: string; content: string };
+        type?: string;
+        behaviors?: Array<Record<string, unknown>>;
       }>;
     };
   }
@@ -631,12 +722,19 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     const card = cardFrom(sends[0]!);
     expect(card.header.title.content).toBe("OpenClaw 日报 2026-07-26");
     expect(JSON.stringify(card.body.elements)).toContain("QQQ 最新价 738.31");
-    const action = card.body.elements.find((element) => element.tag === "action");
-    expect(action?.actions).toContainEqual({
+    // Card JSON 2.0 button: navigation via an open_url behavior, never the 1.0
+    // `url` field (spec drift A2).
+    expect(card.body.elements).toContainEqual({
       tag: "button",
       text: { tag: "plain_text", content: "查看完整报告" },
       type: "default",
-      url: "https://reports.qingverse.com/daily/2026-07-26"
+      behaviors: [{
+        type: "open_url",
+        default_url: "https://reports.qingverse.com/daily/2026-07-26",
+        pc_url: "https://reports.qingverse.com/daily/2026-07-26",
+        ios_url: "https://reports.qingverse.com/daily/2026-07-26",
+        android_url: "https://reports.qingverse.com/daily/2026-07-26"
+      }]
     });
     // The card carries the conclusion, not the body: the 明日跟踪 chapter
     // lives on the platform page the button opens.
@@ -662,7 +760,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     const sends = messageCalls(calls);
     expect(sends).toHaveLength(1);
     const card = cardFrom(sends[0]!);
-    expect(card.body.elements.some((element) => element.tag === "action")).toBe(false);
+    expect(card.body.elements.some((element) => element.tag === "button")).toBe(false);
     expect(JSON.stringify(card)).toContain("请在平台查看全文");
     expect(JSON.stringify(card)).not.toContain("/daily/");
   });

@@ -751,37 +751,62 @@ export function buildReportConclusionCard(payload: ReportDeliveryPayload): Inter
     .slice(0, MAX_CARD_BULLETS)
     .map((bullet) => (bullet.startsWith("-") ? bullet : `- ${bullet}`)));
 
-  const href = resolveReportDeepLink(payload);
+  const link = resolveReportDeepLink(payload);
   if (lines.length === 0) {
     // Honest empty state (§0.4): say the card has nothing rather than pad it.
     lines.push("本次报告未提取到可摘要的结论要点，请在平台查看全文。");
-  } else if (!href) {
-    lines.push("（本部署未配置平台公开地址，请在平台查看全文）");
+  }
+  if (link.href === null) {
+    lines.push(link.disclosure);
   }
 
   return {
     title: payload.title,
     lines,
-    ...(href ? { url: { text: "查看完整报告", href } } : {})
+    ...(link.href ? { url: { text: "查看完整报告", href: link.href } } : {})
   };
 }
 
-// A link only when the caller named BOTH the page kind and the id. Anything
-// else - a missing field, an id buildDeepLink rejects, an unconfigured base
-// url - degrades to a button-free card, because a link that looks right and
-// opens the wrong page is worse than no link at all.
-function resolveReportDeepLink(payload: ReportDeliveryPayload): string | null {
+/**
+ * Either an absolute platform link, or `null` plus the reason THIS card has no
+ * button. A link only when the caller named BOTH the page kind and the id;
+ * anything else degrades to a button-free card, because a link that looks
+ * right and opens the wrong page is worse than no link at all.
+ *
+ * 2026-07-28 (spec drift A2, sibling defect). Three unrelated causes used to
+ * collapse into one hard-coded line, 「（本部署未配置平台公开地址，请在平台查看
+ * 全文）」, so a caller that simply forgot reportKind (which is exactly what
+ * stock-analysis.mjs and official-paper-monitor.mjs had done) produced a card
+ * blaming the deployment's configuration - pointing whoever read it at the
+ * wrong fix entirely. Each cause now names itself.
+ */
+type ReportDeepLink =
+  | { href: string; disclosure?: undefined }
+  | { href: null; disclosure: string };
+
+function resolveReportDeepLink(payload: ReportDeliveryPayload): ReportDeepLink {
   const kind = payload.reportKind;
   const id = payload.reportDate?.trim();
   if (!kind || !id) {
-    return null;
+    return { href: null, disclosure: "（本次报告未指定平台页面，无法生成链接；请在平台查看全文）" };
   }
 
+  let href: string | null;
   try {
-    return buildDeepLink(kind, id);
-  } catch {
-    return null;
+    href = buildDeepLink(kind, id);
+  } catch (error) {
+    // A kind buildDeepLink does not know, or an id it rejects. Reaches here at
+    // runtime because the report callers are plain .mjs with no compiler in the
+    // way, so the actual message is the only thing that identifies the typo.
+    return {
+      href: null,
+      disclosure: `（无法生成报告链接：${sanitizeNotificationError(error).slice(0, 120)}；请在平台查看全文）`
+    };
   }
+
+  return href === null
+    ? { href: null, disclosure: "（本部署未配置平台公开地址 PLATFORM_PUBLIC_BASE_URL，请在平台查看全文）" }
+    : { href };
 }
 
 interface ResolvedReportTarget {
@@ -1151,30 +1176,65 @@ async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string
   }
 }
 
+/**
+ * Serialize an InteractiveCard into the card JSON this repo's ONE card
+ * transport posts to im/v1/messages. The payload declares `schema: "2.0"`, so
+ * every construct in it has to be a card JSON 2.0 construct.
+ *
+ * 2026-07-28 (spec drift A2). It was not. The payload declared 2.0 while its
+ * buttons used card 1.0 syntax: a top-level `url` for navigation, wrapped in a
+ * `{tag: "action"}` module. Per the 2.0 docs
+ * (open.feishu.cn/document/feishu-cards/card-json-v2-components/interactive-
+ * components/button) the button's field table lists `behaviors` as 必填 and
+ * lists neither `url` nor `value`; navigation is an `open_url` behavior and
+ * callbacks are a `callback` behavior. `url`/`multi_url` are 1.0 历史属性. The
+ * 2.0 breaking-change notes (.../card-json-v2-breaking-changes-release-notes)
+ * additionally removed the 备注/交互(action) modules AND changed unsupported
+ * properties from silently ignored to REJECTED with an error - so this was not
+ * merely a dead button, it put every card at risk of being refused. That
+ * covered all five card types this batch produces (report conclusion, alert,
+ * approval, research, review), and no test caught it because they all asserted
+ * the InteractiveCard type instead of the JSON Feishu parses.
+ *
+ * Buttons are body elements in their own right now (2.0 has no action module to
+ * group them); they stack vertically instead of sitting in a row, which is the
+ * cosmetic price of emitting a payload the declared schema actually accepts.
+ */
 export function buildFeishuCardPayload(card: InteractiveCard): unknown {
   const elements: unknown[] = card.lines.map((line) => ({
     tag: "markdown",
     content: line
   }));
 
-  const actions: unknown[] = (card.buttons ?? []).map((button) => ({
-    tag: "button",
-    text: { tag: "plain_text", content: button.text },
-    type: button.style ?? "default",
-    value: { value: button.value }
-  }));
-
-  if (card.url) {
-    actions.push({
+  for (const button of card.buttons ?? []) {
+    elements.push({
       tag: "button",
-      text: { tag: "plain_text", content: card.url.text },
-      type: "default",
-      url: card.url.href
+      text: { tag: "plain_text", content: button.text },
+      type: button.style ?? "default",
+      // The callback data the OpenClaw approval handler reads is unchanged
+      // (`action.value` stays `{value: "<token>"}`); in 2.0 it travels inside
+      // the behavior rather than as a top-level `value` field.
+      behaviors: [{ type: "callback", value: { value: button.value } }]
     });
   }
 
-  if (actions.length > 0) {
-    elements.push({ tag: "action", actions });
+  if (card.url) {
+    elements.push({
+      tag: "button",
+      text: { tag: "plain_text", content: card.url.text },
+      type: "default",
+      // default_url is the only required url; the per-platform ones are
+      // optional overrides. All four are set to the same absolute link so no
+      // client can fall through to a platform field we left blank - these
+      // links come from buildDeepLink, which is platform-agnostic by design.
+      behaviors: [{
+        type: "open_url",
+        default_url: card.url.href,
+        pc_url: card.url.href,
+        ios_url: card.url.href,
+        android_url: card.url.href
+      }]
+    });
   }
 
   return {
