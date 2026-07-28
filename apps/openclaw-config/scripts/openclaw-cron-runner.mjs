@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  deliverReportToFeishu,
+  deliverOperationalAlertToFeishu,
   loadLocalEnv,
   openTradingDatabase,
   resolveRuntimePaths
@@ -97,7 +97,7 @@ const alertBreakerThreshold = Math.max(1, Number(process.env.OPENCLAW_CRON_RUNNE
 const alertRetryBaseMs = Math.max(0, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_RETRY_BASE_MS ?? 60_000));
 const alertRetryMaxMs = Math.max(alertRetryBaseMs, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_RETRY_MAX_MS ?? 15 * 60_000));
 const alertBreakerCooldownMs = Math.max(0, Number(process.env.OPENCLAW_CRON_RUNNER_ALERT_BREAKER_COOLDOWN_MS ?? 30 * 60_000));
-// Hard wall-clock bound on ONE alert send. deliverReportToFeishu talks to a remote HTTP API; a
+// Hard wall-clock bound on ONE alert send. The alert transport talks to a remote HTTP API; a
 // black-holed connection with no timeout would stall the whole poll cycle (the alert passes are
 // awaited inline), which is the same outcome as the runner being dead - so a hang is treated as
 // just another failure and feeds the breaker.
@@ -178,10 +178,18 @@ const discoveryHealth = {
 const ALERT_CHANNEL_REPORT = "feishu-report";
 const alertChannelStates = new Map();
 
-// Injectable transport (tests) - production always uses the real Feishu report delivery. Kept as
+// Injectable transport (tests) - production always uses the real Feishu alert delivery. Kept as
 // a mutable binding rather than a parameter so every call site (including the ones deep inside
 // the persistence-failure escalation path) is covered by one seam.
-let alertDeliverer = deliverReportToFeishu;
+//
+// 2026-07-28 (spec drift A1, CRITICAL): this was bound to deliverReportToFeishu. That call became
+// "render ONE conclusion card and drop the body" when reports moved to card + platform deep link,
+// and alert markdown is not report-shaped (no 窗口 line, no conclusion box, none of the headings
+// the summary extractor looks for) - so every alert this runner emits, the job-failure notice, the
+// halt escalation, the discovery-gap warning and the state-persist failure alike, degraded to a
+// card whose only line was "未提取到可摘要的结论要点". deliverOperationalAlertToFeishu keeps the
+// same {sent, reason} contract and the same channel precedence, and sends the body verbatim.
+let alertDeliverer = deliverOperationalAlertToFeishu;
 
 // Injectable run_log writer (tests) - production opens the trading database per write.
 let runLogRecorder = defaultRunLogRecorder;
@@ -1449,7 +1457,7 @@ export function __getRunnerStateForTest() {
 // edges that touch the network / the database, so tests drive every resilience path through fakes
 // instead of a live gateway or a real sqlite file.
 export function __setAlertDelivererForTest(deliverer) {
-  alertDeliverer = deliverer ?? deliverReportToFeishu;
+  alertDeliverer = deliverer ?? deliverOperationalAlertToFeishu;
 }
 
 export function __setRunLogRecorderForTest(recorder) {

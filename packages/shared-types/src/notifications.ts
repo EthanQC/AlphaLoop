@@ -102,6 +102,41 @@ export interface ReportDeliveryPayload {
   audience?: "group" | "dm";
 }
 
+/**
+ * An operational alert: a cron job failure notice, a halt escalation, a
+ * discovery-gap warning, a state-persistence failure. NOT a report.
+ *
+ * 2026-07-28 (spec drift A1). openclaw-cron-runner.mjs used to send these
+ * through `deliverReportToFeishu`, which was fine while that path pushed the
+ * body as post messages. Once it became ONE conclusion card, every alert
+ * turned into a card with no content: alert markdown carries no 窗口 line, no
+ * conclusion box and none of the headings extractActionableSummaryBullets
+ * looks for, so the card fell through to "未提取到可摘要的结论要点" and the
+ * error, the exit code and the stderr tail were dropped entirely.
+ *
+ * The difference is structural, not cosmetic: a report has a platform page
+ * holding its full text, so a card plus a deep link loses nothing. An alert
+ * has no such page - the body IS the payload, and it ships verbatim.
+ */
+export interface OperationalAlertPayload {
+  title: string;
+  /** The alert body. Delivered in full, never summarized or extracted from. */
+  markdown: string;
+  /**
+   * Split threshold for ONE outbound message. A body longer than this is split
+   * across several messages rather than truncated - an alert that arrives
+   * half-told is worse than one that arrives in two parts.
+   */
+  maxSectionChars?: number;
+}
+
+export interface OperationalAlertResult {
+  sent: boolean;
+  target: NotificationDeliveryTarget;
+  reason?: string;
+  deliveries: ReportDeliveryEntry[];
+}
+
 export interface ReportDeliveryEntry {
   kind: "summary" | "chapter" | "file";
   title: string;
@@ -295,6 +330,158 @@ export async function deliverReportToFeishu(payload: ReportDeliveryPayload): Pro
       reason: `Feishu report user-plugin delivery failed after retries: ${primaryError}`,
       deliveries: []
     };
+  }
+}
+
+/**
+ * Deliver an operational alert to Feishu with its body intact. NEVER throws.
+ *
+ * Channel precedence mirrors deliverReportToFeishu exactly (app credentials,
+ * then the legacy user-plugin MCP channel, then nothing) so an alert reaches
+ * the same operator through the same account a report would - only the
+ * MESSAGE shape differs: post messages carrying the whole body instead of a
+ * conclusion card, because there is no platform page to link to for the rest.
+ *
+ * Alerts always go to the deployment's global/ops target. They are never
+ * owner-scoped, so there is no `openId` on the payload and no group/DM split
+ * to make: FEISHU_GROUP_CHAT_ID belongs to public report cards (§4), an alert
+ * belongs to whoever operates the runner.
+ */
+export async function deliverOperationalAlertToFeishu(
+  payload: OperationalAlertPayload
+): Promise<OperationalAlertResult> {
+  try {
+    return await deliverOperationalAlertParts(payload);
+  } catch (error) {
+    return {
+      sent: false,
+      target: "none",
+      reason: `Feishu operational alert delivery failed: ${sanitizeNotificationError(error)}`,
+      deliveries: []
+    };
+  }
+}
+
+async function deliverOperationalAlertParts(
+  payload: OperationalAlertPayload
+): Promise<OperationalAlertResult> {
+  const parts = splitOperationalAlertBody(payload);
+  const credentials = resolveFeishuAppCredentials();
+  if (credentials) {
+    const target = tryResolveGlobalFeishuTarget();
+    if (!target) {
+      return {
+        sent: false,
+        target: "none",
+        reason: "No Feishu alert target could be resolved. Set FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
+        deliveries: []
+      };
+    }
+    const entryTarget: NotificationDeliveryTarget = target.targetType === "chat_id"
+      ? "feishu-app-chat-id"
+      : "feishu-app-open-id";
+    return sendOperationalAlertParts(parts, payload.title, entryTarget, (part) =>
+      trySendFeishuAppTextMessage(credentials, target, { title: part.title, body: part.body, format: "post" }));
+  }
+
+  const pluginBotReadiness = resolveFeishuUserPluginBotReadiness();
+  if (!pluginBotReadiness.enabled) {
+    return {
+      sent: false,
+      target: "none",
+      reason: [
+        "Feishu operational alert delivery has no usable channel:",
+        "FEISHU_APP_ID/FEISHU_APP_SECRET are not configured and no OpenClaw Feishu app account was found,",
+        `and the legacy user-plugin bot channel is not ready either (${pluginBotReadiness.reason ?? "not ready"}).`
+      ].join(" "),
+      deliveries: []
+    };
+  }
+
+  return sendOperationalAlertParts(parts, payload.title, "feishu-user-plugin-bot-post", async (part) => {
+    try {
+      const result = await sendFeishuUserPluginBotPost({ title: part.title, body: part.body });
+      return { sent: result.sent, ...(result.reason ? { reason: result.reason } : {}) };
+    } catch (error) {
+      return { sent: false, reason: sanitizeNotificationError(error) };
+    }
+  });
+}
+
+interface OperationalAlertPart {
+  title: string;
+  body: string;
+  index: number;
+  parts: number;
+}
+
+/**
+ * The whole body, in as few messages as the size limit allows. A body that is
+ * empty after trimming is DISCLOSED as empty rather than sent as a blank
+ * message - "no body" is a real (if degenerate) alert state, and a silent
+ * blank message reads as a delivery problem instead of the caller's bug.
+ */
+function splitOperationalAlertBody(payload: OperationalAlertPayload): OperationalAlertPart[] {
+  const body = payload.markdown.replace(/\r\n/gu, "\n").trim();
+  const chunks = body
+    ? splitMarkdownText(body, clampInteger(String(payload.maxSectionChars ?? ""), 200, 20_000, 3_600))
+    : ["（本次告警没有正文，请查看 runner 日志。）"];
+  return chunks.map((chunk, index) => ({
+    title: chunks.length > 1 ? `${payload.title}（${index + 1}/${chunks.length}）` : payload.title,
+    body: chunk,
+    index,
+    parts: chunks.length
+  }));
+}
+
+// Stops at the first undelivered part and says which one: half an alert plus a
+// reason naming the missing part is honest; reporting `sent: true` because the
+// first message got through would hide the rest.
+async function sendOperationalAlertParts(
+  parts: OperationalAlertPart[],
+  title: string,
+  entryTarget: NotificationDeliveryTarget,
+  send: (part: OperationalAlertPart) => Promise<{ sent: boolean; reason?: string }>
+): Promise<OperationalAlertResult> {
+  const deliveries: ReportDeliveryEntry[] = [];
+  for (const part of parts) {
+    const result = await send(part);
+    deliveries.push({
+      kind: part.index === 0 ? "summary" : "chapter",
+      title: part.title,
+      target: entryTarget,
+      sent: result.sent,
+      ...(result.reason ? { reason: result.reason } : {}),
+      ...(part.parts > 1 ? { chapter: 1, part: part.index + 1, parts: part.parts } : {})
+    });
+    if (!result.sent) {
+      return {
+        sent: false,
+        target: entryTarget,
+        reason: `运维告警未完整送达（第 ${part.index + 1}/${part.parts} 段「${title}」）：${result.reason ?? "unknown error"}`,
+        deliveries
+      };
+    }
+  }
+
+  return { sent: true, target: entryTarget, deliveries };
+}
+
+// Retry policy matches every other app-credential send in this module
+// (withNotificationRetry: transient network/5xx/429 only, never a 4xx).
+async function trySendFeishuAppTextMessage(
+  credentials: FeishuAppCredentials,
+  target: FeishuAppTarget,
+  payload: NotificationPayload
+): Promise<{ sent: boolean; reason?: string }> {
+  try {
+    await withNotificationRetry(
+      () => postFeishuAppMessage(credentials, target, payload),
+      "feishu operational alert send"
+    );
+    return { sent: true };
+  } catch (error) {
+    return { sent: false, reason: sanitizeNotificationError(error) };
   }
 }
 

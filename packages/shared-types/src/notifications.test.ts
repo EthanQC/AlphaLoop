@@ -8,6 +8,7 @@ import {
   buildFeishuCardPayload,
   buildReportConclusionCard,
   buildReportSummaryMarkdown,
+  deliverOperationalAlertToFeishu,
   deliverReportToFeishu,
   isFeishuProseFailure,
   directHttpCardTransport,
@@ -812,6 +813,224 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(sends).toHaveLength(1);
     expect(sends[0]!.url).toContain("receive_id_type=chat_id");
     expect(sends[0]!.body.receive_id).toBe("oc_group_chat");
+  });
+});
+
+// 2026-07-28 (spec drift A1, CRITICAL regression). openclaw-cron-runner.mjs
+// bound its alert transport to deliverReportToFeishu. Once that path collapsed
+// a report into ONE conclusion card, every runner alert (job failure, halt
+// escalation, discovery gap, state-persist failure) became a card with no
+// content: alert markdown has no 窗口 line, no conclusion box and none of the
+// headings extractActionableSummaryBullets looks for, so the card degraded to
+// the honest-but-useless "未提取到可摘要的结论要点" line and the ENTIRE alert
+// body - the error, the exit code, the stderr tail - was dropped on the floor.
+//
+// An operational alert is not a report: no platform page holds the rest of it
+// and there is nothing to summarize, so the body IS the payload and goes out
+// verbatim. These tests assert the FEISHU-FACING message, not our own payload
+// type, because the abstraction is exactly what hid the regression.
+describe("deliverOperationalAlertToFeishu (operational alerts are not reports)", () => {
+  const realFetch = globalThis.fetch;
+  const envKeys = [
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ACCOUNT_ID",
+    "FEISHU_DOMAIN",
+    "FEISHU_NOTIFY_OPEN_ID",
+    "FEISHU_NOTIFY_CHAT_ID",
+    "FEISHU_GROUP_CHAT_ID",
+    "FEISHU_WEBHOOK_URL",
+    "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
+    "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
+    "FEISHU_USER_PLUGIN_DISABLED",
+    "PLATFORM_PUBLIC_BASE_URL",
+    "HOME"
+  ] as const;
+  const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+  const savedCwd = process.cwd();
+  let tempDir: string | undefined;
+
+  // The real shape openclaw-cron-runner-alerts.mjs produces (buildCronFailure-
+  // AlertMarkdown): "## 摘要" / "## 证据" headings, evidence in fenced blocks.
+  // Deliberately NOT report-shaped - that mismatch is the whole defect.
+  const ALERT_MARKDOWN = [
+    "# OpenClaw 自动报告失败告警",
+    "",
+    "## 摘要",
+    "",
+    "- 任务：daily",
+    "- 命令：pnpm report:daily:run",
+    "- 退出：code=1，signal=null",
+    "",
+    "## 证据",
+    "",
+    "- 错误：子进程返回非零退出码。",
+    "",
+    "### stderr 尾部",
+    "",
+    "```",
+    "Longbridge quote lock timed out after 50s",
+    "```"
+  ].join("\n");
+
+  beforeEach(() => {
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      if (key !== "HOME") {
+        delete process.env[key];
+      }
+    }
+    process.env.FEISHU_APP_ID = "cli_trading_copilot";
+    process.env.FEISHU_APP_SECRET = "app-secret-x";
+    process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (process.cwd() !== savedCwd) {
+      process.chdir(savedCwd);
+    }
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+    if (tempDir) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    }
+  });
+
+  function stubFetch(handler: (url: string) => { status?: number; body: unknown }) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      const out = handler(String(url));
+      return new Response(JSON.stringify(out.body), { status: out.status ?? 200 });
+    }) as typeof fetch;
+    return calls;
+  }
+
+  function okFeishu(url: string) {
+    return url.includes("tenant_access_token")
+      ? { body: { code: 0, tenant_access_token: "t-token-alert", expire: 7200 } }
+      : { body: { code: 0, msg: "success", data: { message_id: "om_alert" } } };
+  }
+
+  function outboundMessages(calls: Array<{ url: string; init: RequestInit }>) {
+    return calls
+      .filter((call) => call.url.includes("/open-apis/im/v1/messages?"))
+      .map((call) => JSON.parse(String(call.init.body)) as {
+        receive_id: string;
+        msg_type: string;
+        content: string;
+      });
+  }
+
+  it("puts the whole alert body in the outbound Feishu message, verbatim", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+    const calls = stubFetch(okFeishu);
+
+    const result = await deliverOperationalAlertToFeishu({
+      title: "OpenClaw 自动报告失败告警：daily",
+      markdown: ALERT_MARKDOWN,
+      maxSectionChars: 3600
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+
+    const sends = outboundMessages(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.receive_id).toBe("ou_operator");
+    // A text/post message, NOT an interactive card: a card summarizes, and an
+    // alert has nothing to summarize from.
+    expect(sends[0]!.msg_type).toBe("post");
+    // Every load-bearing line of the alert must be findable in what Feishu
+    // actually receives - this is the assertion the card path could not pass.
+    for (const needle of [
+      "任务：daily",
+      "命令：pnpm report:daily:run",
+      "退出：code=1，signal=null",
+      "错误：子进程返回非零退出码。",
+      "Longbridge quote lock timed out after 50s"
+    ]) {
+      expect(sends[0]!.content).toContain(needle);
+    }
+  });
+
+  // The regression itself, pinned from the Feishu side: routing an alert
+  // through the report path silently throws the body away.
+  it("is the reason an alert must NOT go through the report path (which drops the body)", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+    const calls = stubFetch(okFeishu);
+
+    await deliverReportToFeishu({
+      title: "OpenClaw 自动报告失败告警：daily",
+      markdown: ALERT_MARKDOWN
+    });
+
+    const sends = outboundMessages(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.msg_type).toBe("interactive");
+    expect(sends[0]!.content).not.toContain("Longbridge quote lock timed out after 50s");
+    expect(sends[0]!.content).not.toContain("退出：code=1");
+  });
+
+  it("splits a long alert across messages instead of truncating it", async () => {
+    process.env.FEISHU_NOTIFY_CHAT_ID = "oc_ops_chat";
+    const calls = stubFetch(okFeishu);
+    const tail = "堆栈第一段".repeat(80);
+    const head = "堆栈第二段".repeat(80);
+
+    const result = await deliverOperationalAlertToFeishu({
+      title: "OpenClaw cron-runner 状态持久化失败",
+      markdown: `# 状态持久化失败\n\n${head}\n\n${tail}`,
+      maxSectionChars: 200
+    });
+
+    expect(result.sent).toBe(true);
+    const sends = outboundMessages(calls);
+    expect(sends.length).toBeGreaterThan(1);
+    const combined = sends.map((send) => send.content).join("");
+    expect(combined).toContain(head.slice(0, 100));
+    expect(combined).toContain(tail.slice(0, 100));
+    expect(result.deliveries.every((entry) => entry.sent)).toBe(true);
+  });
+
+  it("reports {sent:false, reason} - never throws - when no alert target resolves", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "notifications-alert-no-target-"));
+    process.env.HOME = tempDir;
+    process.chdir(tempDir);
+    const calls = stubFetch(okFeishu);
+
+    const result = await deliverOperationalAlertToFeishu({
+      title: "OpenClaw cron-runner 发现盲区：daily",
+      markdown: ALERT_MARKDOWN
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.target).toBe("none");
+    expect(result.reason).toMatch(/FEISHU_NOTIFY_OPEN_ID/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("surfaces a rejected alert send without leaking the tenant token", async () => {
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_bad";
+    stubFetch((url) => url.includes("tenant_access_token")
+      ? { body: { code: 0, tenant_access_token: "secret-token-x", expire: 7200 } }
+      : { status: 400, body: { code: 230001, msg: "invalid receive_id" } });
+
+    const result = await deliverOperationalAlertToFeishu({
+      title: "OpenClaw 自动报告失败告警：daily",
+      markdown: ALERT_MARKDOWN
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.reason).toContain("invalid receive_id");
+    expect(JSON.stringify(result)).not.toContain("secret-token-x");
   });
 });
 

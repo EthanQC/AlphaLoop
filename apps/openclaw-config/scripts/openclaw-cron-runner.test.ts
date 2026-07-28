@@ -839,6 +839,72 @@ describe("alert delivery resilience (2026-07-26 wedge: unbounded alert retries +
     expect(alertCalls.length).toBeGreaterThan(0);
   });
 
+  // 2026-07-28 (spec drift A1, CRITICAL regression). The alert transport was bound to
+  // deliverReportToFeishu, which had become "one conclusion card, body on the platform". Alert
+  // markdown is not report-shaped, so every alert this runner emits arrived as a card whose only
+  // line was "未提取到可摘要的结论要点" - the job, the exit code and the stderr tail were gone.
+  // Every other test in this file injects a fake deliverer and therefore could not see it, so this
+  // one drives the PRODUCTION default and asserts what Feishu actually receives.
+  it("delivers a failure alert through the production transport with the alert body intact", async () => {
+    const runtimeDir = makeTempDir("alphaloop-cron-runner-alert-body-");
+    const fakeDir = makeTempDir("alphaloop-cron-runner-alert-body-fake-");
+    markSeedCompleted(runtimeDir);
+    const cli = writeFakeOpenclawCli(fakeDir, {
+      list: dailyListScenario(1000),
+      runs: { [DAILY_JOB_ID]: { entries: [finishedEntry(1000)] } }
+    });
+    const pnpm = writeFakePnpm(fakeDir, { exitCode: 1 });
+
+    const runner = await importFreshRunner({
+      OPENCLAW_CRON_RUNNER_RUNTIME_DIR: runtimeDir,
+      OPENCLAW_BIN: cli.binPath,
+      PNPM_BIN: pnpm.binPath
+    });
+    // No __setAlertDelivererForTest: this exercises the real binding.
+    runner.__setRunLogRecorderForTest(() => {});
+
+    const realFetch = globalThis.fetch;
+    const feishuEnv = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_NOTIFY_OPEN_ID", "FEISHU_NOTIFY_CHAT_ID", "FEISHU_NOTIFICATION_RETRY_ATTEMPTS"] as const;
+    const savedFeishuEnv = Object.fromEntries(feishuEnv.map((key) => [key, process.env[key]]));
+    const outbound: Array<{ receive_id: string; msg_type: string; content: string }> = [];
+    try {
+      process.env.FEISHU_APP_ID = "cli_trading_copilot";
+      process.env.FEISHU_APP_SECRET = "app-secret-x";
+      process.env.FEISHU_NOTIFY_OPEN_ID = "ou_operator";
+      delete process.env.FEISHU_NOTIFY_CHAT_ID;
+      process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
+      globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+        const href = String(url);
+        if (href.includes("tenant_access_token")) {
+          return new Response(JSON.stringify({ code: 0, tenant_access_token: "t-token", expire: 7200 }), { status: 200 });
+        }
+        outbound.push(JSON.parse(String(init?.body)) as { receive_id: string; msg_type: string; content: string });
+        return new Response(JSON.stringify({ code: 0, msg: "success", data: { message_id: "om_alert" } }), { status: 200 });
+      }) as typeof fetch;
+
+      await runner.pollOpenClawRunLogs();
+    } finally {
+      globalThis.fetch = realFetch;
+      for (const key of feishuEnv) {
+        if (savedFeishuEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = savedFeishuEnv[key];
+        }
+      }
+    }
+
+    expect(readInvocations(pnpm.logPath)).toEqual([["report:daily:run"]]);
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0].receive_id).toBe("ou_operator");
+    // The alert body, not a summary of it: the job, the command, the exit code and the child's own
+    // stderr tail all have to survive into the outbound Feishu message.
+    expect(outbound[0].content).toContain("任务：daily");
+    expect(outbound[0].content).toContain("report:daily:run");
+    expect(outbound[0].content).toContain("code=1");
+    expect(outbound[0].content).toContain("fake pnpm failure");
+  }, 20_000);
+
   it("writes a real run_log row through job-run-log.mjs into the trading database", async () => {
     const runtimeDir = makeTempDir("alphaloop-cron-runner-runlog-sqlite-");
     const fakeDir = makeTempDir("alphaloop-cron-runner-runlog-sqlite-fake-");
