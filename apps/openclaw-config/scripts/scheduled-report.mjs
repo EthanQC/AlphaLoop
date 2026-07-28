@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { MemberRepository, deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import { collectL1News } from "./news-sources.mjs";
@@ -222,16 +222,36 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   const pdfPath = existsSync(reportPdfPath)
     ? reportPdfPath
     : await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
-  // No `openId`: 日报/周报 are 公共通知 (2026-07-12 requirements §0.2 - 群:
-  // 公共通知（报告发布）), not owner-scoped, so delivery uses the global
-  // Feishu target (FEISHU_NOTIFY_CHAT_ID / FEISHU_NOTIFY_OPEN_ID / the stored
-  // one). Owner-scoped reports are the ones that should pass `openId`.
+  // No `openId`, `audience: "group"`: 日报/周报 are 公共通知 (requirements §4 -
+  // 群: 公共报告发布卡), not owner-scoped, so the card goes to the circle's
+  // group chat (FEISHU_GROUP_CHAT_ID). With no group configured the delivery
+  // layer still ships the card to the global target and reports
+  // `groupFallback`, which is recorded below rather than swallowed.
+  // `reportKind`/`reportDate` are what let the card carry the 查看完整报告
+  // button back to /daily/<date> (§1.1).
   const result = await deliverReportToFeishu({
     title: `${titlePrefix} ${info.label}`,
     markdown,
     markdownPath: reportPath,
-    pdfPath
+    pdfPath,
+    audience: "group",
+    reportKind,
+    reportDate: info.label
   });
+
+  // The personal half of §4 (单聊: 个人页摘要). Runs whether or not the public
+  // card made it: the two audiences fail independently, and a group chat
+  // misconfiguration must not also cost every member the page that carries
+  // their own holdings and strategy (which Task 4 removed from the public
+  // body, so this is the ONLY channel that delivers it).
+  const personalCards = await deliverPersonalPageCards({ db, reportKind, date: info.label });
+  if (personalCards.failed.length > 0 || personalCards.skipped.length > 0) {
+    console.error(JSON.stringify({
+      personalCards: { failed: personalCards.failed, skipped: personalCards.skipped },
+      kind: reportKind,
+      label: info.label
+    }, null, 2));
+  }
   // Only stamp `deliveredAt` on entries that actually sent - a not-delivered
   // entry carrying a delivery timestamp is exactly the kind of false record
   // the state file exists to prevent.
@@ -258,6 +278,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
       deliveries,
       deliveryFailedAt: new Date().toISOString(),
       deliveryFailureReason: result.reason ?? "Report delivery was not sent.",
+      personalCards,
       regeneratedDuringDelivery,
       preparedInSameRun: alreadyPrepared
     });
@@ -267,6 +288,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
       label: info.label,
       reason: result.reason ?? "Report delivery was not sent.",
       targets: deliveries.map((entry) => entry.target),
+      personalCards: summarizePersonalCardOutcome(personalCards),
       path: reportPath
     }, null, 2));
     process.exitCode = 1;
@@ -281,6 +303,9 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     chunks: chapterMessages.length,
     deliveries,
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
+    groupFallback: result.groupFallback ?? false,
+    ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
+    personalCards,
     // Clear any failure recorded by an earlier attempt at this same window
     // (updateState merges into the existing entry; undefined drops the key).
     deliveryFailedAt: undefined,
@@ -296,10 +321,194 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     chunks: chapterMessages.length,
     targets: deliveries.map((entry) => entry.target),
     fallbackUsed: deliveries.some((entry) => entry.fallback),
+    groupFallback: result.groupFallback ?? false,
+    ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
+    personalCards: summarizePersonalCardOutcome(personalCards),
     pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
     path: reportPath,
     pdfPath
   }, null, 2));
+
+  // A member who did not get their page IS a failed delivery, even though the
+  // public card went out - the run must not report success for it. A member
+  // with no Feishu account bound is a configuration fact, not a failure, so it
+  // is disclosed above without failing the run.
+  if (personalCards.failed.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
+const PERSONAL_PAGE_KIND_LABELS = { daily: "日报", weekly: "周报" };
+
+// Which owner-only platform page the card's button opens (deep-links.ts).
+const PERSONAL_PAGE_DEEP_LINK_KINDS = { daily: "personal-daily", weekly: "personal-weekly" };
+
+// How much of a personal page fits on a glance card before it stops being a
+// glance surface. The full page is one button-tap away.
+const PERSONAL_CARD_MAX_BULLETS = 4;
+const PERSONAL_CARD_MAX_LINE_CHARS = 160;
+
+/**
+ * §4 单聊: every active member gets THEIR OWN personal page as one card in
+ * their own DM, with a /daily/<date>/me (or /weekly/…) button.
+ *
+ * Reads the pages back out of `personal_pages` rather than taking them from
+ * the generator's return value, so a delivery-only run (the report was
+ * prepared by an earlier invocation) sends exactly the same pages the platform
+ * will show. Nothing is rendered here: a page that does not exist is REPORTED,
+ * never improvised.
+ *
+ * Per-member outcomes are collected, never thrown:
+ *   - `delivered` - the card was sent.
+ *   - `skipped`   - the member has no Feishu account bound; disclosed with the
+ *                   reason, since their page still exists on the platform.
+ *   - `failed`    - the page is missing, or Feishu rejected the card.
+ *
+ * @param {{db: object, reportKind: 'daily'|'weekly', date: string, deliver?: Function}} input
+ */
+export async function deliverPersonalPageCards({ db, reportKind, date, deliver = deliverReportToFeishu } = {}) {
+  if (!db) {
+    throw new Error("deliverPersonalPageCards requires a db handle.");
+  }
+  const kindLabel = PERSONAL_PAGE_KIND_LABELS[reportKind];
+  if (!kindLabel) {
+    throw new Error(`deliverPersonalPageCards supports daily/weekly only, got: ${String(reportKind)}`);
+  }
+  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(date)) {
+    throw new Error(`deliverPersonalPageCards requires a YYYY-MM-DD date, got: ${String(date)}`);
+  }
+
+  const delivered = [];
+  const skipped = [];
+  const failed = [];
+  const selectPage = db.prepare(`
+    SELECT markdown FROM personal_pages WHERE owner_id = ? AND kind = ? AND date = ?
+  `);
+
+  for (const member of new MemberRepository(db).listActive()) {
+    const row = selectPage.get(member.id, reportKind, date);
+    const markdown = row ? String(row.markdown ?? "") : "";
+    if (markdown.trim() === "") {
+      failed.push({
+        ownerId: member.id,
+        reason: `本次${kindLabel}未生成该成员的个人页（personal_pages 无记录），没有可投递的内容。`
+      });
+      continue;
+    }
+
+    const openId = member.feishuOpenId?.trim();
+    if (!openId) {
+      skipped.push({
+        ownerId: member.id,
+        reason: "该成员未绑定飞书 open_id，个人页只能在平台查看；绑定后下一次报告即可送达单聊。"
+      });
+      continue;
+    }
+
+    try {
+      const result = await deliver({
+        title: `我的个人页 · ${kindLabel} ${date}`,
+        markdown,
+        openId,
+        reportKind: PERSONAL_PAGE_DEEP_LINK_KINDS[reportKind],
+        reportDate: date,
+        conclusion: summarizePersonalPage(markdown)
+      });
+      if (result?.sent) {
+        const messageId = result.deliveries?.find((entry) => entry.kind === "summary" && entry.sent)?.detail;
+        delivered.push({ ownerId: member.id, ...(messageId ? { messageId } : {}) });
+      } else {
+        failed.push({
+          ownerId: member.id,
+          reason: result?.reason ?? "个人页卡片未送达（投递层没有给出原因）。"
+        });
+      }
+    } catch (error) {
+      failed.push({ ownerId: member.id, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  return { delivered, skipped, failed };
+}
+
+/**
+ * The card-sized read of a personal page: one headline plus at most four
+ * labelled bullets, each taken VERBATIM from the page (truncated, never
+ * paraphrased) so the card and the page cannot disagree.
+ *
+ * Sections are the `## <n>. <title>` headings personal-page.mjs writes. A page
+ * with no sections yields an empty conclusion, which the card layer turns into
+ * its own honest empty state rather than padding.
+ *
+ * @param {string} markdown
+ * @returns {{headline: string, bullets: string[]}}
+ */
+export function summarizePersonalPage(markdown) {
+  const sections = parsePersonalPageSections(String(markdown ?? ""));
+  if (sections.length === 0) {
+    return { headline: "", bullets: [] };
+  }
+
+  const [holdings, ...rest] = sections;
+  const headline = truncateCardLine(
+    holdings.bullets.find((line) => line.startsWith("速览："))?.slice("速览：".length)
+      ?? holdings.bullets.find((line) => !line.startsWith("数据归属："))
+      ?? holdings.bullets[0]
+      ?? ""
+  );
+
+  const bullets = [];
+  const netChange = holdings.bullets.find((line) => line.startsWith("区间净值变动："));
+  if (netChange) {
+    bullets.push(truncateCardLine(netChange));
+  }
+  for (const section of rest) {
+    if (bullets.length >= PERSONAL_CARD_MAX_BULLETS) {
+      break;
+    }
+    const first = section.bullets[0];
+    if (first) {
+      bullets.push(truncateCardLine(`${section.label}：${first}`));
+    }
+  }
+
+  return { headline, bullets: bullets.slice(0, PERSONAL_CARD_MAX_BULLETS) };
+}
+
+function parsePersonalPageSections(markdown) {
+  const sections = [];
+  for (const rawLine of markdown.replace(/\r\n/gu, "\n").split("\n")) {
+    const line = rawLine.trim();
+    const heading = /^##\s+\d+\.\s+(.+)$/u.exec(line);
+    if (heading?.[1]) {
+      const title = heading[1].trim();
+      sections.push({ title, label: title.replace(/^我的/u, ""), bullets: [] });
+      continue;
+    }
+    const bullet = /^-\s+(.+)$/u.exec(line);
+    if (bullet?.[1] && sections.length > 0) {
+      sections[sections.length - 1].bullets.push(bullet[1].trim());
+    }
+  }
+  return sections;
+}
+
+function truncateCardLine(text) {
+  const single = String(text).replace(/\s+/gu, " ").trim();
+  return single.length > PERSONAL_CARD_MAX_LINE_CHARS
+    ? `${single.slice(0, PERSONAL_CARD_MAX_LINE_CHARS - 1)}…`
+    : single;
+}
+
+// Counts for the run's structured stdout line; the per-member detail (with
+// reasons) goes to the state file and to stderr, so a summary never hides a
+// member who did not get their page.
+function summarizePersonalCardOutcome(personalCards) {
+  return {
+    delivered: personalCards.delivered.length,
+    skipped: personalCards.skipped.length,
+    failed: personalCards.failed.length
+  };
 }
 
 // Exported for the seam test (scheduled-report.test.ts): generates a real

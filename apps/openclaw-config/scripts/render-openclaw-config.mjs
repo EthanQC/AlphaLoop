@@ -55,7 +55,19 @@ export function buildNextConfig({ existing = {}, env = {}, processEnv = {}, repo
   const feishuGroupPolicy = "allowlist";
   // Group ids explicitly supplied via env; only THESE receive a fresh AlphaLoop
   // group entry. Existing groups are preserved verbatim (see mergeFeishuGroups).
-  const envFeishuGroupIds = parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? processEnv.FEISHU_GROUP_ALLOW_FROM ?? "");
+  //
+  // FEISHU_GROUP_CHAT_ID (Task 7, requirements §4) names the ONE group the
+  // public report card is published to. The bot has to be allowed to speak in
+  // that group, so naming it as the report target implies allowlisting it -
+  // otherwise an operator sets the delivery target, the card is posted into a
+  // group the channel config never admitted, and the group's @-bot
+  // conversation stays dead. `unique` keeps it from doubling up when the
+  // operator also listed it in FEISHU_GROUP_ALLOW_FROM.
+  const reportGroupChatId = String(env.FEISHU_GROUP_CHAT_ID ?? processEnv.FEISHU_GROUP_CHAT_ID ?? "").trim();
+  const envFeishuGroupIds = unique([
+    ...parseCsv(env.FEISHU_GROUP_ALLOW_FROM ?? processEnv.FEISHU_GROUP_ALLOW_FROM ?? ""),
+    ...(reportGroupChatId ? [reportGroupChatId] : [])
+  ]);
   const feishuGroupAllowFrom = unique([
     ...envFeishuGroupIds,
     ...collectExistingFeishuGroups(existingFeishu)

@@ -232,6 +232,49 @@ describe("FIX 2: feishu channel is merged, not wholesale-rebuilt", () => {
     expect(feishu.allowFrom).toContain("envUser");
     expect(feishu.dmPolicy).toBe("allowlist");
   });
+
+  // Task 7 (2026-07-28 spec drift, §4 群/单聊分工): FEISHU_GROUP_CHAT_ID names
+  // the group the public report card is posted to. The bot has to be allowed
+  // to speak in that group, so naming it once must also allowlist it - an
+  // operator setting only the report target and finding the group silently
+  // muted is the failure this covers.
+  it("allowlists the public report group named by FEISHU_GROUP_CHAT_ID", () => {
+    const output = buildNextConfig({
+      existing: twoGroupExisting(),
+      env: {
+        FEISHU_APP_ID: "a",
+        FEISHU_APP_SECRET: "b",
+        FEISHU_GROUP_CHAT_ID: "oc_public_group",
+        FEISHU_ALLOW_FROM: "envUser"
+      },
+      processEnv: {},
+      repoRoot: "/repo"
+    });
+    const feishu = output.channels.feishu;
+
+    expect(feishu.groupAllowFrom).toContain("oc_public_group");
+    expect(feishu.accounts.main.groupAllowFrom).toContain("oc_public_group");
+    expect(feishu.groups.oc_public_group.allowFrom).toEqual(["envUser"]);
+    // Existing groups still untouched.
+    expect(feishu.groups.groupA).toEqual({ allowFrom: ["userA"], requireMention: false });
+  });
+
+  it("does not duplicate the report group when FEISHU_GROUP_ALLOW_FROM already lists it", () => {
+    const output = buildNextConfig({
+      existing: {},
+      env: {
+        FEISHU_APP_ID: "a",
+        FEISHU_APP_SECRET: "b",
+        FEISHU_GROUP_ALLOW_FROM: "oc_public_group,oc_other",
+        FEISHU_GROUP_CHAT_ID: "oc_public_group"
+      },
+      processEnv: {},
+      repoRoot: "/repo"
+    });
+    const feishu = output.channels.feishu;
+
+    expect(feishu.groupAllowFrom).toEqual(["oc_public_group", "oc_other"]);
+  });
 });
 
 describe("FIX 3: defensive edges", () => {

@@ -502,6 +502,7 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     "FEISHU_DOMAIN",
     "FEISHU_NOTIFY_OPEN_ID",
     "FEISHU_NOTIFY_CHAT_ID",
+    "FEISHU_GROUP_CHAT_ID",
     "FEISHU_WEBHOOK_URL",
     "FEISHU_NOTIFICATION_RETRY_ATTEMPTS",
     "FEISHU_USER_PLUGIN_BOT_CHAT_ID",
@@ -719,6 +720,78 @@ describe("deliverReportToFeishu app-credential path (2026-07-26 fix)", () => {
     expect(result.deliveries).toHaveLength(1);
     expect(result.deliveries[0]!.sent).toBe(false);
     expect(JSON.stringify(result.deliveries)).not.toContain("secret-token-x");
+  });
+
+  // Task 7 (2026-07-28 spec drift). §4: 群 carries 公共报告发布卡, 单聊 carries
+  // the personal ones. Everything used to land in the same DM because report
+  // delivery had exactly one target notion.
+  it("sends a public report card to the configured group chat instead of the DM target", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      audience: "group",
+      reportKind: "daily",
+      reportDate: "2026-07-26"
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-chat-id");
+    expect(result.groupFallback).toBeFalsy();
+
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=chat_id");
+    expect(sends[0]!.body.receive_id).toBe("oc_public_group");
+  });
+
+  it("falls back to the DM target and says why when no group chat id is configured", async () => {
+    delete process.env.FEISHU_GROUP_CHAT_ID;
+    process.env.FEISHU_NOTIFY_OPEN_ID = "ou_global_member";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "OpenClaw 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      audience: "group",
+      reportKind: "daily",
+      reportDate: "2026-07-26"
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+    expect(result.groupFallback).toBe(true);
+    expect(result.groupFallbackReason).toContain("FEISHU_GROUP_CHAT_ID");
+
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.body.receive_id).toBe("ou_global_member");
+  });
+
+  it("keeps an owner-scoped report in that owner's DM even when a group chat id is configured", async () => {
+    process.env.FEISHU_GROUP_CHAT_ID = "oc_public_group";
+    const calls = stubFetch(okFeishu());
+
+    const result = await deliverReportToFeishu({
+      title: "我的个人页 · 日报 2026-07-26",
+      markdown: REPORT_MARKDOWN,
+      openId: "ou_owner_specific",
+      audience: "group",
+      reportKind: "personal-daily",
+      reportDate: "2026-07-26"
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.target).toBe("feishu-app-open-id");
+    expect(result.groupFallback).toBeFalsy();
+
+    const sends = messageCalls(calls);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.url).toContain("receive_id_type=open_id");
+    expect(sends[0]!.body.receive_id).toBe("ou_owner_specific");
   });
 
   it("stays at one message for a long report - no chapter fan-out to fall back to", async () => {

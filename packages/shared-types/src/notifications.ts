@@ -82,6 +82,24 @@ export interface ReportDeliveryPayload {
   reportKind?: DeepLinkKind;
   reportDate?: string;
   conclusion?: ReportConclusion;
+  /**
+   * Which Feishu channel this report belongs in (2026-07-12 requirements §4).
+   *
+   *   "group" - 公共通知：日报/周报的发布卡 goes to the circle's group chat
+   *             (`FEISHU_GROUP_CHAT_ID`). With no group configured the card
+   *             still ships, to the global DM/notify target, and the result
+   *             says so (`groupFallback`) instead of pretending it reached the
+   *             group.
+   *   "dm" (default) - 个人通道：个人页摘要、提醒、审批、复盘。Pair it with
+   *             `openId` to address one member; an `openId` always wins, so an
+   *             owner-scoped payload never leaks into the group.
+   *
+   * Honored by the app-credential channel, which is the only one production
+   * uses. The legacy user-plugin and degraded-webhook channels each post to
+   * one fixed chat of their own and cannot address a second target; a report
+   * that falls through to them lands wherever that channel points.
+   */
+  audience?: "group" | "dm";
 }
 
 export interface ReportDeliveryEntry {
@@ -104,6 +122,14 @@ export interface ReportDeliveryResult {
   fallback?: boolean;
   reason?: string;
   deliveries: ReportDeliveryEntry[];
+  /**
+   * The payload asked for the group (`audience: "group"`) but this deployment
+   * has no `FEISHU_GROUP_CHAT_ID`, so the card went to the DM/global target.
+   * Set alongside `groupFallbackReason` so the run log records WHY the public
+   * card was not public rather than showing a clean delivery.
+   */
+  groupFallback?: boolean;
+  groupFallbackReason?: string;
 }
 
 export interface InteractiveCardButton {
@@ -455,16 +481,17 @@ async function deliverReportViaFallback(payload: ReportDeliveryPayload, primaryE
 // degraded fallback). splitReportIntoChapterMessages still serves those other
 // two, which have no card transport of their own.
 async function deliverReportViaAppCredentials(payload: ReportDeliveryPayload): Promise<ReportDeliveryResult> {
-  const target = resolveReportDeliveryTarget(payload);
-  if (!target) {
+  const resolved = resolveReportDeliveryTarget(payload);
+  if (!resolved) {
     return {
       sent: false,
       target: "none",
-      reason: "No Feishu report target could be resolved. Pass `openId` on the report payload, set FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
+      reason: "No Feishu report target could be resolved. Pass `openId` on the report payload, set FEISHU_GROUP_CHAT_ID (public reports) / FEISHU_NOTIFY_OPEN_ID / FEISHU_NOTIFY_CHAT_ID, or DM the bot once to seed the stored target.",
       deliveries: []
     };
   }
 
+  const target = resolved.target;
   const entryTarget: NotificationDeliveryTarget = target.targetType === "chat_id"
     ? "feishu-app-chat-id"
     : "feishu-app-open-id";
@@ -479,6 +506,9 @@ async function deliverReportViaAppCredentials(payload: ReportDeliveryPayload): P
     // user-plugin branch above, so a failure still tells the caller where it
     // tried; `sent` is the only success signal.
     target: entryTarget,
+    ...(resolved.groupFallback
+      ? { groupFallback: true, groupFallbackReason: resolved.groupFallbackReason }
+      : {}),
     deliveries: [{
       kind: "summary",
       title: payload.title,
@@ -567,19 +597,70 @@ function resolveReportDeepLink(payload: ReportDeliveryPayload): string | null {
   }
 }
 
-// Per-owner target first, then the global one. Wrapped because
-// resolveFeishuAppTarget touches sqlite and the filesystem, and report
-// delivery must degrade rather than throw.
-function resolveReportDeliveryTarget(payload: ReportDeliveryPayload): FeishuAppTarget | null {
+interface ResolvedReportTarget {
+  target: FeishuAppTarget;
+  groupFallback?: boolean;
+  groupFallbackReason?: string;
+}
+
+/**
+ * Who gets this report card (§4 群/单聊分工):
+ *
+ *   1. `openId` on the payload - an owner-scoped report (个人页/个股分析/个人
+ *      复盘). Wins over everything, including `audience: "group"`, so private
+ *      content can never be routed into the shared group by a caller that set
+ *      both.
+ *   2. `audience: "group"` + `FEISHU_GROUP_CHAT_ID` - the public report card
+ *      lands in the circle's group chat.
+ *   3. `audience: "group"` with no group configured - the card still ships, to
+ *      whatever the global target is, and the caller is told (groupFallback)
+ *      so the run log shows a public report that did not reach the group.
+ *   4. otherwise - the global target, exactly as before.
+ *
+ * Wrapped in try/catch because resolveFeishuAppTarget touches sqlite and the
+ * filesystem, and report delivery must degrade rather than throw.
+ */
+function resolveReportDeliveryTarget(payload: ReportDeliveryPayload): ResolvedReportTarget | null {
   const openId = payload.openId?.trim();
   if (openId) {
     return {
-      targetType: "open_id",
-      targetId: openId,
-      source: "report-payload:openId"
+      target: {
+        targetType: "open_id",
+        targetId: openId,
+        source: "report-payload:openId"
+      }
     };
   }
 
+  if (payload.audience === "group") {
+    const groupChatId = process.env.FEISHU_GROUP_CHAT_ID?.trim();
+    if (groupChatId) {
+      return {
+        target: {
+          targetType: "chat_id",
+          targetId: groupChatId,
+          source: "env:FEISHU_GROUP_CHAT_ID"
+        }
+      };
+    }
+
+    const fallback = tryResolveGlobalFeishuTarget();
+    if (!fallback) {
+      return null;
+    }
+
+    return {
+      target: fallback,
+      groupFallback: true,
+      groupFallbackReason: `未配置 FEISHU_GROUP_CHAT_ID，公共报告卡改发默认目标（${fallback.targetType === "chat_id" ? "会话" : "单聊"}，来源 ${fallback.source}），群里本次没有收到发布卡。`
+    };
+  }
+
+  const target = tryResolveGlobalFeishuTarget();
+  return target ? { target } : null;
+}
+
+function tryResolveGlobalFeishuTarget(): FeishuAppTarget | null {
   try {
     return resolveFeishuAppTarget();
   } catch {
