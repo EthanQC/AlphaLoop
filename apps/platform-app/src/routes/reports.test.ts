@@ -11,6 +11,7 @@ import {
   MemberRepository,
   MonthlyReviewRepository,
   ResearchTaskRepository,
+  createId,
   migrate,
   type Member
 } from "@packages/shared-types";
@@ -34,6 +35,49 @@ function writeReport(repoRoot: string, type: string, filename: string, content: 
   writeFileSync(join(dir, filename), content, "utf8");
 }
 
+/** A real `renderPnlReport` shaped body (official-paper-monitor.mjs): the
+ * account's net assets, cash, position valuation and per-symbol holdings.
+ * These exact numbers are what the B1 assertions below prove a non-owner
+ * never receives. */
+const PAPER_ACCOUNT_MARKDOWN = [
+  "# OpenClaw 模拟盘收支变化 2026-06-17",
+  "",
+  "## 收支变化表",
+  "",
+  "| 对比项 | 净资产 | 现金 | 持仓估值 |",
+  "| --- | ---: | ---: | ---: |",
+  "| 当前 | 122951.22 USD | 122220.08 USD | 731.42 USD |",
+  "",
+  "## 持仓",
+  "",
+  "- QQQ.US：数量 1，成本 663.88 USD，最新价 731.42 USD。"
+].join("\n");
+
+/** Seeds one `official_paper_snapshots` row - the record the report generator
+ * writes in the SAME run that writes `<date>-post-open.md`, and therefore the
+ * only thing on the platform side that can say whose account that file
+ * describes. `ownerId: null` reproduces a pre-schema-v4 historical row. */
+function seedPaperSnapshot(
+  db: DatabaseSync,
+  opts: { fetchedAt: string; ownerId: string | null; reason?: string }
+): void {
+  db.prepare(
+    `INSERT INTO official_paper_snapshots
+     (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    createId("official_paper_snapshot"),
+    opts.fetchedAt,
+    opts.reason ?? "post_open_pnl",
+    122951.22,
+    122220.08,
+    731.42,
+    JSON.stringify([{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, price: 731.42, priceSource: "live" }]),
+    JSON.stringify({ fetchedAt: opts.fetchedAt }),
+    opts.ownerId
+  );
+}
+
 describe("reports routes", () => {
   let repoRoot: string;
   let db: DatabaseSync;
@@ -41,6 +85,8 @@ describe("reports routes", () => {
   let baseUrl: string;
   let token: string;
   let member: Member;
+  let otherToken: string;
+  let otherMember: Member;
 
   beforeEach(async () => {
     repoRoot = mkdtempSync(join(tmpdir(), "platform-app-reports-route-"));
@@ -55,8 +101,15 @@ describe("reports routes", () => {
       status: "active" as const,
       createdAt: "2026-07-01T00:00:00.000Z"
     };
+    // A SECOND active member - the whole point of defect B1 is that an
+    // ordinary active member (not the paper account's owner) must not be able
+    // to read that account's content, and with only one member seeded no test
+    // can ever observe that.
+    otherMember = { ...member, id: "member_2", email: "member2@example.com", displayName: "Member Two" };
     new MemberRepository(db).upsert(member);
+    new MemberRepository(db).upsert(otherMember);
     token = new ApiTokenRepository(db).issue(member.id, "test").token;
+    otherToken = new ApiTokenRepository(db).issue(otherMember.id, "test-other").token;
 
     // Fixed clock (rather than the real wall clock) so the freshness
     // assertions below ("最新" for today's date, "延迟" for an older one)
@@ -77,6 +130,12 @@ describe("reports routes", () => {
 
   function authed(path: string): Promise<Response> {
     return fetch(`${baseUrl}${path}`, { headers: { authorization: `Bearer ${token}` } });
+  }
+
+  /** Same request as `authed`, but as `otherMember` - an ordinary
+   * `status='active'` member who owns no paper account. */
+  function authedAsOther(path: string): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, { headers: { authorization: `Bearer ${otherToken}` } });
   }
 
   describe("GET /reports", () => {
@@ -381,6 +440,10 @@ describe("reports routes", () => {
         "2026-06-17-post-open.md",
         "# 模拟盘收支变化 06-17\n\n收支内容。\n"
       );
+      // official-paper is owner-scoped (defect B1): the snapshot row written
+      // alongside the file is what attributes it, so the viewer only gets a
+      // 200 here because THEY own that day's account snapshot.
+      seedPaperSnapshot(db, { fetchedAt: "2026-06-17T13:40:00.000Z", ownerId: member.id });
 
       const weekly = await authed("/weekly/2026-05-25");
       const stock = await authed("/stock-analysis/2026-06-19");
@@ -428,6 +491,153 @@ describe("reports routes", () => {
       const body = await stock.text();
       expect(body).not.toContain("我的个人页");
       expect(body).not.toContain("/me\"");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Defect B1 (2026-07-28 adversarial review, CRITICAL live exposure):
+  // `/official-paper/<date>` served the paper account's 净资产/现金/持仓明细 to
+  // ANY status='active' member, and the /reports list linked it. The file on
+  // disk carries no owner attribution, so the ONLY honest source is the
+  // `official_paper_snapshots` row the generator wrote in the same run.
+  //
+  // These cases assert the contract that actually decides who sees the
+  // account content - HTTP status + response body + what the listing links -
+  // for every attribution state that column can be in (a real member, the
+  // '__shared__' sentinel, a legacy NULL, two members on one date, nothing at
+  // all). None of them touch an internal helper, so none of them can pass
+  // while the URL still leaks.
+  // -------------------------------------------------------------------------
+  describe("GET /official-paper/<date> is readable ONLY by the member the account belongs to (B1)", () => {
+    const DATE = "2026-06-17";
+    const FETCHED_AT = `${DATE}T13:40:00.000Z`;
+    /** Every account figure the file contains; none may reach a non-owner. */
+    const ACCOUNT_FIGURES = ["122951.22", "122220.08", "731.42", "663.88", "QQQ.US", "净资产"];
+
+    function writePaperReport(): void {
+      writeReport(repoRoot, "official-paper", `${DATE}-post-open.md`, PAPER_ACCOUNT_MARKDOWN);
+    }
+
+    async function expectNoAccountContent(response: Response): Promise<string> {
+      const body = await response.text();
+      for (const figure of ACCOUNT_FIGURES) {
+        expect(body).not.toContain(figure);
+      }
+      return body;
+    }
+
+    it("owner: 200 with the account content (the report is not lost, just owner-scoped)", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+
+      const response = await authed(`/official-paper/${DATE}`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain("122951.22");
+      expect(body).toContain("QQQ.US");
+    });
+
+    it("non-owner: 403 and NOT ONE account figure in the body", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+
+      const response = await authedAsOther(`/official-paper/${DATE}`);
+      expect(response.status).toBe(403);
+      const body = await expectNoAccountContent(response);
+      expect(body).toContain("403 无权访问");
+    });
+
+    it("unattributable ('__shared__' sentinel): 403 for EVERY member, with the reason stated - never guessed onto the only active member", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: "__shared__" });
+
+      for (const response of [await authed(`/official-paper/${DATE}`), await authedAsOther(`/official-paper/${DATE}`)]) {
+        expect(response.status).toBe(403);
+        const body = await expectNoAccountContent(response);
+        expect(body).toContain("无法确认");
+      }
+    });
+
+    it("unattributable (legacy NULL owner_id): 403 for every member", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: null });
+
+      for (const response of [await authed(`/official-paper/${DATE}`), await authedAsOther(`/official-paper/${DATE}`)]) {
+        expect(response.status).toBe(403);
+        await expectNoAccountContent(response);
+      }
+    });
+
+    it("unattributable (two members' snapshots on the same date): 403 for both - ambiguity is not ownership", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+      seedPaperSnapshot(db, { fetchedAt: `${DATE}T13:41:00.000Z`, ownerId: otherMember.id });
+
+      for (const response of [await authed(`/official-paper/${DATE}`), await authedAsOther(`/official-paper/${DATE}`)]) {
+        expect(response.status).toBe(403);
+        await expectNoAccountContent(response);
+      }
+    });
+
+    it("unattributable (no snapshot row at all): 403, not 200 - an unattributed file is never readable", async () => {
+      writePaperReport();
+
+      const response = await authed(`/official-paper/${DATE}`);
+      expect(response.status).toBe(403);
+      await expectNoAccountContent(response);
+    });
+
+    it("a snapshot from another run kind (hourly poll) does not attribute the post-open report file", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id, reason: "hourly_poll" });
+
+      const response = await authed(`/official-paper/${DATE}`);
+      expect(response.status).toBe(403);
+      await expectNoAccountContent(response);
+    });
+
+    it("listing: a non-owner's /reports never links or labels the snapshot, and says how many were withheld", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+      writeReport(repoRoot, "daily", "2026-06-19.md", "# OpenClaw 日报 2026-06-19\n\n公共内容。\n");
+
+      const response = await authedAsOther("/reports");
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).not.toContain(`href="/official-paper/${DATE}"`);
+      expect(body).not.toContain("OpenClaw 模拟盘收支变化");
+      expect(body).toContain("已隐藏 1 份"); // honest disclosure, not a silent drop
+      // The rest of the library is untouched for that member.
+      expect(body).toContain("OpenClaw 日报 2026-06-19");
+    });
+
+    it("listing: the owner's /reports still shows their own snapshot card", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+
+      const body = await (await authed("/reports")).text();
+      expect(body).toContain(`href="/official-paper/${DATE}"`);
+      expect(body).toContain("OpenClaw 模拟盘收支变化 2026-06-17"); // the card's title, not just the type chip
+      expect(body).not.toContain("已隐藏");
+    });
+
+    it("listing: ?type=official-paper for a non-owner lists nothing and discloses why", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id });
+
+      const body = await (await authedAsOther("/reports?type=official-paper")).text();
+      expect(body).not.toContain(`href="/official-paper/${DATE}"`);
+      expect(body).toContain("暂无报告");
+      expect(body).toContain("已隐藏 1 份");
+    });
+
+    it("listing: an unattributable snapshot is withheld from the owner-ish member too, with its own reason", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: null });
+
+      const body = await (await authed("/reports")).text();
+      expect(body).not.toContain(`href="/official-paper/${DATE}"`);
+      expect(body).toContain("归属无法确认");
     });
   });
 });

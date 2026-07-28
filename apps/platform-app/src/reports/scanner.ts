@@ -14,6 +14,24 @@ import { join } from "node:path";
  * for what the UI labels "模拟盘快照" (see routes/reports.ts's TYPE_LABELS). */
 export type ReportType = "daily" | "weekly" | "stock-analysis" | "official-paper";
 
+/**
+ * Report types whose ARTIFACTS ARE ONE MEMBER'S ACCOUNT STATEMENT rather than
+ * circle-wide material. `reports/official-paper/<date>-post-open.md` is
+ * renderPnlReport's output: 净资产 / 现金 / 持仓估值 / 持仓明细 of the paper
+ * account it was fetched from (official-paper-monitor.mjs sendPnlReport).
+ *
+ * Defect B1 (2026-07-28 adversarial review) was exactly that these entries
+ * came back from `scanReports` like any other report, so the /reports list
+ * linked them and the reading page served them to any logged-in member. The
+ * structural half of the fix lives here: `scanReports` NO LONGER RETURNS THEM
+ * AT ALL. A surface that shows report material without resolving ownership
+ * (routes/home.ts's latest-daily card, routes/stock.ts's analysis list, the
+ * /reports library list) therefore cannot surface one by accident - the only
+ * way to obtain these entries is `scanOwnerScopedReports`, whose single
+ * caller (routes/reports.ts) resolves the artifact's owner first.
+ */
+export const OWNER_SCOPED_REPORT_TYPES: readonly ReportType[] = ["official-paper"];
+
 export interface ReportIndexEntry {
   type: ReportType;
   /** `YYYY-MM-DD`, parsed from the filename. */
@@ -27,6 +45,14 @@ export interface ReportIndexEntry {
 }
 
 const REPORT_TYPES: readonly ReportType[] = ["daily", "weekly", "stock-analysis", "official-paper"];
+
+/** The types `scanReports` walks: every scannable type MINUS the owner-scoped
+ * ones. Derived from the two lists above (never a third hand-written literal)
+ * so adding a type to OWNER_SCOPED_REPORT_TYPES removes it from the
+ * unrestricted scan in the same edit. */
+const CIRCLE_VISIBLE_REPORT_TYPES: readonly ReportType[] = REPORT_TYPES.filter(
+  (type) => !OWNER_SCOPED_REPORT_TYPES.includes(type)
+);
 
 /**
  * Every report file scanReports can see today predates the public/personal
@@ -126,18 +152,38 @@ function scanDirectory(repoRoot: string, type: ReportType): ReportIndexEntry[] {
   return entries;
 }
 
-/**
- * Scans `reports/{daily,weekly,stock-analysis,official-paper}` under
- * `repoRoot` and returns every recognized report, newest first (ties broken
- * by type name for determinism). `.pdf` siblings are ignored outright (PDF
- * is retired per plan Global Constraints) and `README.md` is excluded from
- * every directory.
- */
-export function scanReports(repoRoot: string): ReportIndexEntry[] {
+function scanTypes(repoRoot: string, types: readonly ReportType[]): ReportIndexEntry[] {
   const all: ReportIndexEntry[] = [];
-  for (const type of REPORT_TYPES) {
+  for (const type of types) {
     all.push(...scanDirectory(repoRoot, type));
   }
   all.sort((a, b) => b.date.localeCompare(a.date) || a.type.localeCompare(b.type));
   return all;
+}
+
+/**
+ * Scans the CIRCLE-VISIBLE report directories (`reports/{daily,weekly,
+ * stock-analysis}`) under `repoRoot` and returns every recognized report,
+ * newest first (ties broken by type name for determinism). `.pdf` siblings
+ * are ignored outright (PDF is retired per plan Global Constraints) and
+ * `README.md` is excluded from every directory.
+ *
+ * Deliberately EXCLUDES the owner-scoped types - see
+ * OWNER_SCOPED_REPORT_TYPES above (defect B1). Callers that want those must
+ * ask for them via `scanOwnerScopedReports` and gate them on ownership.
+ */
+export function scanReports(repoRoot: string): ReportIndexEntry[] {
+  return scanTypes(repoRoot, CIRCLE_VISIBLE_REPORT_TYPES);
+}
+
+/**
+ * Scans ONLY the owner-scoped report directories (`reports/official-paper`),
+ * same entry shape and ordering as `scanReports`. Every entry returned here
+ * is one member's account statement, so the caller MUST establish which member
+ * each entry belongs to before rendering, listing or linking it (routes/
+ * reports.ts's resolveOfficialPaperAttributions) - "identity-gated" is not
+ * sufficient for this material.
+ */
+export function scanOwnerScopedReports(repoRoot: string): ReportIndexEntry[] {
+  return scanTypes(repoRoot, OWNER_SCOPED_REPORT_TYPES);
 }

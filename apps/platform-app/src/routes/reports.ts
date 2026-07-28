@@ -32,6 +32,35 @@
  * "circle" variant to ever add here. This was the plan's last disabled/"P9
  * 上线" placeholder chip - after this task, `renderReportsListBody` renders
  * NO disabled chips at all.
+ *
+ * 模拟盘快照 IS OWNER-SCOPED, NOT CIRCLE-VISIBLE (defect B1, 2026-07-28)
+ * ---------------------------------------------------------------------
+ * The module header above used to claim "there is no per-owner filtering
+ * needed for reports themselves (report content isn't member-scoped data)".
+ * That was false for ONE type: `reports/official-paper/<date>-post-open.md` is
+ * renderPnlReport's output - the 净资产 / 现金 / 持仓估值 / 持仓明细 of the paper
+ * account it was fetched from - and until this fix, being any `status='active'`
+ * member was enough to read it by URL, with the /reports list linking it.
+ * Requirements §3.1 keeps personal account content off shared surfaces and §5
+ * makes account content owner-scoped, so:
+ *
+ *   - reports/scanner.ts's `scanReports` no longer returns official-paper
+ *     entries at all; only `scanOwnerScopedReports` does.
+ *   - THE ARTIFACT ON DISK CARRIES NO OWNER ATTRIBUTION, so ownership is not
+ *     read from the file and never inferred from "who is asking" or "who is
+ *     the only member". It comes from the `official_paper_snapshots` row that
+ *     official-paper-monitor.mjs's `sendPnlReport` persisted in the SAME run
+ *     that wrote the file: the filename's date is literally
+ *     `snapshot.fetchedAt.slice(0, 10)`, so `substr(fetched_at, 1, 10)` +
+ *     `reason = 'post_open_pnl'` identifies that row exactly, and its
+ *     `owner_id` is the answer (see resolveOfficialPaperAttributions).
+ *   - An artifact whose owner CANNOT be established that way - no such row, a
+ *     legacy NULL `owner_id`, the `'__shared__'` sentinel (which means the
+ *     writer itself could not attribute it), or two members' rows on one date
+ *     - is readable by NOBODY. Guessing an owner would be fabrication, and
+ *     "probably the operator" is not a permission.
+ *   - Withheld entries are DISCLOSED with a count and a reason on the list
+ *     page rather than silently dropped.
  */
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -43,7 +72,13 @@ import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-revie
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderMarkdown, type MarkdownRenderResult } from "../reports/markdown.js";
-import { scanReports, type ReportIndexEntry, type ReportType } from "../reports/scanner.js";
+import {
+  OWNER_SCOPED_REPORT_TYPES,
+  scanOwnerScopedReports,
+  scanReports,
+  type ReportIndexEntry,
+  type ReportType
+} from "../reports/scanner.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
 
@@ -89,6 +124,110 @@ const READING_PATH_SEGMENTS: Record<string, ReportType> = {
   "stock-analysis": "stock-analysis",
   "official-paper": "official-paper"
 };
+
+// ---------------------------------------------------------------------------
+// Ownership of official-paper artifacts (defect B1 - see the module header)
+// ---------------------------------------------------------------------------
+
+/** The `official_paper_snapshots.reason` written by the run that also writes
+ * `reports/official-paper/<date>-post-open.md` (official-paper-monitor.mjs
+ * sendPnlReport: `saveSnapshot(db, snapshot, "post_open_pnl")` immediately
+ * before `writeFileSync(markdownPath, ...)`). Snapshots from any other run
+ * kind (hourly_poll, hourly_poll_per_member, manual) did not produce this
+ * file and therefore say nothing about who it belongs to. */
+const OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl";
+
+/** `owner_id` values that are NOT a member: `'__shared__'` is the writer's own
+ * "could not attribute this to exactly one member" sentinel (official-paper-
+ * monitor.mjs SHARED_OWNER_SENTINEL, mirrored in data/snapshots.ts), and
+ * `'__legacy_system__'` is the v7 migration placeholder identity.ts refuses to
+ * resolve. Neither may ever be treated as an owner who can be matched. */
+const NON_MEMBER_OWNER_IDS: ReadonlySet<string> = new Set(["__shared__", "__legacy_system__"]);
+
+/** Who an on-disk official-paper artifact belongs to. `unattributable` carries
+ * the REASON, which is shown to the member instead of an invented owner. */
+type OfficialPaperAttribution =
+  | { kind: "owner"; ownerId: string }
+  | { kind: "unattributable"; reason: string };
+
+const NO_SNAPSHOT_ROW: OfficialPaperAttribution = {
+  kind: "unattributable",
+  reason: "没有找到与这份快照同一次生成的账户记录（official_paper_snapshots 里没有当天的 post_open_pnl 行）"
+};
+
+/**
+ * Builds `report date -> attribution` for every official-paper artifact, in
+ * one query. The date key is `substr(fetched_at, 1, 10)`, which is exactly how
+ * the writer derived the filename (`snapshot.fetchedAt.slice(0, 10)`) - a
+ * string match on the same value, not a timezone conversion that could drift.
+ *
+ * A date is attributed ONLY when every `post_open_pnl` row on it names ONE
+ * real member. Zero rows, a NULL `owner_id`, a non-member sentinel, or two
+ * members on one date are all `unattributable` WITH A REASON - never resolved
+ * to a best guess, and (see the callers) never readable by anyone.
+ */
+function resolveOfficialPaperAttributions(db: DatabaseSync): Map<string, OfficialPaperAttribution> {
+  const rows = db
+    .prepare(
+      `SELECT substr(fetched_at, 1, 10) AS report_date, owner_id
+       FROM official_paper_snapshots
+       WHERE reason = ?
+       GROUP BY report_date, owner_id`
+    )
+    .all(OFFICIAL_PAPER_REPORT_REASON) as Array<{ report_date?: unknown; owner_id?: unknown }>;
+
+  const ownersByDate = new Map<string, Set<string | null>>();
+  for (const row of rows) {
+    const date = typeof row.report_date === "string" ? row.report_date : null;
+    if (!date) {
+      continue;
+    }
+    const ownerId = typeof row.owner_id === "string" && row.owner_id.length > 0 ? row.owner_id : null;
+    const owners = ownersByDate.get(date) ?? new Set<string | null>();
+    owners.add(ownerId);
+    ownersByDate.set(date, owners);
+  }
+
+  const attributions = new Map<string, OfficialPaperAttribution>();
+  for (const [date, owners] of ownersByDate) {
+    attributions.set(date, attributeOwners(owners));
+  }
+  return attributions;
+}
+
+function attributeOwners(owners: ReadonlySet<string | null>): OfficialPaperAttribution {
+  if (owners.size > 1) {
+    return {
+      kind: "unattributable",
+      reason: "同一天存在多份归属不同的账户记录，无法判断这份文件写的是谁的账户"
+    };
+  }
+  const [ownerId] = [...owners];
+  if (ownerId === null || ownerId === undefined) {
+    return {
+      kind: "unattributable",
+      reason: "当天的账户记录没有归属标注（owner_id 为空，属于 schema v4 之前写入的历史行）"
+    };
+  }
+  if (NON_MEMBER_OWNER_IDS.has(ownerId)) {
+    return {
+      kind: "unattributable",
+      reason: `当天的账户记录归属为占位值 ${ownerId}，写入时就没能确定属于哪一位成员`
+    };
+  }
+  return { kind: "owner", ownerId };
+}
+
+function attributionFor(
+  attributions: Map<string, OfficialPaperAttribution>,
+  date: string
+): OfficialPaperAttribution {
+  return attributions.get(date) ?? NO_SNAPSHOT_ROW;
+}
+
+function isOwnerScopedType(type: ReportType): boolean {
+  return OWNER_SCOPED_REPORT_TYPES.includes(type);
+}
 
 function sendHtml(res: ServerResponse, status: number, body: string): void {
   res.writeHead(status, {
@@ -198,8 +337,17 @@ function renderReportsListPage(
 
   // 研判/复盘 are both DB-backed, owner-scoped lists (never scanned from
   // disk) - see module header. Every other `?type=` value (or none) keeps
-  // the original on-disk `scanReports` behavior unchanged.
-  const entries = isResearchView || isReviewView ? [] : scanReports(deps.repoRoot);
+  // the original on-disk `scanReports` behavior unchanged - except that
+  // scanReports no longer contains ANY owner-scoped artifact (defect B1), so
+  // the viewer's own 模拟盘快照 entries are added back explicitly below.
+  const circleEntries = isResearchView || isReviewView ? [] : scanReports(deps.repoRoot);
+  const owned =
+    isResearchView || isReviewView
+      ? { entries: [], withheld: { otherOwner: 0, unattributable: 0 } }
+      : loadViewerOwnedPaperReports(deps.db, deps.repoRoot, member.id);
+  const entries = [...circleEntries, ...owned.entries].sort(
+    (a, b) => b.date.localeCompare(a.date) || a.type.localeCompare(b.type)
+  );
   const filtered =
     !isResearchView && !isReviewView && typeParam ? entries.filter((entry) => entry.type === typeParam) : entries;
   const researchTasks = isResearchView ? loadOwnerResearchArchive(deps.db, member.id) : [];
@@ -213,11 +361,52 @@ function renderReportsListPage(
     member: { displayName: member.displayName },
     freshness: "最新",
     degraded: [],
-    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks, reviews),
+    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks, reviews, owned.withheld),
     nonce,
     now
   });
   sendHtml(res, 200, page);
+}
+
+/** Counts of official-paper artifacts left OFF this viewer's list, split by
+ * why - disclosed on the page (never silently dropped). */
+interface WithheldPaperReports {
+  /** Attributed to a different member. */
+  otherOwner: number;
+  /** No owner could be established at all, so nobody may read them. */
+  unattributable: number;
+}
+
+/**
+ * The viewer's OWN official-paper artifacts, plus the counts of the ones that
+ * were withheld. `scanOwnerScopedReports` is the only way to obtain these
+ * entries (reports/scanner.ts) and this is its only call site, so no listing
+ * can include one without passing through this ownership decision.
+ */
+function loadViewerOwnedPaperReports(
+  db: DatabaseSync,
+  repoRoot: string,
+  viewerId: string
+): { entries: ReportIndexEntry[]; withheld: WithheldPaperReports } {
+  const candidates = scanOwnerScopedReports(repoRoot);
+  if (candidates.length === 0) {
+    return { entries: [], withheld: { otherOwner: 0, unattributable: 0 } };
+  }
+
+  const attributions = resolveOfficialPaperAttributions(db);
+  const entries: ReportIndexEntry[] = [];
+  const withheld: WithheldPaperReports = { otherOwner: 0, unattributable: 0 };
+  for (const entry of candidates) {
+    const attribution = attributionFor(attributions, entry.date);
+    if (attribution.kind === "unattributable") {
+      withheld.unattributable += 1;
+    } else if (attribution.ownerId === viewerId) {
+      entries.push(entry);
+    } else {
+      withheld.otherOwner += 1;
+    }
+  }
+  return { entries, withheld };
 }
 
 // Owner's own done/degraded research tasks (plan Task 4: "「研判」筛选片从
@@ -317,11 +506,39 @@ function renderReviewArchiveCard(review: TypedMonthlyReview): Html {
     </a>`;
 }
 
+/**
+ * Honest disclosure for official-paper artifacts kept off this list (defect
+ * B1): a member is told HOW MANY were withheld and WHY, so an empty 模拟盘快照
+ * filter never reads as "no snapshot was ever produced". Counts only - no
+ * date, no title, and none of the account content itself.
+ */
+function renderWithheldPaperNote(withheld: WithheldPaperReports): Html {
+  const clauses: string[] = [];
+  if (withheld.otherOwner > 0) {
+    clauses.push(`已隐藏 ${withheld.otherOwner} 份属于其他成员的快照`);
+  }
+  if (withheld.unattributable > 0) {
+    clauses.push(`已隐藏 ${withheld.unattributable} 份归属无法确认的快照`);
+  }
+  if (clauses.length === 0) {
+    return trustedHtml("");
+  }
+  return html`<div class="bento" style="margin-top:10px">
+    <section class="card w2 dt-w4">
+      <h2>模拟盘快照仅本人可见</h2>
+      <p style="margin:0;font-size:13px;color:var(--sub)">
+        模拟盘快照写的是某一位成员账户的资金与仓位，只有该账户归属成员本人能看到：${clauses.join("，")}。
+      </p>
+    </section>
+  </div>`;
+}
+
 function renderReportsListBody(
   entries: ReportIndexEntry[],
   activeType: string | null,
   researchTasks: ResearchTask[],
-  reviews: TypedMonthlyReview[]
+  reviews: TypedMonthlyReview[],
+  withheldPaper: WithheldPaperReports
 ): Html {
   const chips = joinHtml([
     ...TYPE_ORDER.map((type) => renderTypeChip(type, TYPE_LABELS[type], activeType)),
@@ -349,6 +566,7 @@ function renderReportsListBody(
         <div>${chips}</div>
       </section>
     </div>
+    ${isResearchView || isReviewView ? trustedHtml("") : renderWithheldPaperNote(withheldPaper)}
     <div class="bento" style="margin-top:10px">${cards}</div>`;
 }
 
@@ -510,6 +728,69 @@ function renderReadingBody(entry: ReportIndexEntry, rawMd: string, rendered: Mar
     ${REPORT_BODY_STYLE}`;
 }
 
+/**
+ * 403 for an official-paper artifact this member may not read (defect B1).
+ * States the actual reason - "belongs to another member" vs the concrete
+ * reason ownership could not be established - because a 404 would claim the
+ * report does not exist, and an empty page would read like "your account is
+ * empty". Neither is true.
+ */
+function renderPaperForbiddenPage(member: Member, nonce: string, now: Date, detail: Html): string {
+  const body = html`<div class="bento">
+    <section class="card w2 dt-w4">
+      <h2>403 无权访问</h2>
+      ${detail}
+    </section>
+  </div>`;
+  return renderPage({
+    title: "403 无权访问",
+    nav: "reports",
+    member: { displayName: member.displayName },
+    freshness: "最新",
+    degraded: [],
+    bodyHtml: body,
+    nonce,
+    now
+  });
+}
+
+/**
+ * The ownership gate for owner-scoped artifacts. Returns `true` when the
+ * request has been answered with a 403 and the caller must stop.
+ *
+ * Runs BEFORE the entry is looked up and before the file is read, so (a) no
+ * account bytes are loaded for a member who may not have them, and (b) a
+ * non-owner gets the SAME 403 whether or not that date has a file - the
+ * response never reveals which dates exist. The viewer's own id is the only
+ * thing compared against the attribution; nothing in the request can name an
+ * owner.
+ */
+function refusedOwnerScopedReport(
+  res: ServerResponse,
+  deps: ReportsRouteDeps,
+  dateParam: string,
+  member: Member,
+  nonce: string,
+  now: Date
+): boolean {
+  const attribution = attributionFor(resolveOfficialPaperAttributions(deps.db), dateParam);
+  if (attribution.kind === "owner" && attribution.ownerId === member.id) {
+    return false;
+  }
+
+  const detail =
+    attribution.kind === "owner"
+      ? html`<p style="font-size:13px;color:var(--sub)">
+          模拟盘快照写的是某一位成员账户的资金与仓位，只有该账户归属成员本人能打开。这一份不属于你。
+        </p>`
+      : html`<p style="font-size:13px;color:var(--sub)">
+          这份模拟盘快照在磁盘上没有归属标注，系统也无法确认它写的是谁的账户（${attribution.reason}）。为避免把别人的账户内容给错人，它对任何成员都不开放；你自己的账户数据在
+          <a href="/paper" style="color:var(--accent)">模拟盘</a> 页面。
+        </p>`;
+  sendHtml(res, 403, renderPaperForbiddenPage(member, nonce, now, detail));
+  return true;
+}
+
 function renderReadingPage(
   res: ServerResponse,
   deps: ReportsRouteDeps,
@@ -528,7 +809,14 @@ function renderReadingPage(
     return;
   }
 
-  const entries = scanReports(deps.repoRoot);
+  // Owner-scoped types (模拟盘快照) are gated on ownership before anything is
+  // scanned or read - see refusedOwnerScopedReport.
+  const ownerScoped = isOwnerScopedType(type);
+  if (ownerScoped && refusedOwnerScopedReport(res, deps, dateParam, member, nonce, now)) {
+    return;
+  }
+
+  const entries = ownerScoped ? scanOwnerScopedReports(deps.repoRoot) : scanReports(deps.repoRoot);
   const entry = entries.find((candidate) => candidate.type === type && candidate.date === dateParam);
   if (!entry) {
     sendHtml(res, 404, renderNotFoundPage(member, nonce, now));

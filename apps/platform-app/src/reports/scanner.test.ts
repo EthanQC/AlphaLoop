@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { scanReports } from "./scanner.js";
+import { scanOwnerScopedReports, scanReports } from "./scanner.js";
 
 let repoRoot: string;
 
@@ -27,19 +27,44 @@ afterEach(() => {
 });
 
 describe("scanReports", () => {
-  it("scans daily/weekly/stock-analysis/official-paper, mirroring the real reports/ layout", () => {
+  it("scans the circle-visible types (daily/weekly/stock-analysis), mirroring the real reports/ layout", () => {
     writeReport("daily", "2026-06-19.md", "# 日报 2026-06-19\n\n内容。\n");
     writeReport("daily", "2026-06-14.md", "# 日报 2026-06-14\n\n内容。\n");
     writeReport("weekly", "2026-05-25.md", "# 周报 2026-05-25\n\n内容。\n");
     writeReport("stock-analysis", "2026-06-19.md", "# 个股分析 2026-06-19\n\n内容。\n");
+
+    const entries = scanReports(repoRoot);
+
+    expect(entries).toHaveLength(4);
+    expect(entries.map((e) => e.type).sort()).toEqual(["daily", "daily", "stock-analysis", "weekly"].sort());
+  });
+
+  // Defect B1 (2026-07-28 adversarial review): `official-paper` artifacts are
+  // one member's account statement (净资产/现金/持仓明细), so a caller that has
+  // NOT resolved ownership must not be able to obtain them by accident. Every
+  // caller that only shows circle-visible material (routes/home.ts,
+  // routes/stock.ts, the /reports library list) uses scanReports; the single
+  // owner-gated caller has to ask for them by name.
+  it("never returns official-paper entries - owner-scoped artifacts need the explicit call", () => {
+    writeReport("daily", "2026-06-19.md", "# 日报 2026-06-19\n\n内容。\n");
     writeReport("official-paper", "2026-06-17-post-open.md", "# 模拟盘收支变化 2026-06-17\n\n内容。\n");
 
     const entries = scanReports(repoRoot);
 
-    expect(entries).toHaveLength(5);
-    expect(entries.map((e) => e.type).sort()).toEqual(
-      ["daily", "daily", "official-paper", "stock-analysis", "weekly"].sort()
-    );
+    expect(entries.map((e) => e.type)).toEqual(["daily"]);
+    expect(entries.some((e) => e.mdPath.includes("official-paper"))).toBe(false);
+  });
+
+  it("scanOwnerScopedReports returns ONLY the official-paper entries, same shape as scanReports", () => {
+    writeReport("daily", "2026-06-19.md", "# 日报 2026-06-19\n\n内容。\n");
+    writeReport("official-paper", "2026-06-17-post-open.md", "# 模拟盘收支变化 2026-06-17\n\n内容。\n");
+    writeReport("official-paper", "2026-05-31-post-open.md", "# 模拟盘收支变化 2026-05-31\n\n内容。\n");
+
+    const entries = scanOwnerScopedReports(repoRoot);
+
+    expect(entries.map((e) => e.type)).toEqual(["official-paper", "official-paper"]);
+    expect(entries.map((e) => e.date)).toEqual(["2026-06-17", "2026-05-31"]); // newest first
+    expect(entries[0]?.title).toBe("模拟盘收支变化 2026-06-17");
   });
 
   it("excludes README.md from every directory", () => {
@@ -68,7 +93,7 @@ describe("scanReports", () => {
     // NOT be picked up - it doesn't match this type's naming convention.
     writeReport("official-paper", "2026-06-18.md", "# 不应被识别\n\n内容。\n");
 
-    const entries = scanReports(repoRoot);
+    const entries = scanOwnerScopedReports(repoRoot);
 
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ type: "official-paper", date: "2026-06-17" });
