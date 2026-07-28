@@ -454,8 +454,8 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
   const reflection = buildStrategyReflection(current);
 
   const bullets = [
-    renderComparisonBullet("跟前一日", currentAsset, previousDay),
-    renderComparisonBullet("跟上一周最后一个交易日", currentAsset, previousWeek),
+    renderComparisonBullet(PREVIOUS_DAY_COMPARISON, currentAsset, previousDay),
+    renderComparisonBullet(PREVIOUS_WEEK_COMPARISON, currentAsset, previousWeek),
     renderPositionsBullet(current, degradedCount),
     `反思：${reflection.summary}（动作：${reflection.action}）`
   ];
@@ -487,12 +487,32 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
   };
 }
 
-function renderComparisonBullet(label, currentAsset, baseSnapshot) {
+/**
+ * The two baselines this report compares against, described ONCE so the card
+ * bullet and the markdown table cannot disagree about what a row means or about
+ * why a baseline is absent.
+ *
+ * `minGapText` is the gap `findComparisonSnapshot` actually requires, and
+ * `COMPARISON_LOOKBACK_ROWS` is the `LIMIT` that same query actually uses - the
+ * "no baseline" sentence below is generated from the same two values the search
+ * runs on, so it states the real reason rather than a plausible one.
+ */
+const COMPARISON_LOOKBACK_ROWS = 80;
+const PREVIOUS_DAY_COMPARISON = { label: "前一日", minGapText: "24 小时" };
+const PREVIOUS_WEEK_COMPARISON = { label: "上一周最后一个交易日", minGapText: "7 天" };
+
+function missingBaselineSentence(comparison) {
+  return `无可比快照（本次快照之前最近 ${COMPARISON_LOOKBACK_ROWS} 条记录里，没有比它早 ${comparison.minGapText}以上的快照），本次不计算变化。`;
+}
+
+function renderComparisonBullet(comparison, currentAsset, baseSnapshot) {
   if (!baseSnapshot) {
-    return `${label}：无可比快照，本次不计算变化。`;
+    return `跟${comparison.label}：${missingBaselineSentence(comparison)}`;
   }
   const base = summarizeAsset(baseSnapshot);
-  return `${label}：净资产 ${formatFigureDelta(currentAsset.netAssets, base.netAssets)}，现金 ${formatFigureDelta(currentAsset.totalCash, base.totalCash)}`;
+  // Names the baseline snapshot itself, so "跟前一日" is a claim the reader can
+  // check rather than a label over unlabelled arithmetic.
+  return `跟${comparison.label}（基准快照 ${formatShanghaiTime(baseSnapshot.fetchedAt)}）：净资产 ${formatFigureDelta(currentAsset.netAssets, base.netAssets)}，现金 ${formatFigureDelta(currentAsset.totalCash, base.totalCash)}`;
 }
 
 function renderPositionsBullet(snapshot, degradedCount) {
@@ -509,11 +529,32 @@ function renderPositionsBullet(snapshot, degradedCount) {
   return `持仓：${listed}${more}${degraded}。`;
 }
 
+/**
+ * The 收支变化表.
+ *
+ * 2026-07-28 (spec drift R4/F8). Every row used to print the CURRENT snapshot's
+ * net assets/cash/market value in columns 2-4, whichever comparison the row was
+ * labelled with - so 「跟前一日 | 100123.45 USD | ...」 showed today's balances
+ * under headings a reader takes for the comparison point. And a row with no
+ * baseline printed 「基准」 in both delta columns, which reads as "this row IS
+ * the reference", i.e. a baseline that does not exist.
+ *
+ * Now: columns 2-4 belong to the row's OWN snapshot (the 当前 row shows the
+ * current one, a comparison row shows the baseline it names, with that
+ * baseline's timestamp), the delta columns state their own direction in the
+ * header, and a missing baseline says 无可比快照 in every cell plus a note under
+ * the table giving the reason - never a number and never 基准.
+ */
 export function renderPnlReport(current, previousDay, previousWeek) {
   const currentAsset = summarizeAsset(current);
-  const dayAsset = previousDay ? summarizeAsset(previousDay) : null;
-  const weekAsset = previousWeek ? summarizeAsset(previousWeek) : null;
   const reflection = buildStrategyReflection(current);
+  const comparisons = [
+    { comparison: PREVIOUS_DAY_COMPARISON, baseSnapshot: previousDay },
+    { comparison: PREVIOUS_WEEK_COMPARISON, baseSnapshot: previousWeek }
+  ];
+  const missingNotes = comparisons
+    .filter((entry) => !entry.baseSnapshot)
+    .map((entry) => `- ${entry.comparison.label}：${missingBaselineSentence(entry.comparison)}`);
 
   return [
     `# OpenClaw 模拟盘收支变化 ${current.fetchedAt.slice(0, 10)}`,
@@ -528,11 +569,18 @@ export function renderPnlReport(current, previousDay, previousWeek) {
     "",
     "## 收支变化表",
     "",
-    "| 对比项 | 净资产 | 现金 | 持仓估值 | 净资产变化 | 现金变化 |",
+    "| 对比项 | 该行净资产 | 该行现金 | 该行持仓估值 | 净资产变化（当前 − 该行） | 现金变化（当前 − 该行） |",
     "| --- | ---: | ---: | ---: | ---: | ---: |",
-    renderComparisonRow("当前", currentAsset, null),
-    renderComparisonRow("跟前一日", currentAsset, dayAsset),
-    renderComparisonRow("跟上一周最后一个交易日", currentAsset, weekAsset),
+    renderTableRow([
+      "当前",
+      formatMoney(currentAsset.netAssets),
+      formatMoney(currentAsset.totalCash),
+      formatMoney(currentAsset.marketValue),
+      "—（本行即当前快照）",
+      "—（本行即当前快照）"
+    ]),
+    ...comparisons.map((entry) => renderComparisonRow(entry.comparison, currentAsset, entry.baseSnapshot)),
+    ...(missingNotes.length > 0 ? ["", ...missingNotes] : []),
     "",
     "## 持仓",
     "",
@@ -546,15 +594,26 @@ export function renderPnlReport(current, previousDay, previousWeek) {
   ].join("\n");
 }
 
-function renderComparisonRow(label, current, base) {
-  return [
-    label,
-    formatMoney(current.netAssets),
-    formatMoney(current.totalCash),
-    formatMoney(current.marketValue),
-    base ? formatFigureDelta(current.netAssets, base.netAssets) : "基准",
-    base ? formatFigureDelta(current.totalCash, base.totalCash) : "基准"
-  ].join(" | ").replace(/^/u, "| ").replace(/$/u, " |");
+function renderTableRow(cells) {
+  return `| ${cells.join(" | ")} |`;
+}
+
+/** One baseline row: the named snapshot's own figures, then what changed
+ * between it and the current snapshot. A baseline that does not exist prints
+ * 无可比快照 in every cell - not a number, and not 基准. */
+function renderComparisonRow(comparison, currentAsset, baseSnapshot) {
+  if (!baseSnapshot) {
+    return renderTableRow([comparison.label, "无可比快照", "无可比快照", "无可比快照", "无可比快照", "无可比快照"]);
+  }
+  const base = summarizeAsset(baseSnapshot);
+  return renderTableRow([
+    `${comparison.label}（${formatShanghaiTime(baseSnapshot.fetchedAt)}）`,
+    formatMoney(base.netAssets),
+    formatMoney(base.totalCash),
+    formatMoney(base.marketValue),
+    formatFigureDelta(currentAsset.netAssets, base.netAssets),
+    formatFigureDelta(currentAsset.totalCash, base.totalCash)
+  ]);
 }
 
 function renderPositionLines(snapshot) {
@@ -647,11 +706,13 @@ export function estimateMarketValue(snapshot) {
 function findComparisonSnapshot(db, fetchedAt, mode) {
   const currentMs = new Date(fetchedAt).getTime();
   const offsetMs = mode === "previous_day" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+  // The LIMIT comes from the same constant the "no baseline" disclosure quotes,
+  // so the sentence can never describe a search this query does not run.
   const rows = db.prepare(`
     SELECT raw FROM official_paper_snapshots
     WHERE fetched_at < ?
     ORDER BY fetched_at DESC
-    LIMIT 80
+    LIMIT ${COMPARISON_LOOKBACK_ROWS}
   `).all(fetchedAt);
   const target = rows.find((row) => currentMs - new Date(JSON.parse(String(row.raw)).fetchedAt).getTime() >= offsetMs);
   if (!target) {

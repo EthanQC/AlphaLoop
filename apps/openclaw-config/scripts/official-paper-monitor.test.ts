@@ -219,6 +219,105 @@ describe("renderPnlReport: report reading discloses per-position degradation", (
   });
 });
 
+// 2026-07-28 (spec drift R4/F8). Every row of the 收支变化表 printed the CURRENT
+// snapshot's net assets/cash/market value in columns 2-4 - so 「跟前一日 |
+// 100123.45 USD | ...」 put today's balances under headings a reader takes for
+// the comparison point - and a row with no baseline printed 「基准」 in the delta
+// columns, i.e. announced a reference point that does not exist.
+//
+// These assert the rendered LINES, so they fail on the text a reader actually
+// gets rather than on a helper's return value.
+describe("renderPnlReport 收支变化表: every row says what it actually is (spec drift R4/F8)", () => {
+  const CURRENT = buildSnapshot({
+    fetchedAt: "2026-07-28T14:00:00.000Z",
+    primaryAsset: { net_assets: "100123.45", total_cash: "40000" },
+    positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 663.88 }],
+    quotes: [{ symbol: "QQQ.US", last: 663.88 }]
+  });
+  const PREVIOUS_DAY = buildSnapshot({
+    fetchedAt: "2026-07-27T14:00:00.000Z",
+    primaryAsset: { net_assets: "99000", total_cash: "40000" },
+    positions: [{ symbol: "QQQ.US", quantity: 1, costPrice: 663.88, priceSource: "live", price: 600 }],
+    quotes: [{ symbol: "QQQ.US", last: 600 }]
+  });
+
+  function tableLines(markdown: string): string[] {
+    return markdown.split("\n").filter((line) => line.startsWith("| "));
+  }
+
+  it("gives the comparison row the BASELINE's own figures, not a repeat of the current ones", () => {
+    const markdown = officialPaperMonitor.renderPnlReport(CURRENT, PREVIOUS_DAY, null);
+    const lines = tableLines(markdown);
+
+    expect(lines).toContain(
+      "| 前一日（2026-07-27 22:00） | 99000.00 USD | 40000.00 USD | 600.00 USD | +1123.45 USD | +0.00 USD |"
+    );
+    // The exact defect: the previous-day row carrying the current snapshot's
+    // 100123.45/40000.00/663.88 under 净资产/现金/持仓估值.
+    expect(markdown).not.toContain("| 前一日（2026-07-27 22:00） | 100123.45 USD");
+    // And the column headings now name whose figures they are.
+    expect(lines[0]).toBe(
+      "| 对比项 | 该行净资产 | 该行现金 | 该行持仓估值 | 净资产变化（当前 − 该行） | 现金变化（当前 − 该行） |"
+    );
+  });
+
+  it("says 无可比快照 with the reason - never 基准 - for a baseline that does not exist", () => {
+    const markdown = officialPaperMonitor.renderPnlReport(CURRENT, PREVIOUS_DAY, null);
+
+    expect(tableLines(markdown)).toContain(
+      "| 上一周最后一个交易日 | 无可比快照 | 无可比快照 | 无可比快照 | 无可比快照 | 无可比快照 |"
+    );
+    expect(markdown).toContain(
+      "- 上一周最后一个交易日：无可比快照（本次快照之前最近 80 条记录里，没有比它早 7 天以上的快照），本次不计算变化。"
+    );
+    // 基准 announced a reference point; there is none.
+    expect(markdown).not.toContain("基准 |");
+    // And a missing baseline is never rendered as a computed change.
+    expect(markdown).not.toContain("| 上一周最后一个交易日 | 100123.45 USD");
+  });
+
+  it("marks the 当前 row's delta cells as the row itself, not as a comparison", () => {
+    const markdown = officialPaperMonitor.renderPnlReport(CURRENT, null, null);
+
+    expect(tableLines(markdown)).toContain(
+      "| 当前 | 100123.45 USD | 40000.00 USD | 663.88 USD | —（本行即当前快照） | —（本行即当前快照） |"
+    );
+  });
+
+  it("states the same missing-baseline reason in the card bullet as in the report", () => {
+    const bullets = officialPaperMonitor.buildPnlDeliveryPayload({
+      current: CURRENT,
+      previousDay: null,
+      previousWeek: null,
+      markdown: officialPaperMonitor.renderPnlReport(CURRENT, null, null),
+      markdownPath: "/tmp/x.md",
+      pdfPath: "/tmp/x.pdf",
+      scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" }
+    }).conclusion.bullets.join("\n");
+
+    expect(bullets).toContain(
+      "跟前一日：无可比快照（本次快照之前最近 80 条记录里，没有比它早 24 小时以上的快照），本次不计算变化。"
+    );
+    expect(bullets).toContain(
+      "跟上一周最后一个交易日：无可比快照（本次快照之前最近 80 条记录里，没有比它早 7 天以上的快照），本次不计算变化。"
+    );
+  });
+
+  it("names the baseline snapshot in the card bullet when one exists", () => {
+    const bullets = officialPaperMonitor.buildPnlDeliveryPayload({
+      current: CURRENT,
+      previousDay: PREVIOUS_DAY,
+      previousWeek: null,
+      markdown: officialPaperMonitor.renderPnlReport(CURRENT, PREVIOUS_DAY, null),
+      markdownPath: "/tmp/x.md",
+      pdfPath: "/tmp/x.pdf",
+      scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" }
+    }).conclusion.bullets.join("\n");
+
+    expect(bullets).toContain("跟前一日（基准快照 2026-07-27 22:00）：净资产 +1123.45 USD，现金 +0.00 USD");
+  });
+});
+
 describe("runManualSnapshot: audit item (b) - environment assertion is no longer skipped", () => {
   const originalEnv = { ...process.env };
 
