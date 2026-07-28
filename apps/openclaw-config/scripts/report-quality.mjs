@@ -767,27 +767,118 @@ function extractChineseRatioPercent(markdown) {
 // (no NEW_FORMAT_SECTION_MARKER) are skipped entirely - this is a NEW gate
 // only meaningful once Task 7's event-clustering section (with its per-event
 // "原文链接" URLs) exists to sample from.
-export async function validateReportUrls(markdown, { fetchImpl, sampleSize = 5, timeoutMs = 5000 } = {}) {
+// 2026-07-28 OUTAGE FIX (four consecutive weekly runs died on
+// `news.url_reachability:https://wallstreetcn.com/livenews/3140449`, after
+// which the cron-runner halted the weekly job entirely). The gate used to
+// treat ANY single sampled URL that did not answer `ok` right now as a hard
+// failure, and deliverReport threw the finished report away over it. That is
+// the wrong test for what this gate actually exists to catch.
+//
+// What it exists to catch: a FABRICATED link (an LLM inventing a
+// plausible-looking URL). What it kept catching instead: the external world -
+// publisher rate-limiting (429), a transient 5xx, a China-network
+// reachability quirk, a request that timed out. None of those say anything
+// about whether the link is real.
+//
+// New semantics - classify, then judge on the aggregate:
+//   - reachable          : the origin answered about this specific resource
+//                          (any status < 400, plus 401/403 - "you may not
+//                          read it" still proves the resource exists).
+//   - hard   (404/410)   : the origin says this resource does not exist.
+//                          This is exactly what a fabricated link looks like.
+//   - transient (429/5xx/network error/timeout/no-fetch-in-runtime): we
+//                          learned nothing about the link.
+//
+// FAIL policy (URL_HARD_FAILURE_THRESHOLD):
+//   - >= 2 hard failures in the sample -> fail. One 404 is ordinary link rot
+//     (news orgs unpublish and re-slug constantly); two independent "this
+//     does not exist" answers in a 5-link sample is the fabrication signal.
+//   - zero reachable URLs while at least one was actually probed -> fail.
+//     A wholly invented source list resolves nowhere; this is the case where
+//     "everything failed" IS evidence.
+//   - otherwise pass, but report `unverified` so the caller can DISCLOSE it.
+//     Never let "we could not check" print as "verified".
+//
+// The one deliberate exception to the all-failed rule is a runtime with no
+// fetch at all (`unverifiable: true`): nothing was probed, so there is no
+// evidence of anything. It does not hard-fail a report over an environment
+// quirk, and it does not silently pass either - it forces the disclosure.
+export const URL_HARD_FAILURE_THRESHOLD = 2;
+
+export async function validateReportUrls(
+  markdown,
+  { fetchImpl, sampleSize = 5, timeoutMs = 5000, retryDelayMs = 400 } = {}
+) {
   const text = normalizeText(markdown);
   if (!isNewFormatReport(text)) {
-    return buildResult([]);
+    return buildUrlResult({ failures: [], unverified: [], sampled: 0, probed: 0 });
   }
 
   const urls = extractReportUrls(text);
   const sample = urls.length <= sampleSize ? urls : urls.slice(0, sampleSize);
-  const failures = [];
+  const hard = [];
+  const unverified = [];
+  let reachableCount = 0;
+  let probedCount = 0;
   for (const url of sample) {
-    // eslint-disable-next-line no-await-in-loop -- sequential HEAD checks
-    // keep the failure list deterministically ordered and keep this
-    // trivially testable with a simple fake fetchImpl; report generation
-    // runs at most a handful of these (sampleSize, default 5), so the
-    // sequential cost is negligible against the plan's <=15 minute budget.
-    const reachable = await checkUrlReachable(url, { fetchImpl, timeoutMs });
-    if (!reachable) {
-      failures.push(`news.url_reachability:${url}`);
+    // eslint-disable-next-line no-await-in-loop -- sequential checks keep the
+    // failure list deterministically ordered and keep this trivially testable
+    // with a simple fake fetchImpl; at most `sampleSize` (5) of them run.
+    const verdict = await classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs });
+    if (verdict.status !== "no_fetch") {
+      probedCount += 1;
     }
+    if (verdict.status === "reachable") {
+      reachableCount += 1;
+      continue;
+    }
+    if (verdict.status === "hard") {
+      hard.push(`news.url_reachability:${url}`);
+    }
+    unverified.push({ url, reason: verdict.reason });
   }
-  return buildResult(failures);
+
+  const unverifiable = probedCount === 0 && sample.length > 0;
+  const allFailed = probedCount > 0 && reachableCount === 0;
+  const failures = hard.length >= URL_HARD_FAILURE_THRESHOLD || allFailed ? [...hard] : [];
+  if (allFailed && failures.length === 0) {
+    failures.push("news.url_reachability:all_sampled_unreachable");
+  }
+
+  return buildUrlResult({
+    failures,
+    unverified,
+    sampled: sample.length,
+    probed: probedCount,
+    hardCount: hard.length,
+    unverifiable
+  });
+}
+
+function buildUrlResult({ failures, unverified, sampled, probed, hardCount = 0, unverifiable = false }) {
+  const base = buildResult(failures);
+  return {
+    ...base,
+    sampled,
+    probed,
+    hardCount,
+    unverifiable,
+    unverified,
+    // A one-line, honest disclosure the report can carry verbatim. Only
+    // produced when something really was left unverified AND the gate passed
+    // (a failing gate blocks delivery, so there is nothing to disclose).
+    disclosure: base.ok && unverified.length > 0 ? buildUrlDisclosure({ sampled, unverified, unverifiable }) : null
+  };
+}
+
+// Matches the report's existing tail-statistics bullet style (来源分布 /
+// 中文源占比 / 事件稀少提示): a single "- <label>：<facts>。" line.
+export const URL_DISCLOSURE_PREFIX = "- 链接核验";
+
+function buildUrlDisclosure({ sampled, unverified, unverifiable }) {
+  const reasons = Array.from(new Set(unverified.map((entry) => entry.reason)));
+  const why = unverifiable ? "运行环境不具备联网核验能力" : reasons.join("、");
+  return `${URL_DISCLOSURE_PREFIX}：抽样 ${sampled} 条原文链接，其中 ${unverified.length} 条未能核验（${why}），未核验不等于链接已确认有效，也不等于已确认失效。`;
 }
 
 function extractReportUrls(markdown) {
@@ -798,23 +889,85 @@ function extractReportUrls(markdown) {
   return Array.from(urls);
 }
 
-async function checkUrlReachable(url, { fetchImpl, timeoutMs = 5000 } = {}) {
+// 401/403 mean "this resource exists, you just may not read it" - a
+// fabricated URL does not get an auth challenge, it gets a 404. 405 means the
+// origin rejects HEAD as a method, which says nothing about the resource;
+// that case falls through to the GET-with-Range fallback below.
+const HARD_MISSING_STATUSES = new Set([404, 410]);
+const EXISTS_DESPITE_ERROR_STATUSES = new Set([401, 403]);
+
+async function classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs }) {
   const impl = fetchImpl ?? globalThis.fetch;
   if (typeof impl !== "function") {
-    // No fetch available in this runtime - treat as unreachable rather than
-    // silently skipping the check (never let "we couldn't check" masquerade
-    // as "it's fine").
-    return false;
+    return { status: "no_fetch", reason: "运行时无 fetch" };
   }
+  // One retry with backoff: rate-limits and transient 5xx/network blips are
+  // overwhelmingly one-shot, and a second attempt is cheap at sampleSize 5.
+  // A hard 404/410 is never retried - the origin already gave a definitive
+  // answer, and retrying it only burns the delivery budget.
+  let last = { status: "transient", reason: "网络异常" };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0 && retryDelayMs > 0) {
+      // eslint-disable-next-line no-await-in-loop -- deliberate backoff
+      await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+    }
+    // eslint-disable-next-line no-await-in-loop -- sequential by design
+    last = await probeUrlOnce(url, { impl, timeoutMs });
+    if (last.status === "reachable" || last.status === "hard") {
+      return last;
+    }
+  }
+  return last;
+}
+
+async function probeUrlOnce(url, { impl, timeoutMs }) {
+  const head = await requestUrl(url, { impl, timeoutMs, method: "HEAD" });
+  if (head.status === "http" && head.code === 405) {
+    // Some publishers reject HEAD outright. Retry as a ranged GET so we pull
+    // one byte instead of the whole article.
+    const ranged = await requestUrl(url, {
+      impl,
+      timeoutMs,
+      method: "GET",
+      headers: { Range: "bytes=0-0" }
+    });
+    return interpret(ranged);
+  }
+  return interpret(head);
+}
+
+function interpret(outcome) {
+  if (outcome.status === "error") {
+    return { status: "transient", reason: outcome.reason };
+  }
+  if (outcome.ok || (outcome.code > 0 && outcome.code < 400) || EXISTS_DESPITE_ERROR_STATUSES.has(outcome.code)) {
+    return { status: "reachable" };
+  }
+  if (!(outcome.code > 0)) {
+    // A response object that is neither ok nor carries a status code tells us
+    // nothing definitive - classify it transient, never as "does not exist".
+    return { status: "transient", reason: "无状态码响应" };
+  }
+  if (HARD_MISSING_STATUSES.has(outcome.code)) {
+    return { status: "hard", reason: `HTTP ${outcome.code}` };
+  }
+  return { status: "transient", reason: `HTTP ${outcome.code}` };
+}
+
+async function requestUrl(url, { impl, timeoutMs, method, headers }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await impl(url, { method: "HEAD", signal: controller.signal });
-    return Boolean(response?.ok);
-  } catch {
-    // Any thrown error - network failure, abort-on-timeout, malformed URL -
-    // is "unreachable", per the task brief ("timeout 5s = unreachable").
-    return false;
+    const response = await impl(url, { method, signal: controller.signal, ...(headers ? { headers } : {}) });
+    // A fetchImpl that returns nothing at all is a broken stub, not evidence
+    // about the URL.
+    if (!response || typeof response !== "object") {
+      return { status: "error", reason: "无响应" };
+    }
+    const code = typeof response.status === "number" ? response.status : (response.ok ? 200 : 0);
+    return { status: "http", ok: Boolean(response.ok), code };
+  } catch (error) {
+    return { status: "error", reason: error?.name === "AbortError" ? "请求超时" : "网络异常" };
   } finally {
     clearTimeout(timer);
   }

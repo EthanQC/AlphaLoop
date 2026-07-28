@@ -360,7 +360,9 @@ describe("Phase 4 Task 6 - era compatibility rule (new gates are strictly opt-in
     let called = false;
     const result = await validateReportUrls(legacyReport, { fetchImpl: async () => { called = true; return { ok: false }; } });
 
-    expect(result).toEqual({ ok: true, failures: [] });
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.disclosure).toBeNull();
     expect(called).toBe(false);
   });
 
@@ -377,7 +379,9 @@ describe("Phase 4 Task 6 - era compatibility rule (new gates are strictly opt-in
     const urlResult = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       fetchImpl: async () => ({ ok: true })
     });
-    expect(urlResult).toEqual({ ok: true, failures: [] });
+    expect(urlResult.ok).toBe(true);
+    expect(urlResult.failures).toEqual([]);
+    expect(urlResult.disclosure).toBeNull();
 
     const numericResult = validateNarrativeNumbers(GOOD_NEW_FORMAT_REPORT, GOOD_SAMPLE_FACTS);
     expect(numericResult).toEqual({ ok: true, failures: [] });
@@ -456,22 +460,18 @@ describe("Phase 4 Task 6 - news.chinese_ratio", () => {
   });
 });
 
-describe("Phase 4 Task 6 - validateReportUrls (news.url_reachability)", () => {
-  it("fails and names the dead URL when a sampled link is unreachable", async () => {
-    const deadUrl = "https://wallstreetcn.com/live/2";
-    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      fetchImpl: async (url) => ({ ok: url !== deadUrl })
-    });
+// 2026-07-28 outage fix. The gate used to fail on ANY single unreachable
+// sampled URL, and deliverReport threw the finished report away over it - four
+// consecutive weekly runs died on one wallstreetcn.com link and the cron
+// runner halted the weekly job. These tests pin the threshold+disclosure
+// semantics that replaced it.
+describe("validateReportUrls - threshold + disclosure (news.url_reachability)", () => {
+  const fast = { retryDelayMs: 0 } as const;
 
-    expect(result.ok).toBe(false);
-    expect(result.failures).toContain(`news.url_reachability:${deadUrl}`);
-  });
-
-  it("treats a thrown/timed-out fetch as unreachable", async () => {
+  it("fails when every sampled URL is unreachable (a wholly invented source list resolves nowhere)", async () => {
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      fetchImpl: async () => {
-        throw new Error("timeout");
-      }
+      ...fast,
+      fetchImpl: async () => ({ ok: false, status: 404 })
     });
 
     expect(result.ok).toBe(false);
@@ -479,12 +479,177 @@ describe("Phase 4 Task 6 - validateReportUrls (news.url_reachability)", () => {
     expect(result.failures.every((failure) => failure.startsWith("news.url_reachability:"))).toBe(true);
   });
 
+  it("fails when a whole-network outage leaves nothing reachable, even with zero hard 404s", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async () => {
+        throw new Error("network down");
+      }
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("news.url_reachability:all_sampled_unreachable");
+  });
+
+  it("PASSES with a disclosure when a single link times out (the production outage case)", async () => {
+    const flaky = "https://wallstreetcn.com/live/2";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => {
+        if (url === flaky) {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          throw error;
+        }
+        return { ok: true, status: 200 };
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.unverified).toEqual([{ url: flaky, reason: "请求超时" }]);
+    expect(result.disclosure).toContain("链接核验");
+    expect(result.disclosure).toContain("1 条未能核验");
+    expect(result.disclosure).toContain("请求超时");
+  });
+
+  it("PASSES with a disclosure for a single 429 rate-limit", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 429 : 200 })
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toContain("HTTP 429");
+  });
+
+  it("PASSES with a disclosure for a single transient 5xx", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 503 : 200 })
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toContain("HTTP 503");
+  });
+
+  it("counts a 404 as a HARD failure but does not fail the gate on one (ordinary link rot)", async () => {
+    const dead = "https://reuters.com/example-3";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => ({ ok: url !== dead, status: url === dead ? 404 : 200 })
+    });
+
+    expect(result.hardCount).toBe(1);
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toContain("HTTP 404");
+  });
+
+  it("fails once HARD failures reach the threshold (two independent 'does not exist' answers)", async () => {
+    const dead = ["https://reuters.com/example-3", "https://cls.cn/telegraph/1"];
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => ({ ok: !dead.includes(url), status: dead.includes(url) ? 410 : 200 })
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain(`news.url_reachability:${dead[0]}`);
+    expect(result.failures).toContain(`news.url_reachability:${dead[1]}`);
+  });
+
+  it("retries once with backoff before classifying a URL as unreachable", async () => {
+    const attempts: string[] = [];
+    const flaky = "https://cls.cn/telegraph/1";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => {
+        attempts.push(url);
+        if (url === flaky && attempts.filter((entry) => entry === flaky).length === 1) {
+          return { ok: false, status: 503 };
+        }
+        return { ok: true, status: 200 };
+      }
+    });
+
+    expect(attempts.filter((entry) => entry === flaky)).toHaveLength(2);
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toBeNull();
+  });
+
+  it("does not retry a definitive 404", async () => {
+    const dead = "https://reuters.com/example-3";
+    const attempts: string[] = [];
+    await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => {
+        attempts.push(url);
+        return { ok: url !== dead, status: url === dead ? 404 : 200 };
+      }
+    });
+
+    expect(attempts.filter((entry) => entry === dead)).toHaveLength(1);
+  });
+
+  it("falls back to a ranged GET when the publisher rejects HEAD with 405, and counts it reachable", async () => {
+    const picky = "https://wallstreetcn.com/live/2";
+    const methods: string[] = [];
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string, init: { method: string; headers?: Record<string, string> }) => {
+        if (url !== picky) {
+          return { ok: true, status: 200 };
+        }
+        methods.push(init.method);
+        if (init.method === "HEAD") {
+          return { ok: false, status: 405 };
+        }
+        expect(init.headers?.Range).toBe("bytes=0-0");
+        return { ok: true, status: 200 };
+      }
+    });
+
+    expect(methods).toEqual(["HEAD", "GET"]);
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toBeNull();
+  });
+
+  it("treats 401/403 as reachable - an auth wall proves the resource exists", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 403 : 200 })
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toBeNull();
+  });
+
+  it("in a runtime with no fetch: does not silently pass (forces a disclosure) and does not hard-fail the report", async () => {
+    const originalFetch = globalThis.fetch;
+    // @ts-expect-error - deliberately simulating a runtime without fetch
+    delete globalThis.fetch;
+    try {
+      const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, fast);
+
+      // Nothing was probed, so there is no evidence of fabrication - failing
+      // the report over an environment quirk would repeat the outage this fix
+      // exists to end. But the report must never claim verification it did
+      // not perform, so the disclosure is mandatory.
+      expect(result.ok).toBe(true);
+      expect(result.unverifiable).toBe(true);
+      expect(result.probed).toBe(0);
+      expect(result.disclosure).toContain("运行环境不具备联网核验能力");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("samples all links when there are fewer than sampleSize", async () => {
     const checked: string[] = [];
     await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      fetchImpl: async (url) => {
+      ...fast,
+      fetchImpl: async (url: string) => {
         checked.push(url);
-        return { ok: true };
+        return { ok: true, status: 200 };
       },
       sampleSize: 5
     });

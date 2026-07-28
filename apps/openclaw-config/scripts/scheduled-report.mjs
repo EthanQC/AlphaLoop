@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,8 +22,7 @@ import {
 } from "./report-data.mjs";
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
-import { assertReportQuality, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";
-import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
+import { assertReportQuality, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
 import { writeMarkdownPdf } from "./report-rendering.mjs";
 
 // Phase 4 Task 7: news-search budgets/limits (Global Constraints - spec
@@ -143,19 +142,36 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // anywhere - both are strictly opt-in to the new-format marker (see their
   // own era-compatibility comments in report-quality.mjs), so running them
   // unconditionally here is safe for legacy-format reports (they no-op).
-  // Matches assertReportQuality's existing failure contract exactly (throw
-  // with the failure-code list) - this codebase has no
-  // regenerate-then-degrade-with-disclosure retry loop anywhere today for a
-  // validateReportMarkdown-family failure to model after, so failing loud
-  // here (same as assertReportQuality above) is the one behavior this can
-  // consistently match rather than inventing new, unspecified retry
-  // machinery at delivery time.
+  // validateNarrativeNumbers still throws: a narrative number that does not
+  // match daily_facts is OUR OWN output being wrong, and shipping it would
+  // ship a false claim.
+  //
+  // validateReportUrls no longer throws for every unreachable link. 2026-07-28
+  // outage: four consecutive weekly runs died on a single wallstreetcn.com
+  // link that did not answer, the cron-runner halted the weekly job after 3
+  // same-class failures, and weekly reports stopped shipping. Reachability of
+  // a third-party news URL is not something this pipeline controls, so the
+  // gate now judges the aggregate (see URL_HARD_FAILURE_THRESHOLD in
+  // report-quality.mjs): fabrication-grade evidence still blocks delivery,
+  // while a link we merely could not verify is DISCLOSED in the report
+  // instead of destroying it. The disclosure is appended before the PDF is
+  // rendered and before delivery, so the file on disk, the PDF and the
+  // Feishu message all carry the same honest text.
   const db = openTradingDatabase(dbPath);
   const urlCheck = await validateReportUrls(markdown, { timeoutMs: 5000 });
   const dailyFacts = getDailyFacts(db, info.label);
   const numericCheck = validateNarrativeNumbers(markdown, dailyFacts);
   if (!urlCheck.ok || !numericCheck.ok) {
     throw new Error(`报告质量校验失败：${[...urlCheck.failures, ...numericCheck.failures].join(", ")}`);
+  }
+  if (urlCheck.disclosure) {
+    markdown = appendUrlVerificationDisclosure(markdown, urlCheck.disclosure);
+    writeFileSync(reportPath, markdown, "utf8");
+    // The prepared PDF (if any) predates the disclosure - drop it so the
+    // renderer below rebuilds it from the disclosed markdown.
+    if (existsSync(reportPdfPath)) {
+      rmSync(reportPdfPath, { force: true });
+    }
   }
 
   const pdfPath = existsSync(reportPdfPath)
@@ -1609,6 +1625,26 @@ export function isPreparedReportMarkdownComplete(markdown) {
     "长桥行情",
     "QQQ 行情"
   ].every((marker) => text.includes(marker));
+}
+
+// Places the link-verification disclosure where the report already keeps its
+// other honesty lines: the tail-statistics block of 多源新闻（事件聚类）,
+// directly beside 新闻来源分布/中文源占比/事件稀少提示. Falls back to the end
+// of the document when that block is absent (legacy-format report), so the
+// disclosure can never be silently dropped. Idempotent: re-delivering an
+// already-disclosed report does not stack duplicate lines.
+export function appendUrlVerificationDisclosure(markdown, disclosure) {
+  const text = String(markdown ?? "");
+  if (!disclosure || text.includes(disclosure)) {
+    return text;
+  }
+  const lines = text.split("\n");
+  const anchor = lines.findLastIndex((line) => line.trimStart().startsWith("- 中文源占比："));
+  if (anchor === -1) {
+    return `${text.replace(/\s*$/u, "")}\n\n${disclosure}\n`;
+  }
+  lines.splice(anchor + 1, 0, disclosure);
+  return lines.join("\n");
 }
 
 export function resolveReportWindow(reportKind, explicitDate) {

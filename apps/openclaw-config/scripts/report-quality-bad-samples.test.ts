@@ -254,14 +254,33 @@ describe("bad sample: 中文占比 20% (news.chinese_ratio)", () => {
 });
 
 describe("bad sample: 死链 (news.url_reachability)", () => {
-  it("fails news.url_reachability and names the dead URL when the injected fetchImpl reports it unreachable", async () => {
+  // 2026-07-28: one dead link is link rot, not fabrication - it is disclosed,
+  // not fatal (see report-quality.mjs's URL_HARD_FAILURE_THRESHOLD). The
+  // fabricated-source-list sample below is what still has to fail.
+  it("discloses a single 404'd link without destroying the report", async () => {
     const deadUrl = "https://reuters.com/example-3";
     const result = await validateReportUrls(goodNewFormatReport(), {
-      fetchImpl: async (url) => ({ ok: url !== deadUrl })
+      retryDelayMs: 0,
+      fetchImpl: async (url) => ({ ok: url !== deadUrl, status: url === deadUrl ? 404 : 200 })
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(1);
+    expect(result.unverified.map((entry) => entry.url)).toContain(deadUrl);
+    expect(result.disclosure).toContain("链接核验");
+  });
+
+  it("fails news.url_reachability and names the dead URLs when the sample looks fabricated (>=2 hard 404s)", async () => {
+    const deadUrls = ["https://reuters.com/example-3", "https://cls.cn/telegraph/1"];
+    const result = await validateReportUrls(goodNewFormatReport(), {
+      retryDelayMs: 0,
+      fetchImpl: async (url) => ({ ok: !deadUrls.includes(url), status: deadUrls.includes(url) ? 404 : 200 })
     });
 
     expect(result.ok).toBe(false);
-    expect(result.failures).toContain(`news.url_reachability:${deadUrl}`);
+    for (const deadUrl of deadUrls) {
+      expect(result.failures).toContain(`news.url_reachability:${deadUrl}`);
+    }
   });
 });
 

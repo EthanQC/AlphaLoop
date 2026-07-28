@@ -422,3 +422,42 @@ describe("news channel labels (deriveChannelLabel)", () => {
     expect(markdown).toContain("渠道：未知渠道");
   });
 });
+
+// 2026-07-28 outage fix: deliverReport no longer throws away a finished report
+// because a third-party news link did not answer; it appends this disclosure
+// instead (see report-quality.mjs's URL_HARD_FAILURE_THRESHOLD comment).
+describe("appendUrlVerificationDisclosure", () => {
+  const disclosure = "- 链接核验：抽样 3 条原文链接，其中 1 条未能核验（请求超时），未核验不等于链接已确认有效，也不等于已确认失效。";
+
+  it("places the disclosure with the report's other tail-statistics lines", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, buildFixtureData());
+
+    const disclosed = scheduledReport.appendUrlVerificationDisclosure(markdown, disclosure);
+    const lines = disclosed.split("\n");
+    const ratioIndex = lines.findIndex((line: string) => line.startsWith("- 中文源占比："));
+
+    expect(ratioIndex).toBeGreaterThan(-1);
+    expect(lines[ratioIndex + 1]).toBe(disclosure);
+    // The disclosure must not disturb any gate the report already passes.
+    expect(validateReportMarkdown(disclosed, { kind: "daily" }).ok).toBe(true);
+  });
+
+  it("is idempotent across a re-delivery of an already-disclosed report", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, buildFixtureData());
+    const once = scheduledReport.appendUrlVerificationDisclosure(markdown, disclosure);
+
+    expect(scheduledReport.appendUrlVerificationDisclosure(once, disclosure)).toBe(once);
+  });
+
+  it("appends at the end rather than dropping the disclosure when there is no statistics block", () => {
+    const disclosed = scheduledReport.appendUrlVerificationDisclosure("# 旧格式报告\n\n- 无来源统计\n", disclosure);
+
+    expect(disclosed.trimEnd().endsWith(disclosure)).toBe(true);
+  });
+
+  it("returns the markdown untouched when there is nothing to disclose", () => {
+    expect(scheduledReport.appendUrlVerificationDisclosure("# 报告", null)).toBe("# 报告");
+  });
+});
