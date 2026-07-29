@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  REPORT_DELIVERY_DESCRIPTION,
   createId,
   deliverReportToFeishu,
   loadLocalEnv,
@@ -45,10 +46,12 @@ import {
   nasdaqAssetClassOrder,
   resolveInstrumentKind
 } from "./stock-analysis-sources.mjs";
-import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
+  PATH_PROBABILITY_BOUNDS,
+  PATH_PROBABILITY_DISCLOSURE,
   extractStockAnalysisStatistics,
   formatMovingAverage,
+  formatPathProbability,
   mergeFundamentalSnapshots,
   normalizeFinnhubMetrics,
   normalizeNasdaqHistorical,
@@ -246,6 +249,69 @@ async function runScheduled(db, force = false) {
   await runAnalysis(db, { force });
 }
 
+// ---------------------------------------------------------------------------
+// On-demand single-symbol analysis (Task 24, 2026-07-28 spec-drift
+// remediation). Spec §3.4 says 个股分析 is produced "每 3 天批量 + 按需 + 站内
+// 研究触发" and §4 lists 分析请求 among the Feishu conversation capabilities,
+// but until now the only two ways in were the 3-day batch and `prepare`, a
+// dry-run that writes a `-preview.md` file and prints paths. Neither is
+// something a member can ask for in a chat.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO, and why:
+//
+//   - it does not write reports/stock-analysis/<date>.md. That filename is the
+//     day's DELIVERED batch archive, and it is what the platform's stock page
+//     reads (scanner.ts anchors on `<date>.md`, routes/stock.ts picks the
+//     newest report containing a `## SYMBOL` section). One member asking about
+//     one symbol must not replace every other symbol's public analysis for
+//     that day.
+//   - it does not write stock_facts, analysis_predictions or
+//     stock_analysis_runs. persistStockFacts REPLACES the (trading_day,
+//     symbol) pair, so an on-demand run would silently rewrite the ground
+//     truth the day's delivered batch was numerically validated against.
+//   - it therefore also skips narrative orchestration, which needs those
+//     persisted facts. The answer is the deterministic 9-section analysis -
+//     complete, every number computed from the quote/history/fundamentals
+//     just fetched, with no model prose appended. The returned envelope says
+//     so in `note` rather than letting the reader assume otherwise.
+//
+// So this is a READ: fetch, render, hand back. Safe to run at any time, from
+// any number of chats at once, with no effect on the public analysis library.
+export async function runAnalyzeOnDemand(symbols, { fetchRecords = fetchStockAnalysisRecords, now = new Date() } = {}) {
+  const requested = (Array.isArray(symbols) ? symbols : []).map(normalizeSymbol).filter(Boolean);
+  if (requested.length !== 1) {
+    throw new Error("Usage: stock-analysis.mjs analyze <SYMBOL>（一次只分析一只标的，例如 analyze NVDA.US）");
+  }
+  const symbol = requested[0];
+
+  const generatedAt = now.toISOString();
+  const label = generatedAt.slice(0, 10);
+  const { records, failedSymbols } = await fetchRecords([symbol], { generatedAt });
+  if (records.length === 0) {
+    const reason = failedSymbols[0]?.error ?? "未知原因";
+    throw new Error(`无法获取 ${symbol} 的行情数据，本次按需分析没有产出：${reason}`);
+  }
+
+  const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
+  // The same structural gate a delivered batch has to pass. An on-demand
+  // answer a member reads in Feishu is held to the report's own standard, not
+  // to a lower one.
+  assertStockAnalysisQuality(markdown);
+
+  return {
+    ok: true,
+    onDemand: true,
+    symbol,
+    generatedAt,
+    published: false,
+    note:
+      "按需分析：只读，未写入公共分析库，也未记录预测。本节结论由确定性事实直接生成，"
+      + `没有叠加模型叙述。公共版个股分析仍按每 ${STOCK_ANALYSIS_INTERVAL_DAYS} 天的节奏发布，`
+      + `可在平台 /stock/${symbol} 页面查看。`,
+    markdown
+  };
+}
+
 async function runAnalysis(db, { deliver = true, targetsOverride = null, narrativeBackend = createNarrativeLlmBackend() } = {}) {
   const targets = Array.isArray(targetsOverride) && targetsOverride.length
     ? [...new Set(targetsOverride.map(normalizeSymbol).filter(Boolean))]
@@ -289,7 +355,7 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
 
   const markdown = renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols });
   assertStockAnalysisQuality(markdown);
-  const { markdownPath, pdfPath } = resolveReportPaths(reportsDir, label, deliver);
+  const { markdownPath } = resolveReportPaths(reportsDir, label, deliver);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
 
   // Phase 5 Task 5 (2026-07-15 plan) minor (b): predictions are written
@@ -299,15 +365,13 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   // table with rows for a report that was never actually delivered/archived
   // (flagged by Task 2's own comment as deferred to this task). Now gated by
   // `deliver` via persistPredictionsIfDelivered - a `prepare` dry-run writes
-  // its markdown/pdf to the `-preview` path (resolveReportPaths above) purely
+  // its markdown to the `-preview` path (resolveReportPaths above) purely
   // for human inspection and writes NOTHING to analysis_predictions.
   persistPredictionsIfDelivered(db, deliver, markdownPath, markdown, records);
 
-  await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
-
   const deliveredSymbols = records.map((record) => record.symbol);
   if (!deliver) {
-    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath, pdfPath }, null, 2));
+    console.log(JSON.stringify({ prepared: true, delivered: false, symbols: deliveredSymbols, failedSymbols, markdownPath }, null, 2));
     return;
   }
 
@@ -336,8 +400,7 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
   const delivery = await deliverReportToFeishu(buildStockAnalysisDeliveryPayload({
     label,
     markdown,
-    markdownPath,
-    pdfPath
+    markdownPath
   }));
   // 2026-07-26: a failed Feishu delivery must NOT discard a successfully
   // generated analysis. This used to throw BEFORE the stock_analysis_runs
@@ -357,9 +420,9 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
 
   const runId = createId("stock_analysis_run");
   db.prepare(`
-    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, pdfPath, JSON.stringify(delivery));
+    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, delivery)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(runId, generatedAt, JSON.stringify(deliveredSymbols), markdownPath, JSON.stringify(delivery));
 
   const { state, envelope } = buildStockAnalysisRunSummary({
     delivery,
@@ -367,8 +430,7 @@ async function runAnalysis(db, { deliver = true, targetsOverride = null, narrati
     generatedAt,
     deliveredSymbols,
     failedSymbols,
-    markdownPath,
-    pdfPath
+    markdownPath
   });
   writeState(state);
   console.log(JSON.stringify(envelope, null, 2));
@@ -414,8 +476,7 @@ export function buildStockAnalysisRunSummary({
   generatedAt,
   deliveredSymbols,
   failedSymbols,
-  markdownPath,
-  pdfPath
+  markdownPath
 }) {
   const groupFallbackFields = {
     groupFallback: delivery.groupFallback ?? false,
@@ -430,7 +491,6 @@ export function buildStockAnalysisRunSummary({
       symbols: deliveredSymbols,
       failedSymbols,
       markdownPath,
-      pdfPath,
       ...groupFallbackFields,
       ...(delivery.sent ? {} : { deliveryReason: delivery.reason })
     }
@@ -468,12 +528,11 @@ export function buildStockAnalysisRunSummary({
  * direct test, instead of being an object literal buried in a path that needs
  * live Longbridge data to reach.
  */
-export function buildStockAnalysisDeliveryPayload({ label, markdown, markdownPath, pdfPath }) {
+export function buildStockAnalysisDeliveryPayload({ label, markdown, markdownPath }) {
   return {
     title: `OpenClaw 个股分析 ${label}`,
     markdown,
     markdownPath,
-    pdfPath,
     scope: { visibility: "circle-public" },
     audience: "group",
     reportKind: "stock-analysis",
@@ -511,7 +570,7 @@ export async function fetchStockAnalysisRecords(targets, { fetchRecord = fetchSt
 // per-symbol isolation above). Exported and kept as a standalone,
 // dependency-injectable-free function (only db + plain data in, no network)
 // so it is directly unit-testable without exercising runAnalysis's heavier
-// network/PDF/delivery side effects - mirrors this file's existing pattern
+// network/delivery side effects - mirrors this file's existing pattern
 // of testing fetchStockAnalysisRecords/renderBatchStockAnalysis in isolation
 // rather than the CLI-facing runAnalysis orchestrator itself.
 export function persistStockFactsForRecords(db, tradingDay, records) {
@@ -551,7 +610,7 @@ const NARRATIVE_SECTION_KEYS = ["basic", "thesis", "fundamentals", "catalysts", 
 // same "test the exported piece, not the CLI orchestrator" convention as
 // persistStockFactsForRecords above - so a test can drive this directly with
 // a fake backend and a real (temp) db, without exercising runAnalysis's
-// heavier network/PDF/delivery side effects.
+// heavier network/delivery side effects.
 //
 // A record with no facts at all (should not happen for a real fetch, but
 // defensively handled) still gets a `narrative` result: getStockFacts
@@ -653,7 +712,7 @@ export function persistPredictionsForRecords(db, reportPath, markdown, records) 
 // Phase 5 Task 5 (2026-07-15 plan) minor (b): the "predictions only on a
 // real delivered run, never for a `prepare` dry-run" gate, extracted as its
 // own pure/network-free function so it is directly unit-testable without
-// exercising runAnalysis's heavier network/PDF/delivery side effects (same
+// exercising runAnalysis's heavier network/delivery side effects (same
 // convention as persistStockFactsForRecords/attachNarrativeSections above).
 // runAnalysis calls this instead of calling persistPredictionsForRecords
 // directly - see that call site's own comment for why this gate exists.
@@ -665,12 +724,12 @@ export function persistPredictionsIfDelivered(db, deliver, reportPath, markdown,
 }
 
 // Phase 5 Task 5 (2026-07-15 plan) minor (b): a `prepare` dry-run (deliver:
-// false) writes to `<label>-preview.md`/`.pdf` - NEVER `<label>.md`/`.pdf`,
+// false) writes to `<label>-preview.md` - NEVER `<label>.md`,
 // which is reserved for a real delivered archive (a `run`/`scheduled`
 // invocation). Previously `prepare` and `run` wrote to the exact same path,
 // so re-running `prepare` for a same-day preview could silently overwrite
 // that day's already-delivered archive file on disk (the delivered Feishu
-// message/PDF attachment itself was unaffected, but the on-disk archive a
+// message itself was unaffected, but the on-disk archive a
 // human or another tool might later open no longer matched what was
 // actually sent). Extracted as its own pure function (reportsDir/label/
 // deliver in, paths out - no fs/db/network) so this exact "-preview never
@@ -682,8 +741,7 @@ export function persistPredictionsIfDelivered(db, deliver, reportPath, markdown,
 export function resolveReportPaths(reportsDir, label, deliver) {
   const suffix = deliver ? "" : "-preview";
   return {
-    markdownPath: join(reportsDir, `${label}${suffix}.md`),
-    pdfPath: join(reportsDir, `${label}${suffix}.pdf`)
+    markdownPath: join(reportsDir, `${label}${suffix}.md`)
   };
 }
 
@@ -739,8 +797,23 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
   const newsTitles = selectDiverseNewsArticles(news, 6).map((entry) => entry.titleZh ?? entry.title).join("；");
   const nextMonthlyExpiry = nextUsMonthlyOptionExpiry(new Date());
   const trendBias = historyStats.trendScore;
-  const bullishProbability = Math.round(Math.min(60, Math.max(20, 35 + (pct ?? 0) + trendBias)));
-  const bearishProbability = Math.round(Math.min(55, Math.max(20, 32 - (pct ?? 0) - trendBias)));
+  // Bases/clamps come from stock-analysis-metrics.mjs's PATH_PROBABILITY_BOUNDS
+  // (Task 23) so that PATH_PROBABILITY_DISCLOSURE - the sentence printed next
+  // to these numbers, which spells the bases and clamp ranges out - is built
+  // from the SAME constants the arithmetic uses and cannot describe a rule
+  // this line no longer follows.
+  const bullishProbability = Math.round(
+    Math.min(
+      PATH_PROBABILITY_BOUNDS.bullishMax,
+      Math.max(PATH_PROBABILITY_BOUNDS.bullishMin, PATH_PROBABILITY_BOUNDS.bullishBase + (pct ?? 0) + trendBias)
+    )
+  );
+  const bearishProbability = Math.round(
+    Math.min(
+      PATH_PROBABILITY_BOUNDS.bearishMax,
+      Math.max(PATH_PROBABILITY_BOUNDS.bearishMin, PATH_PROBABILITY_BOUNDS.bearishBase - (pct ?? 0) - trendBias)
+    )
+  );
   const neutralProbability = Math.max(0, 100 - bullishProbability - bearishProbability);
 
   const conclusionBoxParams = buildConclusionBoxParams({
@@ -805,9 +878,10 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
       "当前系统不执行、不模拟、不建议任何期权自动化，仅把期权交割作为现货波动影响因素。"
     ],
     conclusion: [
-      `上行路径（约 ${formatPercent(bullishProbability)}）：若守住 ${formatNumber(historyStats.support ?? support)} 并放量突破 ${formatNumber(historyStats.resistance ?? resistance)}，短线偏上行。`,
-      `震荡路径（约 ${formatPercent(neutralProbability)}）：若价格继续围绕日内区间运行且新闻没有改变基本面，维持观察。`,
-      `回撤路径（约 ${formatPercent(bearishProbability)}）：若跌破 ${formatNumber(historyStats.support ?? support)} 且新闻/宏观共振转弱，短线偏回撤。`,
+      `上行路径（约 ${formatPathProbability(bullishProbability)}）：若守住 ${formatNumber(historyStats.support ?? support)} 并放量突破 ${formatNumber(historyStats.resistance ?? resistance)}，短线偏上行。`,
+      `震荡路径（约 ${formatPathProbability(neutralProbability)}）：若价格继续围绕日内区间运行且新闻没有改变基本面，维持观察。`,
+      `回撤路径（约 ${formatPathProbability(bearishProbability)}）：若跌破 ${formatNumber(historyStats.support ?? support)} 且新闻/宏观共振转弱，短线偏回撤。`,
+      PATH_PROBABILITY_DISCLOSURE,
       upsidePotential,
       "复盘标签：stock-analysis、support-resistance、options-expiry-watch、prediction-review。"
     ],
@@ -987,19 +1061,26 @@ function computeReviewDate(generatedAt) {
 
 // 核心结论: picks the highest-probability of the three existing paths
 // (bullish/neutral/bearish, from buildDeterministicAnalysis's own
-// probability model) as the report's single headline stance, phrased with
-// the same support/resistance levels the three-path conclusion[] bullets
-// already cite - the box's core conclusion is a condensed pointer to that
-// existing prose, never a second, independently-derived judgement.
+// deterministic heuristic - see stock-analysis-metrics.mjs's
+// PATH_PROBABILITY_DISCLOSURE, which the 结论与复盘标签 section prints
+// verbatim right below these numbers) as the report's single headline
+// stance, phrased with the same support/resistance levels the three-path
+// conclusion[] bullets already cite - the box's core conclusion is a
+// condensed pointer to that existing prose, never a second, independently-
+// derived judgement.
+//
+// Task 23 (2026-07-30): these used to render through `formatPercent`, the
+// SIGNED two-decimal formatter for price change, so the shipped box read
+// "上行概率约 +31.00%" - a probability wearing a return's sign and precision.
 function computeCoreConclusion({ bullishProbability, neutralProbability, bearishProbability, rangeSupport, rangeResistance }) {
   const max = Math.max(bullishProbability, neutralProbability, bearishProbability);
   if (max === bullishProbability) {
-    return `短线偏上行：若守住支撑位 ${formatNumber(rangeSupport)} 美元并放量突破 ${formatNumber(rangeResistance)} 美元，上行概率约 ${formatPercent(bullishProbability)}。`;
+    return `短线偏上行：若守住支撑位 ${formatNumber(rangeSupport)} 美元并放量突破 ${formatNumber(rangeResistance)} 美元，上行概率约 ${formatPathProbability(bullishProbability)}。`;
   }
   if (max === bearishProbability) {
-    return `短线偏回撤：若跌破支撑位 ${formatNumber(rangeSupport)} 美元，回撤概率约 ${formatPercent(bearishProbability)}。`;
+    return `短线偏回撤：若跌破支撑位 ${formatNumber(rangeSupport)} 美元，回撤概率约 ${formatPathProbability(bearishProbability)}。`;
   }
-  return `短线震荡：价格围绕当前区间运行，观察概率约 ${formatPercent(neutralProbability)}。`;
+  return `短线震荡：价格围绕当前区间运行，观察概率约 ${formatPathProbability(neutralProbability)}。`;
 }
 
 function buildConclusionBoxParams({
@@ -1099,7 +1180,7 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
     "",
     "- 语言：中文。",
     "- 范围：仅美股；不覆盖中概/港股。",
-    "- 投递：飞书摘要卡片 + PDF。",
+    `- 投递：${REPORT_DELIVERY_DESCRIPTION}。`,
     "- 风控：不触发实盘交易；期权只作为交割影响分析，不自动化。",
     "",
     "## 本批次结论",
@@ -1810,6 +1891,10 @@ async function main() {
     console.log(JSON.stringify(runListTargetsCommand({ dbPath }), null, 2));
     return;
   }
+  if (command === "analyze") {
+    console.log(JSON.stringify(await runAnalyzeOnDemand(args.filter((arg) => !arg.startsWith("--"))), null, 2));
+    return;
+  }
 
   const db = openTradingDatabase(dbPath);
   try {
@@ -1823,7 +1908,7 @@ async function main() {
     } else if (command === "scheduled") {
       await runScheduled(db, args.includes("--force"));
     } else {
-      throw new Error("Usage: stock-analysis.mjs <targets|list-targets|prepare|run|scheduled> [SYMBOL...] [--force]");
+      throw new Error("Usage: stock-analysis.mjs <targets|list-targets|analyze|prepare|run|scheduled> [SYMBOL...] [--force]");
     }
   } finally {
     db.close();

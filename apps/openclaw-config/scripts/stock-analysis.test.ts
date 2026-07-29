@@ -8,7 +8,7 @@
 // see market-alerts-seam.test.ts for the writer (setTargets) <-> reader
 // (isSymbolWatched) cross-module seam test, per this task's "writer-side
 // and reader-side must be tested against each other" instruction.
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -27,6 +27,10 @@ import { validateStockAnalysisMarkdown, validateStockNarrativeNumbers } from "./
 import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
+// Task 23: the probability formatter/disclosure/clamp constants the renderer
+// above imports - asserted from the same module the producer uses, so the
+// tests cannot pin a hand-typed copy of a literal that has since changed.
+const metrics = await import("./stock-analysis-metrics.mjs");
 
 /**
  * H3 (2026-07-28, round-5): this file left the typecheck backlog. Its 27 errors
@@ -368,9 +372,9 @@ describe("listTargets: collapses per-owner duplicates into one global distinct s
 
 // Phase 5 Task 1 (2026-07-15 plan): runAnalysis persists stock_facts per
 // SUCCESSFULLY-fetched record before rendering. Tested here against the
-// standalone, network/PDF-free persistStockFactsForRecords (the exact
+// standalone, network-free persistStockFactsForRecords (the exact
 // function runAnalysis calls) rather than runAnalysis itself, which also
-// spawns a real Chrome subprocess for PDF rendering (writeMarkdownPdf) - see
+// fetches live Longbridge data and delivers to Feishu - see
 // this file's existing fetchStockAnalysisRecords/renderBatchStockAnalysis
 // tests for the same "test the exported piece, not the CLI orchestrator"
 // convention.
@@ -944,17 +948,19 @@ describe("nextUsMonthlyOptionExpiry: same-day behavior (minor c)", () => {
 });
 
 describe("resolveReportPaths: prepare writes -preview files, never the delivered archive name (minor b)", () => {
-  it("resolves the plain <label>.md/.pdf archive name when deliver=true", () => {
+  // Task 14 (§0.4 PDF 已退役): the resolver used to return a `pdfPath` beside
+  // the markdown one, and every batch really did spawn Chrome to render it.
+  // markdown is now the ONLY artifact a batch writes - asserted with toEqual
+  // (not toMatchObject) so a re-added artifact path fails here.
+  it("resolves the plain <label>.md archive name when deliver=true", () => {
     expect(stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", true)).toEqual({
-      markdownPath: join("/reports/stock-analysis", "2026-07-15.md"),
-      pdfPath: join("/reports/stock-analysis", "2026-07-15.pdf")
+      markdownPath: join("/reports/stock-analysis", "2026-07-15.md")
     });
   });
 
-  it("resolves the <label>-preview.md/.pdf name when deliver=false (prepare dry-run)", () => {
+  it("resolves the <label>-preview.md name when deliver=false (prepare dry-run)", () => {
     expect(stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", false)).toEqual({
-      markdownPath: join("/reports/stock-analysis", "2026-07-15-preview.md"),
-      pdfPath: join("/reports/stock-analysis", "2026-07-15-preview.pdf")
+      markdownPath: join("/reports/stock-analysis", "2026-07-15-preview.md")
     });
   });
 
@@ -962,7 +968,6 @@ describe("resolveReportPaths: prepare writes -preview files, never the delivered
     const delivered = stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", true);
     const preview = stockAnalysis.resolveReportPaths("/reports/stock-analysis", "2026-07-15", false);
     expect(preview.markdownPath).not.toBe(delivered.markdownPath);
-    expect(preview.pdfPath).not.toBe(delivered.pdfPath);
   });
 });
 
@@ -1287,7 +1292,7 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
 });
 
 // 2026-07-28 (spec drift A3). The scheduled run handed deliverReportToFeishu
-// only {title, markdown, markdownPath, pdfPath}. That was harmless while a
+// only {title, markdown, markdownPath}. That was harmless while a
 // report was delivered as summary-plus-chapters, but the payload is now a
 // conclusion card whose ONLY route to the full text is the deep link built from
 // reportKind + reportDate - so with those absent the reader got a card with no
@@ -1298,10 +1303,10 @@ describe("stock-analysis Feishu delivery payload (spec drift A3)", () => {
     const payload = stockAnalysis.buildStockAnalysisDeliveryPayload({
       label: "2026-07-28",
       markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83。",
-      markdownPath: "/tmp/reports/2026-07-28.md",
-      pdfPath: "/tmp/reports/2026-07-28.pdf"
+      markdownPath: "/tmp/reports/2026-07-28.md"
     });
 
+    expect(payload).not.toHaveProperty("pdfPath");
     expect(payload.reportKind).toBe("stock-analysis");
     expect(payload.reportDate).toBe("2026-07-28");
     expect(payload.title).toBe("OpenClaw 个股分析 2026-07-28");
@@ -1316,8 +1321,7 @@ describe("stock-analysis Feishu delivery payload (spec drift A3)", () => {
       const card = notifications.buildReportConclusionCard(asDeliveryPayload(stockAnalysis.buildStockAnalysisDeliveryPayload({
         label: "2026-07-28",
         markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83；阻力位 312.51。",
-        markdownPath: "/tmp/reports/2026-07-28.md",
-        pdfPath: "/tmp/reports/2026-07-28.pdf"
+        markdownPath: "/tmp/reports/2026-07-28.md"
       })));
 
       expect(card.url).toEqual({ text: "查看完整报告", href: "https://reports.qingverse.com/stock-analysis/2026-07-28" });
@@ -1402,8 +1406,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
     return stockAnalysis.buildStockAnalysisDeliveryPayload({
       label: "2026-07-28",
       markdown: "# OpenClaw 个股分析 2026-07-28\n\n## 本批次结论\n\n- AAPL.US：支撑位 276.83；阻力位 312.51。",
-      markdownPath: "/tmp/reports/2026-07-28.md",
-      pdfPath: undefined
+      markdownPath: "/tmp/reports/2026-07-28.md"
     }) as Record<string, unknown>;
   }
 
@@ -1509,8 +1512,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       generatedAt: "2026-07-28T12:00:00.000Z",
       deliveredSymbols: ["AAPL.US"],
       failedSymbols: [],
-      markdownPath: "/tmp/reports/2026-07-28.md",
-      pdfPath: undefined
+      markdownPath: "/tmp/reports/2026-07-28.md"
     });
 
     // stdout envelope: "delivered" is false, and the two fields say which
@@ -1546,8 +1548,7 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
       generatedAt: "2026-07-28T12:00:00.000Z",
       deliveredSymbols: ["AAPL.US"],
       failedSymbols: [],
-      markdownPath: "/tmp/reports/2026-07-28.md",
-      pdfPath: undefined
+      markdownPath: "/tmp/reports/2026-07-28.md"
     });
 
     // Written even on the good path: an absent key cannot be told apart from an
@@ -1719,16 +1720,15 @@ describe("reportSkippedStockAnalysisSlot: a slot that produces nothing stops loo
       dir: string,
       label: string,
       deliver: boolean
-    ) => { markdownPath: string; pdfPath: string })(reportsDir, label, true);
+    ) => { markdownPath: string })(reportsDir, label, true);
     db.prepare(`
-      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, delivery)
+      VALUES (?, ?, ?, ?, ?)
     `).run(
       `stock_analysis_run_${label}`,
       generatedAt,
       JSON.stringify(["TSM.US"]),
       paths.markdownPath,
-      paths.pdfPath,
       JSON.stringify({ sent: true })
     );
   }
@@ -1821,5 +1821,191 @@ describe("reportSkippedStockAnalysisSlot: a slot that produces nothing stops loo
 
     expect(thrown?.message).toContain("从未产出过个股分析批次");
     expect(thrown?.message).toContain("no_targets");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 23 (2026-07-30): honest rendering of the three-path probabilities
+// ---------------------------------------------------------------------------
+//
+// Driven through the REAL producer (`buildDeterministicAnalysis`) with the
+// same fixtures the confidence-heuristic cases above use, not against a
+// re-typed copy of the format. The defect these pin was live on the mini:
+// reports/stock-analysis/2026-07-27.md rendered
+// 「- 上行路径（约 +31.00%）：…」 - a probability carrying the SIGNED
+// two-decimal formatter meant for price change, with nothing anywhere saying
+// the number is a hand-written heuristic rather than a model output.
+describe("buildDeterministicAnalysis: three-path probability disclosure", () => {
+  function conclusionOf(overrides: Partial<Record<string, unknown>> = {}): string[] {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      stockQuote(overrides),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      GENERATED_AT
+    );
+    return analysis.conclusion as string[];
+  }
+
+  it("renders each path probability unsigned and without decimals", () => {
+    const bullets = conclusionOf();
+    const paths = bullets.filter((line) => /路径（约/u.test(line));
+    expect(paths).toHaveLength(3);
+    for (const line of paths) {
+      expect(line).toMatch(/路径（约 \d{1,3}%）/u);
+      // The exact defect: a `+` or a `.00` in front of a probability.
+      expect(line).not.toMatch(/路径（约 [+-]/u);
+      expect(line).not.toMatch(/路径（约 [\d.]*\.\d/u);
+    }
+  });
+
+  it("prints the heuristic disclosure alongside the three paths", () => {
+    const bullets = conclusionOf();
+    expect(bullets).toContain(metrics.PATH_PROBABILITY_DISCLOSURE);
+    // The disclosure must name what it is, its inputs and its clamp range -
+    // asserted on the shipped literal, not on a paraphrase.
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("确定性启发式");
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("不是模型概率");
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("当日涨跌幅");
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("趋势分");
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("20-60%");
+    expect(metrics.PATH_PROBABILITY_DISCLOSURE).toContain("20-55%");
+  });
+
+  it("states clamp bounds that the arithmetic actually honours", () => {
+    // A violently positive day cannot push the bullish path past its stated
+    // ceiling, and cannot push the bearish path below its stated floor.
+    const bullets = conclusionOf({ last: "400.00", prev_close: "200.00" });
+    const bullish = Number(/上行路径（约 (\d+)%）/u.exec(bullets.join("\n"))?.[1]);
+    const bearish = Number(/回撤路径（约 (\d+)%）/u.exec(bullets.join("\n"))?.[1]);
+    expect(bullish).toBeLessThanOrEqual(metrics.PATH_PROBABILITY_BOUNDS.bullishMax);
+    expect(bearish).toBeGreaterThanOrEqual(metrics.PATH_PROBABILITY_BOUNDS.bearishMin);
+  });
+
+  it("renders the conclusion box's headline probability the same way", () => {
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      "AAPL.US",
+      stockQuote(),
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      GENERATED_AT
+    );
+    expect(analysis.conclusionBox.coreConclusion).toMatch(/概率约 \d{1,3}%。$/u);
+    expect(analysis.conclusionBox.coreConclusion).not.toContain("+");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 24 (2026-07-28 spec-drift remediation): on-demand `analyze <SYMBOL>`.
+//
+// Spec §3.4 produces 个股分析 "每 3 天批量 + 按需 + 站内研究触发" and §4 lists
+// 分析请求 as a Feishu conversation capability, but the only two entry points
+// were the 3-day batch and `prepare`'s file-writing dry run. These tests drive
+// the REAL renderer and the REAL quality gate; only the network fetch is
+// injected, and what it returns is the exact shape fetchStockAnalysisRecord
+// builds (same keys, and `analysis` really is buildDeterministicAnalysis's
+// output, not a hand-written stand-in).
+// ---------------------------------------------------------------------------
+describe("runAnalyzeOnDemand: single-symbol analysis a member can ask for in Feishu", () => {
+  const analyzeOnDemand = stockAnalysis.runAnalyzeOnDemand as (
+    symbols: string[],
+    options?: {
+      fetchRecords?: (
+        targets: string[],
+        options: { generatedAt: string }
+      ) => Promise<{ records: unknown[]; failedSymbols: { symbol: string; error: string }[] }>;
+      now?: Date;
+    }
+  ) => Promise<{
+    ok: boolean;
+    onDemand: boolean;
+    symbol: string;
+    generatedAt: string;
+    published: boolean;
+    note: string;
+    markdown: string;
+  }>;
+
+  function realRecord(symbol: string, generatedAt: string) {
+    const quote = stockQuote({ symbol });
+    const history = stockHistorySeries(130, 180, 0.3);
+    const fundamentals = stockFundamentals();
+    const optionChain = stockOptionChain();
+    const news = stockNewsList();
+    return {
+      symbol,
+      instrumentKind: "stock",
+      quote,
+      history,
+      fundamentals,
+      optionChain,
+      news,
+      analysis: stockAnalysis.buildDeterministicAnalysis(
+        symbol,
+        quote,
+        news,
+        { history, fundamentals, optionChain, instrumentKind: "stock" },
+        generatedAt
+      )
+    };
+  }
+
+  function fetchOne(symbol: string) {
+    return async (_targets: string[], { generatedAt }: { generatedAt: string }) => ({
+      records: [realRecord(symbol, generatedAt)],
+      failedSymbols: []
+    });
+  }
+
+  it("renders the full analysis for one symbol and passes the same quality gate a delivered batch does", async () => {
+    const result = await analyzeOnDemand(["nvda.us"], {
+      fetchRecords: fetchOne("NVDA.US"),
+      now: new Date("2026-07-30T13:00:00.000Z")
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.symbol).toBe("NVDA.US");
+    expect(result.markdown).toContain("## NVDA.US");
+    expect(result.markdown).toContain("### 结论框");
+    // The gate the delivered batch has to pass, run against this exact output.
+    expect(validateStockAnalysisMarkdown(result.markdown).ok).toBe(true);
+  });
+
+  it("says out loud that the answer is not published and carries no model prose", async () => {
+    const result = await analyzeOnDemand(["NVDA.US"], {
+      fetchRecords: fetchOne("NVDA.US"),
+      now: new Date("2026-07-30T13:00:00.000Z")
+    });
+
+    expect(result.published).toBe(false);
+    expect(result.note).toContain("未写入公共分析库");
+    expect(result.note).toContain("没有叠加模型叙述");
+    expect(result.note).toContain("/stock/NVDA.US");
+  });
+
+  it("writes nothing to reports/stock-analysis - the day's delivered batch is untouched", async () => {
+    const reportsDir = join(process.cwd(), "reports", "stock-analysis");
+    const before = existsSync(reportsDir) ? readdirSync(reportsDir).sort() : [];
+
+    await analyzeOnDemand(["NVDA.US"], {
+      fetchRecords: fetchOne("NVDA.US"),
+      now: new Date("2026-07-30T13:00:00.000Z")
+    });
+
+    const after = existsSync(reportsDir) ? readdirSync(reportsDir).sort() : [];
+    expect(after).toEqual(before);
+  });
+
+  it("refuses zero or multiple symbols instead of quietly analysing the wrong thing", async () => {
+    await expect(analyzeOnDemand([])).rejects.toThrow(/一次只分析一只标的/u);
+    await expect(analyzeOnDemand(["NVDA.US", "AAPL.US"])).rejects.toThrow(/一次只分析一只标的/u);
+  });
+
+  it("reports the fetch failure honestly instead of returning an empty analysis", async () => {
+    await expect(
+      analyzeOnDemand(["NVDA.US"], {
+        fetchRecords: async () => ({ records: [], failedSymbols: [{ symbol: "NVDA.US", error: "行情读取失败。" }] })
+      })
+    ).rejects.toThrow(/行情读取失败/u);
   });
 });
