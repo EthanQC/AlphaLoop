@@ -30,6 +30,10 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 
+import { usEasternWeekStartUtcIso } from "@packages/shared-types";
+
+import { SHARED_OWNER_SENTINEL, loadLatestSnapshotForOwner } from "./snapshots.js";
+
 export type ThesisDirection = "bull" | "bear" | "neutral";
 export type StrategyVisibility = "system" | "public";
 export type ThesisStatus = "active" | "withdrawn" | "superseded";
@@ -647,4 +651,240 @@ export function computeThesisOutcome({ thesis, judgments, latestPrice }: ThesisO
   }
 
   return { perJudgment, hitRate };
+}
+
+// ---------------------------------------------------------------------------
+// 纪律速览的情境匹配 (Task 22, req §1.2) - 2026-07-30
+// ---------------------------------------------------------------------------
+//
+// req §1.2 asks the home page's 纪律速览 to lead with the rules that MATTER
+// RIGHT NOW rather than the newest ones: "临近财报→财报类纪律；接近仓位上限→
+// 仓位纪律；周亏接近 3%→熔断预警；无匹配→已连续遵守 N 天".
+//
+// Each context below is either backed by a real measurement or is reported as
+// UNEVALUABLE with the reason. Nothing here is allowed to "look matched" on
+// missing data: a context that cannot be computed is named in `unavailable`,
+// which the page prints, instead of quietly never firing.
+//
+// 财报 IS ONE OF THOSE, TODAY. The earnings-week rule family
+// (discipline-engine.mjs's `财报周不买入/加仓`) reads the `earnings.nextDate`
+// stock fact, and NO producer in this repo writes that key - report-facts.mjs's
+// buildStockFacts emits only the quote./valuation./history./options./news./
+// institutional. families (verified against the live mini's stock_facts:
+// `SELECT DISTINCT fact_key` returns 21 keys, none of them earnings.*). So the
+// honest behavior is to say the earnings context cannot be evaluated and why,
+// which is what EARNINGS_CONTEXT_UNAVAILABLE_REASON is for - not to silently
+// return "no earnings coming up", which asserts something nobody measured.
+
+/** The paper-trading budget ceiling every member's exposure is measured
+ * against (portfolio-exposure.mjs's `BUDGET_RATIO`; Global Constraint
+ * "每人模拟盘 ≤10% 预算服务端校验"). */
+export const PAPER_BUDGET_RATIO = 0.1;
+
+/** Weekly-loss ratio at which circuit-breaker.mjs trips
+ * (`WEEKLY_LOSS_TRIP_THRESHOLD`). */
+export const CIRCUIT_BREAKER_TRIP_RATIO = -0.03;
+
+/** "Approaching" = within the last 20% of the run-up to the limit, i.e. at or
+ * past 80% of it (8% exposure of a 10% budget; -2.4% of a -3% trip). A single
+ * shared fraction so the two contexts cannot end up with differently-tuned
+ * notions of "close". */
+export const CONTEXT_NEAR_FRACTION = 0.8;
+
+export const EARNINGS_CONTEXT_UNAVAILABLE_REASON =
+  "临近财报暂时无法判定：本仓库还没有任何生产者写入财报日（earnings.nextDate）事实，因此不做匹配，也不宣称你没有临近的财报。";
+
+export type DisciplineContext =
+  | { kind: "budget_near"; exposureRatio: number; budgetRatio: number }
+  | { kind: "budget_over"; exposureRatio: number; budgetRatio: number }
+  | { kind: "circuit_near"; weeklyLossRatio: number; tripRatio: number }
+  | { kind: "circuit_tripped"; weeklyLossRatio: number; tripRatio: number };
+
+export interface DisciplineContextMatch {
+  /** Matched contexts, most urgent first. */
+  contexts: DisciplineContext[];
+  /** Ids of the rules to pin to the top, in the order they should appear.
+   * At most two (req §1.2's "挑 1-2 条置顶"). */
+  pinnedRuleIds: string[];
+  /** Human-readable reasons a context could not be evaluated at all. */
+  unavailable: string[];
+}
+
+/** Rule-text families each context pins. Broader than discipline-engine.mjs's
+ * strict `仓位≤N%` parser - that parser has to decide whether to BLOCK an
+ * order, so it only accepts what it can evaluate numerically, whereas this is
+ * a display-ordering hint where surfacing a free-prose 「单票持仓不超过两成」
+ * next to a budget warning is helpful and costs nothing.
+ *
+ * But NOT so broad that it mislabels a rule. The budget pattern deliberately
+ * requires a position/exposure NOUN (仓位/敞口/预算/持仓/占比) rather than
+ * matching action verbs like 加仓 - 「财报周不加仓」 contains 加仓 and is an
+ * EARNINGS rule; pinning it under "your exposure is near the budget" would
+ * put the wrong reason next to the right number. */
+const CONTEXT_RULE_PATTERNS: Record<string, RegExp> = {
+  budget_near: /仓位|敞口|预算|持仓|占比/u,
+  budget_over: /仓位|敞口|预算|持仓|占比/u,
+  circuit_near: /熔断|亏损|止损|回撤|周亏/u,
+  circuit_tripped: /熔断|亏损|止损|回撤|周亏/u
+};
+
+interface NetAssetsPoint {
+  fetchedAt: string;
+  netAssets: number | null;
+}
+
+/**
+ * The owner's net-assets series as of `nowIso`, ascending. Mirrors
+ * circuit-breaker.mjs's `loadOwnerNetAssetsSeries` precedence rule exactly:
+ * the owner's OWN rows win even when older than everything else, and the
+ * NULL/`'__shared__'` fallback set is consulted ONLY when the owner has zero
+ * own rows - the two sets are never mixed.
+ */
+function loadOwnerNetAssetsSeries(db: DatabaseSync, ownerId: string, nowIso: string): NetAssetsPoint[] {
+  const ownRows = db
+    .prepare(`
+      SELECT fetched_at, net_assets FROM official_paper_snapshots
+      WHERE owner_id = ? AND fetched_at <= ?
+      ORDER BY fetched_at ASC
+    `)
+    .all(ownerId, nowIso) as Array<Record<string, unknown>>;
+
+  const rows =
+    ownRows.length > 0
+      ? ownRows
+      : (db
+          .prepare(`
+            SELECT fetched_at, net_assets FROM official_paper_snapshots
+            WHERE (owner_id IS NULL OR owner_id = ?) AND fetched_at <= ?
+            ORDER BY fetched_at ASC
+          `)
+          .all(SHARED_OWNER_SENTINEL, nowIso) as Array<Record<string, unknown>>);
+
+  return rows.map((row) => ({
+    fetchedAt: String(row.fetched_at),
+    netAssets: row.net_assets === null || row.net_assets === undefined ? null : Number(row.net_assets)
+  }));
+}
+
+/**
+ * This trading week's loss ratio for `ownerId` (e.g. -0.024 for -2.4%), or
+ * `null` when it cannot be computed - NEVER a fabricated 0.
+ *
+ * This is a TypeScript port of circuit-breaker.mjs's `computeWeeklyLoss`,
+ * needed because that .mjs is outside platform-app's tsc project. It is the
+ * SAME rule, not a similar one: baseline = the last usable snapshot strictly
+ * before this week's Monday 00:00 America/New_York, falling back to the
+ * earliest usable snapshot inside the week; latest = the newest usable
+ * snapshot at or before now; fewer than 2 usable points or a zero baseline ->
+ * null.
+ *
+ * ANTI-DRIFT: data/circuit-breaker-parity.test.ts runs THIS function and the
+ * real circuit-breaker.mjs export against the same seeded database over a
+ * table of cases and asserts identical results. If either side's rule
+ * changes, that test fails - the home page can never end up warning about a
+ * "-2.6% week" that the breaker itself measures differently.
+ */
+export function computeWeeklyLossRatio(db: DatabaseSync, ownerId: string, now: Date): number | null {
+  const nowIso = now.toISOString();
+  const weekStartUtcIso = usEasternWeekStartUtcIso(now);
+  const series = loadOwnerNetAssetsSeries(db, ownerId, nowIso);
+  const usable = series.filter(
+    (point): point is { fetchedAt: string; netAssets: number } =>
+      point.netAssets !== null && Number.isFinite(point.netAssets)
+  );
+
+  if (usable.length < 2) {
+    return null;
+  }
+
+  const preWeek = usable.filter((point) => point.fetchedAt < weekStartUtcIso);
+  const baseline =
+    preWeek.length > 0 ? preWeek[preWeek.length - 1] : usable.find((point) => point.fetchedAt >= weekStartUtcIso);
+  const latest = usable[usable.length - 1];
+
+  if (!baseline || baseline.netAssets === 0 || !latest) {
+    return null;
+  }
+
+  const loss = (latest.netAssets - baseline.netAssets) / baseline.netAssets;
+  return Number.isFinite(loss) ? loss : null;
+}
+
+/**
+ * Current portfolio exposure ratio (marketValue / netAssets) for the owner's
+ * latest snapshot, or `null` when there is no snapshot or its net assets are
+ * missing/non-positive.
+ *
+ * DELIBERATELY STRICTER THAN portfolio-exposure.mjs's `computeExposure`,
+ * which returns exposure 0 when netAssets <= 0 - a documented legacy quirk
+ * that under-reports a real position as "0% exposure". That behavior is
+ * acceptable where it is (it decides whether to attach a caveat to a
+ * proposal); here it would put a REASSURING number on the front page for an
+ * account whose net assets are broken, so this returns null and the caller
+ * simply does not claim a budget context.
+ */
+export function computeCurrentExposureRatio(db: DatabaseSync, ownerId: string): number | null {
+  const snapshot = loadLatestSnapshotForOwner(db, ownerId);
+  if (!snapshot || snapshot.netAssets === null || !(snapshot.netAssets > 0)) {
+    return null;
+  }
+  const ratio = snapshot.marketValue / snapshot.netAssets;
+  return Number.isFinite(ratio) ? ratio : null;
+}
+
+/**
+ * Picks the 1-2 discipline rules to pin at the top of 纪律速览, based on the
+ * owner's real current situation (req §1.2). Contexts are ordered by urgency
+ * - an already-breached limit outranks an approaching one, and the weekly
+ * loss outranks exposure (one stops your proposals entirely; the other caps
+ * their size).
+ *
+ * A matched context with NO rule to pin still gets reported in `contexts`:
+ * "you are near your 3% weekly stop and have no discipline rule about it" is
+ * worth telling someone, and the page renders it as a standalone line.
+ */
+export function matchDisciplineContexts(
+  db: DatabaseSync,
+  ownerId: string,
+  rules: ReadonlyArray<{ id: string; ruleText: string }>,
+  now: Date
+): DisciplineContextMatch {
+  const contexts: DisciplineContext[] = [];
+
+  const weeklyLossRatio = computeWeeklyLossRatio(db, ownerId, now);
+  if (weeklyLossRatio !== null) {
+    if (weeklyLossRatio <= CIRCUIT_BREAKER_TRIP_RATIO) {
+      contexts.push({ kind: "circuit_tripped", weeklyLossRatio, tripRatio: CIRCUIT_BREAKER_TRIP_RATIO });
+    } else if (weeklyLossRatio <= CIRCUIT_BREAKER_TRIP_RATIO * CONTEXT_NEAR_FRACTION) {
+      contexts.push({ kind: "circuit_near", weeklyLossRatio, tripRatio: CIRCUIT_BREAKER_TRIP_RATIO });
+    }
+  }
+
+  const exposureRatio = computeCurrentExposureRatio(db, ownerId);
+  if (exposureRatio !== null) {
+    if (exposureRatio > PAPER_BUDGET_RATIO) {
+      contexts.push({ kind: "budget_over", exposureRatio, budgetRatio: PAPER_BUDGET_RATIO });
+    } else if (exposureRatio >= PAPER_BUDGET_RATIO * CONTEXT_NEAR_FRACTION) {
+      contexts.push({ kind: "budget_near", exposureRatio, budgetRatio: PAPER_BUDGET_RATIO });
+    }
+  }
+
+  const pinnedRuleIds: string[] = [];
+  for (const context of contexts) {
+    const pattern = CONTEXT_RULE_PATTERNS[context.kind];
+    const match = pattern ? rules.find((rule) => !pinnedRuleIds.includes(rule.id) && pattern.test(rule.ruleText)) : undefined;
+    if (match) {
+      pinnedRuleIds.push(match.id);
+    }
+    if (pinnedRuleIds.length >= 2) {
+      break;
+    }
+  }
+
+  // Only worth saying when the owner actually keeps an earnings-week rule -
+  // otherwise it is a disclosure about a feature they never asked for.
+  const hasEarningsRule = rules.some((rule) => /财报/u.test(rule.ruleText));
+  const unavailable = hasEarningsRule ? [EARNINGS_CONTEXT_UNAVAILABLE_REASON] : [];
+
+  return { contexts, pinnedRuleIds, unavailable };
 }

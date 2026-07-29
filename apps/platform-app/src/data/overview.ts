@@ -58,27 +58,8 @@ export interface DisciplineRuleRow {
   createdAt: string;
 }
 
-/**
- * Recent alert_events for this owner, joined to alert_rules for the
- * symbol/rule_type the mobile/desktop alert feed needs to render a
- * meaningful line (raw alert_events rows have neither). Owner-filtered at
- * the SQL level via `ae.owner_id = ?` - never joined-then-filtered in JS.
- */
-export function loadRecentAlertEvents(db: DatabaseSync, ownerId: string, limit: number): AlertEventRow[] {
-  const rows = db
-    .prepare(`
-      SELECT ae.id AS id, ae.rule_id AS rule_id, ae.owner_id AS owner_id,
-             ae.triggered_at AS triggered_at, ae.value AS value,
-             ar.symbol AS symbol, ar.rule_type AS rule_type
-      FROM alert_events ae
-      JOIN alert_rules ar ON ar.id = ae.rule_id
-      WHERE ae.owner_id = ?
-      ORDER BY ae.triggered_at DESC
-      LIMIT ?
-    `)
-    .all(ownerId, limit) as Array<Record<string, unknown>>;
-
-  return rows.map((row) => ({
+function mapAlertEventRow(row: Record<string, unknown>): AlertEventRow {
+  return {
     id: String(row.id),
     ruleId: String(row.rule_id),
     ownerId: String(row.owner_id),
@@ -86,7 +67,68 @@ export function loadRecentAlertEvents(db: DatabaseSync, ownerId: string, limit: 
     ruleType: String(row.rule_type),
     triggeredAt: String(row.triggered_at),
     value: Number(row.value)
-  }));
+  };
+}
+
+const ALERT_EVENT_SELECT = `
+  SELECT ae.id AS id, ae.rule_id AS rule_id, ae.owner_id AS owner_id,
+         ae.triggered_at AS triggered_at, ae.value AS value,
+         ar.symbol AS symbol, ar.rule_type AS rule_type
+  FROM alert_events ae
+  JOIN alert_rules ar ON ar.id = ae.rule_id
+`;
+
+/**
+ * Recent alert_events for this owner, joined to alert_rules for the
+ * symbol/rule_type the mobile/desktop alert feed needs to render a
+ * meaningful line (raw alert_events rows have neither). Owner-filtered at
+ * the SQL level via `ae.owner_id = ?` - never joined-then-filtered in JS.
+ *
+ * NOT SESSION-SCOPED - this is "the newest N, whenever they happened". The
+ * home page uses `loadAlertEventsInSession` below instead; this one stays for
+ * callers that genuinely want the unbounded history.
+ */
+export function loadRecentAlertEvents(db: DatabaseSync, ownerId: string, limit: number): AlertEventRow[] {
+  const rows = db
+    .prepare(`${ALERT_EVENT_SELECT} WHERE ae.owner_id = ? ORDER BY ae.triggered_at DESC LIMIT ?`)
+    .all(ownerId, limit) as Array<Record<string, unknown>>;
+
+  return rows.map(mapAlertEventRow);
+}
+
+/**
+ * This owner's alert_events inside ONE US trading session's half-open window
+ * `[startUtcIso, endUtcIso)` (Task 22, req §1.1: 提醒流水 = 最近一个美股交易
+ * 时段). Owner-filtered AND window-filtered in SQL.
+ *
+ * Why this had to exist: the home page's alert block already TOLD the reader
+ * its rows were from the most recent session (「最近一个美股交易时段…」) while
+ * calling `loadRecentAlertEvents`, which has no time bound at all - an alert
+ * from three sessions ago was presented as having fired in the latest one.
+ *
+ * Both bounds are compared lexicographically, which is exact here: every
+ * `alert_events.triggered_at` is written by market-alerts-poll.mjs as
+ * `new Date().toISOString()` and both bounds come from
+ * `latestUsTradingSession`, so all three share the fixed-width
+ * `YYYY-MM-DDTHH:mm:ss.sssZ` form, where string order IS chronological order.
+ * (This is the same argument database.ts's trading-day quota window makes.)
+ */
+export function loadAlertEventsInSession(
+  db: DatabaseSync,
+  ownerId: string,
+  window: { startUtcIso: string; endUtcIso: string },
+  limit: number
+): AlertEventRow[] {
+  const rows = db
+    .prepare(`
+      ${ALERT_EVENT_SELECT}
+      WHERE ae.owner_id = ? AND ae.triggered_at >= ? AND ae.triggered_at < ?
+      ORDER BY ae.triggered_at DESC
+      LIMIT ?
+    `)
+    .all(ownerId, window.startUtcIso, window.endUtcIso, limit) as Array<Record<string, unknown>>;
+
+  return rows.map(mapAlertEventRow);
 }
 
 /**

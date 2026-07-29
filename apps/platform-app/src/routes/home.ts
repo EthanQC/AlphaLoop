@@ -32,10 +32,23 @@
  *                      task with an honest reason, research-engine.mjs's own
  *                      `operational_intent` branch) - this form performs no
  *                      client-side validation beyond HTML5 `required`.
+ *                      Task 22 (2026-07-30) added req §1.2's 最近研判 entry
+ *                      below the box: the viewer's OWN most recent
+ *                      research_tasks (ResearchTaskRepository.listForOwner),
+ *                      including queued/running ones, which the /reports
+ *                      研判 chip does not list.
  *   ② 我的模拟盘概览 - real snapshot data (net assets + today's change) via
- *                      data/overview.ts, or an honest empty state.
+ *                      data/overview.ts, or an honest empty state. Task 22
+ *                      added req §1.2's 净值 sparkline (a script-free inline
+ *                      SVG over loadSnapshotSeriesForOwner, plotting only
+ *                      points with a real net-asset value) and the 对比入口
+ *                      to /paper.
  *   ③ 我的待办       - real pending proposals, or an honest empty state.
- *   ④ 我的提醒流水   - real alert_events rows, or an honest empty state.
+ *   ④ 我的提醒流水   - this owner's alert_events INSIDE THE MOST RECENT US
+ *                      trading session (req §1.1), with that session named in
+ *                      the block header; or an honest empty state. Until
+ *                      Task 22 this block read the newest 10 rows of any age
+ *                      while its empty state claimed session scope.
  *   ⑤ 今日日报卡     - latest daily report from Task 4's disk scanner, or
  *                      an honest empty state.
  *   ⑥ 纪律速览       - real discipline_rules, each with its own real 近30天
@@ -45,7 +58,15 @@
  *                      the same module the strategy page's 我的纪律 section
  *                      uses. Until 2026-07-30 this block stopped at the rule
  *                      text and req §1.2's compliance half was the
- *                      「策略记忆 P7 上线」 placeholder.
+ *                      「策略记忆 P7 上线」 placeholder. Task 22 added req
+ *                      §1.2's 情境匹配: `matchDisciplineContexts` measures
+ *                      this week's loss against the -3% circuit-breaker line
+ *                      and current exposure against the 10% paper budget, and
+ *                      the 1-2 rules those contexts hit are pinned to the top
+ *                      with the measured number stated. The 临近财报 context
+ *                      in req §1.2 is NOT matched - nothing writes the
+ *                      earnings-date fact it needs - and that is disclosed
+ *                      rather than silently treated as "no earnings soon".
  *
  * EMPTY STATES (2026-07-30, U3): every block above used to fall back to a
  * bare 暂无X - and two of them ("提案审批 P6 上线", "策略记忆 P7 上线") still
@@ -71,24 +92,36 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { CircuitBreakerRepository, methodNotAllowed, type Member } from "@packages/shared-types";
+import {
+  CircuitBreakerRepository,
+  ResearchTaskRepository,
+  latestUsTradingSession,
+  methodNotAllowed,
+  type Member,
+  type ResearchTask,
+  type UsTradingSession
+} from "@packages/shared-types";
 
 import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-review.js";
 import {
+  loadAlertEventsInSession,
   loadDisciplineRules,
   loadLatestSnapshotForOwner,
   loadPendingProposals,
   loadPreviousDaySnapshotForOwner,
-  loadRecentAlertEvents,
   type AlertEventRow,
   type DisciplineRuleRow,
   type OwnerSnapshot,
   type ProposalRow
 } from "../data/overview.js";
+import { loadSnapshotSeriesForOwner, type SnapshotSeriesPoint } from "../data/snapshots.js";
 import {
   computeComplianceStats,
   computeDisciplineStreak,
+  matchDisciplineContexts,
   type ComplianceStats,
+  type DisciplineContext,
+  type DisciplineContextMatch,
   type DisciplineStreak
 } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
@@ -102,7 +135,7 @@ import {
   formatBeijingShortTime
 } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { freshnessPillClass, renderPage, snapshotFreshness, type Freshness } from "../render/layout.js";
+import { freshnessPillClass, renderPage, snapshotFreshness, unknownDataTime, type Freshness } from "../render/layout.js";
 
 export interface HomeRouteDeps {
   db: DatabaseSync;
@@ -112,6 +145,9 @@ export interface HomeRouteDeps {
 }
 
 const ALERT_EVENT_LIMIT = 10;
+/** Points behind the 净值 sparkline. ~2 weeks of hourly-poll snapshots; enough
+ * for a shape, bounded so the home page stays one small query. */
+const SPARKLINE_POINT_LIMIT = 60;
 /* Snapshot age threshold moved to render/layout.ts's SNAPSHOT_FRESH_WINDOW_MS
  * (2026-07-30) so member-card.ts and paper.ts, which render the same snapshot,
  * cannot disagree with this page about whether it is fresh. The rule is
@@ -237,7 +273,52 @@ function renderCircuitBreakerBanner(pausedUntil: string | null): Html {
 // ① 开始研究
 // ---------------------------------------------------------------------------
 
-function renderStartResearchBlock(): Html {
+const RESEARCH_STATUS_LABELS: Record<string, string> = {
+  queued: "排队中",
+  running: "进行中",
+  done: "已完成",
+  degraded: "降级完成",
+  failed: "失败"
+};
+
+const RESEARCH_STATUS_PILL: Record<string, string> = {
+  queued: "warn",
+  running: "warn",
+  done: "ok",
+  degraded: "warn",
+  failed: "warn"
+};
+
+/** req §1.2's 「开始研究（提问框 + 最近研判入口）」: the entry point back into
+ * work already in flight. WITHOUT it, a member who submitted a question,
+ * closed the tab and came back had no route to their own task short of
+ * /reports?type=研判 - the running ones are not even listed there (that chip
+ * lists done/degraded only). Owner-scoped by construction:
+ * `ResearchTaskRepository.listForOwner(member.id)` takes the VIEWER's id and
+ * has no "everyone's" mode. */
+const RECENT_RESEARCH_LIMIT = 3;
+
+function renderRecentResearchRow(task: ResearchTask): Html {
+  const statusLabel = RESEARCH_STATUS_LABELS[task.status] ?? task.status;
+  const pill = RESEARCH_STATUS_PILL[task.status] ?? "warn";
+  return html`<div class="alert">
+    <span class="pill ${pill}">${statusLabel}</span>
+    <a href="/research/${task.id}" style="color:var(--accent)">${task.title ?? task.question}</a>
+  </div>`;
+}
+
+function renderRecentResearchEntry(tasks: ReadonlyArray<ResearchTask>): Html {
+  if (tasks.length === 0) {
+    return trustedHtml("");
+  }
+  return html`<div style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+    <h3 style="font-size:13px;color:var(--sub);margin:0 0 6px">最近研判</h3>
+    ${joinHtml(tasks.map(renderRecentResearchRow))}
+    <p style="margin-top:6px"><a href="/reports?type=研判" style="color:var(--accent);font-size:12px">全部研判 →</a></p>
+  </div>`;
+}
+
+function renderStartResearchBlock(recentResearch: ReadonlyArray<ResearchTask>): Html {
   return html`<section class="card w2 dt-w4">
     <h2>开始研究</h2>
     <form method="post" action="/api/research">
@@ -255,6 +336,7 @@ function renderStartResearchBlock(): Html {
       </div>
     </form>
     <p class="ask-hint">每日最多 10 次，操作类请求（改规则/下单等）请走飞书</p>
+    ${renderRecentResearchEntry(recentResearch)}
   </section>`;
 }
 
@@ -269,10 +351,58 @@ function renderDegradedNote(snapshot: OwnerSnapshot): Html {
   return html`<p style="margin-top:8px;font-size:12px;color:var(--amber)">估值降级：${degradedReasonText(snapshot)}</p>`;
 }
 
+/**
+ * req §1.2's 净值 sparkline. A pure inline `<svg>` `<polyline>` - no script,
+ * no external asset, nothing for the CSP (`default-src 'none'`) to block.
+ *
+ * WHAT IT WILL AND WILL NOT DRAW. It plots ONLY points whose `netAssets` is a
+ * real number; a snapshot with a missing value is skipped rather than drawn
+ * at zero or interpolated across, because a line that dips to the axis says
+ * "your account went to nothing" when the truth is "we failed to fetch". With
+ * fewer than two plottable points there is no line to draw at all, and the
+ * caller says so in words instead - one point is a dot, and a dot rendered as
+ * a flat line is a fabricated "unchanged".
+ *
+ * The polyline is drawn in a 100x28 user-space box scaled to the value range,
+ * with a 1-unit vertical inset so a flat series still renders inside the box
+ * rather than clipped along its edge.
+ */
+function renderNetAssetsSparkline(series: ReadonlyArray<SnapshotSeriesPoint>): Html {
+  const values = series
+    .map((point) => point.netAssets)
+    .filter((value): value is number => value !== null && Number.isFinite(value));
+  if (values.length < 2) {
+    return html`<p style="margin-top:8px;font-size:12px;color:var(--sub)">净值走势图需要至少 2 个有净值的快照，当前只有 ${values.length} 个。</p>`;
+  }
+
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  const points = values
+    .map((value, index) => {
+      const x = (index / (values.length - 1)) * 100;
+      // span === 0 (a genuinely flat series) draws down the middle.
+      const y = span === 0 ? 14 : 27 - ((value - min) / span) * 26;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+
+  const rising = (values[values.length - 1] as number) >= (values[0] as number);
+  const stroke = rising ? "var(--up, #16a34a)" : "var(--down, #dc2626)";
+  return html`<svg
+    viewBox="0 0 100 28"
+    preserveAspectRatio="none"
+    style="width:100%;height:34px;margin-top:10px;display:block"
+    role="img"
+    aria-label="最近 ${values.length} 个快照的净值走势"
+  ><polyline points="${points}" fill="none" stroke="${stroke}" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline></svg>`;
+}
+
 function renderPaperOverviewBlock(
   snapshot: OwnerSnapshot | null,
   previousDay: OwnerSnapshot | null,
-  freshness: Freshness
+  freshness: Freshness,
+  series: ReadonlyArray<SnapshotSeriesPoint>
 ): Html {
   if (!snapshot) {
     return html`<section class="card w2 dt-w2">
@@ -295,7 +425,9 @@ function renderPaperOverviewBlock(
       <div class="kpi-main"><div class="num mono">${netAssetsDisplay}</div><div class="lbl">净值</div></div>
       <div class="kpi"><div class="num mono ${changeClass}">${changeDisplay}</div><div class="lbl">今日</div></div>
     </div>
+    ${renderNetAssetsSparkline(series)}
     ${renderDegradedNote(snapshot)}
+    <p style="margin-top:8px"><a href="/paper" style="color:var(--accent);font-size:12px">净值曲线与提案成交对比 →</a></p>
   </section>`;
 }
 
@@ -341,16 +473,48 @@ function renderAlertRow(event: AlertEventRow): Html {
   </div>`;
 }
 
-function renderAlertFeedBlock(events: ReadonlyArray<AlertEventRow>): Html {
+const ALERT_RULES_HINT =
+  "提醒按你自己的规则触发（日内波动 / 浮动盈亏 / 5分钟异动 / 组合敞口），每人每日上限 30 张。在飞书单聊里说一句「给 NVDA 加一条涨跌 4% 提醒」即可建规则。";
+
+/**
+ * ④ 我的提醒流水 - req §1.1 defines it as 最近一个美股交易时段, and the header
+ * now NAMES the session it is showing.
+ *
+ * THE DEFECT THIS FIXES (2026-07-30, Task 22): the empty state below already
+ * read 「最近一个美股交易时段你没有触发过提醒」 while the reader behind it was
+ * `loadRecentAlertEvents` - newest 10 rows, no time bound whatsoever. On the
+ * live mini this member's newest alerts were from 07-28 and 07-29; on 07-30
+ * the page presented them as this session's. The block is now filtered by
+ * `latestUsTradingSession`'s real window and states which day that is, so the
+ * rows and the sentence describing them cannot disagree.
+ *
+ * `session === null` means the calendar does not cover this instant's year
+ * (packages/shared-types/src/trading-session.ts refuses to guess). That is
+ * disclosed with the reason rather than silently rendering "no alerts", which
+ * would be a claim about the member's day made from a calendar gap.
+ */
+function renderAlertFeedBlock(events: ReadonlyArray<AlertEventRow>, session: UsTradingSession | null): Html {
+  if (!session) {
+    return html`<section class="card dt-w2">
+      <h2>我的提醒流水</h2>
+      ${renderEmptyState(
+        "暂时无法确定最近一个美股交易时段，所以这里不显示提醒。",
+        "平台内置的 NYSE 休市日历没有覆盖当前年份，需要先更新交易日历（packages/shared-types/src/trading-session.ts 与 trading-schedule.mjs 同步维护）。"
+      )}
+    </section>`;
+  }
+
+  const sessionLabel = session.inProgress
+    ? `${session.tradingDay} 美东时段（进行中）`
+    : `${session.tradingDay} 美东时段`;
+
   const body =
     events.length > 0
       ? joinHtml(events.map(renderAlertRow))
-      : renderEmptyState(
-          "最近一个美股交易时段你没有触发过提醒。",
-          "提醒按你自己的规则触发（日内波动 / 浮动盈亏 / 5分钟异动 / 组合敞口），每人每日上限 30 张。在飞书单聊里说一句「给 NVDA 加一条涨跌 4% 提醒」即可建规则。"
-        );
+      : renderEmptyState(`最近一个美股交易时段（${sessionLabel}）你没有触发过提醒。`, ALERT_RULES_HINT);
+
   return html`<section class="card dt-w2">
-    <h2>我的提醒流水</h2>
+    <h2>我的提醒流水 <span class="pill" style="font-weight:400">${sessionLabel}</span></h2>
     ${body}
   </section>`;
 }
@@ -396,11 +560,41 @@ function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
 // ⑥ 纪律速览
 // ---------------------------------------------------------------------------
 
-function renderDisciplineRow(rule: DisciplineRuleRow, stats: ComplianceStats): Html {
+function renderDisciplineRow(rule: DisciplineRuleRow, stats: ComplianceStats, pinned: boolean): Html {
   const label = ENFORCEMENT_LABELS[rule.enforcement] ?? rule.enforcement;
+  const pin = pinned ? html`<span class="pill warn">当前相关</span> ` : trustedHtml("");
   return html`<div class="disc">
-    ${rule.ruleText} <span style="color:var(--sub);font-size:12px">· ${label}</span>
+    ${pin}${rule.ruleText} <span style="color:var(--sub);font-size:12px">· ${label}</span>
     ${renderComplianceLine(stats)}
+  </div>`;
+}
+
+/** One sentence per matched context, stating the MEASURED number and the
+ * limit it is being measured against - never a bare "接近上限", which tells
+ * the reader nothing they can check. */
+function describeDisciplineContext(context: DisciplineContext): string {
+  const pct = (ratio: number): string => `${(ratio * 100).toFixed(2)}%`;
+  switch (context.kind) {
+    case "circuit_tripped":
+      return `本交易周净值 ${pct(context.weeklyLossRatio)}，已达到 ${pct(context.tripRatio)} 熔断线。`;
+    case "circuit_near":
+      return `本交易周净值 ${pct(context.weeklyLossRatio)}，正在接近 ${pct(context.tripRatio)} 熔断线。`;
+    case "budget_over":
+      return `当前持仓敞口 ${pct(context.exposureRatio)}，已超出 ${pct(context.budgetRatio)} 模拟盘预算。`;
+    case "budget_near":
+      return `当前持仓敞口 ${pct(context.exposureRatio)}，接近 ${pct(context.budgetRatio)} 模拟盘预算上限。`;
+  }
+}
+
+function renderDisciplineContextNotes(match: DisciplineContextMatch): Html {
+  const lines = [...match.contexts.map(describeDisciplineContext), ...match.unavailable];
+  if (lines.length === 0) {
+    return trustedHtml("");
+  }
+  return html`<div style="margin:0 0 8px">
+    ${joinHtml(
+      lines.map((line) => html`<p style="font-size:12px;color:var(--amber);margin:2px 0">${line}</p>`)
+    )}
   </div>`;
 }
 
@@ -417,17 +611,39 @@ function renderDisciplineRow(rule: DisciplineRuleRow, stats: ComplianceStats): H
 function renderDisciplineBlock(
   rules: DisciplineRuleRow[],
   statsByRuleId: Map<string, ComplianceStats>,
-  streak: DisciplineStreak
+  streak: DisciplineStreak,
+  contextMatch: DisciplineContextMatch
 ): Html {
+  // req §1.2's 匹配规则: pinned rules first (in the order their contexts were
+  // ranked), then the rest in their existing newest-first order. The list is
+  // REORDERED, never filtered - a rule that did not match today is still the
+  // member's rule and still shows, just below the ones that matter now.
+  const pinnedSet = new Set(contextMatch.pinnedRuleIds);
+  const ordered = [
+    ...contextMatch.pinnedRuleIds
+      .map((id) => rules.find((rule) => rule.id === id))
+      .filter((rule): rule is DisciplineRuleRow => rule !== undefined),
+    ...rules.filter((rule) => !pinnedSet.has(rule.id))
+  ];
+
   const body =
-    rules.length > 0
-      ? joinHtml(rules.map((rule) => renderDisciplineRow(rule, statsByRuleId.get(rule.id) ?? { sample: "none" })))
+    ordered.length > 0
+      ? joinHtml(
+          ordered.map((rule) =>
+            renderDisciplineRow(rule, statsByRuleId.get(rule.id) ?? { sample: "none" }, pinnedSet.has(rule.id))
+          )
+        )
       : renderEmptyState(
           "你还没有登记任何纪律规则。",
           "纪律是系统能替你硬拦的东西（如「财报周不加仓」「单票不超过 20%」）。在飞书单聊里说一句「记一条纪律：…」即可登记，之后每条提案都会按它做检查。"
         );
+
+  // req §1.2's 无匹配 fallback is the streak line; when a context DID match,
+  // the streak line stays too - "已连续遵守 23 天" and "本周已亏 2.6%" are both
+  // true and neither replaces the other.
   return html`<section class="card w2 dt-w4">
     <h2>纪律速览</h2>
+    ${renderDisciplineContextNotes(contextMatch)}
     <p style="font-size:12px;color:var(--sub);margin:-2px 0 8px">${describeDisciplineStreak(streak)}</p>
     ${body}
   </section>`;
@@ -465,36 +681,47 @@ function renderMonthlyReviewBlock(latestReview: TypedMonthlyReview | null): Html
 // Assembly
 // ---------------------------------------------------------------------------
 
-function renderHomeBody(
-  snapshot: OwnerSnapshot | null,
-  previousDay: OwnerSnapshot | null,
-  freshness: Freshness,
-  proposals: ProposalRow[],
-  alertEvents: ReadonlyArray<AlertEventRow>,
-  latestDaily: ReportIndexEntry | undefined,
-  disciplineRules: DisciplineRuleRow[],
-  complianceStatsByRuleId: Map<string, ComplianceStats>,
-  disciplineStreak: DisciplineStreak,
-  circuitPausedUntil: string | null,
-  latestReview: TypedMonthlyReview | null
-): Html {
-  return html`${renderCircuitBreakerBanner(circuitPausedUntil)}
+interface HomeBodyData {
+  snapshot: OwnerSnapshot | null;
+  previousDay: OwnerSnapshot | null;
+  freshness: Freshness;
+  snapshotSeries: ReadonlyArray<SnapshotSeriesPoint>;
+  recentResearch: ReadonlyArray<ResearchTask>;
+  proposals: ProposalRow[];
+  alertEvents: ReadonlyArray<AlertEventRow>;
+  session: UsTradingSession | null;
+  latestDaily: ReportIndexEntry | undefined;
+  disciplineRules: DisciplineRuleRow[];
+  complianceStatsByRuleId: Map<string, ComplianceStats>;
+  disciplineStreak: DisciplineStreak;
+  disciplineContexts: DisciplineContextMatch;
+  circuitPausedUntil: string | null;
+  latestReview: TypedMonthlyReview | null;
+}
+
+function renderHomeBody(data: HomeBodyData): Html {
+  return html`${renderCircuitBreakerBanner(data.circuitPausedUntil)}
     <div class="bento">
-      ${renderStartResearchBlock()}
+      ${renderStartResearchBlock(data.recentResearch)}
     </div>
     <div class="bento" style="margin-top:10px">
-      ${renderPaperOverviewBlock(snapshot, previousDay, freshness)}
-      ${renderTodoBlock(proposals)}
+      ${renderPaperOverviewBlock(data.snapshot, data.previousDay, data.freshness, data.snapshotSeries)}
+      ${renderTodoBlock(data.proposals)}
     </div>
     <div class="bento" style="margin-top:10px">
-      ${renderAlertFeedBlock(alertEvents)}
-      ${renderDailyReportBlock(latestDaily)}
+      ${renderAlertFeedBlock(data.alertEvents, data.session)}
+      ${renderDailyReportBlock(data.latestDaily)}
     </div>
     <div class="bento" style="margin-top:10px">
-      ${renderDisciplineBlock(disciplineRules, complianceStatsByRuleId, disciplineStreak)}
+      ${renderDisciplineBlock(
+        data.disciplineRules,
+        data.complianceStatsByRuleId,
+        data.disciplineStreak,
+        data.disciplineContexts
+      )}
     </div>
     <div class="bento" style="margin-top:10px">
-      ${renderMonthlyReviewBlock(latestReview)}
+      ${renderMonthlyReviewBlock(data.latestReview)}
     </div>`;
 }
 
@@ -508,8 +735,19 @@ export function renderHomePage(
 
   const snapshot = loadLatestSnapshotForOwner(deps.db, member.id);
   const previousDay = loadPreviousDaySnapshotForOwner(deps.db, member.id, now);
+  const snapshotSeries = loadSnapshotSeriesForOwner(deps.db, member.id, SPARKLINE_POINT_LIMIT);
   const proposals = loadPendingProposals(deps.db, member.id);
-  const alertEvents = loadRecentAlertEvents(deps.db, member.id, ALERT_EVENT_LIMIT);
+  // 最近研判 (req §1.2): the viewer's OWN tasks only - listForOwner takes an
+  // owner id and has no cross-member mode.
+  const recentResearch = new ResearchTaskRepository(deps.db)
+    .listForOwner(member.id)
+    .slice(0, RECENT_RESEARCH_LIMIT);
+  // ④ 提醒流水 is scoped to the most recent US trading session (req §1.1), not
+  // to "the newest N rows" - see renderAlertFeedBlock.
+  const session = latestUsTradingSession(now);
+  const alertEvents = session
+    ? loadAlertEventsInSession(deps.db, member.id, session, ALERT_EVENT_LIMIT)
+    : [];
   const disciplineRules = loadDisciplineRules(deps.db, member.id);
   // ⑥ 纪律速览's compliance half (Task 11) - the viewer's OWN id on every
   // call; a member's discipline record is never anyone else's business.
@@ -517,6 +755,8 @@ export function renderHomePage(
     disciplineRules.map((rule) => [rule.id, computeComplianceStats(deps.db, member.id, rule.id, now)])
   );
   const disciplineStreak = computeDisciplineStreak(deps.db, member.id, now);
+  // 情境匹配 (req §1.2) - measured against this member's OWN snapshots only.
+  const disciplineContexts = matchDisciplineContexts(deps.db, member.id, disciplineRules, now);
   const latestDaily = scanReports(deps.repoRoot).find((entry) => entry.type === "daily");
   // ⑦ 复盘速览 (Phase 9 Task 4 addition) - loadOwnerReviews is already
   // period-DESC ordered, so the first row (if any) is the most recent.
@@ -543,25 +783,33 @@ export function renderHomePage(
     // snapshot is the home page's own live figure (净值/今日), so it names
     // the data time; with no snapshot the newest daily report's date is the
     // only dated content left, and with neither there is nothing to state.
+    // Task 19: with neither, the home page is still showing database-backed
+    // content (提醒 / 待确认提案 / 纪律遵守), so it says the data time is
+    // unknown and why - the request clock alone would be the pre-fix shape
+    // this whole change exists to end.
     dataAsOf: snapshot
       ? describeDataInstant(snapshot.fetchedAt, now)
       : latestDaily
         ? describeDataDay(latestDaily.date, now)
-        : null,
+        : unknownDataTime("还没有模拟盘快照，也没有任何一期日报"),
     degraded,
-    bodyHtml: renderHomeBody(
+    bodyHtml: renderHomeBody({
       snapshot,
       previousDay,
       freshness,
+      snapshotSeries,
+      recentResearch,
       proposals,
       alertEvents,
+      session,
       latestDaily,
       disciplineRules,
       complianceStatsByRuleId,
       disciplineStreak,
+      disciplineContexts,
       circuitPausedUntil,
       latestReview
-    ),
+    }),
     nonce,
     now
   });

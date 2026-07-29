@@ -159,7 +159,10 @@ describe("home route (GET /)", () => {
       "我的待办",
       "当前没有等你审批的提案。",
       "我的提醒流水",
-      "最近一个美股交易时段你没有触发过提醒。",
+      // Task 22: the empty state now NAMES the session it is talking about.
+      // The clock is 2026-07-14 08:00 EDT (before the open), so the most
+      // recent session is Monday 2026-07-13's.
+      "最近一个美股交易时段（2026-07-13 美东时段）你没有触发过提醒。",
       "今日日报卡",
       "还没有可读的日报。",
       "纪律速览",
@@ -277,7 +280,9 @@ describe("home route (GET /)", () => {
       ownerId: member.id,
       symbol: "NVDA.US",
       ruleType: "daily_move",
-      triggeredAt: "2026-07-14T10:10:00.000Z", // 18:10 Beijing
+      // Inside the most recent session as of the fixed clock: 2026-07-13
+      // 10:10 EDT, i.e. 07-13 22:10 Beijing.
+      triggeredAt: "2026-07-13T14:10:00.000Z",
       value: -4.3
     });
 
@@ -287,8 +292,8 @@ describe("home route (GET /)", () => {
     expect(body).toContain("NVDA.US");
     expect(body).toContain("日内波动");
     expect(body).toContain("-4.3");
-    expect(body).toContain("07-14 18:10"); // Beijing time
-    expect(body).not.toContain("最近一个美股交易时段你没有触发过提醒。");
+    expect(body).toContain("07-13 22:10"); // Beijing time
+    expect(body).not.toContain("你没有触发过提醒。");
   });
 
   it("two-member isolation: member A's alert events never appear on member B's home page", async () => {
@@ -297,7 +302,7 @@ describe("home route (GET /)", () => {
       ownerId: memberA.id,
       symbol: "NVDA.US",
       ruleType: "daily_move",
-      triggeredAt: "2026-07-14T10:10:00.000Z",
+      triggeredAt: "2026-07-13T14:10:00.000Z",
       value: -4.3
     });
 
@@ -309,7 +314,7 @@ describe("home route (GET /)", () => {
     const body = await response.text();
 
     expect(body).not.toContain("NVDA.US");
-    expect(body).toContain("最近一个美股交易时段你没有触发过提醒。");
+    expect(body).toContain("最近一个美股交易时段（2026-07-13 美东时段）你没有触发过提醒。");
   });
 
   it("renders the latest daily report as a link, with a legacy pill (every current report is legacy)", async () => {
@@ -590,6 +595,271 @@ describe("home route (GET /)", () => {
       const block = disciplineBlock(await (await authed("/", token)).text());
 
       expect(block).toContain("已连续遵守至少 5 天");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Task 22 (req §1.1/§1.2), 2026-07-30: 最近研判入口 / 净值 sparkline /
+  // 提醒流水按最近一个交易时段过滤 / 纪律速览情境匹配.
+  // -------------------------------------------------------------------------
+
+  describe("Task 22: 最近研判入口", () => {
+    function seedResearch(
+      ownerId: string,
+      opts: { id?: string; question: string; status: string; createdAt: string; title?: string }
+    ): string {
+      const id = opts.id ?? createId("research");
+      db.prepare(`
+        INSERT INTO research_tasks (id, owner_id, question, status, steps, budget_spent, title, visibility, created_at)
+        VALUES (?, ?, ?, ?, '[]', 0, ?, 'private', ?)
+      `).run(id, ownerId, opts.question, opts.status, opts.title ?? null, opts.createdAt);
+      return id;
+    }
+
+    it("lists the viewer's most recent research tasks with a link to each", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = seedResearch(member.id, {
+        question: "NVDA 财报前要减仓吗",
+        status: "done",
+        createdAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain("最近研判");
+      expect(body).toContain(`href="/research/${id}"`);
+      expect(body).toContain("NVDA 财报前要减仓吗");
+      expect(body).toContain("已完成");
+    });
+
+    it("includes a RUNNING task, which the /reports 研判 chip does not list", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedResearch(member.id, {
+        question: "TSLA 的止损位定在哪",
+        status: "running",
+        createdAt: "2026-07-14T09:30:00.000Z"
+      });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain("TSLA 的止损位定在哪");
+      expect(body).toContain("进行中");
+    });
+
+    it("shows no 最近研判 section at all when the viewer has never asked anything", async () => {
+      const { token } = seedMemberWithToken();
+      const body = await (await authed("/", token)).text();
+      expect(body).not.toContain("最近研判");
+    });
+
+    it("never shows another member's research", async () => {
+      const { member: memberA } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      seedResearch(memberA.id, {
+        question: "A 的私密问题",
+        status: "done",
+        createdAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const memberB = makeMember({ id: "member_b", email: "b@example.com" });
+      new MemberRepository(db).upsert(memberB);
+      const tokenB = new ApiTokenRepository(db).issue(memberB.id, "test").token;
+
+      const body = await (await authed("/", tokenB)).text();
+
+      expect(body).not.toContain("A 的私密问题");
+      expect(body).not.toContain("最近研判");
+    });
+  });
+
+  describe("Task 22: 净值 sparkline", () => {
+    it("draws a polyline over the owner's real net-asset points", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-12T05:00:00.000Z", netAssets: 1000 });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-13T05:00:00.000Z", netAssets: 1050 });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T11:30:00.000Z", netAssets: 1100 });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain("<polyline");
+      expect(body).toContain('aria-label="最近 3 个快照的净值走势"');
+      // Rising series: first point at the bottom of the box, last at the top.
+      expect(body).toContain('points="0.00,27.00 50.00,14.00 100.00,1.00"');
+    });
+
+    it("says so in words rather than drawing a flat line from a single point", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T11:30:00.000Z", netAssets: 1100 });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).not.toContain("<polyline");
+      expect(body).toContain("净值走势图需要至少 2 个有净值的快照，当前只有 1 个。");
+    });
+
+    it("skips a null-net-assets snapshot instead of plotting it at zero", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-12T05:00:00.000Z", netAssets: 1000 });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-13T05:00:00.000Z", netAssets: null });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T11:30:00.000Z", netAssets: 1100 });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain('aria-label="最近 2 个快照的净值走势"');
+      expect(body).toContain('points="0.00,27.00 100.00,1.00"');
+    });
+
+    it("offers the 对比入口 to the paper page", async () => {
+      const { token } = seedMemberWithToken();
+      const body = await (await authed("/", token)).text();
+      expect(body).toContain('href="/paper"');
+    });
+  });
+
+  describe("Task 22: 提醒流水按最近一个美股交易时段过滤", () => {
+    // Fixed clock is 2026-07-14T12:00:00Z = Tuesday 08:00 EDT, BEFORE the
+    // open - so the most recent session is Monday 2026-07-13,
+    // [13:30Z, 20:00Z).
+    it("names the session it is showing in the block header", async () => {
+      const { token } = seedMemberWithToken();
+      const body = await (await authed("/", token)).text();
+      expect(body).toContain("我的提醒流水");
+      expect(body).toContain("2026-07-13 美东时段");
+    });
+
+    it("EXCLUDES an alert from the session before the most recent one", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedAlertRuleAndEvent(db, {
+        ownerId: member.id,
+        symbol: "OLDSESSION.US",
+        ruleType: "daily_move",
+        triggeredAt: "2026-07-10T15:00:00.000Z", // Friday's session
+        value: -0.043
+      });
+
+      const body = await (await authed("/", token)).text();
+
+      // The defect this pins: before Task 22 this row rendered under a header
+      // claiming it came from the most recent session.
+      expect(body).not.toContain("OLDSESSION.US");
+      expect(body).toContain("最近一个美股交易时段（2026-07-13 美东时段）你没有触发过提醒。");
+    });
+
+    it("EXCLUDES an alert stamped after the session close", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedAlertRuleAndEvent(db, {
+        ownerId: member.id,
+        symbol: "AFTERHOURS.US",
+        ruleType: "daily_move",
+        triggeredAt: "2026-07-13T20:30:00.000Z", // 16:30 EDT, after the close
+        value: -0.02
+      });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).not.toContain("AFTERHOURS.US");
+    });
+
+    it("INCLUDES an alert from inside the session window", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedAlertRuleAndEvent(db, {
+        ownerId: member.id,
+        symbol: "INSESSION.US",
+        ruleType: "daily_move",
+        triggeredAt: "2026-07-13T13:30:00.000Z", // exactly at the open - inclusive bound
+        value: -0.031
+      });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain("INSESSION.US");
+    });
+  });
+
+  describe("Task 22: 纪律速览情境匹配", () => {
+    function seedRule(ownerId: string, ruleText: string): string {
+      const id = createId("rule");
+      db.prepare(`
+        INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, enabled, created_at)
+        VALUES (?, ?, ?, 'proposal_check', 1, '2026-07-01T00:00:00.000Z')
+      `).run(id, ownerId, ruleText);
+      return id;
+    }
+
+    it("pins the 熔断-related rule and states the measured weekly loss when the week is near -3%", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "财报周不加仓");
+      seedRule(member.id, "周亏超过 2% 就停手");
+      // Week starts Monday 2026-07-13 04:00Z. Baseline = the last pre-week
+      // snapshot; latest = 2.6% below it.
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-10T20:00:00.000Z", netAssets: 100_000 });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T11:30:00.000Z", netAssets: 97_400 });
+
+      const body = await (await authed("/", token)).text();
+      const block = body.slice(body.indexOf("纪律速览"));
+
+      expect(block).toContain("本交易周净值 -2.60%，正在接近 -3.00% 熔断线。");
+      // The matched rule is pinned ABOVE the unrelated one.
+      expect(block.indexOf("周亏超过 2% 就停手")).toBeLessThan(block.indexOf("财报周不加仓"));
+      expect(block).toContain("当前相关");
+    });
+
+    it("says nothing about the weekly loss when the week is comfortably flat", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "周亏超过 2% 就停手");
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-10T20:00:00.000Z", netAssets: 100_000 });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T11:30:00.000Z", netAssets: 99_900 });
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).not.toContain("熔断线");
+      expect(body).not.toContain("当前相关");
+    });
+
+    it("pins the 仓位 rule and states measured exposure when it nears the 10% budget", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "财报周不加仓");
+      seedRule(member.id, "单票仓位≤20%");
+      db.prepare(`
+        INSERT INTO official_paper_snapshots (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
+        VALUES (?, '2026-07-14T11:30:00.000Z', 'hourly_poll', 100000, NULL, 9000, '[]', '{}', ?)
+      `).run(createId("snapshot"), member.id);
+
+      const body = await (await authed("/", token)).text();
+      const block = body.slice(body.indexOf("纪律速览"));
+
+      expect(block).toContain("当前持仓敞口 9.00%，接近 10.00% 模拟盘预算上限。");
+      expect(block.indexOf("单票仓位≤20%")).toBeLessThan(block.indexOf("财报周不加仓"));
+    });
+
+    it("discloses that 临近财报 cannot be evaluated when the member keeps an earnings rule", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "财报周不加仓");
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).toContain("临近财报暂时无法判定");
+      expect(body).toContain("earnings.nextDate");
+    });
+
+    it("does not print the 财报 disclosure to a member with no earnings rule", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "单票仓位≤20%");
+
+      const body = await (await authed("/", token)).text();
+
+      expect(body).not.toContain("临近财报暂时无法判定");
+    });
+
+    it("keeps the streak line and every rule when no context matches", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "单票仓位≤20%");
+
+      const body = await (await authed("/", token)).text();
+      const block = body.slice(body.indexOf("纪律速览"));
+
+      expect(block).toContain("单票仓位≤20%");
+      expect(block).not.toContain("当前相关");
+      expect(block).toContain("还没有提案触发过纪律检查");
     });
   });
 });

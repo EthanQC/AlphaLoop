@@ -6,3 +6,4 @@ export * from "./http.js";
 export * from "./notifications.js";
 export * from "./proposal-cards.js";
 export * from "./runtime.js";
+export * from "./trading-session.js";
