@@ -61,7 +61,11 @@ import {
   summarizeValuation
 } from "./stock-analysis-metrics.mjs";
 import { loadStockAnalysisTemplate } from "./stock-analysis-template.mjs";
-import { shouldRunStockAnalysis } from "./trading-schedule.mjs";
+import {
+  computeStockAnalysisFreshness,
+  describeStockAnalysisFreshness
+} from "./stock-analysis-freshness.mjs";
+import { STOCK_ANALYSIS_INTERVAL_DAYS, shouldRunStockAnalysis } from "./trading-schedule.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
@@ -194,16 +198,49 @@ export function runListTargetsCommand(options = {}) {
   }
 }
 
+/**
+ * Turns a SKIPPED scheduled slot into a loud failure when the analysis on
+ * display has gone stale (see stock-analysis-freshness.mjs for why).
+ *
+ * Every skip path funnels through here, and each one prints the freshness it
+ * measured - so a run record no longer says only "not_due"/"no_targets", it
+ * says how old the batch on display actually is. Past
+ * STOCK_ANALYSIS_STALE_AFTER_DAYS this THROWS: the process exits non-zero, the
+ * cron runner records `ok: false`, and its existing per-job failure notice
+ * (and, after 3 consecutive same-class failures, its halt escalation) carries
+ * the Chinese explanation to Feishu. That is how a stalled pipeline announces
+ * itself; before this, a skip exited 0 and was indistinguishable from health.
+ *
+ * Note the deliberate asymmetry: freshness is read from the delivered
+ * `stock_analysis_runs` archive, NOT from `state.lastRunAt`. The state file is
+ * exactly the thing that was lying, and a guard that trusts it would have
+ * stayed silent through the same three days.
+ */
+export function reportSkippedStockAnalysisSlot(db, reason, state, now = new Date()) {
+  const freshness = computeStockAnalysisFreshness(db, now);
+  console.log(JSON.stringify({
+    skipped: true,
+    reason,
+    lastRunAt: state.lastRunAt ?? null,
+    freshness
+  }, null, 2));
+  if (freshness.stale) {
+    throw new Error(
+      `${describeStockAnalysisFreshness(freshness)}本次调度未产出（原因：${reason}）。`
+    );
+  }
+}
+
 async function runScheduled(db, force = false) {
   const state = readState();
   const targets = listTargets(db);
   if (targets.length === 0) {
-    console.log(JSON.stringify({ skipped: true, reason: "no_targets", lastRunAt: state.lastRunAt ?? null }, null, 2));
+    reportSkippedStockAnalysisSlot(db, "no_targets", state);
     return;
   }
   const cronTriggered = process.env.OPENCLAW_CRON_TRIGGERED === "1";
   if (!force && !shouldRunStockAnalysis(new Date(), state.lastRunAt, { cronTriggered })) {
-    console.log(JSON.stringify({ skipped: true, reason: "not_due", lastRunAt: state.lastRunAt ?? null }, null, 2));
+    reportSkippedStockAnalysisSlot(db, "not_due", state);
     return;
   }
   await runAnalysis(db, { force });
@@ -1020,12 +1057,45 @@ function bullet(value) {
   return `- ${String(value ?? "").replace(/[\r\n\u2028\u2029]+/gu, " ")}`;
 }
 
+/**
+ * The per-symbol "how old is this number" stamp, rendered as the FIRST line of
+ * every `## SYMBOL` section (2026-07-30).
+ *
+ * Placement is the whole point. The platform app's stock page takes a symbol
+ * section's first non-heading line as that symbol's summary card
+ * (routes/stock.ts `extractSectionSummary`), and a report is read for days
+ * after it is written - so this is the line a reader sees next to a support
+ * level, whether they open the report today or three days from now. The
+ * numbers it carries are ones the pipeline already holds: `label` is the batch
+ * date (also the report filename and every `stock_facts.trading_day` row), and
+ * `quote.timestamp` is the quote's own as-of (also every quote fact's
+ * `data_time`). Nothing is computed or assumed - a quote with no timestamp is
+ * said to have none rather than being back-stamped with the batch date.
+ */
+function renderSymbolAsOfBullet(record, label) {
+  const quoteTimestamp = record.quote?.timestamp;
+  const quoteAsOf = quoteTimestamp
+    ? `行情时点 ${formatShanghaiTime(quoteTimestamp)}（北京时间）`
+    : "行情时点：数据源未提供时间戳";
+  return bullet(
+    `数据截至：本批次 ${label}；${quoteAsOf}。`
+    + `本节价格、支撑位与阻力位均为该时点数据，不是实时价；`
+    + `个股分析每 ${STOCK_ANALYSIS_INTERVAL_DAYS} 天更新一次，请对照当前日期判断时效。`
+  );
+}
+
 export function renderBatchStockAnalysis({ label, generatedAt, records, failedSymbols = [] }) {
   const template = loadStockAnalysisTemplate();
   const lines = [
     `# OpenClaw 个股分析 ${label}`,
     "",
     `生成时间：${formatShanghaiTime(generatedAt)}`,
+    "",
+    // The batch-level twin of renderSymbolAsOfBullet: whatever surface quotes
+    // "本批次结论" (the Feishu summary card, the reports list) carries the
+    // batch's own date and cadence with it, so an old batch cannot be read as
+    // today's without the reader being told which day it describes.
+    `数据截至：${label}；更新节奏：每 ${STOCK_ANALYSIS_INTERVAL_DAYS} 天一次。以下所有价位为该批次时点数据，不是实时价。`,
     "",
     "- 语言：中文。",
     "- 范围：仅美股；不覆盖中概/港股。",
@@ -1046,7 +1116,7 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
   ];
 
   for (const record of records) {
-    lines.push(`## ${record.symbol}`, "");
+    lines.push(`## ${record.symbol}`, "", renderSymbolAsOfBullet(record, label), "");
     // Phase 5 Task 3 (2026-07-15 plan): a GLOBAL narrative degrade (the
     // backend threw) is disclosed exactly ONCE per symbol, right here -
     // never per-section (a per-section validation-exhausted fallback is

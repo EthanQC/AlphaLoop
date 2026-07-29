@@ -24,6 +24,10 @@ import {
   toFiniteNumber
 } from "./launchd-health.mjs";
 import { newsEngineHealthStats } from "./news-store.mjs";
+import {
+  computeStockAnalysisFreshness,
+  describeStockAnalysisFreshness
+} from "./stock-analysis-freshness.mjs";
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
 import { getZonedParts, isUsRegularMarketHours } from "./trading-schedule.mjs";
@@ -357,6 +361,7 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "broker-executor-health", run: () => checkBrokerExecutorHealth(snapshot) },
     { name: "daily-backup-health", run: () => checkDailyBackupHealth(snapshot, nowMs) },
     { name: "official-paper-health", run: () => checkOfficialPaperHealth(snapshot, nowMs) },
+    { name: "stock-analysis-health", run: () => checkStockAnalysisHealth(snapshot, nowMs) },
     { name: "rsshub-health", run: () => checkRsshubHealth(snapshot) },
     { name: "news-engine-health", run: () => checkNewsEngineHealth(snapshot, nowMs) },
     { name: "control-persona", run: () => checkControlPersona(snapshot) },
@@ -1518,6 +1523,63 @@ function checkDailyBackupHealth(snapshot, nowMs) {
   }
 
   return [];
+}
+
+// 2026-07-30 - "stock-analysis-health" check.
+//
+// The gap this closes is one an operator hit head-on: on 2026-07-30 the site
+// was serving the 2026-07-27 batch's support level for TSM.US (398.37, against
+// a real price near 375) and NOTHING anywhere said the batch was three days
+// old. The cron job was registered and firing daily; every firing skipped
+// `not_due` and exited 0, so run_log, the cron runner's result files and the
+// runner's own failure/halt machinery all recorded health. A pipeline that
+// stops by SKIPPING is invisible to a failure counter.
+//
+// So this check does not look at exit codes at all. It reads what is ON
+// DISPLAY - the newest delivered `stock_analysis_runs` row, whose
+// markdown_path names the very report file the platform app renders - and
+// judges its age against the cadence (stock-analysis-freshness.mjs owns both
+// the reading and the threshold, so /health and the job's own stall alert can
+// never disagree about whether the pipeline is stalled).
+//
+// Gated on the pool actually having symbols in it: `runScheduled` refuses to
+// produce anything when `stock_analysis_targets` has no active row, so on a
+// machine where nobody has configured a watchlist, "no batch" is the correct
+// state and complaining about it would be noise. That gate is read from the
+// db, not assumed.
+function checkStockAnalysisHealth(snapshot, nowMs) {
+  if (!snapshot.dbPath) {
+    return [];
+  }
+
+  return withReadOnlyTradingDb(snapshot.dbPath, "stock-analysis-health", "个股分析产出", (db) => {
+    const targets = db
+      .prepare("SELECT COUNT(*) AS n FROM stock_analysis_targets WHERE active = 1")
+      .get();
+    if (Number(targets?.n ?? 0) === 0) {
+      return [];
+    }
+
+    const freshness = computeStockAnalysisFreshness(db, new Date(nowMs));
+    if (!freshness.stale) {
+      return [];
+    }
+    if (freshness.latestLabel === null) {
+      return [warn(
+        "stock-analysis-health.never_ran",
+        `${describeStockAnalysisFreshness(freshness)}`
+          + `标的池里有 ${Number(targets?.n ?? 0)} 只在用标的，但 stock_analysis_runs 表里没有任何一次交付记录。`
+          + `可以手动跑一次 pnpm stock-analysis:run 看它报什么错。`
+      )];
+    }
+    return [error(
+      "stock-analysis-health.stale",
+      `${describeStockAnalysisFreshness(freshness)}`
+        + `openclaw-trading-stock-analysis 每天 21:00 触发一次，隔这么久没产出说明它每次都跳过或每次都失败了。`
+        + `请看 runtime/openclaw-cron-runner/ 里最近的 *-stock-analysis.json（stdoutTail 会写明 skipped 的原因），`
+        + `以及 run_log 里 job='stock-analysis' 的行。`
+    )];
+  });
 }
 
 // Round-4 finding I5 - "official-paper-health" check, covering the last two

@@ -1602,3 +1602,224 @@ describe("stock-analysis delivery scope (spec drift R3/F7)", () => {
     expect(result.reason).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-07-30: what the report carries about its OWN age, and what a skipped
+// scheduled slot does about it.
+//
+// The operator opened /stock/TSM.US and read "支撑位 398.37" - a level from the
+// 2026-07-27 batch - while TSM traded near 375. Two things had to be true for
+// that screen to exist: production had stopped (trading-schedule.mjs's cadence
+// gate, fixed and pinned in trading-schedule.test.ts), and nothing on either
+// side said how old the number was.
+// ---------------------------------------------------------------------------
+
+describe("renderBatchStockAnalysis: every symbol section states its own as-of before any price", () => {
+  function renderWithQuote(quoteOverrides: Partial<Record<string, unknown>> = {}) {
+    const symbol = "AAPL.US";
+    // The record shape the REAL producer builds: fetchStockAnalysisRecord
+    // returns {symbol, instrumentKind, quote, history, fundamentals,
+    // optionChain, news, analysis} and passes that object straight into
+    // renderBatchStockAnalysis - `quote` is normalizeQuotePayload's output,
+    // which is the broker payload verbatim (report-data.mjs returns `quote`
+    // unchanged). Its `timestamp` is the same field buildStockQuoteFacts
+    // writes as every quote fact's `data_time`; on the mini that column holds
+    // '2026-07-27T16:36:22.000Z' for TSM.US's quote.* rows, i.e. a full ISO
+    // instant, which is what stockQuote() carries too.
+    const quote = stockQuote({ symbol, ...quoteOverrides });
+    const analysis = stockAnalysis.buildDeterministicAnalysis(
+      symbol,
+      quote,
+      stockNewsList(),
+      { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
+      GENERATED_AT
+    );
+    return renderBatch({
+      label: GENERATED_AT.slice(0, 10),
+      generatedAt: GENERATED_AT,
+      records: [{ symbol, quote, news: stockNewsList(), analysis }],
+      failedSymbols: []
+    });
+  }
+
+  /** The line the platform app's stock page shows as this symbol's summary:
+   * routes/stock.ts takes the first non-empty, non-heading line of the
+   * `## SYMBOL` section. Re-implemented here (it is TypeScript in another
+   * app's build, unreachable from this package) so a change to the section's
+   * opening lines is caught on THIS side too. */
+  function firstSummaryLine(markdown: string, symbol: string): string {
+    const body = markdown.split(`## ${symbol}\n`)[1] ?? "";
+    for (const raw of body.split("\n")) {
+      const line = raw.trim();
+      if (!line || /^#{1,6}\s+/u.test(line)) {
+        continue;
+      }
+      return line.replace(/^[-*]\s+/u, "");
+    }
+    return "";
+  }
+
+  it("makes the as-of the FIRST thing a reader of the section sees", () => {
+    const summary = firstSummaryLine(renderWithQuote(), "AAPL.US");
+
+    expect(summary).toContain("数据截至");
+    expect(summary).toContain("本批次 2026-07-15");
+    expect(summary).toContain("不是实时价");
+  });
+
+  it("carries the quote's own timestamp, not the batch date, as the quote as-of", () => {
+    // stockQuote()'s timestamp is 2026-07-14T20:00:00.000Z - the trading day
+    // BEFORE this batch's label, which is the normal case for a 21:00
+    // Asia/Shanghai batch reading a US close. A stamp that quietly reused the
+    // batch label here would overstate the price's freshness by a day.
+    const summary = firstSummaryLine(renderWithQuote(), "AAPL.US");
+
+    expect(summary).toContain("2026-07-15 04:00");
+    expect(summary).not.toContain("行情时点：数据源未提供时间戳");
+  });
+
+  it("says the timestamp is missing rather than back-stamping it with the batch date", () => {
+    const summary = firstSummaryLine(renderWithQuote({ timestamp: undefined }), "AAPL.US");
+
+    expect(summary).toContain("行情时点：数据源未提供时间戳");
+  });
+
+  it("puts the as-of ahead of every support/resistance number in the section", () => {
+    const markdown = renderWithQuote();
+    const sectionStart = markdown.indexOf("## AAPL.US");
+    const asOfIndex = markdown.indexOf("数据截至", sectionStart);
+    const supportIndex = markdown.indexOf("支撑位", sectionStart);
+
+    expect(asOfIndex).toBeGreaterThan(sectionStart);
+    expect(supportIndex).toBeGreaterThan(asOfIndex);
+  });
+
+  it("stamps the batch-level summary too, so a quoted 本批次结论 carries its date", () => {
+    const markdown = renderWithQuote();
+    const batchStamp = markdown.slice(0, markdown.indexOf("## 本批次结论"));
+
+    expect(batchStamp).toContain("数据截至：2026-07-15");
+    expect(batchStamp).toContain("每 3 天一次");
+  });
+
+  it("still passes every existing stock-analysis quality gate with the stamps in place", () => {
+    const result = validateStockAnalysisMarkdown(renderWithQuote());
+
+    expect(result.failures).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("reportSkippedStockAnalysisSlot: a slot that produces nothing stops looking like health", () => {
+  const reportsDir = "/tmp/alphaloop-stock-analysis-reports";
+
+  function archiveBatch(db: DatabaseSync, generatedAt: string): void {
+    const label = generatedAt.slice(0, 10);
+    const paths = (stockAnalysis.resolveReportPaths as (
+      dir: string,
+      label: string,
+      deliver: boolean
+    ) => { markdownPath: string; pdfPath: string })(reportsDir, label, true);
+    db.prepare(`
+      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      `stock_analysis_run_${label}`,
+      generatedAt,
+      JSON.stringify(["TSM.US"]),
+      paths.markdownPath,
+      paths.pdfPath,
+      JSON.stringify({ sent: true })
+    );
+  }
+
+  function captureStdout(run: () => void): { lines: string[]; thrown: Error | null } {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map((a) => String(a)).join(" "));
+    };
+    let thrown: Error | null = null;
+    try {
+      run();
+    } catch (error) {
+      thrown = error as Error;
+    } finally {
+      console.log = original;
+    }
+    return { lines, thrown };
+  }
+
+  const skip = stockAnalysis.reportSkippedStockAnalysisSlot as (
+    db: DatabaseSync,
+    reason: string,
+    state: { lastRunAt?: string },
+    now?: Date
+  ) => void;
+
+  it("prints the measured age of what is on display, not just the skip reason", () => {
+    const { db } = makeDb();
+    archiveBatch(db, "2026-07-27T16:35:02.483Z");
+
+    const { lines, thrown } = captureStdout(() => {
+      skip(db, "not_due", { lastRunAt: "2026-07-27T16:35:02.483Z" }, new Date("2026-07-29T13:00:00.000Z"));
+    });
+
+    expect(thrown).toBeNull();
+    const printed = JSON.parse(lines.join("\n")) as {
+      skipped: boolean;
+      reason: string;
+      freshness: { latestLabel: string; ageDays: number; stale: boolean };
+    };
+    expect(printed.skipped).toBe(true);
+    expect(printed.reason).toBe("not_due");
+    expect(printed.freshness.latestLabel).toBe("2026-07-27");
+    expect(printed.freshness.ageDays).toBe(2);
+    expect(printed.freshness.stale).toBe(false);
+  });
+
+  it("THROWS once the analysis on display has gone stale, so the cron runner records a failure", () => {
+    // This is the live failure reproduced: the mini's state file said
+    // lastRunAt 2026-07-27T16:35:02.483Z and the 07-28 / 07-29 / 07-30 slots
+    // all skipped `not_due` and exited 0. From the 4th day on, the slot now
+    // exits non-zero instead - the only signal openclaw-cron-runner.mjs
+    // escalates to Feishu.
+    const { db } = makeDb();
+    archiveBatch(db, "2026-07-27T16:35:02.483Z");
+
+    const { thrown } = captureStdout(() => {
+      skip(db, "not_due", { lastRunAt: "2026-07-27T16:35:02.483Z" }, new Date("2026-07-31T13:00:00.000Z"));
+    });
+
+    expect(thrown).not.toBeNull();
+    expect(thrown?.message).toContain("个股分析已停摆");
+    expect(thrown?.message).toContain("2026-07-27");
+    expect(thrown?.message).toContain("not_due");
+  });
+
+  it("judges the archive, not the state file - a state file claiming a recent run does not buy silence", () => {
+    // The exact dishonesty this guard exists to defeat: `lastRunAt` says the
+    // pipeline ran an hour ago; the delivered archive says the newest batch is
+    // a week old. The archive is what the platform app renders, so the archive
+    // decides.
+    const { db } = makeDb();
+    archiveBatch(db, "2026-07-20T13:04:00.000Z");
+
+    const { thrown } = captureStdout(() => {
+      skip(db, "not_due", { lastRunAt: "2026-07-30T12:00:00.000Z" }, new Date("2026-07-30T13:00:00.000Z"));
+    });
+
+    expect(thrown?.message).toContain("最新批次为 2026-07-20");
+  });
+
+  it("fails a no-targets slot too when nothing has ever been produced", () => {
+    const { db } = makeDb();
+
+    const { thrown } = captureStdout(() => {
+      skip(db, "no_targets", {}, new Date("2026-07-30T13:00:00.000Z"));
+    });
+
+    expect(thrown?.message).toContain("从未产出过个股分析批次");
+    expect(thrown?.message).toContain("no_targets");
+  });
+});
