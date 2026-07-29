@@ -18,9 +18,17 @@
  *   parameter this route executes will never find the hidden member's id,
  *   not just "never find it in the rendered HTML".
  *
+ *   The 提案与成交历史 block is not rendered AT ALL on another member's page
+ *   (2026-07-30, req §1.6) - see `renderProposalsHistoryCard`'s own note for
+ *   why hiding it beats showing the viewer's own proposals there.
+ *
  * `?compare=1` overlays a second member's net-worth curve onto the viewer's
  * own curve in the SAME chart (final.html's mockup has a "对比 mashu →" link
  * for exactly this - comparing against another member, not a benchmark).
+ * Reachable from the UI since 2026-07-30: every OTHER member's chip carries a
+ * 「对比 →」 entry (`renderCompareEntry`), greyed and non-clickable for a
+ * member with `show_performance = 0` so the entry can never invite a
+ * comparison this page would then refuse to draw.
  * The rest of the page (KPI/holdings/bar/donut) always stays pinned to the
  * viewer's OWN data in compare mode - compare is "my dashboard with an
  * overlay added", not a second full page swap. The overlaid member is
@@ -113,6 +121,10 @@ const PAPER_PAGE_STYLE = trustedHtml(`<style>
 :root[data-theme="dark"]{ --series-1:${SERIES_COLORS_DARK[0]}; --series-2:${SERIES_COLORS_DARK[1]}; --series-3:${SERIES_COLORS_DARK[2]}; --series-4:${SERIES_COLORS_DARK[3]}; --series-5:${SERIES_COLORS_DARK[4]}; }
 .member-chip{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0}
 .member-chip.on{background:var(--accent-soft);color:var(--accent);border-color:var(--accent-border);font-weight:600}
+.member-slot{display:inline-flex;align-items:center;margin-right:10px}
+.compare-entry{font-size:12px;color:var(--accent);margin:0 4px 8px -4px;white-space:nowrap}
+.compare-entry.off{color:var(--sub);opacity:.55;cursor:not-allowed}
+.sr-note{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .legend-row{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink)}
 .swatch{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}
 .positions-table th,.positions-table td{white-space:nowrap;padding:6px 8px;text-align:left}
@@ -203,14 +215,49 @@ function loadPaperViewData(db: DatabaseSync, target: Member, canSeePerformance: 
 // Member switcher
 // ---------------------------------------------------------------------------
 
-function renderMemberChip(member: Member, active: boolean): Html {
-  const cls = active ? "member-chip on" : "member-chip";
-  const href = `/paper?member=${encodeURIComponent(member.id)}`;
-  return html`<a class="${cls}" href="${href}">${member.displayName}</a>`;
+/**
+ * 对比入口 (req §1.6: 「＋对比视图（两人净值曲线同图…良性竞赛）」) - the switcher
+ * used to be chips only, with no way to reach `?compare=1` from the UI at all;
+ * compare mode existed but was URL-only.
+ *
+ * Three shapes, decided by the SAME `show_performance` flag the compare
+ * renderer itself honors, so the entry can never invite a comparison the page
+ * would then refuse to draw:
+ *   - the viewer's own chip -> no entry (comparing yourself with yourself is
+ *     not a thing);
+ *   - another member showing performance -> a real link;
+ *   - another member hiding it -> greyed, `aria-disabled`, NOT a link, and it
+ *     says why. Following it would land on a page that draws only the
+ *     viewer's own curve plus 「对方未公开战绩」 (renderCurveCard), so an
+ *     enabled link here would be an invitation to a dead end.
+ */
+function renderCompareEntry(member: Member, isViewer: boolean): Html {
+  if (isViewer) {
+    return trustedHtml("");
+  }
+  if (!member.showPerformance) {
+    return html`<span
+      class="compare-entry off"
+      aria-disabled="true"
+      title="${member.displayName}未公开战绩，无法对比"
+      >对比 →<span class="sr-note">（对方未公开战绩）</span></span
+    >`;
+  }
+  // `&amp;` (not a bare `&`) - this literal is the STATIC part of the template
+  // and so is emitted verbatim, and a bare `&` in an attribute is invalid HTML.
+  return html`<a class="compare-entry" href="/paper?member=${encodeURIComponent(member.id)}&amp;compare=1">对比 →</a>`;
 }
 
-function renderMemberSwitcherCard(members: Member[], viewedId: string): Html {
-  const chips = joinHtml(members.map((m) => renderMemberChip(m, m.id === viewedId)));
+function renderMemberChip(member: Member, active: boolean, isViewer: boolean): Html {
+  const cls = active ? "member-chip on" : "member-chip";
+  const href = `/paper?member=${encodeURIComponent(member.id)}`;
+  return html`<span class="member-slot">
+    <a class="${cls}" href="${href}">${member.displayName}</a>${renderCompareEntry(member, isViewer)}
+  </span>`;
+}
+
+function renderMemberSwitcherCard(members: Member[], viewedId: string, viewerId: string): Html {
+  const chips = joinHtml(members.map((m) => renderMemberChip(m, m.id === viewedId, m.id === viewerId)));
   return html`<section class="card w2 dt-w4">
     <h2>成员</h2>
     <div>${chips}</div>
@@ -563,9 +610,16 @@ function renderPositionDonutCard(snapshot: OwnerSnapshot | null): Html {
 // database that the feature did not exist.
 //
 // PRIVACY: proposals are owner-private (routes/proposal.ts 403s on someone
-// else's). This card therefore ALWAYS renders the VIEWER's own proposals and
-// says so in its subtitle - it is never re-pointed at the member being
-// viewed, so switching to another member's paper view cannot leak theirs.
+// else's). This card is therefore only ever built from the VIEWER's own rows -
+// it is never re-pointed at the member being viewed, so no switch of the
+// member selector can reach another member's proposals.
+//
+// AND IT IS NOT RENDERED AT ALL ON SOMEONE ELSE'S PAGE (req §1.6, 2026-07-30):
+// every other block on that page describes the member being viewed, so the
+// viewer's own proposal history sitting among them reads as that member's.
+// Compare mode is the exception and not an inconsistency - there the KPI row,
+// holdings and donut are all pinned to the VIEWER's own account (see the
+// module header), so this card is describing the same account they are.
 // ---------------------------------------------------------------------------
 
 const PROPOSAL_HISTORY_LIMIT = 20;
@@ -616,7 +670,7 @@ function renderProposalsHistoryCard(proposals: ProposalHistoryRow[]): Html {
         );
   return html`<section class="card w2 dt-w4">
     <h2>提案与成交历史</h2>
-    <p style="font-size:11.5px;color:var(--sub);margin:-2px 0 6px">始终只显示你自己的提案——提案是各人私有的，切换成员视图不会显示对方的。</p>
+    <p style="font-size:11.5px;color:var(--sub);margin:-2px 0 6px">只显示你自己的提案——提案是各人私有的；看别人的盘时这一区块整块不显示。</p>
     ${body}
   </section>`;
 }
@@ -654,9 +708,18 @@ function renderPaperPage(
   let bodyHtml: Html;
   let freshnessSnapshot: OwnerSnapshot | null;
 
+  // Whether this page is describing the viewer's OWN account. Compare mode
+  // always is (main content stays pinned to the viewer); otherwise it depends
+  // on `?member=`. Decides both whether the proposal block renders and, if it
+  // does, whose rows it reads - the two can never disagree because there is
+  // only one flag.
+  const showsOwnAccount = compareRequested || !requested || requested.id === viewer.id;
   // Always the VIEWER's own proposals - never `requested`'s. See
-  // renderProposalsHistoryCard's PRIVACY note.
-  const proposalHistory = loadProposalHistory(deps.db, viewer.id, PROPOSAL_HISTORY_LIMIT);
+  // renderProposalsHistoryCard's PRIVACY note. Not loaded at all when the
+  // block will not render.
+  const proposalsCard = showsOwnAccount
+    ? renderProposalsHistoryCard(loadProposalHistory(deps.db, viewer.id, PROPOSAL_HISTORY_LIMIT))
+    : trustedHtml("");
 
   if (compareRequested) {
     // Main content always pinned to the viewer's own account (see module doc).
@@ -673,11 +736,11 @@ function renderPaperPage(
       otherHidden: Boolean(other) && !otherVisible
     });
 
-    bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewer.id)}</div>
+    bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewer.id, viewer.id)}</div>
       <div class="bento" style="margin-top:10px">${renderKpiRowCard(self.kpis)}</div>
       <div class="bento" style="margin-top:10px">${curveCard}${renderDailyMoveBarsCard()}</div>
       <div class="bento" style="margin-top:10px">${renderPositionsTableCard(self.snapshot)}</div>
-      <div class="bento" style="margin-top:10px">${renderPositionDonutCard(self.snapshot)}${renderProposalsHistoryCard(proposalHistory)}</div>
+      <div class="bento" style="margin-top:10px">${renderPositionDonutCard(self.snapshot)}${proposalsCard}</div>
       ${PAPER_PAGE_STYLE}`;
   } else {
     const viewed = requested ?? viewer;
@@ -690,11 +753,10 @@ function renderPaperPage(
       ? html`<div class="bento" style="margin-top:10px">${renderKpiRowCard(data.kpis)}</div>
         <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown)}${renderDailyMoveBarsCard()}</div>
         <div class="bento" style="margin-top:10px">${renderPositionsTableCard(data.snapshot)}</div>
-        <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${renderProposalsHistoryCard(proposalHistory)}</div>`
-      : html`<div class="bento" style="margin-top:10px">${renderHiddenPerformanceCard(viewed)}</div>
-        <div class="bento" style="margin-top:10px">${renderProposalsHistoryCard(proposalHistory)}</div>`;
+        <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${proposalsCard}</div>`
+      : html`<div class="bento" style="margin-top:10px">${renderHiddenPerformanceCard(viewed)}</div>`;
 
-    bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewed.id)}</div>
+    bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewed.id, viewer.id)}</div>
       ${contentHtml}
       ${PAPER_PAGE_STYLE}`;
   }

@@ -79,6 +79,7 @@ import {
   sendJson
 } from "@packages/shared-types";
 
+import { createThesis, type ThesisDirection } from "../data/strategy-write.js";
 import { resolveIdentity } from "../identity.js";
 import { guardAsyncWrite } from "./async-guard.js";
 
@@ -271,6 +272,12 @@ async function handlePromote(
   const wasAlreadyPublic = task.visibility === "public";
   const updated = repo.promoteVisibility(taskId, identity.id);
 
+  // Task 18 (2026-07-30): the research page's 「确认设为公开」 is a real
+  // `<form method="post">` (routes/research.ts), so this endpoint now has the
+  // SAME two submission shapes handleSubmit documents. A full-page navigation
+  // gets a 303 back to the page it came from; the skill/bearer caller keeps
+  // the unchanged JSON body.
+
   // Plan Task 3: "本阶段简化：仅 owner 校验 + 记 audit" - the reference-check
   // confirmation dialog (does the promoted verdict cite any 系统档 private
   // thesis/discipline text?) is explicitly out of scope here (front-end P10);
@@ -281,7 +288,103 @@ async function handlePromote(
     new AuditLogRepository(deps.db).write("research", "research promote", { taskId, ownerId: identity.id });
   }
 
+  if (isFormUrlEncoded(req)) {
+    res.writeHead(303, { Location: `/research/${taskId}` });
+    res.end();
+    return;
+  }
+
   sendJson(res, 200, { ok: true, task: updated });
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/research/:id/thesis - 存为论点 (req §1.3 step 4: 研判中的判断可一键
+// "存为论点"), Task 18. The research page's control; owner-gated exactly like
+// promote above (resolve the row first by id, then compare owners, so a
+// missing row 404s and someone else's row 403s).
+//
+// WHY NOT api-strategy.ts: that module is bearer-token-only by design (its own
+// module header), because it is the machine/skill write face. This is a
+// browser form on a page the member is already reading, so it uses the same
+// `resolveIdentity` chain the rest of this module documents - and the thesis
+// it writes is owned by the RESOLVED identity, never by a body field.
+//
+// The thesis lands at `system` visibility (data/strategy-write.ts's default):
+// saving a judgment is not publishing it, and there is a separate, deliberate
+// promote step for that.
+// ---------------------------------------------------------------------------
+
+const THESIS_DIRECTIONS: ReadonlySet<string> = new Set(["bull", "bear", "neutral"]);
+
+async function handleSaveAsThesis(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ApiResearchRouteDeps,
+  taskId: string
+): Promise<void> {
+  const identity = resolveIdentity(req, deps.db);
+  if (!identity) {
+    unauthorized(res);
+    return;
+  }
+
+  const isFormSubmit = isFormUrlEncoded(req);
+  const body = await readBody(req, isFormSubmit);
+
+  const task = new ResearchTaskRepository(deps.db).getById(taskId);
+  if (!task) {
+    sendJson(res, 404, { ok: false, error: `未找到研究任务：${taskId}` });
+    return;
+  }
+  if (task.ownerId !== identity.id) {
+    sendJson(res, 403, { ok: false, error: "无权操作：该研究任务属于其他成员" });
+    return;
+  }
+
+  const symbol = typeof body.symbol === "string" ? body.symbol.trim().toUpperCase() : "";
+  if (!symbol) {
+    sendJson(res, 400, { ok: false, error: "缺少 symbol 字段", field: "symbol" });
+    return;
+  }
+  const rawDirection = typeof body.direction === "string" ? body.direction : "";
+  if (!THESIS_DIRECTIONS.has(rawDirection)) {
+    sendJson(res, 400, { ok: false, error: "direction 只能是 bull/bear/neutral", field: "direction" });
+    return;
+  }
+  const direction = rawDirection as ThesisDirection;
+
+  // The saved thesis carries the verdict's OWN conclusion as its evidence
+  // point - never an invented one, and never an empty shell. A finished task
+  // always has a result_json; a hand-seeded row without one is refused rather
+  // than saved blank.
+  const conclusion = task.resultJson?.conclusion?.trim() ?? "";
+  if (!conclusion) {
+    sendJson(res, 400, { ok: false, error: "这条研判没有可保存的结论（result_json 为空）" });
+    return;
+  }
+  const point = `来自研判「${task.title ?? task.question}」：${conclusion}`;
+
+  const thesis = createThesis(deps.db, {
+    ownerId: identity.id,
+    symbol,
+    direction,
+    ...(direction === "bear" ? { bearPoints: [point] } : { bullPoints: [point] })
+  });
+
+  new AuditLogRepository(deps.db).write("research", "thesis from research", {
+    taskId,
+    thesisId: thesis.id,
+    ownerId: identity.id,
+    symbol
+  });
+
+  if (isFormSubmit) {
+    res.writeHead(303, { Location: `/research/${taskId}` });
+    res.end();
+    return;
+  }
+
+  sendJson(res, 201, { ok: true, thesis });
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +423,15 @@ export function handleApiResearchRoute(
       return true;
     }
     guardAsyncWrite(handlePromote(req, res, deps, segments[2] as string), req, res, "api-research");
+    return true;
+  }
+
+  if (segments.length === 4 && segments[3] === "thesis") {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    guardAsyncWrite(handleSaveAsThesis(req, res, deps, segments[2] as string), req, res, "api-research");
     return true;
   }
 

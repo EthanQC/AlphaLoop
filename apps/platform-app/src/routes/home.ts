@@ -38,7 +38,14 @@
  *   ④ 我的提醒流水   - real alert_events rows, or an honest empty state.
  *   ⑤ 今日日报卡     - latest daily report from Task 4's disk scanner, or
  *                      an honest empty state.
- *   ⑥ 纪律速览       - real discipline_rules, or an honest empty state.
+ *   ⑥ 纪律速览       - real discipline_rules, each with its own real 近30天
+ *                      tally (`computeComplianceStats`), under a streak line
+ *                      (`computeDisciplineStreak`) - or an honest empty
+ *                      state. Both lines are phrased by render/compliance.ts,
+ *                      the same module the strategy page's 我的纪律 section
+ *                      uses. Until 2026-07-30 this block stopped at the rule
+ *                      text and req §1.2's compliance half was the
+ *                      「策略记忆 P7 上线」 placeholder.
  *
  * EMPTY STATES (2026-07-30, U3): every block above used to fall back to a
  * bare 暂无X - and two of them ("提案审批 P6 上线", "策略记忆 P7 上线") still
@@ -78,8 +85,15 @@ import {
   type OwnerSnapshot,
   type ProposalRow
 } from "../data/overview.js";
+import {
+  computeComplianceStats,
+  computeDisciplineStreak,
+  type ComplianceStats,
+  type DisciplineStreak
+} from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
+import { describeDisciplineStreak, renderComplianceLine } from "../render/compliance.js";
 import { renderEmptyState } from "../render/empty-state.js";
 import {
   describeDataDay,
@@ -382,21 +396,39 @@ function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
 // ⑥ 纪律速览
 // ---------------------------------------------------------------------------
 
-function renderDisciplineRow(rule: DisciplineRuleRow): Html {
+function renderDisciplineRow(rule: DisciplineRuleRow, stats: ComplianceStats): Html {
   const label = ENFORCEMENT_LABELS[rule.enforcement] ?? rule.enforcement;
-  return html`<div class="disc">${rule.ruleText} <span style="color:var(--sub);font-size:12px">· ${label}</span></div>`;
+  return html`<div class="disc">
+    ${rule.ruleText} <span style="color:var(--sub);font-size:12px">· ${label}</span>
+    ${renderComplianceLine(stats)}
+  </div>`;
 }
 
-function renderDisciplineBlock(rules: DisciplineRuleRow[]): Html {
+/**
+ * req §1.2's 纪律速览: the rules AND how they have actually been going. The
+ * per-rule 近30天 tally and the streak line are both real measurements
+ * (data/strategy.ts) - this block used to end at the rule text, with the
+ * compliance half standing in as 「策略记忆 P7 上线」 long after P7 shipped.
+ *
+ * Both lines come from render/compliance.ts, the same module the strategy
+ * page's 我的纪律 section uses, so the two pages cannot end up describing the
+ * same tally in two different ways.
+ */
+function renderDisciplineBlock(
+  rules: DisciplineRuleRow[],
+  statsByRuleId: Map<string, ComplianceStats>,
+  streak: DisciplineStreak
+): Html {
   const body =
     rules.length > 0
-      ? joinHtml(rules.map(renderDisciplineRow))
+      ? joinHtml(rules.map((rule) => renderDisciplineRow(rule, statsByRuleId.get(rule.id) ?? { sample: "none" })))
       : renderEmptyState(
           "你还没有登记任何纪律规则。",
           "纪律是系统能替你硬拦的东西（如「财报周不加仓」「单票不超过 20%」）。在飞书单聊里说一句「记一条纪律：…」即可登记，之后每条提案都会按它做检查。"
         );
   return html`<section class="card w2 dt-w4">
     <h2>纪律速览</h2>
+    <p style="font-size:12px;color:var(--sub);margin:-2px 0 8px">${describeDisciplineStreak(streak)}</p>
     ${body}
   </section>`;
 }
@@ -441,6 +473,8 @@ function renderHomeBody(
   alertEvents: ReadonlyArray<AlertEventRow>,
   latestDaily: ReportIndexEntry | undefined,
   disciplineRules: DisciplineRuleRow[],
+  complianceStatsByRuleId: Map<string, ComplianceStats>,
+  disciplineStreak: DisciplineStreak,
   circuitPausedUntil: string | null,
   latestReview: TypedMonthlyReview | null
 ): Html {
@@ -457,7 +491,7 @@ function renderHomeBody(
       ${renderDailyReportBlock(latestDaily)}
     </div>
     <div class="bento" style="margin-top:10px">
-      ${renderDisciplineBlock(disciplineRules)}
+      ${renderDisciplineBlock(disciplineRules, complianceStatsByRuleId, disciplineStreak)}
     </div>
     <div class="bento" style="margin-top:10px">
       ${renderMonthlyReviewBlock(latestReview)}
@@ -477,6 +511,12 @@ export function renderHomePage(
   const proposals = loadPendingProposals(deps.db, member.id);
   const alertEvents = loadRecentAlertEvents(deps.db, member.id, ALERT_EVENT_LIMIT);
   const disciplineRules = loadDisciplineRules(deps.db, member.id);
+  // ⑥ 纪律速览's compliance half (Task 11) - the viewer's OWN id on every
+  // call; a member's discipline record is never anyone else's business.
+  const complianceStatsByRuleId = new Map<string, ComplianceStats>(
+    disciplineRules.map((rule) => [rule.id, computeComplianceStats(deps.db, member.id, rule.id, now)])
+  );
+  const disciplineStreak = computeDisciplineStreak(deps.db, member.id, now);
   const latestDaily = scanReports(deps.repoRoot).find((entry) => entry.type === "daily");
   // ⑦ 复盘速览 (Phase 9 Task 4 addition) - loadOwnerReviews is already
   // period-DESC ordered, so the first row (if any) is the most recent.
@@ -517,6 +557,8 @@ export function renderHomePage(
       alertEvents,
       latestDaily,
       disciplineRules,
+      complianceStatsByRuleId,
+      disciplineStreak,
       circuitPausedUntil,
       latestReview
     ),

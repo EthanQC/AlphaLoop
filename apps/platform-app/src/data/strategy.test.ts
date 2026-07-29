@@ -6,6 +6,7 @@ import { MemberRepository, createId, migrate, type Member } from "@packages/shar
 
 import {
   computeComplianceStats,
+  computeDisciplineStreak,
   groupThesesByOwner,
   loadCirclePublicTheses,
   loadLatestPriceForSymbol,
@@ -381,6 +382,117 @@ describe("computeComplianceStats: 近30天遵守 from proposals.discipline_repor
 
     expect(() => computeComplianceStats(db, "member_a", "rule_1", NOW)).not.toThrow();
     expect(computeComplianceStats(db, "member_a", "rule_1", NOW)).toEqual({ sample: "none" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 11 (2026-07-30): 首页纪律速览's 「已连续遵守 N 天」. The home page used
+// to print 「策略记忆 P7 上线」 there; N has to be a real measurement or it
+// must not be printed at all.
+// ---------------------------------------------------------------------------
+
+describe("computeDisciplineStreak: 连续遵守天数 from the owner's own discipline checks", () => {
+  const NOW = new Date("2026-07-14T12:00:00.000Z");
+
+  it("no completed check anywhere in the scan window -> no streak to state", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }]);
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({ kind: "no_checks" });
+  });
+
+  it("pass: null rows are not completed checks - they cannot start a streak", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }]);
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-10T00:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: null }]
+    });
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({ kind: "no_checks" });
+  });
+
+  it("counts the days since the most recent VIOLATION, not since the first check", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }]);
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-06-20T00:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: false }]
+    });
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-04T12:00:00.000Z", // exactly 10 days before NOW
+      disciplineReport: [{ ruleId: "rule_1", pass: false }]
+    });
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-12T00:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: true }]
+    });
+
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({
+      kind: "since_violation",
+      days: 10,
+      lastViolationAt: "2026-07-04T12:00:00.000Z"
+    });
+  });
+
+  it("no violation at all -> a LOWER BOUND tied to the oldest check it actually saw", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }]);
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-09T12:00:00.000Z", // 5 days before NOW
+      disciplineReport: [{ ruleId: "rule_1", pass: true }]
+    });
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-13T00:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: true }]
+    });
+
+    // NOT "5 days" as a fact and NOT 30 (the window) - the honest claim is
+    // "at least 5, because that is as far back as the evidence goes".
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({
+      kind: "clean_since",
+      atLeastDays: 5,
+      oldestCheckedAt: "2026-07-09T12:00:00.000Z",
+      checked: 2
+    });
+  });
+
+  it("another member's violation never breaks this member's streak", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }, { id: "member_b" }]);
+    seedProposal(db, {
+      ownerId: "member_b",
+      createdAt: "2026-07-13T00:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: false }]
+    });
+    seedProposal(db, {
+      ownerId: "member_a",
+      createdAt: "2026-07-09T12:00:00.000Z",
+      disciplineReport: [{ ruleId: "rule_1", pass: true }]
+    });
+
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({
+      kind: "clean_since",
+      atLeastDays: 5,
+      oldestCheckedAt: "2026-07-09T12:00:00.000Z",
+      checked: 1
+    });
+  });
+
+  it("malformed discipline_report JSON is skipped, not thrown", () => {
+    const db = memoryDb();
+    seedMembers(db, [{ id: "member_a" }]);
+    db.prepare(`
+      INSERT INTO proposals (id, owner_id, symbol, side, quantity, order_type, reason, discipline_report, status, created_at, expires_at)
+      VALUES (?, 'member_a', 'NVDA.US', 'buy', 1, 'limit', 'test', 'not json', 'pending', '2026-07-10T00:00:00.000Z', '2026-07-15T00:00:00.000Z')
+    `).run(createId("proposal"));
+
+    expect(() => computeDisciplineStreak(db, "member_a", NOW)).not.toThrow();
+    expect(computeDisciplineStreak(db, "member_a", NOW)).toEqual({ kind: "no_checks" });
   });
 });
 

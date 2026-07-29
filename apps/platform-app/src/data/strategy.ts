@@ -135,6 +135,31 @@ export function loadOwnTheses(db: DatabaseSync, ownerId: string): ThesisEvidence
 }
 
 /**
+ * The subset of `ids` that are THIS owner's theses, in `ids` order-independent
+ * created_at DESC (Task 18: the research promotion confirmation needs to say
+ * which of the theses a verdict cites are still 系统可用 档).
+ *
+ * `owner_id = ?` is in the WHERE clause, not applied afterwards, so a caller
+ * that passes an id belonging to another member gets nothing back rather than
+ * a row it then has to remember to filter. An empty `ids` short-circuits
+ * instead of building a `IN ()` that no SQL dialect accepts.
+ */
+export function loadOwnThesesByIds(
+  db: DatabaseSync,
+  ownerId: string,
+  ids: readonly string[]
+): ThesisEvidenceRow[] {
+  if (ids.length === 0) {
+    return [];
+  }
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`${THESIS_EVIDENCE_SELECT} WHERE t.owner_id = ? AND t.id IN (${placeholders}) ORDER BY t.created_at DESC`)
+    .all(ownerId, ...ids) as Array<Record<string, unknown>>;
+  return rows.map(mapThesisEvidenceRow);
+}
+
+/**
  * OTHER active members' `public` theses only - "他人仅 public". `owner_id !=
  * ?` and `visibility = 'public'` are both enforced in the WHERE clause
  * itself, never filtered in JS after an unfiltered fetch; joining `members`
@@ -343,6 +368,111 @@ export function computeComplianceStats(
     return { sample: "none" };
   }
   return { sample: "ok", checked, passed, failed };
+}
+
+// ---------------------------------------------------------------------------
+// 已连续遵守 N 天 (req §1.2's 纪律速览 fallback line) - Task 11
+// ---------------------------------------------------------------------------
+
+/**
+ * How long the owner has gone without breaking a discipline rule.
+ *
+ * `computeComplianceStats` above cannot answer this: it returns
+ * checked/passed/failed over a window, and a count of passes is not a span of
+ * days. The home page's 「已连续遵守 N 天」 needs a real N or it must not print
+ * one, so this is its own measurement with its own three honest outcomes:
+ *
+ *   `since_violation`  the owner DID break a rule, and this is how many whole
+ *                      days ago - an exact, defensible N.
+ *   `clean_since`      no violation among the checks this scan saw. The
+ *                      streak may well be longer than the evidence, so the
+ *                      claim is a LOWER BOUND (「至少 N 天」) anchored to the
+ *                      oldest check actually examined - never the window
+ *                      length (which would assert clean days nobody checked)
+ *                      and never the count of checks (which is not days).
+ *   `no_checks`        no completed check at all -> there is no streak to
+ *                      state, and the caller must say that rather than print
+ *                      a zero.
+ */
+export type DisciplineStreak =
+  | { kind: "no_checks" }
+  | { kind: "since_violation"; days: number; lastViolationAt: string }
+  | { kind: "clean_since"; atLeastDays: number; oldestCheckedAt: string; checked: number };
+
+/** How far back the streak scan reads. Bounded so this stays one indexed,
+ * predictable query on a page load; a streak longer than this reports as
+ * "at least <window>" via `clean_since`, which is true. */
+const STREAK_WINDOW_MS = 180 * 24 * 60 * 60 * 1000;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function wholeDaysBetween(from: string, now: Date): number {
+  const fromMs = new Date(from).getTime();
+  if (!Number.isFinite(fromMs)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor((now.getTime() - fromMs) / MS_PER_DAY));
+}
+
+/**
+ * Reads this owner's proposals in the scan window and classifies them by
+ * their `discipline_report` entries - the SAME JSON array, written by the
+ * same producer (discipline-engine.mjs), that `computeComplianceStats` above
+ * tallies, and with the same `pass: null` rule: 「无法判定」 is not a
+ * completed check, so it neither breaks a streak nor starts one.
+ *
+ * A violation is ANY entry with `pass: false`, regardless of which rule it
+ * belonged to (including a rule since deleted) - the claim being made is
+ * "you have not broken a rule since X", and a rule that existed and was
+ * broken at the time still broke it.
+ */
+export function computeDisciplineStreak(db: DatabaseSync, ownerId: string, now: Date): DisciplineStreak {
+  const windowStart = new Date(now.getTime() - STREAK_WINDOW_MS).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT created_at, discipline_report FROM proposals
+       WHERE owner_id = ? AND created_at >= ?
+       ORDER BY created_at DESC`
+    )
+    .all(ownerId, windowStart) as Array<{ created_at: unknown; discipline_report: unknown }>;
+
+  let lastViolationAt: string | null = null;
+  let oldestCheckedAt: string | null = null;
+  let checked = 0;
+
+  for (const row of rows) {
+    let entries: DisciplineReportEntry[];
+    try {
+      const parsed: unknown = JSON.parse(String(row.discipline_report ?? "[]"));
+      entries = Array.isArray(parsed) ? (parsed as DisciplineReportEntry[]) : [];
+    } catch {
+      continue;
+    }
+    const completed = entries.filter((entry) => entry?.pass === true || entry?.pass === false);
+    if (completed.length === 0) {
+      continue;
+    }
+    const createdAt = String(row.created_at ?? "");
+    checked += completed.length;
+    oldestCheckedAt = createdAt;
+    if (lastViolationAt === null && completed.some((entry) => entry.pass === false)) {
+      // Rows arrive newest-first, so the first violation seen is the latest.
+      lastViolationAt = createdAt;
+    }
+  }
+
+  if (lastViolationAt !== null) {
+    return { kind: "since_violation", days: wholeDaysBetween(lastViolationAt, now), lastViolationAt };
+  }
+  if (oldestCheckedAt === null) {
+    return { kind: "no_checks" };
+  }
+  return {
+    kind: "clean_since",
+    atLeastDays: wholeDaysBetween(oldestCheckedAt, now),
+    oldestCheckedAt,
+    checked
+  };
 }
 
 // ---------------------------------------------------------------------------

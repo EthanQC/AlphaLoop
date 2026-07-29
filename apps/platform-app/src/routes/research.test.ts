@@ -377,4 +377,197 @@ describe("research route (GET /research/<id>)", () => {
     expect(body).toContain(`nonce="${nonceMatch?.[1]}"`);
     expect(body).not.toMatch(/https?:\/\//iu);
   });
+
+  // ---------------------------------------------------------------------------
+  // 设为公开 / 存为论点 (req §1.3 step 4, plan Task 18) - 2026-07-30. The
+  // promote endpoint existed since P8 but nothing on the page could reach it,
+  // and 「存为论点」 had no control at all.
+  // ---------------------------------------------------------------------------
+
+  describe("研判页 owner controls", () => {
+    function seedThesis(ownerId: string, opts: { id: string; symbol: string; visibility: "system" | "public" }): void {
+      db.prepare(`
+        INSERT INTO theses (id, owner_id, symbol, direction, visibility, created_at, updated_at, bull_points, bear_points)
+        VALUES (?, ?, ?, 'bull', ?, '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z', '[]', '[]')
+      `).run(opts.id, ownerId, opts.symbol, opts.visibility);
+    }
+
+    it("offers 设为公开 and 存为论点 to the owner of a finished verdict", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const body = await (await authed(`/research/${id}`, token)).text();
+
+      expect(body).toContain("设为公开");
+      expect(body).toContain("存为论点");
+      expect(body).toContain(`action="/api/research/${id}/thesis"`);
+    });
+
+    it("offers neither control to another member reading a PUBLIC verdict", async () => {
+      const { member } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+      new ResearchTaskRepository(db).promoteVisibility(id, member.id);
+
+      new MemberRepository(db).upsert(makeMember({ id: "member_b", email: "b@example.com" }));
+      const tokenB = new ApiTokenRepository(db).issue("member_b", "test-b").token;
+
+      const body = await (await authed(`/research/${id}`, tokenB)).text();
+
+      expect(body).not.toContain("设为公开");
+      expect(body).not.toContain("存为论点");
+      expect(body).not.toContain("/promote");
+    });
+
+    it("shows no 设为公开 control on a task that is already public", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+      new ResearchTaskRepository(db).promoteVisibility(id, member.id);
+
+      const body = await (await authed(`/research/${id}`, token)).text();
+
+      expect(body).toContain("已公开");
+      expect(body).not.toContain("设为公开");
+    });
+
+    it("offers no controls on a task that has not finished", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+
+      const body = await (await authed(`/research/${id}`, token)).text();
+
+      expect(body).not.toContain("设为公开");
+      expect(body).not.toContain("存为论点");
+    });
+
+    it("the confirmation counts the REAL system-tier items this verdict would expose", async () => {
+      const { member, token } = seedMemberWithToken();
+      // The verdict's comparison references thesis_1 and rule_1.
+      seedThesis(member.id, { id: "thesis_1", symbol: "NVDA.US", visibility: "system" });
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const body = await (await authed(`/research/${id}?promote=confirm`, token)).text();
+
+      // 1 system-tier thesis + 1 discipline rule = 2.
+      expect(body).toContain("连带暴露以下 2 条");
+      expect(body).toContain("NVDA.US");
+      expect(body).toContain("单一标的仓位不超过 20%");
+      expect(body).toContain(`action="/api/research/${id}/promote"`);
+      expect(body).toContain("确认设为公开");
+    });
+
+    it("does not count a thesis the owner has ALREADY made public as newly exposed", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedThesis(member.id, { id: "thesis_1", symbol: "NVDA.US", visibility: "public" });
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const body = await (await authed(`/research/${id}?promote=confirm`, token)).text();
+
+      expect(body).toContain("连带暴露以下 1 条");
+    });
+
+    it("says so plainly when a verdict would expose nothing extra", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", {
+        resultJson: { ...FULL_RESULT_JSON, comparison: { theses: [], disciplines: [] } }
+      });
+
+      const body = await (await authed(`/research/${id}?promote=confirm`, token)).text();
+
+      expect(body).toContain("没有「系统可用」档内容会被连带暴露");
+      expect(body).toContain("确认设为公开");
+    });
+
+    it("403s the confirmation page for a non-owner of a public task", async () => {
+      const { member } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+      new ResearchTaskRepository(db).promoteVisibility(id, member.id);
+
+      new MemberRepository(db).upsert(makeMember({ id: "member_b", email: "b@example.com" }));
+      const tokenB = new ApiTokenRepository(db).issue("member_b", "test-b").token;
+
+      const body = await (await authed(`/research/${id}?promote=confirm`, tokenB)).text();
+      expect(body).not.toContain("确认设为公开");
+    });
+
+    it("a browser form submit to promote redirects back to the research page and really promotes", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const response = await fetch(`${baseUrl}/api/research/${id}/promote`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/x-www-form-urlencoded" },
+        body: "",
+        redirect: "manual"
+      });
+
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toBe(`/research/${id}`);
+      expect(new ResearchTaskRepository(db).getById(id)?.visibility).toBe("public");
+    });
+
+    it("a browser form submit to 存为论点 creates a REAL system-tier thesis owned by the submitter", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const response = await fetch(`${baseUrl}/api/research/${id}/thesis`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ symbol: "nvda.us", direction: "bear" }).toString(),
+        redirect: "manual"
+      });
+
+      expect(response.status).toBe(303);
+      const rows = db.prepare(`SELECT * FROM theses WHERE owner_id = ?`).all(member.id) as Array<Record<string, unknown>>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.symbol).toBe("NVDA.US");
+      expect(rows[0]?.direction).toBe("bear");
+      expect(rows[0]?.visibility).toBe("system");
+      // The verdict's own conclusion is what got saved - not an empty shell.
+      expect(String(rows[0]?.bear_points)).toContain("NVDA 短期承压");
+    });
+
+    it("refuses 存为论点 on someone else's research task", async () => {
+      const { member } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      new MemberRepository(db).upsert(makeMember({ id: "member_b", email: "b@example.com" }));
+      const tokenB = new ApiTokenRepository(db).issue("member_b", "test-b").token;
+
+      const response = await fetch(`${baseUrl}/api/research/${id}/thesis`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${tokenB}`, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ symbol: "NVDA.US", direction: "bull" }).toString(),
+        redirect: "manual"
+      });
+
+      expect(response.status).toBe(403);
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM theses`).get()).toMatchObject({ c: 0 });
+    });
+
+    it("rejects 存为论点 with a missing symbol instead of writing a blank thesis", async () => {
+      const { member, token } = seedMemberWithToken();
+      const id = createQueuedTask(member.id);
+      finishTask(id, "done", { resultJson: FULL_RESULT_JSON });
+
+      const response = await fetch(`${baseUrl}/api/research/${id}/thesis`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ direction: "bull" }).toString(),
+        redirect: "manual"
+      });
+
+      expect(response.status).toBe(400);
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM theses`).get()).toMatchObject({ c: 0 });
+    });
+  });
 });

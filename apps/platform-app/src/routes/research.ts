@@ -51,6 +51,15 @@
  * `renderInProgressBody`'s output - the done/degraded/failed branches never
  * emit it, so a finished task's page never keeps auto-reloading.
  *
+ * ARCHIVE ACTIONS (2026-07-30, plan Task 18 / req §1.3 step 4): the
+ * done/degraded page ends with a 归档动作 card, rendered ONLY for the task's
+ * owner - 设为公开 (via a `?promote=confirm` interstitial that lists what
+ * promoting would expose) and 存为论点 (a form posting to
+ * `/api/research/<id>/thesis`). A member reading someone else's PUBLIC verdict
+ * gets the seven verdict sections and no controls at all. See
+ * `collectPromotionExposure` below for what the confirmation counts and why it
+ * does not claim the cited theses get promoted along with the page.
+ *
  * LABEL FIX (plan Task 4: "visibility label 修正"): the header card's
  * visibility pill used to read a private row as "系统可用" (a copy-paste
  * leftover from theses'/strategy_cards' three-tier system/public
@@ -72,6 +81,7 @@ import {
   type ResearchTask
 } from "@packages/shared-types";
 
+import { loadOwnThesesByIds, type ThesisEvidenceRow } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
@@ -418,7 +428,110 @@ function renderProcessDetailsCard(task: ResearchTask, skipped: ResearchResult["s
   </section>`;
 }
 
-function renderVerdictBody(task: ResearchTask): Html {
+// ---------------------------------------------------------------------------
+// ⑧ 归档动作: 设为公开 / 存为论点 (req §1.3 step 4) - 2026-07-30, plan Task 18.
+//
+// The promote ENDPOINT has existed since P8 (routes/api-research.ts) but no
+// surface could reach it, and 「存为论点」 had no control at all - the spec's
+// two archive actions were both unreachable from the page they belong to.
+//
+// OWNER ONLY, and only on a finished verdict. A public research task is
+// readable by any member (this route's own exception to the ownership gate),
+// so these forms are gated on `isOwner`, never on "the page rendered".
+//
+// The confirmation is the spec's, and it states what promoting ACTUALLY does:
+// `promoteVisibility` flips this task's row and nothing else, so the theses
+// and rules keep their own tier - what changes is that their content, as
+// quoted inside this verdict's 对照 block, becomes readable by the circle.
+// Claiming the items get promoted too would be a claim the code does not make.
+// ---------------------------------------------------------------------------
+
+interface PromotionExposure {
+  /** This owner's `system`-tier theses the verdict quotes. */
+  theses: ThesisEvidenceRow[];
+  /** Discipline rule texts the verdict quotes - rules have no public tier at
+   * all (there is no `visibility` column on discipline_rules), so every one
+   * of them is owner-private today and every one is newly exposed. */
+  disciplineTexts: string[];
+}
+
+function readComparisonRecords(entries: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(entries)
+    ? entries.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+    : [];
+}
+
+function collectPromotionExposure(db: DatabaseSync, task: ResearchTask): PromotionExposure {
+  const comparison = task.resultJson?.comparison;
+  const thesisRefs = readComparisonRecords(comparison?.theses)
+    .map((record) => record.ref)
+    .filter((ref): ref is string => typeof ref === "string" && ref.length > 0);
+  const disciplineTexts = readComparisonRecords(comparison?.disciplines)
+    .map((record) => record.ruleText)
+    .filter((text): text is string => typeof text === "string" && text.length > 0);
+
+  const theses = loadOwnThesesByIds(db, task.ownerId, thesisRefs).filter((row) => row.visibility === "system");
+  return { theses, disciplineTexts };
+}
+
+const THESIS_DIRECTION_LABELS: Record<string, string> = { bull: "看多", bear: "看空", neutral: "中性" };
+
+function renderExposureList(exposure: PromotionExposure): Html {
+  const items = [
+    ...exposure.theses.map(
+      (thesis) => html`<li style="margin:4px 0">论点 · <b>${thesis.symbol}</b>（${THESIS_DIRECTION_LABELS[thesis.direction] ?? thesis.direction}）</li>`
+    ),
+    ...exposure.disciplineTexts.map((text) => html`<li style="margin:4px 0">纪律 · ${text}</li>`)
+  ];
+  if (items.length === 0) {
+    return html`<p style="font-size:13px;color:var(--ink)">这条研判没有引用你的任何论点或纪律，没有「系统可用」档内容会被连带暴露。</p>`;
+  }
+  return html`<p style="font-size:13px;color:var(--ink)">
+      设为公开后，本页的「与我的论点/纪律对照」区块会<b>连带暴露以下 ${items.length} 条</b>「系统可用」档内容（这些论点/纪律本身的档位不变，改变的是它们在本页里的内容会被圈内成员读到）：
+    </p>
+    <ul style="margin:6px 0 0 18px;font-size:13px">${joinHtml(items)}</ul>`;
+}
+
+function renderPromoteConfirmCard(task: ResearchTask, exposure: PromotionExposure): Html {
+  return html`<section class="card w2 dt-w4 amber" aria-label="设为公开确认">
+    <h2 style="color:var(--amber)">设为公开前请确认</h2>
+    ${renderExposureList(exposure)}
+    <form method="post" action="/api/research/${task.id}/promote" style="margin-top:10px">
+      <button class="btn primary" type="submit">确认设为公开</button>
+      <a href="/research/${task.id}" style="margin-left:10px;font-size:13px;color:var(--sub)">取消</a>
+    </form>
+  </section>`;
+}
+
+function renderArchiveActionsCard(task: ResearchTask): Html {
+  const visibilityRow =
+    task.visibility === "public"
+      ? html`<p style="font-size:13px;color:var(--sub);margin:0">这条研判<b>已公开</b>，会出现在你名片的「公开研判」区。</p>`
+      : html`<p style="font-size:13px;color:var(--sub);margin:0 0 8px">
+            这条研判目前仅你自己可见。公开后它会进入你名片的「公开研判」区。
+          </p>
+          <a class="btn" href="/research/${task.id}?promote=confirm">设为公开 →</a>`;
+
+  return html`<section class="card w2 dt-w4">
+    <h2>归档动作</h2>
+    ${visibilityRow}
+    <hr style="border:none;border-top:1px solid var(--line);margin:12px 0" />
+    <p style="font-size:13px;color:var(--sub);margin:0 0 8px">
+      把这次研判的核心结论存成一条论点，之后每次研判与个股分析都会拿它做对照。存下来的论点是「系统可用」档（仅系统与你可见），要公开另外操作。
+    </p>
+    <form method="post" action="/api/research/${task.id}/thesis" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input name="symbol" required placeholder="标的代码，如 NVDA.US" style="padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px" />
+      <select name="direction" style="padding:6px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+        <option value="bull">看多</option>
+        <option value="bear">看空</option>
+        <option value="neutral">中性</option>
+      </select>
+      <button class="btn" type="submit">存为论点</button>
+    </form>
+  </section>`;
+}
+
+function renderVerdictBody(task: ResearchTask, archiveActions: Html): Html {
   const banner = task.status === "degraded" ? renderDegradedBanner() : trustedHtml("");
   const result = task.resultJson;
 
@@ -448,7 +561,8 @@ function renderVerdictBody(task: ResearchTask): Html {
     <div class="bento" style="margin-top:10px">${renderComparisonCard(result.comparison)}</div>
     <div class="bento" style="margin-top:10px">${renderSuggestedActionCard(result.suggestedAction)}</div>
     <div class="bento" style="margin-top:10px">${renderEvidenceCard(result.evidence)}</div>
-    <div class="bento" style="margin-top:10px">${renderProcessDetailsCard(task, result.skipped)}</div>`;
+    <div class="bento" style="margin-top:10px">${renderProcessDetailsCard(task, result.skipped)}</div>
+    ${archiveActions}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +603,8 @@ function renderResearchPage(
   deps: ResearchRouteDeps,
   member: Member,
   task: ResearchTask,
+  isOwner: boolean,
+  promoteConfirm: boolean,
   nonce: string
 ): void {
   const now = currentNow(deps);
@@ -497,7 +613,16 @@ function renderResearchPage(
   if (task.status === "queued" || task.status === "running") {
     bodyHtml = renderInProgressBody(task, nonce);
   } else if (task.status === "done" || task.status === "degraded") {
-    bodyHtml = renderVerdictBody(task);
+    // Archive actions belong to the OWNER only - a member reading someone
+    // else's public verdict gets the verdict and nothing they could act on.
+    const archiveActions = !isOwner
+      ? trustedHtml("")
+      : promoteConfirm && task.visibility !== "public"
+        ? html`<div class="bento" style="margin-top:10px">
+            ${renderPromoteConfirmCard(task, collectPromotionExposure(deps.db, task))}
+          </div>`
+        : html`<div class="bento" style="margin-top:10px">${renderArchiveActionsCard(task)}</div>`;
+    bodyHtml = renderVerdictBody(task, archiveActions);
   } else {
     bodyHtml = renderFailedBody(task);
   }
@@ -560,6 +685,6 @@ export function handleResearchRoute(
     return true;
   }
 
-  renderResearchPage(res, deps, member, task, nonce);
+  renderResearchPage(res, deps, member, task, isOwner, url.searchParams.get("promote") === "confirm", nonce);
   return true;
 }

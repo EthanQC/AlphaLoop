@@ -493,4 +493,103 @@ describe("home route (GET /)", () => {
       expect(body).toContain("还没有你的月度复盘。");
     });
   });
+
+  // -------------------------------------------------------------------------
+  // ⑥ 纪律速览 (req §1.2) - Task 11, 2026-07-30. This block used to list the
+  // rule text and nothing else; the compliance half of req §1.2 ("近 30 天
+  // 遵守情况" / "已连续遵守 N 天") was the 「策略记忆 P7 上线」 placeholder.
+  // -------------------------------------------------------------------------
+
+  describe("⑥ 纪律速览: real compliance, or an honest reason there is none", () => {
+    function seedRule(ownerId: string, ruleText: string, enforcement = "proposal_check"): string {
+      const id = createId("rule");
+      db.prepare(`
+        INSERT INTO discipline_rules (id, owner_id, rule_text, enforcement, enabled, created_at)
+        VALUES (?, ?, ?, ?, 1, '2026-07-01T00:00:00.000Z')
+      `).run(id, ownerId, ruleText, enforcement);
+      return id;
+    }
+
+    function seedProposalWithChecks(ownerId: string, createdAt: string, report: unknown[]): void {
+      db.prepare(`
+        INSERT INTO proposals (id, owner_id, symbol, side, quantity, order_type, reason, discipline_report, status, created_at, expires_at)
+        VALUES (?, ?, 'NVDA.US', 'buy', 1, 'limit', 'test', ?, 'pending', ?, ?)
+      `).run(createId("proposal"), ownerId, JSON.stringify(report), createdAt, createdAt);
+    }
+
+    function disciplineBlock(body: string): string {
+      const start = body.indexOf("纪律速览");
+      return start < 0 ? "" : body.slice(start, start + 1600);
+    }
+
+    it("renders each rule's REAL 近30天 tally, never a P7 placeholder", async () => {
+      const { member, token } = seedMemberWithToken();
+      const ruleId = seedRule(member.id, "财报周不加仓");
+      seedProposalWithChecks(member.id, "2026-07-10T00:00:00.000Z", [{ ruleId, pass: true }]);
+      seedProposalWithChecks(member.id, "2026-07-11T00:00:00.000Z", [{ ruleId, pass: true }]);
+      seedProposalWithChecks(member.id, "2026-07-12T00:00:00.000Z", [{ ruleId, pass: false }]);
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("财报周不加仓");
+      expect(block).toContain("近30天 3 次检查，遵守 2 / 违反 1");
+      expect(block).not.toContain("P7 上线");
+    });
+
+    it("says a rule has no sample rather than printing 0 次 for it", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "单票不超过 20%");
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("近30天无相关提案");
+      expect(block).not.toContain("近30天 0 次检查");
+    });
+
+    it("states 已连续遵守 N 天 counted from the owner's most recent real violation", async () => {
+      const { member, token } = seedMemberWithToken();
+      const ruleId = seedRule(member.id, "财报周不加仓");
+      seedProposalWithChecks(member.id, "2026-07-04T12:00:00.000Z", [{ ruleId, pass: false }]);
+      seedProposalWithChecks(member.id, "2026-07-12T00:00:00.000Z", [{ ruleId, pass: true }]);
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("已连续遵守 10 天");
+    });
+
+    it("with no violation on record, states a LOWER BOUND instead of an invented streak", async () => {
+      const { member, token } = seedMemberWithToken();
+      const ruleId = seedRule(member.id, "财报周不加仓");
+      seedProposalWithChecks(member.id, "2026-07-09T12:00:00.000Z", [{ ruleId, pass: true }]);
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("已连续遵守至少 5 天");
+      expect(block).toContain("1 次检查");
+    });
+
+    it("with no completed check at all, says so instead of claiming a streak", async () => {
+      const { member, token } = seedMemberWithToken();
+      seedRule(member.id, "财报周不加仓");
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("还没有提案触发过纪律检查");
+      expect(block).not.toContain("已连续遵守");
+    });
+
+    it("another member's violation never shortens this member's streak", async () => {
+      const { member, token } = seedMemberWithToken();
+      const ruleId = seedRule(member.id, "财报周不加仓");
+      seedProposalWithChecks(member.id, "2026-07-09T12:00:00.000Z", [{ ruleId, pass: true }]);
+
+      const other = makeMember({ id: "member_other", email: "other@example.com" });
+      new MemberRepository(db).upsert(other);
+      seedProposalWithChecks(other.id, "2026-07-13T00:00:00.000Z", [{ ruleId: "rule_x", pass: false }]);
+
+      const block = disciplineBlock(await (await authed("/", token)).text());
+
+      expect(block).toContain("已连续遵守至少 5 天");
+    });
+  });
 });

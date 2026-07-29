@@ -376,20 +376,77 @@ describe("paper route (GET /paper)", () => {
     expect(body).not.toContain(">暂无提案</p>");
   });
 
-  it("NEVER shows another member's proposals - not even when their paper view is being displayed", async () => {
+  // req §1.6 / plan Task 11: 「看他人盘时该区块隐藏」. The block is about the
+  // account currently on screen, so on someone else's page it has nothing
+  // truthful to show - not B's (private) and not A's (which would read as B's
+  // beside B's KPI row).
+  it("hides the proposal block entirely on another member's page - neither member's proposals appear", async () => {
     const { token: tokenA } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
     const memberB = makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: true });
     new MemberRepository(db).upsert(memberB);
     seedProposal("member_b", { symbol: "NVDA.US" });
     const ownId = seedProposal("member_a", { symbol: "TSM.US" });
 
-    // A views B's paper page: B's proposals must not appear anywhere on it.
     const body = await (await authed(`/paper?member=member_b`, tokenA)).text();
 
-    expect(body).toContain(`/proposal/${ownId}`); // A's own history stays put
-    expect(body).toContain("TSM.US 买入");
+    expect(body).not.toContain("提案与成交历史");
+    expect(body).not.toContain(`/proposal/${ownId}`);
     expect(body).not.toContain("NVDA.US 买入");
-    expect(body).toContain("提案是各人私有的");
+    expect(body).not.toContain("TSM.US 买入");
   });
 
+  it("keeps the proposal block on the viewer's OWN page, including a hidden-performance member's", async () => {
+    const { member, token } = seedMemberWithToken({ showPerformance: false });
+    const ownId = seedProposal(member.id, { symbol: "TSM.US" });
+
+    const body = await (await authed(`/paper?member=${member.id}`, token)).text();
+
+    expect(body).toContain("提案与成交历史");
+    expect(body).toContain(`/proposal/${ownId}`);
+  });
+
+  it("keeps the proposal block in compare mode - the dashboard there is still the viewer's own", async () => {
+    const { member, token } = seedMemberWithToken({ id: "member_a", email: "a@example.com" });
+    const memberB = makeMember({ id: "member_b", email: "b@example.com", displayName: "乙" });
+    new MemberRepository(db).upsert(memberB);
+    const ownId = seedProposal(member.id, { symbol: "TSM.US" });
+    seedProposal("member_b", { symbol: "NVDA.US" });
+
+    const body = await (await authed("/paper?member=member_b&compare=1", token)).text();
+
+    expect(body).toContain("提案与成交历史");
+    expect(body).toContain(`/proposal/${ownId}`);
+    expect(body).not.toContain("NVDA.US 买入");
+  });
+
+  // -------------------------------------------------------------------------
+  // 对比入口 (req §1.6: 「对比视图」; plan Task 18 §1.6) - 2026-07-30.
+  // -------------------------------------------------------------------------
+
+  it("renders a 对比 entry beside every OTHER member's chip, pointing at compare mode", async () => {
+    const { token } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
+    new MemberRepository(db).upsert(
+      makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: true })
+    );
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain('href="/paper?member=member_b&amp;compare=1"');
+    expect(body).toContain("对比");
+    // Never a link to compare yourself with yourself.
+    expect(body).not.toContain('href="/paper?member=member_a&amp;compare=1"');
+  });
+
+  it("greys the 对比 entry out - not a link - for a member who hides their performance", async () => {
+    const { token } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
+    new MemberRepository(db).upsert(
+      makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: false })
+    );
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).not.toContain('href="/paper?member=member_b&amp;compare=1"');
+    expect(body).toContain('aria-disabled="true"');
+    expect(body).toContain("对方未公开战绩");
+  });
 });

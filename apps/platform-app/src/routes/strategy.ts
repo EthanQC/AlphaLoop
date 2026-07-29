@@ -58,6 +58,7 @@ import {
 } from "../data/strategy.js";
 import { loadAllDisciplineRulesForOwner, type DisciplineRuleRow } from "../data/overview.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { renderComplianceLine } from "../render/compliance.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
 import { formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
@@ -112,13 +113,6 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
 // ---------------------------------------------------------------------------
 // ① 我的纪律
 // ---------------------------------------------------------------------------
-
-function renderComplianceLine(stats: ComplianceStats): Html {
-  if (stats.sample === "none") {
-    return html`<span class="days">近30天无相关提案</span>`;
-  }
-  return html`<span class="days">近30天 ${stats.checked} 次检查，遵守 ${stats.passed} / 违反 ${stats.failed}</span>`;
-}
 
 function renderDisciplineRow(rule: DisciplineRuleRow, stats: ComplianceStats): Html {
   const label = ENFORCEMENT_LABELS[rule.enforcement] ?? rule.enforcement;
