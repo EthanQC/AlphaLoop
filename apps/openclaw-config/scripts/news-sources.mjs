@@ -250,6 +250,63 @@ export async function fetchFinnhubCompanyNews(symbol, { apiKey, fetchImpl = fetc
   }
 }
 
+const FINNHUB_EARNINGS_CALENDAR_URL = "https://finnhub.io/api/v1/calendar/earnings";
+
+// Task 20 (2026-07-28 spec-drift plan): the earnings half of requirements
+// §3.1's 「宏观与财报日历」. Same endpoint family, same auth header, same
+// limiter and the same whole-function redaction as fetchFinnhubCompanyNews
+// above - it lives here, beside its sibling, rather than in report-earnings.mjs
+// so that `redactSecret` keeps exactly one caller-facing contract: no error
+// leaving this module has ever seen the key. report-earnings.mjs owns the
+// normalization/rendering; this owns the wire.
+//
+// Returns the raw `earningsCalendar` rows (unnormalized) so the ONE place that
+// decides what a usable row is stays report-earnings.mjs's
+// normalizeEarningsCalendarPayload - the pattern report-macro.mjs already uses
+// with the Longbridge macro payload.
+//
+// Response shape verified against the live API on 2026-07-30 using the
+// deployed mini's own FINNHUB_API_KEY (symbol=NVDA, from=2026-07-30,
+// to=2026-11-30):
+//   {"earningsCalendar":[{"symbol":"NVDA","date":"2026-11-17","hour":"amc",
+//     "quarter":3,"year":2027,"epsEstimate":2.3985,"epsActual":null,
+//     "revenueEstimate":105311630623,"revenueActual":null}, ...]}
+// Two things that probe settled, both of which the normalizer depends on:
+// rows come back UNSORTED (11-17 before 08-26), and Finnhub answers a US
+// ticker with its own primary listing's symbol where they differ (querying
+// `TSM` returns rows carrying `2330.TW`), so the queried symbol has to be
+// carried alongside the returned one.
+export async function fetchFinnhubEarningsCalendar(symbol, { apiKey, from, to, fetchImpl = fetch, limiter, timeoutMs = 12_000 } = {}) {
+  const key = String(apiKey ?? "").trim();
+  try {
+    if (!key) {
+      throw new Error("Finnhub API key is required (FINNHUB_API_KEY not set).");
+    }
+    if (limiter) {
+      limiter.acquire(`earnings-calendar:${symbol}`);
+    }
+
+    const url = new URL(FINNHUB_EARNINGS_CALENDAR_URL);
+    url.searchParams.set("symbol", toBareSymbol(symbol));
+    url.searchParams.set("from", String(from));
+    url.searchParams.set("to", String(to));
+
+    const response = await fetchResponseWithTimeout(url, {
+      fetchImpl,
+      timeoutMs,
+      headers: { "X-Finnhub-Token": key }
+    });
+    if (!response.ok) {
+      throw new Error(`Finnhub HTTP ${response.status} ${response.statusText} for ${symbol}`);
+    }
+
+    const payload = await response.json();
+    return Array.isArray(payload?.earningsCalendar) ? payload.earningsCalendar : [];
+  } catch (error) {
+    throw new Error(redactSecret(String(error?.message ?? error), key));
+  }
+}
+
 function formatFinnhubDate(date) {
   return date.toISOString().slice(0, 10);
 }

@@ -200,8 +200,22 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
   if (newsLines.some(hasLongUntranslatedEnglishOutsideAllowedFields) || /英文摘要已读取|事件细节待核对/u.test(newsLines.join("\n"))) {
     failures.push("news.translation");
   }
-  if (!/(### 宏观日历|宏观日历降级)/u.test(text)) {
+  // Task 20 (2026-07-28 spec-drift plan): the section is 「宏观与财报日历」 now
+  // (requirements §3.1), rendered as `### 宏观与财报日历` over `#### 宏观日历` +
+  // `#### 财报日历`. The old literal `### 宏观日历` is kept as an accepted form
+  // so a legacy report on disk is still judged by the rule it was written
+  // under - the same era discipline `isNewFormatReport` draws below.
+  if (!/(### 宏观与财报日历|#{3,4} 宏观日历|宏观日历降级)/u.test(text)) {
     failures.push("macro.evidence");
+  }
+  // The earnings half is only required of a NEW-format report: it did not
+  // exist before Task 20, and retroactively failing every archived report over
+  // it would be the exact retro-fail this file's era gate exists to prevent.
+  // renderEarningsCalendarLines never returns an empty list - it returns the
+  // reason there is nothing to list - so a new-format report that lost this
+  // heading lost the whole section, not merely its content.
+  if (isNewFormat && !/#### 财报日历/u.test(text)) {
+    failures.push("macro.earnings_missing");
   }
   if (!/(QQQ 固定观察|QQQ 与美股风险温度)/u.test(text)) {
     failures.push("market.qqq");

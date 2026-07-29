@@ -7,9 +7,11 @@
 //     macro/industry minimum, used by both daily (budget<=30) and weekly
 //     (budget<=60) reports (Global Constraints).
 //   - L3 deep dive (runL3DeepDive): cross-verification of the highest-impact
-//     clustered events (news-engine.mjs's `event` shape, Task 3), OFF by
-//     default for the daily report (07-07 decision) and only turned on by the
-//     weekly caller (`enabled: true, perEventBudget: 8`).
+//     clustered events (news-engine.mjs's `event` shape, Task 3), run by BOTH
+//     report kinds since Task 20 (2026-07-28) at the budgets requirements
+//     §3.1/§3.3 name - daily 3 events x <=5 rounds, weekly 5 x <=8. The
+//     earlier "OFF for the daily report" decision (07-07) is superseded; see
+//     runL3DeepDive's own comment.
 //
 // Neither function ever calls a real network/agent itself - `searchBackend`
 // is always injected by the caller as
@@ -31,7 +33,7 @@
 //   1. Content that will be RENDERED (title/summary_zh/evidence_quote/
 //      impact.reason) is passed through Task 1's defuseMarkdownInText so it
 //      can never smuggle a live `[text](url)` markdown link into either
-//      rendering face (PDF/report-rendering.mjs, platform markdown.ts).
+//      rendering face (platform markdown.ts).
 //   2. The raw, pre-defuse text is ALSO preserved verbatim for audit, but
 //      only inside a dedicated `rawText` field wrapped in the delimiters
 //      `<<<EXTERNAL_UNTRUSTED>>>...<<<END_EXTERNAL>>>`. This is the same
@@ -439,11 +441,15 @@ function buildAnalysis(event, evidenceItems, counterEvidence) {
 // each cross-verified with up to `perEventBudget` backend calls (topic
 // evidence + a mandatory counter-evidence query).
 //
-// `enabled` defaults to `false` - the 07-07 binding decision is "L3 日报默认
-// 关" (L3 OFF by default for the daily report); the weekly caller is the one
-// that opts in with `enabled: true, perEventBudget: 8`. When disabled this
-// returns EXACTLY `{ skipped: true, reason: 'l3_disabled_daily' }` and never
-// touches `searchBackend`.
+// `enabled` defaults to `false`, so a caller that forgets it spends no budget.
+// BOTH report kinds now opt in (Task 20, 2026-07-28 spec-drift plan): the
+// 2026-07-12 requirements (r2) supersede the earlier 07-07 "L3 日报默认关"
+// decision this comment used to cite - §3.1 lists 事件深挖（top 2-3，每事件 ≤5
+// 轮） as part of the DAILY report and §3.3 gives the weekly 3-5 events at ≤8
+// rounds. scheduled-report.mjs's L3_BUDGETS holds those four numbers and
+// passes `enabled: true` for both kinds; the defaults below are the daily
+// pair. When disabled this returns EXACTLY
+// `{ skipped: true, reason: 'l3_disabled' }` and never touches `searchBackend`.
 //
 // Degradation: identical contract to runL2TopicSearch - a `searchBackend`
 // throw stops ALL further calls (remaining queries for the current event AND
@@ -456,7 +462,7 @@ function buildAnalysis(event, evidenceItems, counterEvidence) {
 // }} options
 export async function runL3DeepDive({ searchBackend, events = [], perEventBudget = 5, maxEvents = 3, enabled = false } = {}) {
   if (!enabled) {
-    return { skipped: true, reason: "l3_disabled_daily" };
+    return { skipped: true, reason: "l3_disabled" };
   }
 
   const selected = selectTopEventsByImpact(events, maxEvents);

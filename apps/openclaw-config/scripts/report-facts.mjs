@@ -155,6 +155,109 @@ export function persistDailyFacts(db, tradingDay, facts) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 20 (2026-07-28 spec-drift plan): the WEEKLY report's own summary.
+// ---------------------------------------------------------------------------
+//
+// The weekly report used to render the daily renderer's sections verbatim
+// with the headings reworded ("今日结论" -> "本周结论"), so it said nothing
+// about the WEEK: the QQQ block it printed was a single instant's quote, the
+// same one the daily report printed. Requirements §3.3 asks the weekly for
+// 周度行情归因 - what the benchmark did from the week's open to its close, and
+// how far it fell inside the week.
+//
+// The inputs are the daily_facts rows the daily runs already persisted (one
+// `qqq.price` per trading day, written by buildDailyFacts above), so this
+// derives the week from the same recorded ground truth report-quality.mjs
+// checks the narrative against, not from a second, separately-fetched price
+// history that could disagree with it.
+//
+// WHAT IT REFUSES TO DO: with fewer than two priced days in the window it
+// returns `{available:false, reason}` and the renderer prints that reason. A
+// week whose facts table is empty must read as "本周没有可用的每日行情事实",
+// never as a 0.00% return - Global Constraints, 一个算出来的 0 就是编造.
+
+const WEEKLY_PRICE_FACT_KEY = "qqq.price";
+
+/**
+ * @param {Array<{tradingDay: string, facts: Record<string, {valueNum: number|null}>}>} series
+ *   One entry per calendar day in the report window, in ascending date order,
+ *   exactly as news-store.mjs's getDailyFacts returns them. Days with no row
+ *   (weekends, holidays, a run that failed) may be present with empty facts -
+ *   they are counted as missing, not as zero.
+ * @param {{factKey?: string, symbolLabel?: string}} [options]
+ */
+export function summarizeWeeklyMarketPerformance(series, options = {}) {
+  const factKey = options.factKey ?? WEEKLY_PRICE_FACT_KEY;
+  const symbolLabel = options.symbolLabel ?? "QQQ";
+  const rows = Array.isArray(series) ? series : [];
+
+  const priced = [];
+  const missingDays = [];
+  for (const entry of rows) {
+    const tradingDay = String(entry?.tradingDay ?? "");
+    const value = entry?.facts?.[factKey]?.valueNum;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      priced.push({ tradingDay, price: value });
+    } else if (tradingDay) {
+      missingDays.push(tradingDay);
+    }
+  }
+  priced.sort((a, b) => (a.tradingDay < b.tradingDay ? -1 : a.tradingDay > b.tradingDay ? 1 : 0));
+
+  if (priced.length < 2) {
+    return {
+      available: false,
+      symbolLabel,
+      observedDays: priced.length,
+      missingDays,
+      reason: priced.length === 0
+        ? `本窗口没有任何一天记录到 ${symbolLabel} 的每日行情事实（daily_facts.${factKey}），无法计算周度收益与回撤`
+        : `本窗口只有 1 天记录到 ${symbolLabel} 的每日行情事实（${priced[0].tradingDay}），至少需要 2 天才能计算周开到周收的区间收益`
+    };
+  }
+
+  const open = priced[0];
+  const close = priced[priced.length - 1];
+  const returnPct = ((close.price - open.price) / open.price) * 100;
+
+  // Max peak-to-trough decline INSIDE the window, walking forward: the trough
+  // is only ever compared against a peak that came before it, which is what
+  // makes this a drawdown rather than "highest minus lowest".
+  let peak = priced[0];
+  let maxDrawdownPct = 0;
+  let drawdownPeakDay = priced[0].tradingDay;
+  let drawdownTroughDay = priced[0].tradingDay;
+  for (const point of priced) {
+    if (point.price > peak.price) {
+      peak = point;
+      continue;
+    }
+    const declinePct = ((peak.price - point.price) / peak.price) * 100;
+    if (declinePct > maxDrawdownPct) {
+      maxDrawdownPct = declinePct;
+      drawdownPeakDay = peak.tradingDay;
+      drawdownTroughDay = point.tradingDay;
+    }
+  }
+
+  return {
+    available: true,
+    symbolLabel,
+    openDay: open.tradingDay,
+    openPrice: open.price,
+    closeDay: close.tradingDay,
+    closePrice: close.price,
+    returnPct,
+    maxDrawdownPct,
+    drawdownPeakDay,
+    drawdownTroughDay,
+    observedDays: priced.length,
+    missingDays,
+    reason: null
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Phase 5 Task 1 (2026-07-15 plan): per-stock facts (stock_facts, schema v9).
 //
 // Same rationale as buildDailyFacts above, one level down: stock-analysis.mjs

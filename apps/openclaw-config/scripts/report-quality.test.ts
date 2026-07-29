@@ -320,9 +320,19 @@ const GOOD_NEW_FORMAT_REPORT = [
   "- 新闻来源分布：财联社 1 条；华尔街见闻 1 条；路透社 1 条。",
   "- 中文源占比：85.00%。",
   "",
-  "### 宏观日历",
+  // Task 20 (2026-07-28): the section renderMarketIntelligence emits is
+  // 「宏观与财报日历」 with a macro and an earnings sub-heading. Copied from the
+  // real renderer's output shape (see the seam test in
+  // scheduled-report.test.ts, which runs the REAL renderer through THIS gate).
+  "### 宏观与财报日历",
+  "",
+  "#### 宏观日历",
   "",
   "- 2026-07-18 20:30 美国费城联储制造业指数（前值-- / 预测12 / 公告--）",
+  "",
+  "#### 财报日历",
+  "",
+  "- 2026-08-26 盘后 NVDA.US 2027 财年 Q2 财报；EPS 预期 2.1274；营收预期 936.06 亿。",
   "",
   "## 4. QQQ 固定观察",
   "",

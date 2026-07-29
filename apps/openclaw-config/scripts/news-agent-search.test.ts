@@ -247,7 +247,7 @@ describe("runL3DeepDive", () => {
     const searchBackend = vi.fn(async () => ({ results: [] }));
     const result = await agentSearch.runL3DeepDive({ searchBackend, events: [event()] });
 
-    expect(result).toEqual({ skipped: true, reason: "l3_disabled_daily" });
+    expect(result).toEqual({ skipped: true, reason: "l3_disabled" });
     expect(searchBackend).not.toHaveBeenCalled();
   });
 
@@ -255,7 +255,7 @@ describe("runL3DeepDive", () => {
     const searchBackend = vi.fn(async () => ({ results: [] }));
     const result = await agentSearch.runL3DeepDive({ searchBackend, events: [event()], enabled: false });
 
-    expect(result).toEqual({ skipped: true, reason: "l3_disabled_daily" });
+    expect(result).toEqual({ skipped: true, reason: "l3_disabled" });
   });
 
   it("weekly run (enabled: true) selects the top maxEvents by impact score and stays within perEventBudget calls per event", async () => {

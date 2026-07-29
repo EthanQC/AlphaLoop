@@ -96,6 +96,7 @@ a{color:inherit;text-decoration:none}
 .disc{font-size:13px;line-height:1.55}
 .disc .days{display:inline-block;margin-top:8px;font-size:11.5px;color:var(--up);background:var(--up-bg);border-radius:99px;padding:1px 8px}
 .report h3{font-size:16px;font-weight:700;line-height:1.5;margin-bottom:5px}
+.report h4{font-size:14px;font-weight:600;line-height:1.5;margin:10px 0 4px}
 .report p{font-size:13px;color:var(--sub);margin-bottom:10px}
 .report-links{display:flex;gap:8px}
 .btn{flex:1;text-align:center;border:1px solid var(--btn2-border);border-radius:9px;padding:9px 0;font-size:13px;color:var(--accent);background:var(--btn2-bg);font-weight:500;cursor:pointer}

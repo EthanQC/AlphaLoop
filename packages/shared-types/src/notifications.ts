@@ -19,7 +19,6 @@ export interface NotificationPayload {
 export type NotificationDeliveryTarget =
   | "feishu-user-plugin-bot-text"
   | "feishu-user-plugin-bot-post"
-  | "feishu-user-plugin-bot-file"
   | "feishu-webhook"
   | "feishu-app-open-id"
   | "feishu-app-chat-id"
@@ -104,12 +103,6 @@ export interface ReportDeliveryPayload {
   title: string;
   markdown: string;
   markdownPath?: string;
-  /**
-   * Legacy: the PDF attachment is retired (2026-07-12 requirements, §0.4
-   * "PDF 已退役"). Only the legacy feishu-user-plugin channel still uploads
-   * it when a caller passes one; the app-credential channel never does.
-   */
-  pdfPath?: string;
   maxSectionChars?: number;
   /**
    * WHO may read this report. REQUIRED in effect, though the type cannot say
@@ -214,7 +207,10 @@ export interface OperationalAlertResult {
 }
 
 export interface ReportDeliveryEntry {
-  kind: "summary" | "chapter" | "file";
+  // No "file" kind: the PDF attachment is retired (2026-07-12 requirements
+  // §0.4 "PDF 已退役"), so no channel below uploads one and no producer records
+  // one as delivered.
+  kind: "summary" | "chapter";
   title: string;
   target: NotificationDeliveryTarget;
   sent: boolean;
@@ -1436,27 +1432,30 @@ async function deliverReportViaUserPlugin(
     }
   }
 
-  if (payload.pdfPath) {
-    const fileResult = await trySendFeishuUserPluginBotFile(payload.pdfPath, `${payload.title}.pdf`);
-    deliveries.push({
-      kind: "file",
-      title: `${payload.title}.pdf`,
-      target: fileResult.target,
-      sent: fileResult.sent,
-      ...(fileResult.detail ? { detail: fileResult.detail } : {}),
-      ...(fileResult.reason ? { reason: fileResult.reason } : {})
-    });
-    if (!fileResult.sent) {
-      throw new Error(`Feishu report PDF delivery failed: ${fileResult.reason ?? fileResult.detail ?? "unknown error"}`);
-    }
-  }
-
   return {
-    sent: deliveries.some((entry) => entry.kind !== "file" && entry.sent),
+    sent: deliveries.some((entry) => entry.sent),
     target: "feishu-user-plugin-bot-post",
     deliveries
   };
 }
+
+/**
+ * How a report body actually reaches its reader, in the reader's own language.
+ *
+ * Exported so a report's own "- 投递：…" / "- 渠道：…" self-description does not
+ * assert a delivery method from memory. Every renderer that prints one takes
+ * the sentence FROM the delivery layer, so the two cannot drift: until
+ * 2026-07-30 all four of them said "飞书摘要卡片 + PDF" while the mini rendered a
+ * PDF nobody uploaded (`pdfUploaded: false` on every state entry) and Feishu
+ * carried a single conclusion card. Changing what the channels below do means
+ * changing this line, and the reports change with it.
+ *
+ * True of BOTH surviving channels: deliverReportViaAppCredentials sends one
+ * interactive card whose button opens the platform page, and the legacy
+ * user-plugin channel sends one summary post (shouldSendFullReportChapters()
+ * is constant false). Neither sends the body, neither sends a file.
+ */
+export const REPORT_DELIVERY_DESCRIPTION = "飞书只发结论卡片，正文在平台阅读（卡片按钮直达）";
 
 export function allowReportFallbackDelivery(): boolean {
   return false;
@@ -1618,66 +1617,6 @@ async function sendFeishuUserPluginBotPost(payload: NotificationPayload): Promis
       ...(detail ? { detail } : {})
     };
   }, "feishu-user-plugin post send");
-}
-
-async function trySendFeishuUserPluginBotFile(filePath: string, fileName: string): Promise<NotificationResult> {
-  if (!existsSync(filePath)) {
-    return {
-      sent: false,
-      target: "feishu-user-plugin-bot-file",
-      reason: `PDF file was not found: ${filePath}`
-    };
-  }
-
-  try {
-    const upload = await withNotificationRetry(() => callFeishuUserPluginTool("upload_file", {
-      file_path: filePath,
-      file_type: "pdf",
-      file_name: fileName
-    }), "feishu-user-plugin file upload");
-    const uploadText = extractMcpText(upload);
-    const fileKey = uploadText.match(/\bfile_[A-Za-z0-9_-]+\b/u)?.[0];
-    if (upload.isError || !fileKey) {
-      return {
-        sent: false,
-        target: "feishu-user-plugin-bot-file",
-        reason: uploadText || "PDF upload did not return a file key."
-      };
-    }
-
-    const sent = await withNotificationRetry(() => callFeishuUserPluginTool("send_message_as_bot", {
-      chat_id: resolveFeishuUserPluginBotChatId(),
-      msg_type: "file",
-      content: {
-        file_key: fileKey
-      }
-    }), "feishu-user-plugin file send");
-    const detail = extractMcpText(sent);
-    // Item 6 (task P2.5 Task 6): this was the one remaining call site that
-    // checked a narrower `/^error:/iu` directly instead of routing through
-    // isFeishuProseFailure - a "Send failed: ..." prose response (a real
-    // feishu-user-plugin shape, see that helper's own doc comment) fell
-    // through undetected and was reported as a successful PDF delivery.
-    if (sent.isError || isFeishuProseFailure(detail)) {
-      return {
-        sent: false,
-        target: "feishu-user-plugin-bot-file",
-        reason: detail || "PDF file message failed."
-      };
-    }
-
-    return {
-      sent: true,
-      target: "feishu-user-plugin-bot-file",
-      detail
-    };
-  } catch (error) {
-    return {
-      sent: false,
-      target: "feishu-user-plugin-bot-file",
-      reason: sanitizeNotificationError(error)
-    };
-  }
 }
 
 /**
@@ -2344,8 +2283,19 @@ function extractActionableSummaryBullets(markdown: string): string[] {
   const news = extractSection(markdown, [/^###\s+长桥新闻/u]);
   bullets.push(...extractUsefulBullets(news).slice(0, 2));
 
-  const macro = extractSection(markdown, [/^###\s+宏观日历/u]);
+  // Task 20 (2026-07-28 spec-drift plan): the report's section is now
+  // 「宏观与财报日历」 (requirements §3.1), with `#### 宏观日历` / `#### 财报日历`
+  // beneath it. `^###\s` cannot match a level-4 heading (the 4th character is
+  // `#`, not whitespace), so keeping only the old pattern would have silently
+  // dropped the macro bullet from every card - the card would still send, one
+  // line shorter, with nothing anywhere saying why. Both the level-3 section
+  // and the legacy level-3 `### 宏观日历` are matched; the earnings sub-section
+  // gets its own bullet.
+  const macro = extractSection(markdown, [/^###\s+宏观与财报日历/u, /^###\s+宏观日历/u, /^####\s+宏观日历/u]);
   bullets.push(...extractUsefulBullets(macro).slice(0, 1));
+
+  const earnings = extractSection(markdown, [/^####\s+财报日历/u]);
+  bullets.push(...extractUsefulBullets(earnings).slice(0, 1));
 
   const positions = extractSection(markdown, [/^##\s+持仓/u, /^##\s+\d+\.\s+官方模拟盘/u, /^##\s+\d+\.\s+模拟盘/u]);
   bullets.push(...extractUsefulBullets(positions).slice(0, 2));

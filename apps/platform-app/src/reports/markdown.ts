@@ -34,7 +34,12 @@ export interface MarkdownRenderResult {
   sources: MarkdownSourceLink[];
 }
 
-const HEADING_RE = /^(#{1,3})\s+(.+)$/u;
+// Task 20 (2026-07-28 spec-drift plan): was `#{1,3}`. The report's calendar
+// section is now `### 宏观与财报日历` over `#### 宏观日历` / `#### 财报日历`, and
+// a level-4 line does not match `#{1,3}\s` at all (the 4th character is `#`,
+// not whitespace) - it fell straight through to the paragraph branch and the
+// reading page printed a literal "#### 宏观日历" to the user.
+const HEADING_RE = /^(#{1,4})\s+(.+)$/u;
 const ORDERED_ITEM_RE = /^(\d+)[.)]\s+(.+)$/u;
 const BULLET_ITEM_RE = /^[-*]\s+(.+)$/u;
 const FENCE_RE = /^```/u;
@@ -167,9 +172,23 @@ export function renderMarkdown(md: string): MarkdownRenderResult {
     listItems = [];
   };
 
+  // Task 23 (2026-07-30): every table is emitted inside its OWN horizontal
+  // scroll container. Report tables are routinely 6-8 columns of
+  // symbol/price/percentage (个股分析's 数据表, the PnL table, 宏观日历) and on
+  // a phone the widest of them used to push the whole PAGE sideways - the
+  // topbar, the nav and every other card scrolled along with it. `table-scroll`
+  // (styled in routes/reports.ts's REPORT_BODY_STYLE, which routes/personal.ts
+  // shares) confines the overflow to the table itself. `tabindex="0"` is not
+  // decoration: a scrollable region that is not focusable cannot be scrolled
+  // by keyboard at all, and `role="region"` + `aria-label` is what makes a
+  // screen reader announce it as a thing you can scroll.
   const closeTable = (): void => {
     if (tableRows) {
-      blocks.push(html`<table><tbody>${joinHtml(tableRows)}</tbody></table>`);
+      blocks.push(
+        html`<div class="table-scroll" role="region" aria-label="可横向滚动的表格" tabindex="0"><table><tbody>${joinHtml(
+          tableRows
+        )}</tbody></table></div>`
+      );
     }
     tableRows = null;
   };
@@ -239,6 +258,8 @@ export function renderMarkdown(md: string): MarkdownRenderResult {
         blocks.push(html`<h2 id="${id}">${displayHtml}</h2>`);
       } else if (level === 1) {
         blocks.push(html`<h1>${displayHtml}</h1>`);
+      } else if (level === 4) {
+        blocks.push(html`<h4>${displayHtml}</h4>`);
       } else {
         blocks.push(html`<h3>${displayHtml}</h3>`);
       }

@@ -480,3 +480,102 @@ describe("persistStockFacts", () => {
     expect(getStockFacts(db, "2026-07-14", "MSFT.US")["quote.last"].valueNum).toBe(430.1);
   });
 });
+
+// ===========================================================================
+// Task 20 (2026-07-28 spec-drift plan): summarizeWeeklyMarketPerformance
+//
+// The weekly report used to reuse the daily renderer verbatim, so its only
+// "market" content was one instant's quote. §3.3 asks for 周度行情归因; this is
+// the computation behind it, over the daily_facts rows the daily runs already
+// wrote (fact key `qqq.price`, exactly as buildDailyFacts above produces it -
+// the live mini's table was read to confirm the key and the per-day cadence).
+// ===========================================================================
+
+/** The window shape scheduled-report.mjs's readWindowDailyFacts hands in: one
+ * entry per calendar day, days with no run present but empty. */
+function windowSeries(prices: Array<[string, number | null]>) {
+  return prices.map(([tradingDay, price]) => ({
+    tradingDay,
+    facts: price === null ? {} : { "qqq.price": { valueNum: price, unit: "USD", source: "longbridge-quote" } }
+  }));
+}
+
+describe("summarizeWeeklyMarketPerformance", () => {
+  it("computes week open -> week close return and the peak-to-trough drawdown inside the window", () => {
+    // Real-shaped week: rises, falls below the open, recovers part of it.
+    const summary = facts.summarizeWeeklyMarketPerformance(
+      windowSeries([
+        ["2026-07-21", 677.96],
+        ["2026-07-22", 690.0],
+        ["2026-07-23", 655.0],
+        ["2026-07-24", 668.47],
+        ["2026-07-27", 682.12]
+      ])
+    );
+
+    expect(summary.available).toBe(true);
+    expect(summary.openDay).toBe("2026-07-21");
+    expect(summary.closeDay).toBe("2026-07-27");
+    expect(summary.returnPct).toBeCloseTo(((682.12 - 677.96) / 677.96) * 100, 6);
+    // Deepest decline is 690.00 -> 655.00, not open -> lowest.
+    expect(summary.maxDrawdownPct).toBeCloseTo(((690 - 655) / 690) * 100, 6);
+    expect(summary.drawdownPeakDay).toBe("2026-07-22");
+    expect(summary.drawdownTroughDay).toBe("2026-07-23");
+    expect(summary.observedDays).toBe(5);
+  });
+
+  it("measures the drawdown from a PRECEDING peak only - a later high cannot create one", () => {
+    // Monotonically rising week: there is no peak-to-trough decline at all.
+    const summary = facts.summarizeWeeklyMarketPerformance(
+      windowSeries([
+        ["2026-07-21", 600],
+        ["2026-07-22", 610],
+        ["2026-07-23", 620]
+      ])
+    );
+
+    expect(summary.maxDrawdownPct).toBe(0);
+    expect(summary.returnPct).toBeCloseTo(((620 - 600) / 600) * 100, 6);
+  });
+
+  it("counts un-priced days as missing and names them, rather than treating them as flat", () => {
+    const summary = facts.summarizeWeeklyMarketPerformance(
+      windowSeries([
+        ["2026-07-25", null], // Saturday - no daily run
+        ["2026-07-26", null], // Sunday
+        ["2026-07-27", 680],
+        ["2026-07-28", 660]
+      ])
+    );
+
+    expect(summary.available).toBe(true);
+    expect(summary.observedDays).toBe(2);
+    expect(summary.missingDays).toEqual(["2026-07-25", "2026-07-26"]);
+    expect(summary.returnPct).toBeCloseTo(((660 - 680) / 680) * 100, 6);
+  });
+
+  it("refuses to answer - with a reason - when the window has fewer than two priced days", () => {
+    const oneDay = facts.summarizeWeeklyMarketPerformance(windowSeries([["2026-07-27", 680], ["2026-07-28", null]]));
+    expect(oneDay.available).toBe(false);
+    expect(oneDay.returnPct).toBeUndefined();
+    expect(oneDay.reason).toContain("2026-07-27");
+    expect(oneDay.reason).toContain("至少需要 2 天");
+
+    const empty = facts.summarizeWeeklyMarketPerformance(windowSeries([["2026-07-27", null]]));
+    expect(empty.available).toBe(false);
+    expect(empty.reason).toContain("daily_facts.qqq.price");
+    // A computed 0 would be a fabrication - there must be no number at all.
+    expect(empty.maxDrawdownPct).toBeUndefined();
+  });
+
+  it("ignores a non-positive or non-numeric price instead of dividing by it", () => {
+    const summary = facts.summarizeWeeklyMarketPerformance([
+      { tradingDay: "2026-07-27", facts: { "qqq.price": { valueNum: 0 } } },
+      { tradingDay: "2026-07-28", facts: { "qqq.price": { valueNum: null } } },
+      { tradingDay: "2026-07-29", facts: { "qqq.price": { valueNum: 660 } } }
+    ]);
+
+    expect(summary.available).toBe(false);
+    expect(summary.observedDays).toBe(1);
+  });
+});

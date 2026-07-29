@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 
@@ -190,6 +190,87 @@ describe("seam test: a genuinely-generated report always satisfies its own compl
     expect(scheduledReport.isPreparedReportMarkdownComplete(markdown)).toBe(true);
   });
 
+  // Task 14 (§0.4 「PDF 已退役」). Both bodies used to state 「投递：飞书摘要卡片 +
+  // PDF」 and 「渠道：飞书只发送摘要卡片 + PDF」 - four lines describing a delivery
+  // that had not happened for weeks. The mini's own state file recorded
+  // `pdfUploaded: false` on every entry while 28 PDFs piled up in reports/.
+  //
+  // The sentence is now taken FROM the delivery layer
+  // (REPORT_DELIVERY_DESCRIPTION, packages/shared-types/notifications.ts), so
+  // it is the same string the channels' own doc comment is written against and
+  // cannot drift from them independently.
+  it("describes delivery the way the delivery layer does, and never mentions a PDF", async () => {
+    const { REPORT_DELIVERY_DESCRIPTION } = await import("../../../packages/shared-types/dist/index.js");
+    const dailyInfo = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const weeklyInfo = scheduledReport.resolveReportWindow("weekly", "2026-07-14");
+
+    for (const markdown of [
+      scheduledReport.renderDailyReport(dailyInfo, buildFixtureData()),
+      scheduledReport.renderWeeklyReport(weeklyInfo, buildFixtureData())
+    ]) {
+      expect(markdown).toContain(`- 投递：${REPORT_DELIVERY_DESCRIPTION}。`);
+      expect(markdown).toContain(`- 渠道：${REPORT_DELIVERY_DESCRIPTION}。`);
+      expect(markdown).not.toMatch(/PDF/iu);
+    }
+  });
+
+  // Task 23 (2026-07-30): the daily report's 宏观日历 section must render
+  // Chinese labels. THE FIXTURE HERE IS THE REAL PRODUCER'S SHAPE, not the
+  // all-Chinese one buildFixtureData carries: Longbridge's US macro calendar
+  // sends English `content` and English `data_kv` keys, which is why the live
+  // 2026-07-30 daily on the mini shipped
+  // 「美国 United States, Policy Rates, Fed Funds Target Rate（Previous3.625 …）」
+  // inside an otherwise all-Chinese report while every test stayed green.
+  it("renders macro calendar rows in Chinese with the English original in parentheses", async () => {
+    const { normalizeMacroCalendarPayload } = await import("./report-data.mjs");
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = buildFixtureData();
+    data.macroEvents = normalizeMacroCalendarPayload({
+      list: [
+        {
+          date: "2026-07-14",
+          infos: [
+            {
+              id: "evt-real-1",
+              content: "United States, Jobless Claims, National, Initial",
+              date: "20:30",
+              market: "US",
+              star: 2,
+              type: "macrodata",
+              datetime: "1752863400",
+              data_kv: [
+                { key: "Previous", value: "187" },
+                { key: "Estimate", value: "200" },
+                { key: "Actual", value: "--" }
+              ]
+            },
+            {
+              id: "evt-real-2",
+              content: "United States, Widget Shipments, Total",
+              date: "20:30",
+              market: "US",
+              star: 2,
+              type: "macrodata",
+              datetime: "1752863400",
+              data_kv: [{ key: "Previous", value: "1.2" }]
+            }
+          ]
+        }
+      ]
+    });
+
+    const markdown = scheduledReport.renderDailyReport(info, data);
+
+    expect(markdown).toContain("初请失业金人数（United States, Jobless Claims, National, Initial）");
+    expect(markdown).toContain("前值 187 / 预期 200 / 实际 --");
+    // The exact live defect: a bare English name, and a glued key+value.
+    expect(markdown).not.toContain("Previous187");
+    expect(markdown).not.toMatch(/美国 United States, Jobless/u);
+    // An indicator with no Chinese mapping says so instead of printing
+    // English as if it were the label.
+    expect(markdown).toContain("暂无中文名（英文原名：United States, Widget Shipments, Total）");
+  });
+
   it("a report missing even one of the 5 markers is correctly flagged incomplete (the check side still works)", () => {
     expect(scheduledReport.isPreparedReportMarkdownComplete("# OpenClaw 日报 2026-07-14\n\n长桥官方模拟盘 多源新闻 宏观日历 QQQ 行情")).toBe(false);
   });
@@ -264,7 +345,7 @@ describe("Phase 4 Task 7: clustered news section (### 多源新闻（事件聚�
     expect(markdown).not.toContain("新闻检索降级");
   });
 
-  it("renders the weekly-only L3 deep-dive subsection (事件/证据/反方证据/不确定性) when l3DeepDive carries real results", async () => {
+  it("renders the L3 deep-dive subsection (事件/证据/反方证据/不确定性) when l3DeepDive carries real results", async () => {
     const info = scheduledReport.resolveReportWindow("weekly", "2026-07-14");
     const baseData = buildFixtureData();
     // Cluster the fixture's own articles first so the L3 result's
@@ -297,18 +378,82 @@ describe("Phase 4 Task 7: clustered news section (### 多源新闻（事件聚�
     };
     const markdown = scheduledReport.renderWeeklyReport(info, data);
 
-    expect(markdown).toContain("### 深度核查（L3，周报专属）");
+    expect(markdown).toContain("### 事件深挖（L3 深度核查）");
     expect(markdown).toContain(targetEvent.titleZh);
     expect(markdown).toContain("not_found（未找到反方证据）");
     expect(markdown).toContain("不确定性：中");
+    // Task 20: the heading no longer claims 周报专属 - §3.1 puts 事件深挖 in the
+    // DAILY report too.
+    expect(markdown).not.toContain("周报专属");
+
+    // Same payload through the DAILY renderer renders the same section.
+    const dailyInfo = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const dailyMarkdown = scheduledReport.renderDailyReport(dailyInfo, data);
+    expect(dailyMarkdown).toContain("### 事件深挖（L3 深度核查）");
+    expect(dailyMarkdown).toContain(targetEvent.titleZh);
   });
 
-  it("omits the L3 subsection entirely for the daily report (l3DeepDive.skipped)", () => {
+  it("omits the L3 subsection only when the deep dive was actually skipped", () => {
     const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
-    const data = { ...buildFixtureData(), l3DeepDive: { skipped: true, reason: "l3_disabled_daily" } };
+    const data = { ...buildFixtureData(), l3DeepDive: { skipped: true, reason: "l3_disabled" } };
     const markdown = scheduledReport.renderDailyReport(info, data);
 
-    expect(markdown).not.toContain("### 深度核查");
+    expect(markdown).not.toContain("### 事件深挖");
+  });
+
+  it("says 今日/本周 - not always 本周 - when the deep dive found no high-impact event", () => {
+    const emptyL3 = { events: [], callsUsed: 0, degraded: false, degradedReason: null };
+    const dailyInfo = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const weeklyInfo = scheduledReport.resolveReportWindow("weekly", "2026-07-14");
+    const data = { ...buildFixtureData(), l3DeepDive: emptyL3 };
+
+    expect(scheduledReport.renderDailyReport(dailyInfo, data)).toContain("今日没有触发深度核查的高影响事件");
+    expect(scheduledReport.renderWeeklyReport(weeklyInfo, data)).toContain("本周没有触发深度核查的高影响事件");
+  });
+
+  // Task 20 (2026-07-28 spec-drift plan), requirements §3.1「事件深挖（top 2-3，
+  // 每事件 ≤5 轮）」/ §3.3「深挖 3-5 个每事件 ≤8 轮」.
+  //
+  // This drives the REAL runL3DeepDive with the REAL budget object
+  // scheduled-report.mjs hands it, against a counting fake backend - so it
+  // measures what the daily run would actually spend, rather than asserting
+  // that a constant equals a number.
+  it("spends the daily budget the spec names (top 3 events, <=5 rounds each) and the weekly its larger one", async () => {
+    const agentSearch = await import("./news-agent-search.mjs");
+    const makeEvent = (clusterKey: string, affected: string[]) => ({
+      clusterKey,
+      titleZh: `事件 ${clusterKey}`,
+      summaryZh: "摘要",
+      impact: { direction: "bullish", affected, reason: "r" },
+      firstPublishedAt: "2026-07-14T00:00:00.000Z",
+      lastPublishedAt: "2026-07-14T00:00:00.000Z",
+      sources: []
+    });
+    // Six candidate events, each with more affected symbols than any per-event
+    // budget can pay for, so both the event cap and the round cap bite.
+    const events = Array.from({ length: 6 }, (_, i) =>
+      makeEvent(`e${i}`, Array.from({ length: 10 }, (_, j) => `S${i}_${j}`))
+    );
+
+    const dailyBackend = vi.fn(async () => ({ results: [] }));
+    const daily = await agentSearch.runL3DeepDive({
+      searchBackend: dailyBackend,
+      events,
+      enabled: true,
+      ...scheduledReport.L3_BUDGETS.daily
+    });
+    expect(daily.events).toHaveLength(3);
+    expect(dailyBackend).toHaveBeenCalledTimes(3 * 5);
+
+    const weeklyBackend = vi.fn(async () => ({ results: [] }));
+    const weekly = await agentSearch.runL3DeepDive({
+      searchBackend: weeklyBackend,
+      events,
+      enabled: true,
+      ...scheduledReport.L3_BUDGETS.weekly
+    });
+    expect(weekly.events).toHaveLength(5);
+    expect(weeklyBackend).toHaveBeenCalledTimes(5 * 8);
   });
 
   it("shows an honest empty state when no events cluster out of an empty marketNews list", () => {
@@ -973,5 +1118,256 @@ describe("Task 13: daily and weekly lead with a conclusion box carrying a derive
 
     const stripped = markdown.split("\n").filter((line) => !/^-\s*置信度：/u.test(line)).join("\n");
     expect(validateReportMarkdown(stripped, { kind: "daily" }).failures).toContain("report.conclusion_box");
+  });
+});
+
+// ===========================================================================
+// Task 20 (2026-07-28 spec-drift plan): 宏观与财报日历 + the weekly's own summary
+// ===========================================================================
+
+describe("Task 20: the report section is 宏观与财报日历, with a real earnings half", () => {
+  // The rows below are the shape report-earnings.mjs's normalizer produces
+  // from the live Finnhub payload captured on 2026-07-30 - see
+  // report-earnings.test.ts's fixture-provenance header for the raw curl.
+  const earningsCalendar = {
+    entries: [
+      {
+        queriedSymbol: "NVDA.US",
+        symbol: "NVDA",
+        date: "2026-08-26",
+        hour: "amc",
+        quarter: 2,
+        year: 2027,
+        epsEstimate: 2.1274,
+        epsActual: null,
+        revenueEstimate: 93606383310,
+        revenueActual: null
+      }
+    ],
+    queriedSymbols: ["NVDA.US", "AMZN.US"],
+    lookaheadDays: 30,
+    warnings: [],
+    skippedReason: null
+  };
+
+  it("renders the spec's section name with both halves under it, in the daily report", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, { ...buildFixtureData(), earningsCalendar });
+
+    expect(markdown).toContain("### 宏观与财报日历");
+    expect(markdown).toContain("#### 宏观日历");
+    expect(markdown).toContain("#### 财报日历");
+    expect(markdown).toContain("2026-08-26 盘后 NVDA.US 2027 财年 Q2 财报");
+    expect(markdown).toContain("EPS 预期 2.1274");
+  });
+
+  it("discloses the reason instead of rendering an empty earnings list", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, {
+      ...buildFixtureData(),
+      earningsCalendar: {
+        entries: [],
+        queriedSymbols: [],
+        lookaheadDays: 30,
+        warnings: [],
+        skippedReason: "未配置 FINNHUB_API_KEY，本次没有向 Finnhub 查询任何标的的财报日期。"
+      }
+    });
+
+    expect(markdown).toContain("#### 财报日历");
+    expect(markdown).toContain("财报日历本次未查询");
+    expect(markdown).toContain("FINNHUB_API_KEY");
+  });
+
+  // The heading text is consumed OUTSIDE this file too: notifications.ts's
+  // extractActionableSummaryBullets pulls a macro bullet for the Feishu card by
+  // heading pattern. This is the producer half of that coupling - it pins the
+  // exact heading literals the real renderer emits; notifications.test.ts's
+  // "Task 20" case is the consumer half, asserting those same three literals
+  // are matched. (The `^###\s+宏观日历` pattern it used before cannot match a
+  // level-4 `#### 宏观日历`: the 4th character is `#`, not whitespace.)
+  it("emits exactly the three heading literals the Feishu card builder matches on", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, { ...buildFixtureData(), earningsCalendar });
+    const headings = markdown.split("\n").filter((line) => /^#{3,4}\s+.*日历/u.test(line));
+
+    expect(headings).toEqual(["### 宏观与财报日历", "#### 宏观日历", "#### 财报日历"]);
+  });
+
+  it("still satisfies the completeness check and the quality gate with the renamed section", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(info, { ...buildFixtureData(), earningsCalendar });
+
+    expect(scheduledReport.isPreparedReportMarkdownComplete(markdown)).toBe(true);
+    expect(validateReportMarkdown(markdown, { kind: "daily" }).failures).not.toContain("macro.evidence");
+    expect(validateReportMarkdown(markdown, { kind: "daily" }).failures).not.toContain("macro.earnings_missing");
+  });
+
+  it("a report that loses the earnings sub-section fails the gate rather than shipping short", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport
+      .renderDailyReport(info, { ...buildFixtureData(), earningsCalendar })
+      .replace("#### 财报日历", "#### 无关小标题");
+
+    expect(validateReportMarkdown(markdown, { kind: "daily" }).failures).toContain("macro.earnings_missing");
+    expect(scheduledReport.isPreparedReportMarkdownComplete(markdown)).toBe(true);
+  });
+});
+
+describe("Task 20: the weekly report summarizes the WEEK, not one instant", () => {
+  const info = scheduledReport.resolveReportWindow("weekly", "2026-07-28");
+
+  it("renders week open -> week close return and the in-week drawdown", () => {
+    const weeklyMarketPerformance = {
+      available: true,
+      symbolLabel: "QQQ",
+      openDay: "2026-07-21",
+      openPrice: 677.96,
+      closeDay: "2026-07-28",
+      closePrice: 682.12,
+      returnPct: 0.6136,
+      maxDrawdownPct: 5.0725,
+      drawdownPeakDay: "2026-07-22",
+      drawdownTroughDay: "2026-07-23",
+      observedDays: 5,
+      missingDays: ["2026-07-25", "2026-07-26"],
+      reason: null
+    };
+    const markdown = scheduledReport.renderWeeklyReport(info, {
+      ...buildFixtureData(),
+      weeklyMarketPerformance
+    });
+
+    expect(markdown).toContain("### 周度行情归因");
+    expect(markdown).toContain("周开：2026-07-21 QQQ 677.96");
+    expect(markdown).toContain("周收：2026-07-28 QQQ 682.12");
+    expect(markdown).toContain("区间收益：+0.61%");
+    expect(markdown).toContain("最大回撤：5.07%");
+    expect(markdown).toContain("自 2026-07-22 高点回落至 2026-07-23");
+    expect(markdown).toContain("2026-07-25、2026-07-26");
+  });
+
+  it("does NOT write the weekly return as 涨跌 - that phrase is claimed by the single-day numeric gate", () => {
+    // report-quality.mjs's facts.numeric_match matches `涨跌 … %` against the
+    // SINGLE-DAY qqq.changePct fact. A weekly return written that way would be
+    // compared against today's daily change and fail every correct report.
+    const weeklyMarketPerformance = {
+      available: true,
+      symbolLabel: "QQQ",
+      openDay: "2026-07-21",
+      openPrice: 677.96,
+      closeDay: "2026-07-28",
+      closePrice: 682.12,
+      returnPct: 0.6136,
+      maxDrawdownPct: 5.0725,
+      drawdownPeakDay: "2026-07-22",
+      drawdownTroughDay: "2026-07-23",
+      observedDays: 5,
+      missingDays: [],
+      reason: null
+    };
+    const markdown = scheduledReport.renderWeeklyReport(info, {
+      ...buildFixtureData(),
+      weeklyMarketPerformance
+    });
+
+    const weeklySection = markdown.slice(markdown.indexOf("### 周度行情归因"), markdown.indexOf("- 标的："));
+    expect(weeklySection).not.toContain("涨跌");
+
+    const qqqFacts = {
+      "qqq.price": { valueNum: 721.34 },
+      "qqq.changePct": { valueNum: 0.5885 }
+    };
+    expect(validateNarrativeNumbers(markdown, qqqFacts).failures).toEqual([]);
+  });
+
+  it("says why the week cannot be summarized instead of printing a 0.00% week", () => {
+    const markdown = scheduledReport.renderWeeklyReport(info, {
+      ...buildFixtureData(),
+      weeklyMarketPerformance: {
+        available: false,
+        symbolLabel: "QQQ",
+        observedDays: 0,
+        missingDays: [],
+        reason: "本窗口没有任何一天记录到 QQQ 的每日行情事实（daily_facts.qqq.price），无法计算周度收益与回撤"
+      }
+    });
+
+    expect(markdown).toContain("周度收益与回撤本次不可得");
+    expect(markdown).toContain("daily_facts.qqq.price");
+    expect(markdown).not.toContain("区间收益：");
+    expect(markdown).not.toContain("最大回撤：");
+  });
+
+  it("the daily report does not grow a weekly section", () => {
+    const dailyInfo = scheduledReport.resolveReportWindow("daily", "2026-07-28");
+    const markdown = scheduledReport.renderDailyReport(dailyInfo, buildFixtureData());
+
+    expect(markdown).not.toContain("### 周度行情归因");
+  });
+
+  it("reads exactly the window's own days, newest last, excluding the start boundary", () => {
+    // The window is half-open `(start, end]`: a run on startLabel writes its
+    // facts AT the boundary instant, which belongs to the previous window.
+    expect(scheduledReport.reportWindowDateLabels(info)).toEqual([
+      "2026-07-22",
+      "2026-07-23",
+      "2026-07-24",
+      "2026-07-25",
+      "2026-07-26",
+      "2026-07-27",
+      "2026-07-28"
+    ]);
+    expect(scheduledReport.reportWindowDateLabels(scheduledReport.resolveReportWindow("daily", "2026-07-28"))).toEqual([
+      "2026-07-28"
+    ]);
+  });
+});
+
+// ===========================================================================
+// Task 21 (2026-07-28 spec-drift plan): the US-market-holiday guard
+// ===========================================================================
+
+describe("Task 21: a full US market holiday produces an honest skip, not an empty report", () => {
+  it("skips the daily report whose window covers only a full NYSE close", () => {
+    // Thanksgiving 2026 is Thursday 2026-11-26 (full close). The Beijing-dated
+    // daily report that covers it is the NEXT day's, 2026-11-27: its window is
+    // 2026-11-26 20:00 -> 2026-11-27 20:00 Beijing = 11-26 08:00 -> 11-27 08:00
+    // New York, which brackets exactly the 11-26 session.
+    const info = scheduledReport.resolveReportWindow("daily", "2026-11-27");
+    const skip = scheduledReport.resolveUsMarketHolidaySkip("daily", info);
+
+    expect(skip).toMatchObject({ ok: true, skipped: "us-market-holiday", kind: "daily", label: "2026-11-27" });
+    expect(skip.coveredUsDates).toEqual(["2026-11-26"]);
+    expect(skip.reason).toContain("2026-11-26");
+    expect(skip.reason).toContain("休市");
+  });
+
+  it("does NOT skip the day after the holiday - an early close is still a session", () => {
+    // 2026-11-27 is a half day, not a close, so the 2026-11-28 report runs.
+    const info = scheduledReport.resolveReportWindow("daily", "2026-11-28");
+
+    expect(scheduledReport.resolveUsMarketHolidaySkip("daily", info)).toBeNull();
+  });
+
+  it("does not skip an ordinary trading day", () => {
+    const info = scheduledReport.resolveReportWindow("daily", "2026-07-30");
+
+    expect(scheduledReport.resolveUsMarketHolidaySkip("daily", info)).toBeNull();
+    expect(scheduledReport.resolveUsMarketHolidaySkip("daily", scheduledReport.resolveReportWindow("daily", "2026-12-25"))).toBeNull();
+  });
+
+  it("never skips a weekly report - a 7-day window always contains an open session", () => {
+    for (const label of ["2026-11-30", "2026-12-28", "2026-01-05"]) {
+      expect(scheduledReport.resolveUsMarketHolidaySkip("weekly", scheduledReport.resolveReportWindow("weekly", label))).toBeNull();
+    }
+  });
+
+  it("refuses to skip when the holiday calendar cannot answer for that year", () => {
+    // trading-schedule.mjs only carries 2026. A 2027 date reads as "cannot
+    // tell", and an un-updated calendar must never cancel a year of reports.
+    const info = scheduledReport.resolveReportWindow("daily", "2027-01-02");
+
+    expect(scheduledReport.resolveUsMarketHolidaySkip("daily", info)).toBeNull();
   });
 });

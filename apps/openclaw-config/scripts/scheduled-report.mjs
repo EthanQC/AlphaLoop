@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { MemberRepository, deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import {
+  MemberRepository,
+  REPORT_DELIVERY_DESCRIPTION,
+  deliverReportToFeishu,
+  loadLocalEnv,
+  openTradingDatabase
+} from "../../../packages/shared-types/dist/index.js";
 import { CONFIDENCE_LABELS, parseReportConclusionBox, renderReportConclusionBox } from "./conclusion-box.mjs";
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
@@ -23,19 +29,44 @@ import {
 } from "./report-data.mjs";
 import { attachPriceSource, estimateMarketValue } from "./official-paper-monitor.mjs";
 import { generatePersonalPages } from "./personal-page.mjs";
-import { normalizeReportMacroCalendarPayload } from "./report-macro.mjs";
-import { assertReportQuality, findPersonalContentLeaks, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts } from "./report-facts.mjs";
-import { writeMarkdownPdf } from "./report-rendering.mjs";
+import {
+  formatMacroValuePair,
+  localizeMacroTitle,
+  normalizeReportMacroCalendarPayload
+} from "./report-macro.mjs";
+import { fetchEarningsCalendar, renderEarningsCalendarLines } from "./report-earnings.mjs";
+import { isUsRegularTradingDate } from "./trading-schedule.mjs";
+import { assertReportQuality, findPersonalContentLeaks, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts, summarizeWeeklyMarketPerformance } from "./report-facts.mjs";
 
 // Phase 4 Task 7: news-search budgets/limits (Global Constraints - spec
 // values, not to be changed here). L2 topic search runs for both daily and
-// weekly at different budgets; L3 deep-dive is OFF for daily (07-07 binding
-// decision, see news-agent-search.mjs's own `enabled` default) and ON only
-// for weekly, at its own, larger per-event budget.
+// weekly at different budgets.
 const NEWS_SEARCH_BUDGET = { daily: 30, weekly: 60 };
-const L3_PER_EVENT_BUDGET = 8;
-const L3_MAX_EVENTS = 3;
+
+// Task 20 (2026-07-28 spec-drift plan): L3 deep-dive budgets, PER KIND, and
+// it now runs for BOTH kinds.
+//
+// It used to be weekly-only, on a 07-07 decision ("L3 日报默认关") that the
+// 2026-07-12 requirements (r2) supersede: §3.1 lists 事件深挖（top 2-3，每事件
+// ≤5 轮） as a section of the DAILY report, and §3.3 asks the weekly for
+// 深挖 3-5 个每事件 ≤8 轮且须含反方证据或明示未找到. Those two sentences are
+// exactly the four numbers below. The daily's smaller budget is the point of
+// having two: the daily gets the cheap version of the same cross-verification,
+// not none of it.
+export const L3_BUDGETS = {
+  daily: { perEventBudget: 5, maxEvents: 3 },
+  weekly: { perEventBudget: 8, maxEvents: 5 }
+};
+
 const NEWS_CARD_LIMIT = 8;
+
+// Task 20: how far ahead the earnings calendar looks. Longer than the macro
+// lookahead (REPORT_MACRO_LOOKAHEAD_DAYS, 14 days) on purpose - macro releases
+// recur weekly-to-monthly, so 14 days always has something in it, while a
+// given company reports once a quarter and a 14-day window would show an empty
+// list for most of the year. 30 days is the shortest window that reliably
+// contains the pool's next reporting date.
+const EARNINGS_LOOKAHEAD_DAYS = 30;
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 loadLocalEnv(repoRoot);
@@ -54,7 +85,7 @@ const timezone = process.env.TRADING_TIMEZONE ?? "Asia/Shanghai";
 // be invoked with, not "daily"/"weekly"/etc). Guarded the same way every
 // other testable CLI script in this directory already is (stock-analysis.mjs,
 // market-alerts-poll.mjs, official-paper-monitor.mjs) - kind/action/
-// windowInfo/reportPath/reportPdfPath are declared here (prepareReport/
+// windowInfo/reportPath are declared here (prepareReport/
 // deliverReport close over them) but only ever COMPUTED inside the guard,
 // exactly as before when actually run as a CLI. The guard itself lives at
 // the very BOTTOM of this file - see the "CLI entry point" section there for
@@ -63,7 +94,6 @@ let kind;
 let action;
 let windowInfo;
 let reportPath;
-let reportPdfPath;
 
 async function prepareReport(reportKind, info) {
   assertOfficialPaperReportEnvironment();
@@ -90,9 +120,15 @@ async function prepareReport(reportKind, info) {
   });
   persistDailyFacts(db, info.label, dailyFacts);
 
+  // Task 20 (§3.3): the weekly's own 周度行情归因, read AFTER the line above so
+  // this run's own trading day is part of the week it summarizes.
+  const weeklyMarketPerformance = reportKind === "weekly"
+    ? summarizeWeeklyMarketPerformance(readWindowDailyFacts(db, info))
+    : null;
+
   const report = reportKind === "daily"
     ? renderDailyReport(info, marketData)
-    : renderWeeklyReport(info, marketData);
+    : renderWeeklyReport(info, { ...marketData, weeklyMarketPerformance });
 
   assertReportQuality(report, { kind: reportKind });
   writeFileSync(reportPath, `${report}\n`, "utf8");
@@ -136,11 +172,9 @@ async function prepareReport(reportKind, info) {
     }, null, 2));
   }
 
-  const pdfPath = await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown: report });
   updateState(info, {
     preparedAt: new Date().toISOString(),
     path: reportPath,
-    pdfPath,
     kind: reportKind,
     personalPages: {
       generated: personalPages.generated.map((entry) => ({ ownerId: entry.ownerId, id: entry.id })),
@@ -156,14 +190,12 @@ async function prepareReport(reportKind, info) {
     deliveredAt: undefined,
     chunks: undefined,
     deliveries: undefined,
-    pdfUploaded: undefined,
     regeneratedDuringDelivery: undefined,
     preparedInSameRun: undefined
   });
 
   return {
     path: reportPath,
-    pdfPath,
     markdown: report,
     // Handed back (not just written to the state file) so the delivery
     // orchestration can address each member's own page without re-reading it.
@@ -222,9 +254,8 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // livenews/3141798 + /3141797 (both live, both GET 200) and the current one
   // passes it.
   //
-  // The disclosure is appended before the PDF is rendered and before
-  // delivery, so the file on disk, the PDF and the Feishu message all carry
-  // the same honest text.
+  // The disclosure is appended before delivery, so the file on disk, the
+  // platform page and the Feishu card all carry the same honest text.
   const db = openTradingDatabase(dbPath);
   const urlCheck = await validateReportUrls(markdown, { timeoutMs: 5000 });
   const dailyFacts = getDailyFacts(db, info.label);
@@ -235,16 +266,8 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   if (urlCheck.disclosure) {
     markdown = appendUrlVerificationDisclosure(markdown, urlCheck.disclosure);
     writeFileSync(reportPath, markdown, "utf8");
-    // The prepared PDF (if any) predates the disclosure - drop it so the
-    // renderer below rebuilds it from the disclosed markdown.
-    if (existsSync(reportPdfPath)) {
-      rmSync(reportPdfPath, { force: true });
-    }
   }
 
-  const pdfPath = existsSync(reportPdfPath)
-    ? reportPdfPath
-    : await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath: reportPath, pdfPath: reportPdfPath, markdown });
   // No `openId`, `audience: "group"`: 日报/周报 are 公共通知 (requirements §4 -
   // 群: 公共报告发布卡), not owner-scoped, so the card goes to the circle's
   // group chat (FEISHU_GROUP_CHAT_ID). With no group configured the delivery
@@ -271,7 +294,6 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     title: `${titlePrefix} ${info.label}`,
     markdown,
     markdownPath: reportPath,
-    pdfPath,
     audience: "group",
     reportKind,
     reportDate: info.label,
@@ -326,7 +348,6 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   if (!result.sent) {
     updateState(info, {
       path: reportPath,
-      pdfPath,
       kind: reportKind,
       chunks: chapterMessages.length,
       deliveries,
@@ -363,11 +384,9 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   updateState(info, {
     deliveredAt: new Date().toISOString(),
     path: reportPath,
-    pdfPath,
     kind: reportKind,
     chunks: chapterMessages.length,
     deliveries,
-    pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
     groupFallback: result.groupFallback ?? false,
     ...(result.groupFallbackReason ? { groupFallbackReason: result.groupFallbackReason } : {}),
     // The `delivered` list here is what the NEXT run reads back as its
@@ -404,9 +423,7 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     // already printed to stderr above and are persisted in the state file.
     personalCardsComplete: outcome.personalCardsComplete,
     ...(outcome.personalCardsComplete ? {} : { personalCardFailures: outcome.personalCardFailures }),
-    pdfUploaded: deliveries.some((entry) => entry.kind === "file" && entry.sent),
-    path: reportPath,
-    pdfPath
+    path: reportPath
   }, null, 2));
 
   // C4: only the PUBLIC report's delivery decides the exit code. This used to
@@ -713,7 +730,7 @@ export function renderDailyReport(info, data) {
     "",
     ...renderNewsSearchDegradedHeaderMarker(data),
     "- 语言：中文。",
-    "- 投递：飞书摘要卡片 + PDF。",
+    `- 投递：${REPORT_DELIVERY_DESCRIPTION}。`,
     "",
     "## 1. 今日结论",
     "",
@@ -729,7 +746,7 @@ export function renderDailyReport(info, data) {
     "",
     renderDailyRoutineClassification(data),
     "",
-    renderMarketIntelligence(data),
+    renderMarketIntelligence(data, { period: "今日" }),
     "",
     "## 3. 影响路径",
     "",
@@ -750,7 +767,7 @@ export function renderDailyReport(info, data) {
     "- 实盘：禁止自动提交真实资金订单。",
     "- 官方模拟盘：只使用长桥官方模拟盘，OpenClaw 最多使用总仓 10%。",
     "- 期权：不生成、不预览、不执行任何期权自动化。",
-    "- 渠道：飞书只发送摘要卡片 + PDF。",
+    `- 渠道：${REPORT_DELIVERY_DESCRIPTION}。`,
     "",
     "## 7. 明日跟踪",
     "",
@@ -768,7 +785,7 @@ export function renderWeeklyReport(info, data) {
     "",
     ...renderNewsSearchDegradedHeaderMarker(data),
     "- 语言：中文。",
-    "- 投递：飞书摘要卡片 + PDF。",
+    `- 投递：${REPORT_DELIVERY_DESCRIPTION}。`,
     "",
     "## 1. 本周结论",
     "",
@@ -784,9 +801,11 @@ export function renderWeeklyReport(info, data) {
     "",
     renderDailyRoutineClassification(data),
     "",
-    renderMarketIntelligence(data),
+    renderMarketIntelligence(data, { period: "本周" }),
     "",
     "## 3. QQQ 与美股风险温度",
+    "",
+    renderWeeklyMarketPerformance(data.weeklyMarketPerformance, info),
     "",
     renderQqqSection(data.qqqQuote),
     "",
@@ -801,11 +820,54 @@ export function renderWeeklyReport(info, data) {
     "- 实盘：禁止自动提交真实资金订单。",
     "- 官方模拟盘：只使用长桥官方模拟盘，OpenClaw 最多使用总仓 10%。",
     "- 期权：不生成、不预览、不执行任何期权自动化。",
-    "- 渠道：飞书只发送摘要卡片 + PDF。",
+    `- 渠道：${REPORT_DELIVERY_DESCRIPTION}。`,
     "",
     "## 6. 下周跟踪",
     "",
     renderNextTracking(data, "下周")
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Task 20 (2026-07-28 spec-drift plan) - 周度行情归因（§3.3）
+// ---------------------------------------------------------------------------
+//
+// The weekly report used to be the daily report with reworded headings: every
+// section it rendered described a single instant, including the QQQ block,
+// which printed the same one quote the daily printed. Nothing in it was about
+// the WEEK. This is the section that is: week open -> week close over the
+// window, plus the deepest peak-to-trough decline inside it, computed by
+// report-facts.mjs's summarizeWeeklyMarketPerformance from the daily_facts
+// rows the daily runs already persisted.
+//
+// WORDING CONSTRAINT, not a style choice: report-quality.mjs's
+// facts.numeric_match gate scans the narrative for `涨跌 … %` and compares
+// whatever it finds against the SINGLE-DAY `qqq.changePct` fact. A weekly
+// return written as "周涨跌 -1.23%" would be matched against today's daily
+// change and fail the gate on every correct report. 区间收益/最大回撤 carry the
+// same meaning to a reader and are outside every NUMERIC_MATCH_PATTERNS
+// regex, which is why the numbers are labelled that way.
+function renderWeeklyMarketPerformance(summary, info) {
+  const header = ["### 周度行情归因", ""];
+  if (!summary || !summary.available) {
+    return [
+      ...header,
+      `- 周度收益与回撤本次不可得：${summary?.reason ?? "没有拿到本窗口的每日行情事实"}。`,
+      `- 窗口：${formatWindow(info)}；本段只使用已落库的 daily_facts，不会用当日单点行情代替一周表现。`
+    ].join("\n");
+  }
+
+  const direction = summary.returnPct >= 0 ? "+" : "";
+  const missingNote = summary.missingDays.length > 0
+    ? `；窗口内 ${summary.missingDays.length} 天没有行情事实（${summary.missingDays.join("、")}），多为周末/休市或当日报告未产出`
+    : "";
+
+  return [
+    ...header,
+    `- 周开：${summary.openDay} ${summary.symbolLabel} ${formatNumber(summary.openPrice)}；周收：${summary.closeDay} ${summary.symbolLabel} ${formatNumber(summary.closePrice)}。`,
+    `- 区间收益：${direction}${formatNumber(summary.returnPct)}%（按已落库的每日收盘事实，${summary.observedDays} 个交易日）${missingNote}。`,
+    `- 最大回撤：${formatNumber(summary.maxDrawdownPct)}%（自 ${summary.drawdownPeakDay} 高点回落至 ${summary.drawdownTroughDay}）。`,
+    `- 口径：数据来自 daily_facts 的 qqq.price，与本报告数字校验用的是同一份事实表；窗口 ${formatWindow(info)}。`
   ].join("\n");
 }
 
@@ -1737,12 +1799,18 @@ function summarizeMacroSignal(entries) {
     return "未来窗口没有返回二星/三星美国宏观事件，宏观项暂不提供新增交易触发";
   }
   const next = entries[0];
+  // Task 23: the SECOND place a macro entry reaches the reader (the 宏观信号
+  // line, distinct from the 宏观日历 list). It printed the same raw English
+  // title and the same glued "Previous187"; both go through report-macro.mjs
+  // now, so the two renderings of one event cannot describe it differently.
   const values = next.values
     .filter((item) => item.key && item.value)
     .slice(0, 3)
-    .map((item) => `${item.key}${item.value}`)
+    .map((item) => formatMacroValuePair(item))
+    .filter(Boolean)
     .join(" / ");
-  return `${next.date} ${next.time || ""} ${next.title}${values ? `（${values}）` : ""}；关注是否改变利率、通胀或制造业景气预期`;
+  const title = localizeMacroTitle(next.title) || next.title;
+  return `${next.date} ${next.time || ""} ${title}${values ? `（${values}）` : ""}；关注是否改变利率、通胀或制造业景气预期`;
 }
 
 // Task H7 (2026-07-14 legacy audit): this used to read `snapshot.quotes`,
@@ -1806,25 +1874,51 @@ function renderClassifiedNewsLine(article) {
   return `- ${formatReportDateTime(article.publishedAt)} ${article.symbol}：${newsEvent(article)}；媒体：${article.publisher ?? article.sourceName ?? article.source}；分类：${item.bias}；基本面：${item.fundamentalImpact}；影响：${item.impact}。`;
 }
 
-function renderMarketIntelligence(data) {
+function renderMarketIntelligence(data, { period = "本窗口" } = {}) {
+  // Task 23 (2026-07-30): the indicator name and the value keys used to be
+  // printed exactly as Longbridge sends them - all-English, and glued
+  // ("Previous3.625") - inside an otherwise all-Chinese report. Both now go
+  // through report-macro.mjs: a known indicator renders 中文名（English
+  // original）, an unknown one says so outright rather than passing English
+  // off as the label. See that module's header for the rules.
   const macroLines = data.macroEvents.length > 0
     ? data.macroEvents.slice(0, 8).map((entry) => {
         const values = entry.values
           .filter((item) => item.key && item.value)
           .slice(0, 3)
-          .map((item) => `${item.key}${item.value}`)
+          .map((item) => formatMacroValuePair(item))
+          .filter(Boolean)
           .join(" / ");
-        const market = shouldShowMarketPrefix(entry.market, entry.title) ? `${translateMarket(entry.market)} ` : "";
-        return `- ${entry.date} ${entry.time || ""} ${market}${entry.title}${values ? `（${values}）` : ""}`;
+        const title = localizeMacroTitle(entry.title) || entry.title;
+        const market = shouldShowMarketPrefix(entry.market, title) ? `${translateMarket(entry.market)} ` : "";
+        return `- ${entry.date} ${entry.time || ""} ${market}${title}${values ? `（${values}）` : ""}`;
       })
     : ["- 未来宏观日历没有返回高重要性事件。"];
 
+  // Task 20 (2026-07-28 spec-drift plan): requirements §3.1's section is
+  // 「宏观与财报日历」, not 「宏观日历」 - the earnings half had never been built.
+  // THE HEADING TEXT IS LOAD-BEARING IN THREE OTHER PLACES, all updated with
+  // this rename: report-quality.mjs's macro.evidence gate,
+  // isPreparedReportMarkdownComplete's marker list (below), and
+  // notifications.ts's extractActionableSummaryBullets, which pulls the Feishu
+  // card's macro line by heading pattern. None of them would have failed
+  // loudly: "宏观与财报日历" does not contain "宏观日历" as a contiguous
+  // substring, and `^###\s+宏观日历` cannot match the level-4 sub-heading, so
+  // the card would simply have come out one line shorter forever. Same class
+  // of silent divergence H7 found between "长桥行情" and "长桥 QQQ 行情"; see
+  // isPreparedReportMarkdownComplete's own note.
   return [
-    renderClusteredNewsSection(data),
+    renderClusteredNewsSection(data, period),
     "",
-    "### 宏观日历",
+    "### 宏观与财报日历",
     "",
-    ...macroLines
+    "#### 宏观日历",
+    "",
+    ...macroLines,
+    "",
+    "#### 财报日历",
+    "",
+    ...renderEarningsCalendarLines(data.earningsCalendar)
   ].join("\n");
 }
 
@@ -2048,13 +2142,19 @@ function translateUncertaintyLabel(value) {
   return labels[value] ?? "未知";
 }
 
-// L3 deep-dive subsection ("事件-证据-反方证据/not_found-不确定性") - weekly
-// only (news-agent-search.mjs's runL3DeepDive returns
-// `{skipped: true, reason: 'l3_disabled_daily'}` for daily, in which case
-// this renders nothing). Independent of the L2 header/warnings marker: L3
-// carries its OWN degraded flag/reason from its own (possibly-failed)
-// backend calls.
-function renderL3DeepDiveSection(l3Result, events) {
+// L3 deep-dive subsection ("事件-证据-反方证据/not_found-不确定性").
+//
+// Task 20 (2026-07-28 spec-drift plan): this is no longer weekly-only. §3.1
+// puts 事件深挖（top 2-3，每事件 ≤5 轮） in the DAILY report and §3.3 gives the
+// weekly the bigger budget (3-5 events, ≤8 rounds) - both kinds now pass
+// `enabled: true` with their own L3_BUDGETS entry, so the heading no longer
+// claims 周报专属 and the empty state no longer says 本周.
+//
+// It still renders nothing when runL3DeepDive answers `{skipped: true}` -
+// which now only happens when a caller explicitly disables it, not per-kind.
+// Independent of the L2 header/warnings marker: L3 carries its OWN degraded
+// flag/reason from its own (possibly-failed) backend calls.
+function renderL3DeepDiveSection(l3Result, events, periodLabel = "本窗口") {
   if (!l3Result || l3Result.skipped) {
     return null;
   }
@@ -2075,14 +2175,14 @@ function renderL3DeepDiveSection(l3Result, events) {
     : [];
 
   return [
-    "### 深度核查（L3，周报专属）",
+    "### 事件深挖（L3 深度核查）",
     "",
-    ...(eventLines.length > 0 ? eventLines : ["- 本周没有触发深度核查的高影响事件。"]),
+    ...(eventLines.length > 0 ? eventLines : [`- ${periodLabel}没有触发深度核查的高影响事件。`]),
     ...degradedNote
   ].join("\n");
 }
 
-function renderClusteredNewsSection(data) {
+function renderClusteredNewsSection(data, periodLabel = "本窗口") {
   const events = resolveNewsEvents(data);
   if (events.length === 0) {
     return [
@@ -2100,7 +2200,7 @@ function renderClusteredNewsSection(data) {
   const nonBrokerRatio = computeNonBrokerSourceRatio(allSources);
   const chineseRatio = computeChineseSourceRatio(allSources);
 
-  const l3Section = renderL3DeepDiveSection(data.l3DeepDive, events);
+  const l3Section = renderL3DeepDiveSection(data.l3DeepDive, events, periodLabel);
 
   // Quiet-news-day honesty (pairs with report-quality.mjs's scarcity escape
   // on news.detail_depth): fewer than 3 clustered events on a genuinely
@@ -2350,9 +2450,22 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
   const newsSymbolLimit = Math.max(1, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
   const trackedSymbols = pooledSymbols.slice(0, newsSymbolLimit);
   const symbolsBeyondNewsLimit = pooledSymbols.slice(newsSymbolLimit);
-  const [marketNewsResult, macroCalendarResult] = await Promise.all([
+  // Task 20: the earnings half of §3.1's 「宏观与财报日历」, over the FULL pool
+  // (not the news-capped slice) - the news cap exists because each symbol costs
+  // 4-5 upstream news fetches, while an earnings lookup is one cheap Finnhub
+  // call per symbol, so there is no reason to hide a pool member's reporting
+  // date behind that cap. Fetched alongside the other two so a slow calendar
+  // does not serialize behind the news collection.
+  const [marketNewsResult, macroCalendarResult, earningsCalendar] = await Promise.all([
     fetchMarketNews(trackedSymbols),
-    fetchMacroCalendar(info)
+    fetchMacroCalendar(info),
+    fetchEarningsCalendar({
+      symbols: pooledSymbols,
+      from: info.label,
+      to: addDays(info.label, EARNINGS_LOOKAHEAD_DAYS),
+      lookaheadDays: EARNINGS_LOOKAHEAD_DAYS,
+      env: process.env
+    })
   ]);
   const marketNews = marketNewsResult.articles;
   const macroEvents = macroCalendarResult.entries;
@@ -2380,14 +2493,15 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
   const newsEvents = buildNewsEvents(combinedArticles, trackedSymbols);
   persistNewsEvents(db, newsEvents);
 
-  // L3 deep-dive: weekly only (07-07 binding decision - daily always passes
-  // enabled:false via runL3DeepDive's own default, see news-agent-search.mjs).
+  // Task 20: L3 deep-dive runs for BOTH kinds now, each at its own spec'd
+  // budget (see L3_BUDGETS - §3.1 daily 5/3, §3.3 weekly 8/5).
+  const l3Budget = L3_BUDGETS[reportKind] ?? L3_BUDGETS.daily;
   const l3DeepDive = await runL3DeepDive({
     searchBackend: newsSearch.backend,
     events: newsEvents,
-    perEventBudget: L3_PER_EVENT_BUDGET,
-    maxEvents: L3_MAX_EVENTS,
-    enabled: reportKind === "weekly"
+    perEventBudget: l3Budget.perEventBudget,
+    maxEvents: l3Budget.maxEvents,
+    enabled: true
   });
 
   return {
@@ -2408,6 +2522,7 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
     longbridgeWarnings,
     macroEvents,
     macroWarnings: macroCalendarResult.warnings,
+    earningsCalendar,
     sourceEvidence: {
       fetchedAt,
       accountMode: officialPaperSnapshot.accountMode,
@@ -2424,6 +2539,11 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
       longbridgeWarnings,
       macroEventsCount: macroEvents.length,
       macroWarnings: macroCalendarResult.warnings,
+      earningsEventsCount: earningsCalendar.entries.length,
+      earningsQueriedSymbols: earningsCalendar.queriedSymbols,
+      earningsWarnings: earningsCalendar.skippedReason
+        ? [earningsCalendar.skippedReason, ...earningsCalendar.warnings]
+        : earningsCalendar.warnings,
       quoteSymbol: qqqQuote.symbol ?? "QQQ.US",
       quoteTimestamp: qqqQuote.timestamp ?? qqqQuote.post_market_quote?.timestamp ?? qqqQuote.pre_market_quote?.timestamp ?? null
     }
@@ -2551,7 +2671,7 @@ function formatQuoteTimestamp(quote) {
 // (note the space), which does not contain "长桥行情" as a contiguous
 // substring. isPreparedReportMarkdownComplete therefore ALWAYS returned
 // false on a genuine report, so every `deliver` regenerated the report from
-// scratch (doubling every Longbridge/news/macro fetch and PDF render), and
+// scratch (doubling every Longbridge/news/macro fetch), and
 // a delivery-time-only outage would fail delivery even though a valid,
 // already-quality-checked report sat on disk. Fix, chosen side: the
 // RENDERER now emits "长桥行情" literally (see renderDataSourceSummary's
@@ -2566,7 +2686,14 @@ export function isPreparedReportMarkdownComplete(markdown) {
   return [
     "长桥官方模拟盘",
     "多源新闻",
-    "宏观日历",
+    // Task 20: was "宏观日历". A report prepared before the earnings half
+    // existed is genuinely INCOMPLETE for today's deliver step, and the whole
+    // point of this list is that `deliver` re-renders such a file rather than
+    // shipping it. Note that "宏观与财报日历" does not contain "宏观日历" as a
+    // contiguous substring - the old marker survived the rename only by
+    // accidentally matching the `#### 宏观日历` sub-heading, which is exactly
+    // the kind of coincidence the 长桥行情 story below is about.
+    "宏观与财报日历",
     "长桥行情",
     "QQQ 行情"
   ].every((marker) => text.includes(marker));
@@ -2610,6 +2737,71 @@ export function resolveReportWindow(reportKind, explicitDate) {
 function isWithinWindow(value, info) {
   const ts = new Date(String(value)).getTime();
   return Number.isFinite(ts) && ts > info.start.getTime() && ts <= info.end.getTime();
+}
+
+/**
+ * Every calendar date label whose daily_facts row falls inside `info`'s window
+ * (Task 20's weekly summary input), oldest first.
+ *
+ * A daily run on date D writes `daily_facts.trading_day = D` at 20:00 Beijing
+ * on D, which is the window's own boundary instant. The window is half-open
+ * the same way isWithinWindow above is - `(start, end]` - so D = startLabel is
+ * excluded and D = endLabel (this very run) is included.
+ */
+export function reportWindowDateLabels(info) {
+  const labels = [];
+  for (let label = addDays(info.startLabel, 1); label <= info.endLabel; label = addDays(label, 1)) {
+    labels.push(label);
+  }
+  return labels;
+}
+
+function readWindowDailyFacts(db, info) {
+  return reportWindowDateLabels(info).map((tradingDay) => ({
+    tradingDay,
+    facts: getDailyFacts(db, tradingDay)
+  }));
+}
+
+/**
+ * Task 21 (2026-07-28 spec-drift plan): the US-market-holiday guard.
+ *
+ * WHAT THE WINDOW ACTUALLY COVERS. A report labelled L spans
+ * `(L-1 20:00, L 20:00]` Beijing (daily) or `(L-7 20:00, L 20:00]` (weekly).
+ * Beijing 20:00 is 08:00 America/New_York the SAME date, so a daily report's
+ * window brackets exactly one US regular session: the one on L-1. That is why
+ * the daily cron is Tue-Sat Beijing - it covers Mon-Fri New York.
+ *
+ * On a full NYSE close there is no session in that window at all: no quote
+ * moves, no session news, nothing for 影响路径 or 明日跟踪 to be about. The
+ * report still rendered, with every section quietly describing the previous
+ * session's stale numbers as if they were today's. The honest output is not a
+ * thinner report, it is no report plus a stated reason.
+ *
+ * REFUSES TO GUESS. `isUsRegularTradingDate` answers `null` when
+ * trading-schedule.mjs's holiday table has no data for that year, and a `null`
+ * day counts as a POSSIBLE trading day here - an un-updated calendar rolling
+ * into a new year must never be able to cancel a whole year of reports in
+ * silence. The skip only ever fires on a date the calendar can positively
+ * place.
+ *
+ * @returns {{ok: true, skipped: string, kind: string, label: string,
+ *            coveredUsDates: string[], reason: string} | null}
+ */
+export function resolveUsMarketHolidaySkip(reportKind, info) {
+  const coveredUsDates = reportWindowDateLabels(info).map((label) => addDays(label, -1));
+  const openDates = coveredUsDates.filter((label) => isUsRegularTradingDate(label) !== false);
+  if (openDates.length > 0) {
+    return null;
+  }
+  return {
+    ok: true,
+    skipped: "us-market-holiday",
+    kind: reportKind,
+    label: info.label,
+    coveredUsDates,
+    reason: `窗口内的美股日期全部休市（${coveredUsDates.join("、")}），本次不产出${reportKind === "weekly" ? "周报" : "日报"}。`
+  };
 }
 
 function formatWindow(info) {
@@ -2783,7 +2975,17 @@ if (isMainModule) {
   action = assertAction(actionArg);
   windowInfo = resolveReportWindow(kind, dateArg);
   reportPath = join(repoRoot, "reports", kind, `${windowInfo.label}.md`);
-  reportPdfPath = join(repoRoot, "reports", kind, `${windowInfo.label}.pdf`);
+
+  // Task 21: the US-holiday guard runs BEFORE any directory is created, any
+  // upstream is called and any file is written - a skipped run must leave no
+  // half-made report behind. Prints the same `{ok, skipped, reason}` envelope
+  // stock-analysis.mjs's own not_due skip prints, so the cron runner records a
+  // successful, self-explaining run rather than a mystery no-op.
+  const holidaySkip = resolveUsMarketHolidaySkip(kind, windowInfo);
+  if (holidaySkip) {
+    console.log(JSON.stringify(holidaySkip));
+    process.exit(0);
+  }
 
   mkdirSync(join(repoRoot, "reports", kind), { recursive: true });
   mkdirSync(runtimeDir, { recursive: true });

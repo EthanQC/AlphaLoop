@@ -56,7 +56,7 @@ describe("report delivery policy", () => {
     expect(shouldSendFullReportChapters()).toBe(false);
   });
 
-  it("disables degraded report fallback because fallback cannot guarantee PDF delivery", () => {
+  it("disables degraded report fallback because a fallback channel cannot carry the conclusion card", () => {
     process.env.FEISHU_REPORT_ALLOW_FALLBACK = "1";
     process.env.OPENCLAW_REPORT_ALLOW_DEGRADED_FEISHU = "1";
 
@@ -67,7 +67,6 @@ describe("report delivery policy", () => {
     const summary = buildReportSummaryMarkdown({
       title: "OpenClaw 日报 2026-05-29",
       markdownPath: "/Users/mashu/Documents/codex/reports/daily/2026-05-29.md",
-      pdfPath: "/Users/mashu/Documents/codex/reports/daily/2026-05-29.pdf",
       markdown: [
         "# OpenClaw 日报 2026-05-29",
         "",
@@ -95,6 +94,55 @@ describe("report delivery policy", () => {
     expect(summary).not.toContain("/Users/mashu");
     expect(summary).not.toContain("文件上传成功");
     expect(summary).not.toContain("本地报告文件");
+  });
+
+  // Task 20 (2026-07-28 spec-drift plan): the report's calendar section became
+  // 「宏观与财报日历」 with `#### 宏观日历` / `#### 财报日历` beneath it. The old
+  // `^###\s+宏观日历` pattern cannot match a level-4 heading (the 4th character
+  // is `#`, not whitespace), so without the widened patterns this card would
+  // have quietly lost its macro line. The three heading literals below are
+  // pinned against the real renderer by scheduled-report.test.ts's
+  // "emits exactly the three heading literals the Feishu card builder matches
+  // on".
+  it("pulls a macro AND an earnings bullet out of the 宏观与财报日历 section", () => {
+    const summary = buildReportSummaryMarkdown({
+      title: "OpenClaw 日报 2026-07-14",
+      markdown: [
+        "# OpenClaw 日报 2026-07-14",
+        "",
+        "窗口：2026-07-13 20:00 - 2026-07-14 20:00（北京时间）",
+        "",
+        "## 2. 信息收集与分类",
+        "",
+        "### 宏观与财报日历",
+        "",
+        "#### 宏观日历",
+        "",
+        "- 2026-07-18 20:30 美国费城联储制造业指数（前值 -- / 预期 12）",
+        "",
+        "#### 财报日历",
+        "",
+        "- 2026-08-26 盘后 NVDA.US 2027 财年 Q2 财报；EPS 预期 2.1274；营收预期 936.06 亿。"
+      ].join("\n")
+    });
+
+    expect(summary).toContain("费城联储制造业指数");
+    expect(summary).toContain("2026-08-26 盘后 NVDA.US");
+  });
+
+  it("still finds the macro bullet in a legacy report whose heading is level-3 宏观日历", () => {
+    const summary = buildReportSummaryMarkdown({
+      title: "OpenClaw 日报 2026-06-14",
+      markdown: [
+        "# OpenClaw 日报 2026-06-14",
+        "",
+        "### 宏观日历",
+        "",
+        "- 2026-06-18 20:30 美国费城联储制造业指数（预测12）"
+      ].join("\n")
+    });
+
+    expect(summary).toContain("费城联储制造业指数");
   });
 
   it("uses stock-analysis conclusions instead of generic generated-file text", () => {
@@ -616,33 +664,35 @@ describe("isFeishuProseFailure", () => {
   });
 });
 
-// Item 6 (task P2.5 Task 6): trySendFeishuUserPluginBotFile's file-send step
-// used to check `/^error:/iu.test(detail)` directly instead of routing
-// through isFeishuProseFailure (tested standalone above) - the one remaining
-// call site among callFeishuUserPluginTool's several that skipped it. A
-// feishu-user-plugin response that reports failure as "Send failed: ..."
-// prose WITHOUT setting isError (see isFeishuProseFailure's own doc comment -
-// this is a real, observed feishu-user-plugin response shape) fell through
-// that narrower check and was reported as a successful PDF delivery that
-// never actually sent.
+// Item 6 (task P2.5 Task 6): a feishu-user-plugin response that reports
+// failure as "Send failed: ..." prose WITHOUT setting isError (see
+// isFeishuProseFailure's own doc comment - this is a real, observed
+// feishu-user-plugin response shape) must never be read as a delivery.
 //
-// Exercised end to end through the exported deliverReportToFeishu (rather
-// than importing the unexported trySendFeishuUserPluginBotFile directly) by
-// faking the child process callFeishuUserPluginTool spawns - the
+// 2026-07-30: this used to be asserted against the PDF file-send step, which
+// is gone with the PDF (§0.4). The regression it guards is not about files -
+// it is about a send step checking `/^error:/iu` directly instead of routing
+// through isFeishuProseFailure - so it now runs against the step this channel
+// still HAS: the summary post.
+//
+// Exercised end to end through the exported deliverReportToFeishu by faking
+// the child process callFeishuUserPluginTool spawns - the
 // FEISHU_USER_PLUGIN_COMMAND/FEISHU_USER_PLUGIN_ARGS env vars are the
 // officially supported override point (see resolveFeishuUserPluginCommand),
 // so this fakes the SAME subprocess boundary the run-feishu-user-plugin
 // wrapper tests fake, just with a scripted JSON-RPC responder instead of a
 // process-signal marker.
-describe("trySendFeishuUserPluginBotFile prose-failure detection (item 6, task P2.5 Task 6)", () => {
+describe("user-plugin post prose-failure detection (item 6, task P2.5 Task 6)", () => {
   // A minimal JSON-RPC-over-stdio responder matching exactly what
   // callFeishuUserPluginTool speaks (see notifications.ts): one line in, one
   // line out. Responds to `initialize`, ignores the `notifications/initialized`
   // notification (no `id`, no response expected), and for `tools/call`
-  // reproduces the exact bug scenario: the file-send step's response text
-  // starts with "Send failed:" but does NOT set `isError`.
-  const FAKE_PLUGIN_SCRIPT = `
+  // reproduces the exact bug scenario: the send step's response text starts
+  // with "Send failed:" but does NOT set `isError`.
+  const fakePluginScript = (responseText: string) => `
 import { createInterface } from "node:readline";
+
+const RESPONSE_TEXT = ${JSON.stringify(responseText)};
 
 const rl = createInterface({ input: process.stdin, terminal: false });
 
@@ -667,22 +717,17 @@ rl.on("line", (line) => {
     return;
   }
   if (message.method === "tools/call") {
-    const name = message.params?.name;
-    const args = message.params?.arguments ?? {};
-    if (name === "upload_file") {
-      respond(message.id, { content: [{ type: "text", text: "Uploaded: file_fake_abc123" }] });
-      return;
-    }
-    if (name === "send_message_as_bot" && args.msg_type === "file") {
-      respond(message.id, { content: [{ type: "text", text: "Send failed: chat not found" }] });
-      return;
-    }
-    respond(message.id, { content: [{ type: "text", text: "Message sent (bot): om_fake_summary" }] });
+    respond(message.id, { content: [{ type: "text", text: RESPONSE_TEXT }] });
     return;
   }
   respond(message.id, {});
 });
 `;
+
+  /** A send that really succeeded, in this channel's own success shape. */
+  const FAKE_PLUGIN_SCRIPT = fakePluginScript("Message sent (bot): om_fake_summary");
+  /** The bug shape: failure reported as prose, `isError` never set. */
+  const FAKE_PLUGIN_PROSE_FAILURE_SCRIPT = fakePluginScript("Send failed: chat not found");
 
   const envKeys = [
     "LARK_APP_ID",
@@ -719,12 +764,10 @@ rl.on("line", (line) => {
     }
   });
 
-  it("treats a 'Send failed' prose response (isError unset) on the file-send step as a failure, not a false success", async () => {
+  it("treats a 'Send failed' prose response (isError unset) as a failure, not a false success", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "notifications-fake-plugin-"));
     const scriptPath = join(tempDir, "fake-plugin.mjs");
-    writeFileSync(scriptPath, FAKE_PLUGIN_SCRIPT, "utf8");
-    const pdfPath = join(tempDir, "report.pdf");
-    writeFileSync(pdfPath, "%PDF-1.4 fake pdf content", "utf8");
+    writeFileSync(scriptPath, FAKE_PLUGIN_PROSE_FAILURE_SCRIPT, "utf8");
 
     process.env.LARK_APP_ID = "test_app_id";
     process.env.LARK_APP_SECRET = "test_app_secret";
@@ -743,10 +786,10 @@ rl.on("line", (line) => {
     process.env.FEISHU_NOTIFICATION_RETRY_ATTEMPTS = "1";
     delete process.env.FEISHU_USER_PLUGIN_DISABLED;
 
-    // Pre-fix: the file-send step's "Send failed: ..." response is not
-    // caught (only `/^error:/iu` was checked), so trySendFeishuUserPluginBotFile
-    // reports `sent: true` and deliverReportToFeishu resolves as if the PDF
-    // had genuinely been delivered.
+    // Pre-fix: the "Send failed: ..." response is not caught (only
+    // `/^error:/iu` was checked), so the send step reports `sent: true` and
+    // deliverReportToFeishu resolves as if the report had genuinely been
+    // delivered.
     //
     // The failure is still detected after the 2026-07-26 fix, but it is now
     // reported as a structured not-delivered RESULT rather than a throw -
@@ -755,11 +798,10 @@ rl.on("line", (line) => {
     const result = await deliverReportToFeishu({
       // Declared public, because this channel's one chat IS the group and an
       // UNDECLARED payload is now refused before it gets here (R2). The subject
-      // of this test is the PDF step's prose failure, not the scope rule.
+      // of this test is the prose failure, not the scope rule.
       scope: { visibility: "circle-public" },
       title: "测试报告",
-      markdown: "# 测试报告\n\n内容",
-      pdfPath
+      markdown: "# 测试报告\n\n内容"
     });
 
     expect(result.sent).toBe(false);
