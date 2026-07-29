@@ -6,7 +6,7 @@
 
 - `config/openclaw.example.json5`：单 control agent + Feishu allowlist 模板。
 - `agents/control.md`：群聊 @ 回复、日报/周报、个股分析、官方模拟盘的中文操作边界。
-- `scripts/scheduled-report.mjs`：日报/周报生成与飞书 PDF + 摘要卡片投递。
+- `scripts/scheduled-report.mjs`：日报/周报生成与飞书结论卡片投递（正文只在平台阅读）。
 - `scripts/stock-analysis.mjs`：用户指定标的后的三日一次个股分析。
 - `scripts/official-paper-monitor.mjs`：长桥官方模拟盘盘中轮询和开盘后收支变化表。
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
@@ -24,11 +24,9 @@
 
 ## Feishu
 
-报告投递固定为：
+报告投递固定为：一张中文结论卡片，卡片按钮深链到平台阅读页；正文不进飞书。
 
-- 第一条：中文摘要卡片。
-- 第二条：PDF 文件。
-- 不发送完整正文到群里。
+PDF 已按 2026-07-12 需求 §0.4 退役——脚本不再渲染，投递层也不再上传。
 
 刷新 user-plugin OAuth：
 
@@ -201,6 +199,34 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
   这条以前是无条件 warn，理由写的是"开发机本来就一个都不装"。那个理由说的是**机器**，却被套在了**检查项**上，于是对每台机器都成立——第 5 轮实测：四个标签一个域都没装、安装脚本各自退出 1 并明说了，这道门仍然 `ok=true` 退出 0。
 - 加载在错误的域、或两个域同时加载 → **error** `launchd-jobs.<name>.wrong_domain`。这正是 ownership 清单要防的"一个标签两个 owner"（两个 broker-executor 抢同一个交易数据库），任何开发机都不会误入这个状态。
 - 磁盘上还留着系统域标签的用户级 plist（此刻没加载）→ **error** `launchd-plists.stray_user_copy`。任务表里看不出问题，但下次登录 launchd 会把它们全部 bootstrap 起来。
+
+### 定时任务的 run_log 心跳与连续失败升级（Task 24）
+
+launchd 的 8 个 system daemon 里有 4 个是**定时任务**（其余是常驻服务）：`com.alphaloop.market-alerts`（每 300 秒）、`com.alphaloop.daily-backup`（每天 05:30）、`com.openclaw.trading.official-paper.poll`（每小时 :30）、`com.openclaw.trading.official-paper.pnl`（每小时 :00）。
+
+2026-07-29 在 mini 上只读实测：
+
+```
+sqlite> SELECT job, COUNT(*), MAX(started_at) FROM run_log GROUP BY job;
+market-alerts   605  2026-07-29T18:40:34Z
+proposal-sweep   83  2026-07-29T18:04:00Z
+daily            21  2026-07-29T14:33:59Z
+stock-analysis   10  2026-07-29T13:00:30Z
+weekly           13  2026-07-28T02:53:21Z
+```
+
+后三个定时任务一条记录都没有。也就是说「launchd 从来没触发过它」和「它每小时抛一次异常抛了一周」在数据上完全一样——都是没有行，唯一的痕迹是没人会去看的 launchd stderr 日志。
+
+现在这三个跑在 `scripts/scheduled-job-heartbeat.mjs` 的包装里：
+
+- 每次调用写一行 `run_log`（成功与失败都写），这就是心跳；
+- 连续失败 3 次后给运维发一张升级卡片，同一次故障 12 小时内只发一张（沿用 `market-alerts-poll.mjs` 硬失败对的阈值与节流，两套告警不该有两种节奏）；
+- 故障后第一次成功发一张恢复卡；从没升级过的任务不会莫名其妙宣布"恢复"。
+- 升级/恢复的标记写在那一行的 `evidence` 里（`escalation_sent` / `recovery_sent`），与 market-alerts 同一套读法。**卡片没送到就不打标记**，否则下一次会以为已经通知过了。
+
+`market-alerts` 不走这个包装：它自己有更复杂的一套（投递健康对、`ALTER-DOWN` 落盘、数据库打不开时的文件计数兜底），因为它是负责报告别人故障的那一个，自己的失明必须能在数据库不可用时也说出来。
+
+doctor 侧对应 `scheduled-job-heartbeat` 检查：某个标签在 launchd 里加载着但 `run_log` 一条都没有 → warn `never_ran`；心跳超过该任务自己的间隔上限 → warn `stale`；连续失败 ≥3 → **error**。它**不替代** `daily-backup-health` / `official-paper-health`——那两个看的是产物（备份文件、快照行），这个看的是运行本身。一个任务可以按时跑却什么都没产出（个股分析就这么"跳过"了三天），也可以根本没被触发而昨天的产物看起来还很新。两个问题不一样，两半都要有。
 
 ### 回环探针的严重级取决于 launchd 怎么说（第 5 轮 D2）
 

@@ -4,17 +4,23 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  REPORT_DELIVERY_DESCRIPTION,
   createId,
   deliverReportToFeishu,
   loadLocalEnv,
   MemberRepository,
-  openTradingDatabase
+  openTradingDatabase,
+  sendInteractiveCard
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import { buildMemberSubprocessEnv, loadMemberCredentials } from "./member-credentials.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
+import {
+  SCHEDULED_JOB_OFFICIAL_PAPER_PNL,
+  SCHEDULED_JOB_OFFICIAL_PAPER_POLL,
+  runScheduledJobWithHeartbeat
+} from "./scheduled-job-heartbeat.mjs";
 import { assertOfficialPaperReportEnvironment, normalizeOfficialPaperSnapshot, normalizeQuotePayload, toNumber } from "./report-data.mjs";
-import { writeMarkdownPdf } from "./report-rendering.mjs";
 import {
   shouldRunOfficialPaperHourlyPoll,
   shouldRunOfficialPaperPnlReport
@@ -155,9 +161,7 @@ async function sendPnlReport(db, forceRun = false) {
   const markdown = renderPnlReport(snapshot, previousDay, previousWeek);
   const label = snapshot.fetchedAt.slice(0, 10);
   const markdownPath = join(reportsDir, `${label}-post-open.md`);
-  const pdfPath = join(reportsDir, `${label}-post-open.pdf`);
   writeFileSync(markdownPath, `${markdown}\n`, "utf8");
-  await writeMarkdownPdf({ repoRoot, runtimeDir, markdownPath, pdfPath, markdown });
 
   // Resolved from the persisted rows with the platform's own date-level rule
   // (resolveOfficialPaperDateAttribution), never from re-running
@@ -171,7 +175,6 @@ async function sendPnlReport(db, forceRun = false) {
     previousWeek,
     markdown,
     markdownPath,
-    pdfPath,
     scope
   }));
   // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
@@ -191,7 +194,6 @@ async function sendPnlReport(db, forceRun = false) {
     delivered: delivery.sent,
     snapshotId,
     markdownPath,
-    pdfPath,
     // The exact basis the page will re-derive: report date, the rule's verdict
     // over this date's rows, and the scope that verdict produced. A same-date
     // rerun that flips this leaves a record of WHY the page closed on a date
@@ -545,7 +547,7 @@ function countDegradedPositions(positions) {
  * "no baseline exists" and "nothing moved" are different facts, and only one of
  * them is true here.
  */
-export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, markdown, markdownPath, pdfPath, scope }) {
+export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, markdown, markdownPath, scope }) {
   if (!scope || typeof scope.visibility !== "string") {
     // Refusing here rather than defaulting: every default is a guess about who
     // may read one member's account balances, and the delivery layer would have
@@ -570,7 +572,6 @@ export function buildPnlDeliveryPayload({ current, previousDay, previousWeek, ma
     title: `OpenClaw 模拟盘收支变化 ${label}`,
     markdown,
     markdownPath,
-    pdfPath,
     scope,
     audience: "dm",
     // `label` is `fetchedAt.slice(0, 10)` - the exact same string the writer
@@ -684,7 +685,7 @@ export function renderPnlReport(current, previousDay, previousWeek) {
     `生成时间：${formatShanghaiTime(current.fetchedAt)}`,
     "",
     "- 语言：中文。",
-    "- 投递：飞书摘要卡片 + PDF。",
+    `- 投递：${REPORT_DELIVERY_DESCRIPTION}。`,
     "- 账户：长桥官方模拟盘。",
     "- 范围：OpenClaw 最多使用总仓 10%；剩余 90% 不动。",
     "- 实盘：禁止自动提交真实资金订单。",
@@ -899,6 +900,18 @@ function formatShanghaiTime(value) {
 
 const KNOWN_COMMANDS = new Set(["poll", "pnl", "snapshot"]);
 
+// Task 24 (2026-07-28 spec-drift remediation): `poll` and `pnl` are the two
+// bodies launchd runs unattended (com.openclaw.trading.official-paper.poll /
+// .pnl), so they - and only they - write a run_log heartbeat and feed the
+// consecutive-failure escalation. `snapshot` is an operator typing a command
+// by hand and reading the answer on their own screen; wrapping it would put
+// a human's ad-hoc runs into the same failure streak that decides whether the
+// SCHEDULED job is broken, which is exactly the wrong signal.
+const SCHEDULED_JOB_BY_COMMAND = new Map([
+  ["poll", SCHEDULED_JOB_OFFICIAL_PAPER_POLL],
+  ["pnl", SCHEDULED_JOB_OFFICIAL_PAPER_PNL]
+]);
+
 async function main() {
   const [command = "poll", ...args] = process.argv.slice(2);
   const force = args.includes("--force");
@@ -914,10 +927,17 @@ async function main() {
 
   const db = openTradingDatabase(defaultDbPath);
   try {
-    if (command === "poll") {
-      await pollOfficialPaper(db, force);
-    } else if (command === "pnl") {
-      await sendPnlReport(db, force);
+    const scheduledJob = SCHEDULED_JOB_BY_COMMAND.get(command);
+    if (scheduledJob) {
+      await runScheduledJobWithHeartbeat(
+        db,
+        {
+          job: scheduledJob,
+          inputs: [{ command, force }],
+          sendCard: (card) => sendInteractiveCard(card, { operator: true })
+        },
+        () => (command === "poll" ? pollOfficialPaper(db, force) : sendPnlReport(db, force))
+      );
     } else {
       const snapshot = await runManualSnapshot(db);
       console.log(JSON.stringify(snapshot, null, 2));

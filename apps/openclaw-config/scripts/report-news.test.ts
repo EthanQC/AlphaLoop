@@ -341,9 +341,8 @@ describe("report news aggregation", () => {
   });
 
   // #29 audit fix regression: a malicious title using markdown link syntax
-  // must never survive normalization intact - both rendering faces
-  // (report-rendering.mjs formatInlineHtml and platform-app markdown.ts)
-  // turn `[text](url)` into a live anchor.
+  // must never survive normalization intact - the rendering face
+  // (platform-app markdown.ts) turns `[text](url)` into a live anchor.
   it("defuseMarkdownInText neutralizes markdown link syntax deterministically", () => {
     expect(news.defuseMarkdownInText("[紧急：点击核对持仓](https://evil.example/phish)"))
       .toBe("［紧急：点击核对持仓］(https://evil.example/phish)");

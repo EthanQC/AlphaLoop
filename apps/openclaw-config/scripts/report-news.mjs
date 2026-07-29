@@ -160,16 +160,16 @@ export function decorateNewsArticle(article) {
 /**
  * #29 audit fix: neutralizes markdown link syntax `[text](url)` found
  * inside externally-sourced text (news titles/summaries) so it can never
- * become a live, attacker-controlled anchor in either rendering face -
- * report-rendering.mjs's formatInlineHtml (PDF) and platform-app's
- * markdown.ts renderMarkdown (web) both only recognize the link syntax via
- * its literal ASCII `[`/`]` brackets immediately followed by `(url)`.
+ * become a live, attacker-controlled anchor in the rendering face -
+ * platform-app's markdown.ts renderMarkdown (web) only recognizes the link
+ * syntax via its literal ASCII `[`/`]` brackets immediately followed by
+ * `(url)`.
  *
  * Deterministic rule: replace the ASCII brackets around the link label
  * with their full-width equivalents (U+FF3B "［" / U+FF3D "］") whenever
  * they are immediately followed by `(...)`. This keeps the text
  * human-readable (the reader still sees the label and the literal URL
- * text) while making it byte-for-byte impossible for either renderer's
+ * text) while making it byte-for-byte impossible for that renderer's
  * `\[([^\]]+)\]\(...\)`-shaped regex to match - the defused text simply no
  * longer contains that construct. Exported so later news-pipeline work
  * (news-engine.mjs, Task 3) can reuse the same rule instead of

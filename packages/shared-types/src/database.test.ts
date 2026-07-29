@@ -1004,8 +1004,8 @@ function buildSeededV7Database(): DatabaseSync {
   `).run(now, now);
 
   db.prepare(`
-    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
-    VALUES ('run_v7', ?, '["AAPL.US"]', '/tmp/report.md', '/tmp/report.pdf', '{}')
+    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, delivery)
+    VALUES ('run_v7', ?, '["AAPL.US"]', '/tmp/report.md', '{}')
   `).run(now);
 
   db.prepare(`
@@ -3982,11 +3982,7 @@ describe("v16 personal_pages migration (2026-07-28 spec-drift remediation Task 5
 // of the fix.
 // ---------------------------------------------------------------------------
 describe("v17 execution_reports.owner_id migration (C1: per-member fills were public)", () => {
-  it("SCHEMA_VERSION is 17", () => {
-    expect(SCHEMA_VERSION).toBe(17);
-  });
-
-  it("a fresh db lands at v17 with a NULLABLE owner_id on execution_reports, FK'd to members and indexed", () => {
+  it("a fresh db carries a NULLABLE owner_id on execution_reports, FK'd to members and indexed", () => {
     const db = memoryDb();
     migrate(db);
 
@@ -4120,5 +4116,74 @@ describe("v17 execution_reports.owner_id migration (C1: per-member fills were pu
     const listed = new ExecutionReportRepository(db).listRecent(10);
     expect(listed.find((r) => r.id === "er_owned")?.ownerId).toBe("mem_v17_repo");
     expect(listed.find((r) => r.id === "er_unowned")?.ownerId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v18 (Task 14, 2026-07-28 spec-drift plan): the PDF is retired (§0.4), so
+// stock_analysis_runs has no artifact path to record beside the markdown one.
+// The column was NOT NULL, so leaving it in place would have forced the writer
+// to invent a value for a file that no longer exists.
+// ---------------------------------------------------------------------------
+describe("v18 stock_analysis_runs.pdf_path drop (Task 14: PDF retired)", () => {
+  it("SCHEMA_VERSION is 18", () => {
+    expect(SCHEMA_VERSION).toBe(18);
+  });
+
+  it("a fresh db has no pdf_path column on stock_analysis_runs", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    const columns = (db.prepare("PRAGMA table_info(stock_analysis_runs)").all() as Array<{ name: string }>)
+      .map((column) => column.name);
+    expect(columns).toEqual(["id", "created_at", "symbols", "markdown_path", "delivery"]);
+  });
+
+  it("drops the column off a deployed v17 db while keeping every archived run row", () => {
+    const db = memoryDb();
+    migrate(db);
+    // Reproduce the deployed v17 shape: stock_analysis_runs still carrying
+    // pdf_path, with two archived batches in it.
+    db.exec(`
+      DROP TABLE stock_analysis_runs;
+      CREATE TABLE stock_analysis_runs (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        symbols TEXT NOT NULL,
+        markdown_path TEXT NOT NULL,
+        pdf_path TEXT NOT NULL,
+        delivery TEXT NOT NULL
+      );
+      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
+      VALUES ('run_a', '2026-07-27T12:00:00.000Z', '["TSM.US"]', '/r/2026-07-27.md', '/r/2026-07-27.pdf', '{"sent":true}'),
+             ('run_b', '2026-07-28T12:00:00.000Z', '["AAPL.US"]', '/r/2026-07-28.md', '/r/2026-07-28.pdf', '{"sent":true}');
+      PRAGMA user_version = 17;
+    `);
+    expect(getSchemaVersion(db)).toBe(17);
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    const columns = (db.prepare("PRAGMA table_info(stock_analysis_runs)").all() as Array<{ name: string }>)
+      .map((column) => column.name);
+    expect(columns).not.toContain("pdf_path");
+    // History survives the drop - only the retired artifact's path is gone.
+    const rows = db
+      .prepare("SELECT id, markdown_path FROM stock_analysis_runs ORDER BY id")
+      .all() as Array<{ id: string; markdown_path: string }>;
+    expect(rows).toEqual([
+      { id: "run_a", markdown_path: "/r/2026-07-27.md" },
+      { id: "run_b", markdown_path: "/r/2026-07-28.md" }
+    ]);
+  });
+
+  it("is a no-op on a db whose column is already gone (migration-test fixtures wind user_version back)", () => {
+    const db = memoryDb();
+    migrate(db);
+    db.exec("PRAGMA user_version = 17;");
+
+    expect(() => migrate(db)).not.toThrow();
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
   });
 });

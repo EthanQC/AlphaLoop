@@ -1,8 +1,10 @@
+import { REPORT_DELIVERY_DESCRIPTION } from "../../../packages/shared-types/dist/index.js";
+
 export function loadStockAnalysisTemplate() {
   return {
     language: "zh-CN",
     market: "US",
-    delivery: "pdf-summary-card",
+    delivery: "conclusion-card-plus-platform-page",
     source: "Feishu trading-chat history plus knowledge/notes/stock-trading-notes",
     sections: [
       {
@@ -79,7 +81,7 @@ export function renderStockAnalysisTemplateMarkdown(template = loadStockAnalysis
     "",
     "- 语言：中文",
     "- 市场：仅美股",
-    "- 交付：PDF + 摘要卡片",
+    `- 交付：${REPORT_DELIVERY_DESCRIPTION}`,
     "- 规则：事实、推断、预测必须分层；预测必须可复盘。",
     ""
   ];

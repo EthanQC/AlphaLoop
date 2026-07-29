@@ -13,7 +13,7 @@ const resolveReportPaths = stockAnalysis.resolveReportPaths as (
   reportsDir: string,
   label: string,
   deliver: boolean
-) => { markdownPath: string; pdfPath: string };
+) => { markdownPath: string };
 
 const tempDirs: string[] = [];
 
@@ -47,16 +47,16 @@ afterEach(() => {
  *     test instead of silently going unnoticed by it.
  *
  * The INSERT column list is copied from stock-analysis.mjs's own statement;
- * `symbols`/`pdf_path`/`delivery` are not read by anything under test.
+ * `symbols`/`delivery` are not read by anything under test.
  */
 function insertRunLikeTheProducer(db: DatabaseSync, reportsDir: string, generatedAt: string): string {
   const label = generatedAt.slice(0, 10);
-  const { markdownPath, pdfPath } = resolveReportPaths(reportsDir, label, true);
+  const { markdownPath } = resolveReportPaths(reportsDir, label, true);
   const id = `stock_analysis_run_${label}`;
   db.prepare(`
-    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, generatedAt, JSON.stringify(["TSM.US"]), markdownPath, pdfPath, JSON.stringify({ sent: true }));
+    INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, delivery)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, generatedAt, JSON.stringify(["TSM.US"]), markdownPath, JSON.stringify({ sent: true }));
   return id;
 }
 

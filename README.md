@@ -20,8 +20,9 @@
 - `apps/openclaw-config`：OpenClaw/飞书配置、调度脚本、报告脚本、长桥包装脚本。
 - `packages/shared-types`：共享类型、SQLite schema、通知和通用工具。
 - `knowledge/notes/stock-trading-notes`：日报流程、个股分析模板和飞书历史提炼。
-- `reports/daily`：中文日报 Markdown/PDF。
-- `reports/weekly`：中文周报 Markdown/PDF。
+- `reports/daily`：中文日报 Markdown。
+- `reports/weekly`：中文周报 Markdown。
+  （两个目录里 2026-07-30 之前的 `.pdf` 是历史文件：PDF 已按需求 §0.4 退役，现在只产出 Markdown，平台阅读页是唯一正文入口。）
 
 ## 常用命令
 
@@ -48,9 +49,9 @@ pnpm platform:start
 
 ## 调度
 
-- 日报：周二到周五 20:00 发送当天报告，PDF + 摘要卡片。
-- 周报：周一 20:00 发送上一周报告，PDF + 摘要卡片。
-- 个股分析：用户指定标的后，每三天 21:00 发送一次批量分析，PDF + 摘要卡片。
+- 日报：周二到周五 20:00 发送当天报告；飞书只发结论卡片，正文在平台阅读。
+- 周报：周一 20:00 发送上一周报告；同上。
+- 个股分析：用户指定标的后，每三天 21:00 发送一次批量分析；同上。
 - 官方模拟盘：美股常规交易时段每小时轮询；美股开盘后 30 分钟发送收支变化表。
 
 ## 部署机安装顺序（2026-07-29 起：跑一条脚本，不要粘贴命令块）

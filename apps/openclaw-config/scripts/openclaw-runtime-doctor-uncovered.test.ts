@@ -133,7 +133,7 @@ const resolveReportPaths = stockAnalysis.resolveReportPaths as (
   dir: string,
   label: string,
   deliver: boolean
-) => { markdownPath: string; pdfPath: string };
+) => { markdownPath: string };
 
 describe("doctor: 个股分析 stopped producing without ever failing", () => {
   /** Seeds an active member + a watchlist through the REAL writer
@@ -163,14 +163,13 @@ describe("doctor: 个股分析 stopped producing without ever failing", () => {
     const paths = resolveReportPaths(join(dbPath, "..", "reports"), label, true);
     const db = openTradingDatabase(dbPath);
     db.prepare(`
-      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, pdf_path, delivery)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO stock_analysis_runs (id, created_at, symbols, markdown_path, delivery)
+      VALUES (?, ?, ?, ?, ?)
     `).run(
       `stock_analysis_run_${label}`,
       generatedAt,
       JSON.stringify(["TSM.US"]),
       paths.markdownPath,
-      paths.pdfPath,
       JSON.stringify({ sent: true })
     );
     db.close();

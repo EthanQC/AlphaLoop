@@ -15,11 +15,11 @@ import {
   validateStockAnalysisMarkdown,
   validateStockNarrativeNumbers
 } from "./report-quality.mjs";
+import { renderMarkdown } from "../../platform-app/src/reports/markdown.js";
 import { buildStockFacts } from "./report-facts.mjs";
 import { buildDeterministicAnalysis, renderBatchStockAnalysis } from "./stock-analysis.mjs";
 
 const news = await import("./report-news.mjs");
-const rendering = await import("./report-rendering.mjs");
 
 // A well-formed "new-format" report (Task 7's future "### 多源新闻（事件
 // 聚类）" section) - used as the common base for the samples that need the
@@ -187,8 +187,8 @@ describe("bad sample: <img> 实体注入标题 (T1 decode order - normalize outp
   });
 });
 
-describe("bad sample: markdown 链接注入标题 (T1 defuse - no live anchor in either rendering face)", () => {
-  it("produces no <a> anchor in the PDF rendering face after defusing", () => {
+describe("bad sample: markdown 链接注入标题 (T1 defuse - no live anchor in the platform rendering face)", () => {
+  it("produces no <a> anchor in the platform reading page after defusing", () => {
     const maliciousTitle = "[紧急：点击核对持仓](https://evil.example/phish)";
     const article = news.decorateNewsArticle({
       id: "phish-bad-sample",
@@ -207,10 +207,11 @@ describe("bad sample: markdown 链接注入标题 (T1 defuse - no live anchor in
     // The defused line itself no longer contains the `[text](url)` shape.
     expect(line).not.toMatch(/\[[^\]]+\]\(https?:\/\//u);
 
-    const html = rendering.renderReportHtml(`### 多源新闻\n\n${line}`);
+    const rendered = renderMarkdown(line);
 
-    expect(html).not.toContain("<a ");
-    expect(html).not.toMatch(/<a\b[^>]*href="https:\/\/evil\.example\/phish"/u);
+    expect(rendered.html.__html).not.toContain("<a ");
+    expect(rendered.html.__html).not.toMatch(/<a\b[^>]*href="https:\/\/evil\.example\/phish"/u);
+    expect(rendered.sources).toEqual([]);
   });
 });
 

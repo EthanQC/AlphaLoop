@@ -529,7 +529,6 @@ describe("renderPnlReport 收支变化表: every row says what it actually is (s
       previousWeek: null,
       markdown: officialPaperMonitor.renderPnlReport(CURRENT, null, null),
       markdownPath: "/tmp/x.md",
-      pdfPath: "/tmp/x.pdf",
       scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" }
     }).conclusion.bullets.join("\n");
 
@@ -548,7 +547,6 @@ describe("renderPnlReport 收支变化表: every row says what it actually is (s
       previousWeek: null,
       markdown: officialPaperMonitor.renderPnlReport(CURRENT, PREVIOUS_DAY, null),
       markdownPath: "/tmp/x.md",
-      pdfPath: "/tmp/x.pdf",
       scope: { visibility: "owner-private", ownerOpenId: "ou_paper_owner" }
     }).conclusion.bullets.join("\n");
 
@@ -929,7 +927,6 @@ describe("the PnL report cannot reach the shared group chat (spec drift R2)", ()
       previousWeek: null,
       markdown,
       markdownPath: "/tmp/reports/2026-07-01-post-open.md",
-      pdfPath: "/tmp/reports/2026-07-01-post-open.pdf",
       scope: officialPaperMonitor.resolvePnlReportScope(db, snapshotId)
     });
   }
@@ -969,7 +966,7 @@ describe("the PnL report cannot reach the shared group chat (spec drift R2)", ()
 });
 
 // 2026-07-28 (spec drift A3). sendPnlReport handed deliverReportToFeishu only
-// {title, markdown, markdownPath, pdfPath}. Under the one-card delivery path
+// {title, markdown, markdownPath}. Under the one-card delivery path
 // that produced a card with neither the numbers nor a link: the 收支变化表 is a
 // markdown TABLE, and the bullet extractor only picks up "- " lines, so the
 // whole point of the report - net assets and what changed - never reached the
@@ -997,8 +994,7 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
         : overrides.previousDay,
       previousWeek: overrides.previousWeek === undefined ? null : overrides.previousWeek,
       markdown: officialPaperMonitor.renderPnlReport(current, null, null),
-      markdownPath: "/tmp/reports/2026-07-01-post-open.md",
-      pdfPath: "/tmp/reports/2026-07-01-post-open.pdf"
+      markdownPath: "/tmp/reports/2026-07-01-post-open.md"
     });
   }
 
@@ -1023,8 +1019,7 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
       previousDay: null,
       previousWeek: null,
       markdown: "# x",
-      markdownPath: "/tmp/x.md",
-      pdfPath: "/tmp/x.pdf"
+      markdownPath: "/tmp/x.md"
     } as unknown as Parameters<typeof officialPaperMonitor.buildPnlDeliveryPayload>[0];
 
     expect(() => officialPaperMonitor.buildPnlDeliveryPayload(noScope)).toThrow(/scope/);

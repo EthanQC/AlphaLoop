@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -1076,6 +1076,39 @@ const MIGRATIONS: MigrationStep[] = [
       CREATE INDEX IF NOT EXISTS execution_reports_owner_created_idx
         ON execution_reports(owner_id, created_at);
     `);
+  },
+  // v18 (Task 14, 2026-07-28 spec-drift plan): drop stock_analysis_runs.pdf_path.
+  //
+  // The PDF is retired (2026-07-12 requirements §0.4 "PDF 已退役"), so
+  // stock-analysis.mjs no longer renders one and has no path to write here.
+  // The column is `NOT NULL`, so leaving it would force the writer to invent a
+  // value - and every candidate is a lie: '' claims an artifact with an empty
+  // name, and the old `<label>.pdf` string names a file that will never exist
+  // again. Dropping the column is the only option that keeps the row honest.
+  //
+  // No backfill decision to make: this drops a column, it does not add one.
+  // History keeps every field that still means something (id/created_at/
+  // symbols/markdown_path/delivery); what is lost is a path to files that are
+  // themselves being retired. The one consumer that ever read a path -
+  // stock-analysis-freshness.mjs - reads `markdown_path`, never this column.
+  //
+  // ALTER TABLE ... DROP COLUMN, not a table rebuild: nothing references
+  // stock_analysis_runs by foreign key, and SQLite has supported DROP COLUMN
+  // since 3.35 (node:sqlite on Node 24 ships 3.53). So no needsForeignKeysOff.
+  //
+  // Defensive existence check, same precedent as the v11/v12/v13/v17 steps
+  // above: this file's own migration tests wind `user_version` back to an
+  // earlier number while leaving table shapes at their latest, so this step can
+  // legitimately meet a stock_analysis_runs that has already lost the column. A
+  // real v17 database never has. Re-running the ALTER there would abort the
+  // whole migration with "no such column", so an already-absent column is
+  // treated as "nothing to drop", not an error. A missing TABLE (the hand-built
+  // legacy fixture shape v13 documented) is likewise nothing to alter.
+  (db) => {
+    const columns = db.prepare(`PRAGMA table_info(stock_analysis_runs)`).all() as Array<{ name: unknown }>;
+    if (columns.some((column) => String(column.name) === "pdf_path")) {
+      db.exec(`ALTER TABLE stock_analysis_runs DROP COLUMN pdf_path;`);
+    }
   }
 ];
 
