@@ -357,3 +357,73 @@ describe("nyMidnightUtcIso source parity: trading-schedule.mjs vs database.ts", 
     expect(tsText).toBe(mjsText);
   });
 });
+
+// ===========================================================================
+// Task 21 (2026-07-28 spec-drift plan): scheduled-job calendar predicates
+// ===========================================================================
+
+describe("isFirstWeekendOfMonth (monthly review's real first-weekend rule)", () => {
+  it("matches the month's first Saturday and first Sunday, on the Beijing calendar", () => {
+    // 2026-08-01 Sat and 2026-08-02 Sun, at the job's own 10:00 Beijing slot.
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-08-01T02:00:00.000Z"))).toBe(true);
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-08-02T02:00:00.000Z"))).toBe(true);
+  });
+
+  it("rejects the SECOND weekend - the half `0 10 * * 6,0` cannot express", () => {
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-08-08T02:00:00.000Z"))).toBe(false);
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-08-09T02:00:00.000Z"))).toBe(false);
+  });
+
+  it("rejects weekdays inside days 1-7 - the half the old `1-7` day-of-month field wrongly allowed", () => {
+    for (const day of ["03", "04", "05", "06", "07"]) {
+      expect(schedule.isFirstWeekendOfMonth(new Date(`2026-08-${day}T02:00:00.000Z`))).toBe(false);
+    }
+  });
+
+  it("reads the Beijing calendar, not UTC: 2026-08-01 16:00Z is already Sunday the 2nd in Beijing", () => {
+    // Saturday 2026-08-01 16:00Z = Sunday 2026-08-02 00:00 Beijing. Both are
+    // first-weekend days, so a same-answer pair proves nothing - use the month
+    // boundary instead: 2026-07-31 16:00Z is Friday in UTC but Saturday
+    // 2026-08-01 in Beijing, i.e. August's first weekend.
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-07-31T16:00:00.000Z"))).toBe(true);
+    // And the mirror: 2026-08-08 15:00Z is Saturday in UTC, but already Sunday
+    // 2026-08-09 in Beijing - the second weekend either way.
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-08-08T15:00:00.000Z"))).toBe(false);
+  });
+
+  it("matches twice in a month whose 1st is a Sunday, and that is intended", () => {
+    // 2026-11-01 is a Sunday; 2026-11-07 is the following Saturday. Both are
+    // day <= 7 and both are the first of their weekday in November.
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-11-01T02:00:00.000Z"))).toBe(true);
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-11-07T02:00:00.000Z"))).toBe(true);
+    expect(schedule.isFirstWeekendOfMonth(new Date("2026-11-08T02:00:00.000Z"))).toBe(false);
+  });
+});
+
+describe("isUsRegularTradingDate (report holiday guard's calendar half)", () => {
+  it("is false on a full NYSE close", () => {
+    expect(schedule.isUsRegularTradingDate("2026-11-26")).toBe(false); // Thanksgiving
+    expect(schedule.isUsRegularTradingDate("2026-07-03")).toBe(false); // Independence Day observed
+    expect(schedule.isUsRegularTradingDate("2026-12-25")).toBe(false);
+  });
+
+  it("is TRUE on an early-close day - a half session is still a session", () => {
+    expect(schedule.isUsRegularTradingDate("2026-11-27")).toBe(true);
+    expect(schedule.isUsRegularTradingDate("2026-12-24")).toBe(true);
+  });
+
+  it("is false on weekends and true on ordinary weekdays", () => {
+    expect(schedule.isUsRegularTradingDate("2026-07-25")).toBe(false); // Saturday
+    expect(schedule.isUsRegularTradingDate("2026-07-26")).toBe(false); // Sunday
+    expect(schedule.isUsRegularTradingDate("2026-07-29")).toBe(true);
+  });
+
+  it("answers null - never false - for a year the holiday table does not cover", () => {
+    // The table only carries 2026. A 2027 date must read as "cannot tell", so
+    // an un-updated calendar can never silently cancel a year of reports.
+    expect(schedule.CALENDAR_COVERED_YEARS).toEqual([2026]);
+    expect(schedule.isUsRegularTradingDate("2027-01-04")).toBeNull();
+    expect(schedule.isUsRegularTradingDate("2027-01-01")).toBeNull();
+    expect(schedule.isUsRegularTradingDate("not-a-date")).toBeNull();
+  });
+});

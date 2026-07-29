@@ -248,12 +248,20 @@ describe("generate", () => {
 // ===========================================================================
 
 describe("generate-all", () => {
+  // Task 21 (2026-07-28 spec-drift plan): generate-all is now guarded to the
+  // month's first weekend, so every test that expects it to actually GENERATE
+  // has to run at an instant the real cron would fire at. 2026-08-01T02:00:00Z
+  // is Saturday 2026-08-01 10:00 Beijing - day 1 of the month, and precisely
+  // the `0 10 * * 6,0` slot the job is registered on. NOW (2026-07-20, a
+  // Monday) would now be skipped, which is the point of the guard.
+  const FIRST_WEEKEND_NOW = "2026-08-01T02:00:00.000Z";
+
   it("generates a draft for every ACTIVE member, skipping revoked ones", async () => {
     const { db, options } = makeDb();
     seedMember(db, OWNER_A, "active");
     seedMember(db, OWNER_B, "revoked");
 
-    const result = await cli.runGenerateAll({ period: PERIOD }, { ...options, now: NOW });
+    const result = await cli.runGenerateAll({ period: PERIOD }, { ...options, now: FIRST_WEEKEND_NOW });
 
     expect(result.ok).toBe(true);
     expect(result.total).toBe(1);
@@ -286,7 +294,7 @@ describe("generate-all", () => {
     const bDraft = new MonthlyReviewRepository(db).upsertDraft({ ownerId: OWNER_B, period: PERIOD, resultJson: {} });
     new MonthlyReviewRepository(db).confirm(bDraft.id, OWNER_B);
 
-    const result = await cli.runGenerateAll({ period: PERIOD }, { ...options, now: NOW });
+    const result = await cli.runGenerateAll({ period: PERIOD }, { ...options, now: FIRST_WEEKEND_NOW });
 
     expect(result.total).toBe(2);
     expect(result.generated).toBe(1);
@@ -296,11 +304,247 @@ describe("generate-all", () => {
     const failure = result.results.find((r: { ownerId: string }) => r.ownerId === OWNER_B);
     expect(failure.error).toMatch(/already confirmed/);
   });
+
+  // ---------------------------------------------------------------------
+  // Task 21: the first-weekend guard.
+  //
+  // The schedule half is `0 10 * * 6,0` (openclaw-cron-jobs.mjs) - EVERY
+  // Saturday and Sunday. Without this guard that is ~9 monthly-review batches
+  // a month instead of the spec's one weekend. The previous expression,
+  // `0 10 1-7 * 6,0`, did not restrict it either: croner (which is what
+  // OpenClaw schedules with) ORs day-of-month and day-of-week, so it fired 14
+  // times in August 2026.
+  // ---------------------------------------------------------------------
+  it("skips - without touching the database - on a weekend that is not the month's first", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    // 2026-08-08 is the SECOND Saturday of August 2026 - a slot the cron fires
+    // on and the spec does not want a batch on.
+    const result = await cli.runGenerateAll({}, { ...options, now: "2026-08-08T02:00:00.000Z" });
+
+    expect(result).toMatchObject({ ok: true, skipped: "not-first-weekend" });
+    expect(result.reason).toContain("首周末");
+    expect(new MonthlyReviewRepository(db).listForOwner(OWNER_A)).toHaveLength(0);
+  });
+
+  it("skips on a weekday inside the first week - day-of-month alone is not the rule", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    // 2026-08-03 is a Monday, day 3 - inside `1-7`, which is exactly the half
+    // of the old expression that made it fire on 9 consecutive days.
+    const result = await cli.runGenerateAll({}, { ...options, now: "2026-08-03T02:00:00.000Z" });
+
+    expect(result.skipped).toBe("not-first-weekend");
+    expect(new MonthlyReviewRepository(db).listForOwner(OWNER_A)).toHaveLength(0);
+  });
+
+  it("runs on the first Sunday too, not only the first Saturday", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    // 2026-08-02, Sunday, day 2.
+    const result = await cli.runGenerateAll({}, { ...options, now: "2026-08-02T02:00:00.000Z" });
+
+    expect(result.skipped).toBeUndefined();
+    expect(result.generated).toBe(1);
+  });
+
+  it("--force lets an operator re-run the batch off-schedule", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    const result = await cli.runGenerateAll(
+      { period: PERIOD, force: true },
+      { ...options, now: NOW }
+    );
+
+    expect(result.skipped).toBeUndefined();
+    expect(result.generated).toBe(1);
+    expect(new MonthlyReviewRepository(db).getByOwnerPeriod(OWNER_A, PERIOD)).not.toBeNull();
+  });
+
+  it("accepts --force only on generate-all, and only as a no-value flag", () => {
+    expect(cli.parseFlags(["--force"], "generate-all")).toEqual({ force: true });
+    expect(() => cli.parseFlags(["--force"], "generate")).toThrow(/未知参数/u);
+  });
 });
 
 // ===========================================================================
 // confirm
 // ===========================================================================
+
+// ===========================================================================
+// Task 16 (2026-07-28 spec-drift plan): §3.4 says the monthly review is
+// 「发本人单聊」. `generate` saved a draft and notified nobody - the only way to
+// learn a review existed was to open the platform and look for it.
+// ===========================================================================
+
+describe("generate: the owner is told, in Feishu, that a draft exists", () => {
+  it("sends the owner a draft card carrying the headline metrics and the calibration line", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_draft_1" }));
+
+    const result = await cli.runGenerate(
+      { owner: OWNER_A, period: PERIOD },
+      { ...options, now: NOW, feishuNotifier }
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.notify.delivered).toBe(true);
+    expect(feishuNotifier).toHaveBeenCalledTimes(1);
+
+    const args = feishuNotifier.mock.calls[0][0];
+    expect(args.ownerId).toBe(OWNER_A);
+    expect(args.title).toBe(`${PERIOD} 月度复盘草稿已生成`);
+    const body = args.lines.join("\n");
+    expect(body).toContain(`复盘周期：${PERIOD}`);
+    expect(body).toContain("本人论点命中率");
+    expect(body).toContain("决策收益");
+    expect(body).toContain("纪律遵守率");
+    // The calibration line the confirm card does not carry, with its
+    // 「全平台口径，非本人」 qualifier intact - this number is the SYSTEM's.
+    expect(body).toContain("系统置信度校准（全平台口径，非本人）");
+    expect(body).toContain("这是草稿");
+    // An empty db has no graded predictions, so every tier reads 暂无 - never
+    // a fabricated 0%.
+    expect(body).toContain("高 暂无");
+    expect(body).not.toContain("0%");
+
+    const payload = JSON.parse(auditRows(db, "generate")[0].payload);
+    expect(payload.notified).toBe(true);
+  });
+
+  it("carries a /review/<id> deep link button when the deployment has a public base url", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const feishuNotifier = vi.fn(async () => ({ ok: true }));
+    const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+    process.env.PLATFORM_PUBLIC_BASE_URL = "https://reports.qingverse.com";
+    try {
+      const result = await cli.runGenerate(
+        { owner: OWNER_A, period: PERIOD },
+        { ...options, now: NOW, feishuNotifier }
+      );
+
+      expect(feishuNotifier.mock.calls[0][0].url).toEqual({
+        text: "查看复盘草稿",
+        href: `https://reports.qingverse.com/review/${result.review.id}`
+      });
+    } finally {
+      if (previousBaseUrl === undefined) {
+        delete process.env.PLATFORM_PUBLIC_BASE_URL;
+      } else {
+        process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
+      }
+    }
+  });
+
+  it("says so plainly, instead of printing an unopenable path, with no public base url", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const feishuNotifier = vi.fn(async () => ({ ok: true }));
+    const previousBaseUrl = process.env.PLATFORM_PUBLIC_BASE_URL;
+    delete process.env.PLATFORM_PUBLIC_BASE_URL;
+    try {
+      await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW, feishuNotifier });
+
+      const args = feishuNotifier.mock.calls[0][0];
+      expect(args.url).toBeUndefined();
+      expect(args.lines).toContain("完整复盘请在平台复盘页查看。");
+      expect(JSON.stringify(args)).not.toContain("/review/");
+    } finally {
+      if (previousBaseUrl !== undefined) {
+        process.env.PLATFORM_PUBLIC_BASE_URL = previousBaseUrl;
+      }
+    }
+  });
+
+  it("keeps the saved draft when delivery fails, and records the failure honestly", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const feishuNotifier = vi.fn(async () => {
+      throw new Error("feishu unreachable (fake)");
+    });
+
+    const result = await cli.runGenerate(
+      { owner: OWNER_A, period: PERIOD },
+      { ...options, now: NOW, feishuNotifier }
+    );
+
+    // The draft is the artifact; the card is a notification about it. A failed
+    // notification must never cost the member the review.
+    expect(result.ok).toBe(true);
+    expect(result.notify.delivered).toBe(false);
+    expect(result.notify.reason).toMatch(/feishu unreachable/);
+    expect(new MonthlyReviewRepository(db).getById(result.review.id)?.status).toBe("draft");
+
+    const payload = JSON.parse(auditRows(db, "generate")[0].payload);
+    expect(payload.notified).toBe(false);
+  });
+
+  it("degrades honestly (no throw) for a member with no feishu_open_id on file", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+
+    // No injected notifier: the real one runs, finds no open id, and returns
+    // {ok:false, reason} without touching the network.
+    const result = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+
+    expect(result.ok).toBe(true);
+    expect(result.notify.delivered).toBe(false);
+    expect(result.notify.reason).toMatch(/feishu_open_id/);
+    expect(new MonthlyReviewRepository(db).getById(result.review.id)?.status).toBe("draft");
+  });
+
+  it("does not re-send the same period's card when generate runs again (upsert is idempotent, the card must be too)", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_draft_1" }));
+
+    await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW, feishuNotifier });
+    const second = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW, feishuNotifier });
+
+    expect(feishuNotifier).toHaveBeenCalledTimes(1);
+    expect(second.notify.skipped).toBe(true);
+    expect(second.notify.delivered).toBe(false);
+    expect(second.notify.reason).toMatch(/已在此前的运行中投递/);
+  });
+
+  it("retries next run when the first attempt never delivered", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    const failing = vi.fn(async () => ({ ok: false, reason: "transport down (fake)" }));
+    const succeeding = vi.fn(async () => ({ ok: true, messageId: "om_draft_2" }));
+
+    await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW, feishuNotifier: failing });
+    const second = await cli.runGenerate(
+      { owner: OWNER_A, period: PERIOD },
+      { ...options, now: NOW, feishuNotifier: succeeding }
+    );
+
+    expect(succeeding).toHaveBeenCalledTimes(1);
+    expect(second.notify.delivered).toBe(true);
+  });
+
+  it("generate-all notifies each active member about their own draft only", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, OWNER_A);
+    seedMember(db, OWNER_B);
+    const feishuNotifier = vi.fn(async () => ({ ok: true }));
+
+    // 2026-08-01 is the first Saturday of August - the only slot generate-all
+    // actually produces on (see the 首周末 guard in this file's generate-all
+    // block); any other date returns skipped:"not-first-weekend".
+    await cli.runGenerateAll({ period: PERIOD }, { ...options, now: "2026-08-01T02:00:00.000Z", feishuNotifier });
+
+    expect(feishuNotifier).toHaveBeenCalledTimes(2);
+    const owners = feishuNotifier.mock.calls.map((call) => call[0].ownerId);
+    expect(owners.sort()).toEqual([OWNER_A, OWNER_B].sort());
+  });
+});
 
 describe("confirm", () => {
   it("confirms a draft, mirrors to memoryd as type=decision, and notifies Feishu - all fire-and-forget", async () => {

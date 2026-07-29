@@ -45,6 +45,82 @@ export function currentUsEasternTradingDay(date = new Date()) {
   return getZonedParts(date, NEW_YORK_TIMEZONE).dateLabel;
 }
 
+// ---------------------------------------------------------------------------
+// Task 21 (2026-07-28 spec-drift plan): calendar predicates the SCHEDULED
+// jobs need, as opposed to the "is the market open right this second"
+// predicates above.
+// ---------------------------------------------------------------------------
+
+/**
+ * Weekday (Sun=0 .. Sat=6) of a bare 'YYYY-MM-DD' calendar date.
+ *
+ * A calendar date has no time zone, so this deliberately does NOT go through
+ * getZonedParts - it anchors at noon UTC, which is >=12h away from either
+ * midnight in every zone within +/-12h of UTC, so the UTC weekday is the
+ * date's own weekday regardless of where the reader sits.
+ */
+function weekdayOfDateLabel(dateLabel) {
+  return new Date(`${dateLabel}T12:00:00Z`).getUTCDay();
+}
+
+/**
+ * Does the NYSE hold a REGULAR session on `dateLabel` (a US/Eastern calendar
+ * date, 'YYYY-MM-DD')? Weekends and the full-close holidays above are false;
+ * an early close (NYSE_EARLY_CLOSE_DATES) is still a trading day, so true.
+ *
+ * Returns `null`, NOT `false`, when this file's holiday table has no data for
+ * that year (CALENDAR_COVERED_YEARS) or the label is malformed. Callers MUST
+ * treat null as "cannot tell" and fall through to running: `false` here is
+ * what cancels a scheduled report, and an un-updated holiday table rolling
+ * into a new year must never be able to cancel every report of that year in
+ * silence. `assertCalendarCoverage` (which throws) stays the right call for
+ * the intraday pollers, where refusing to answer is the safe direction; for a
+ * once-a-day report the safe direction is the opposite one.
+ */
+export function isUsRegularTradingDate(dateLabel) {
+  const label = String(dateLabel ?? "");
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(label)) {
+    return null;
+  }
+  if (!CALENDAR_COVERED_YEARS.includes(Number(label.slice(0, 4)))) {
+    return null;
+  }
+  const weekday = weekdayOfDateLabel(label);
+  if (weekday === 0 || weekday === 6) {
+    return false;
+  }
+  return !NYSE_FULL_CLOSE_DATES.has(label);
+}
+
+/**
+ * Is `date` the month's first Saturday or first Sunday, on the Beijing
+ * calendar (the tz every managed cron job is registered in)?
+ *
+ * THIS IS THE WHOLE FIRST-WEEKEND RULE, AND IT LIVES HERE RATHER THAN IN THE
+ * CRON EXPRESSION. The monthly-review job used to carry `0 10 1-7 * 6,0` with
+ * a comment calling that "the intersection of within the first 7 days and a
+ * Saturday or Sunday". It is not an intersection. OpenClaw schedules through
+ * croner, whose `legacyMode` default is the POSIX/Vixie rule: when BOTH
+ * day-of-month and day-of-week are restricted, a run fires when EITHER
+ * matches. Enumerated against the croner build installed on the deployed mini,
+ * that expression yields 14 runs in August 2026 (Aug 1-9, then every weekend)
+ * where the spec asks for one weekend a month. The expression is now
+ * `0 10 * * 6,0` - unambiguous under either reading - and the "first" half is
+ * this function, which a test can actually pin.
+ *
+ * Both the first Saturday and the first Sunday necessarily fall on day 1-7,
+ * and any weekend day on day 1-7 is necessarily the first of its weekday in
+ * that month (the previous one would be day <= 0). In a month whose 1st is a
+ * Sunday this therefore matches twice, on two different weekends (e.g.
+ * 2026-11-01 Sun and 2026-11-07 Sat) - harmless and intended: `generate-all`
+ * is an idempotent overwrite-the-draft batch, so a second run in the first
+ * calendar week re-generates the same drafts rather than appending.
+ */
+export function isFirstWeekendOfMonth(date = new Date(), timeZone = SHANGHAI_TIMEZONE) {
+  const parts = getZonedParts(date, timeZone);
+  return (parts.weekday === 6 || parts.weekday === 0) && parts.day <= 7;
+}
+
 // Phase 6 Task 2 (2026-07-15 plan): the ONE shared computation of "which
 // US/Eastern trading week (Monday-Friday) does this instant fall in", used by
 // BOTH circuit-breaker.mjs (weekly-loss window: baseline = last snapshot

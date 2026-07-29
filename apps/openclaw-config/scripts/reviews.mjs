@@ -56,11 +56,16 @@ import {
 
 import { computeComplianceStats, loadLatestPriceForSymbol } from "../../platform-app/dist/data/strategy.js";
 
-import { composeReviewConfirmCardBody, createFeishuReviewNotifier } from "./feishu-review-notifier.mjs";
+import {
+  composeReviewConfirmCardBody,
+  composeReviewDraftCardBody,
+  createFeishuReviewNotifier
+} from "./feishu-review-notifier.mjs";
 import { createMemorydBackend, mirrorRecord } from "./memoryd-mirror.mjs";
 import { buildMonthlyReview } from "./review-engine.mjs";
 import { compareReviewMetrics, recomputeReviewMetrics } from "./review-verifier.mjs";
 import { computeThesisOutcome } from "./thesis-outcome.mjs";
+import { isFirstWeekendOfMonth } from "./trading-schedule.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 
@@ -69,7 +74,7 @@ const PERIOD_PATTERN = /^\d{4}-\d{2}$/;
 // notify-test's mode switches are this CLI's only genuine boolean/no-value
 // flags (every other flag always expects a value) - same explicit-set
 // convention as members.mjs.
-const BOOLEAN_FLAGS = new Set(["dry-run", "send"]);
+const BOOLEAN_FLAGS = new Set(["dry-run", "send", "force"]);
 
 // Per-command flag allowlist (H6 pattern, members.mjs/proposals.mjs/
 // strategy.mjs): scoped PER SUBCOMMAND so a flag real for a different
@@ -77,7 +82,10 @@ const BOOLEAN_FLAGS = new Set(["dry-run", "send"]);
 // silently never being read.
 const COMMAND_FLAGS = {
   generate: new Set(["owner", "period"]),
-  "generate-all": new Set(["period"]),
+  // `force` (Task 21) bypasses the first-weekend guard for a deliberate
+  // operator re-run. It is NOT on any other subcommand: `generate` is
+  // single-owner and ungated, so nothing else has a guard to bypass.
+  "generate-all": new Set(["period", "force"]),
   confirm: new Set(["owner", "review"]),
   list: new Set(["owner"]),
   show: new Set(["owner", "review"]),
@@ -188,30 +196,84 @@ function previousBeijingPeriod(nowValue) {
 // Fire-and-forget wrapper around the injected notifier - never throws/
 // rejects, mirrors memoryd-mirror.mjs's mirrorRecord discipline exactly
 // (backend throw/reject/`{ok:false}` all degrade to a warned, honest
-// `{delivered:false, reason}` instead of propagating to confirm's caller).
-async function notifyFeishuReviewConfirmed(notifier, { ownerId, review }) {
+// `{delivered:false, reason}` instead of propagating to the caller).
+//
+// Shared by both notification points (confirm and, since Task 16, draft
+// generation) - one wrapper, one degrade story, so a new call site cannot
+// invent a weaker one. `compose` is the card body builder for that point;
+// `label` only names the operation in the warning line.
+async function notifyFeishuReview(notifier, { ownerId, title, body, label }) {
   try {
-    const result = await notifier({
-      ownerId,
-      title: `${review.period} 月度复盘已确认`,
-      ...composeReviewConfirmCardBody({
-        id: review.id,
-        period: review.period,
-        confirmedAt: review.confirmedAt ?? null,
-        result: review.resultJson
-      })
-    });
+    const result = await notifier({ ownerId, title, ...body });
     if (result?.ok) {
       return { delivered: true, messageId: result.messageId ?? null };
     }
     const reason = result?.reason ? String(result.reason) : "feishu notifier returned ok:false";
-    console.warn(`飞书单聊复盘确认通知跳过（owner=${ownerId}）：${reason}`);
+    console.warn(`飞书单聊${label}通知跳过（owner=${ownerId}）：${reason}`);
     return { delivered: false, reason };
   } catch (error) {
     const reason = String(error?.message ?? error);
-    console.warn(`飞书单聊复盘确认通知跳过（owner=${ownerId}）：${reason}`);
+    console.warn(`飞书单聊${label}通知跳过（owner=${ownerId}）：${reason}`);
     return { delivered: false, reason };
   }
+}
+
+async function notifyFeishuReviewConfirmed(notifier, { ownerId, review }) {
+  return notifyFeishuReview(notifier, {
+    ownerId,
+    title: `${review.period} 月度复盘已确认`,
+    label: "复盘确认",
+    body: composeReviewConfirmCardBody({
+      id: review.id,
+      period: review.period,
+      confirmedAt: review.confirmedAt ?? null,
+      result: review.resultJson
+    })
+  });
+}
+
+// Task 16 (2026-07-28 spec-drift plan). §3.4 says the monthly review is 「发本
+// 人单聊」, and until now nothing was: `generate`/`generate-all` saved a draft
+// and told nobody, so the only way to discover a review existed was to open the
+// platform and look. The card carries the headline metrics, the confidence
+// calibration and a /review/<id> deep link.
+async function notifyFeishuReviewDraft(notifier, { ownerId, review }) {
+  return notifyFeishuReview(notifier, {
+    ownerId,
+    title: `${review.period} 月度复盘草稿已生成`,
+    label: "复盘草稿",
+    body: composeReviewDraftCardBody({
+      id: review.id,
+      period: review.period,
+      generatedAt: review.updatedAt ?? review.createdAt ?? null,
+      result: review.resultJson
+    })
+  });
+}
+
+// C4-style idempotency, borrowed from scheduled-report.mjs's personal cards:
+// `generate` UPSERTS, so a re-run of the monthly cron (or an operator re-running
+// one owner) rewrites the same draft row - and would, without this, send the
+// owner a second identical card every time. The audit_log row this function
+// reads is the record the previous run already wrote; nothing new is persisted
+// to track it.
+//
+// Deliberately keyed on (owner, period) and NOT on the review id: the id is
+// stable across re-generations of the same period (upsertDraft keeps the
+// existing row's id), so a changed id would mean a different period anyway.
+export function hasNotifiedReviewDraft(db, ownerId, period) {
+  const rows = db
+    .prepare(`SELECT payload FROM audit_log WHERE category = 'monthly_review' AND action = 'generate'`)
+    .all();
+  return rows.some((row) => {
+    let payload;
+    try {
+      payload = JSON.parse(String(row.payload));
+    } catch {
+      return false;
+    }
+    return payload?.ownerId === ownerId && payload?.period === period && payload?.notified === true;
+  });
 }
 
 // -----------------------------------------------------------------------
@@ -239,14 +301,33 @@ async function generateForOwner(db, ownerId, period, options) {
 
   const review = new MonthlyReviewRepository(db).upsertDraft({ ownerId, period, resultJson: primaryResult });
 
+  // Task 16: the draft is SAVED before this runs and stays saved whatever
+  // happens next. notifyFeishuReviewDraft never throws (see the wrapper), so a
+  // missing feishu_open_id, an unreachable Feishu, or a transport error all
+  // come back as `{delivered:false, reason}` - recorded in the audit row and
+  // returned to the caller, never rolled back into a lost review.
+  const alreadyNotified = hasNotifiedReviewDraft(db, ownerId, period);
+  const notify = alreadyNotified
+    ? { delivered: false, reason: "本期草稿卡片已在此前的运行中投递，跳过重复投递。", skipped: true }
+    : await notifyFeishuReviewDraft(
+        options.feishuNotifier ?? createFeishuReviewNotifier({ db }),
+        { ownerId, review }
+      );
+
   new AuditLogRepository(db).write("monthly_review", "generate", {
     reviewId: review.id,
     ownerId,
     period,
-    selfCheck: "consistent"
+    selfCheck: "consistent",
+    // `notified` is what hasNotifiedReviewDraft reads back on the next run. A
+    // skipped re-run must not write `true` a second time (it delivered
+    // nothing), and must not write `false` either in a way that would let a
+    // THIRD run re-send - the read scans every row for any `true`, so a
+    // skipped run's `false` is harmless.
+    notified: notify.delivered
   });
 
-  return { ok: true, review, selfCheck: { consistent: true, mismatches: [] } };
+  return { ok: true, review, selfCheck: { consistent: true, mismatches: [] }, notify };
 }
 
 export async function runGenerate(flags, options = {}) {
@@ -272,6 +353,31 @@ export async function runGenerate(flags, options = {}) {
 // must not let one bad row block everyone else's draft).
 export async function runGenerateAll(flags, options = {}) {
   const nowValue = options.now ?? nowIso();
+
+  // Task 21 (2026-07-28 spec-drift plan) - THE FIRST-WEEKEND RULE LIVES HERE.
+  //
+  // The plan's spec is "每月第一个周末生成". That used to be expressed only in
+  // the cron expression, as `0 10 1-7 * 6,0`, with a comment calling the
+  // day-of-month and day-of-week fields an intersection. Cron does not
+  // intersect them: OpenClaw schedules through croner, whose legacyMode
+  // default is the POSIX/Vixie "either field matches" rule, and enumerating
+  // that expression against the croner build on the deployed mini produced 14
+  // firings in August 2026 instead of one weekend's worth. So the schedule
+  // half is now the unambiguous `0 10 * * 6,0` (see openclaw-cron-jobs.mjs)
+  // and the "first" half is this check, which a test can pin - the ~8 other
+  // weekend slots a month land here and return without generating anything.
+  //
+  // Cheap by construction: this returns BEFORE `withDb`, so a skipped slot
+  // does not even open the database.
+  if (flags.force !== true && !isFirstWeekendOfMonth(new Date(nowValue))) {
+    return {
+      ok: true,
+      skipped: "not-first-weekend",
+      now: nowValue,
+      reason: "月度复盘只在当月第一个周六/周日生成；本次调度不在首周末，未生成任何草稿。"
+    };
+  }
+
   let period = flags.period !== undefined ? String(flags.period).trim() : "";
   if (!period) {
     period = previousBeijingPeriod(nowValue);

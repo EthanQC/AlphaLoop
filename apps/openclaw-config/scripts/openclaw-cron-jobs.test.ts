@@ -35,7 +35,7 @@ describe("managed OpenClaw cron jobs", () => {
         systemEvent: expect.stringContaining("pnpm proposals:sweep")
       }),
       expect.objectContaining({
-        cron: "0 10 1-7 * 6,0",
+        cron: "0 10 * * 6,0",
         timezone: "Asia/Shanghai",
         systemEvent: expect.stringContaining("pnpm reviews:generate")
       })
@@ -59,5 +59,23 @@ describe("managed OpenClaw cron jobs", () => {
     }
     expect(jobs[3]?.systemEvent).toContain("proposal-expiry sweep");
     expect(jobs[4]?.systemEvent).toContain("monthly per-owner review draft generation");
+  });
+
+  // Task 21 (2026-07-28 spec-drift plan). The monthly review carried
+  // `0 10 1-7 * 6,0` with a comment calling day-of-month AND day-of-week an
+  // intersection. OpenClaw schedules through croner, whose legacyMode default
+  // is the POSIX/Vixie OR rule, so that expression fires on days 1-7 *or* any
+  // weekend - 14 times in August 2026, enumerated against the croner build on
+  // the deployed mini. Restricting only day-of-week means the same thing under
+  // either reading; the "first weekend" half is reviews.mjs's own guard.
+  it("expresses the monthly review with day-of-week only, so no cron DOM/DOW semantics can widen it", () => {
+    const monthly = buildManagedOpenClawCronJobs("/repo").find(
+      (job) => job.name === "openclaw-trading-monthly-review"
+    );
+
+    expect(monthly?.cron).toBe("0 10 * * 6,0");
+    const [, , dayOfMonth, month] = String(monthly?.cron).split(" ");
+    expect(dayOfMonth).toBe("*");
+    expect(month).toBe("*");
   });
 });
