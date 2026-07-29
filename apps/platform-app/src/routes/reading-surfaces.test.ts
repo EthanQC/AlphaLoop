@@ -371,6 +371,35 @@ describe("every reading surface: no raw values, honest staleness, informative em
     expect(body).toContain("本月没有可统计的样本，这一段不下结论。");
   });
 
+  // Task 19 (2026-07-30). The topbar has THREE honest answers, and the third
+  // one was missing: a page that shows content but cannot date it used to
+  // render exactly like a page with no data at all - request clock only.
+  it("Task 19: a surface with content but no resolvable data time says 数据时间未知 and why", async () => {
+    // Empty database: no snapshot, no stock facts, no analysis - yet each of
+    // these pages still renders database-backed blocks.
+    for (const path of ["/paper", `/member/${member.id}`, "/stock/TSM.US"]) {
+      const body = await (await get(path)).text();
+      const text = visibleText(body);
+      expect(text, `${path} must disclose the unknown data time`).toContain("数据时间未知");
+      // The disclosure has to name a reason - 未知 on its own is the same
+      // silence in different words. `visibleText` replaces the stripped tags
+      // with spaces, so the reason is separated by whitespace here but not on
+      // the page.
+      expect(text, `${path} must name the reason`).toMatch(/数据时间未知\s*（.+?）/u);
+      // ...and it must not read as a resolved data time.
+      expect(body, `${path} must not claim a data time`).not.toContain("· 数据时间 ");
+    }
+  });
+
+  it("Task 19: a surface WITH a data time never says 数据时间未知 - the disclosure is not blanket", async () => {
+    const ids = seedEverything();
+    for (const path of ["/", "/paper", `/member/${member.id}`, "/stock/TSM.US", `/review/${ids.reviewId}`]) {
+      const body = await (await get(path)).text();
+      expect(visibleText(body), `${path} should state a real data time`).not.toContain("数据时间未知");
+      expect(body, `${path} should state a real data time`).toContain("数据时间 ");
+    }
+  });
+
   it("U1: the seeded alert reaches BOTH the home feed and the stock page as a percentage", async () => {
     seedEverything();
     for (const path of ["/", "/stock/TSM.US"]) {

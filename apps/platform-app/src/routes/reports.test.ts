@@ -16,6 +16,7 @@ import {
   type Member
 } from "@packages/shared-types";
 
+import { createThesis } from "../data/strategy-write.js";
 import { createPlatformServer } from "../server.js";
 
 /** The REAL card writer (apps/openclaw-config/scripts/official-paper-monitor.mjs).
@@ -23,6 +24,45 @@ import { createPlatformServer } from "../server.js";
  * its own recipient resolution against this module's own route, instead of
  * restating either side's rule in a fixture. */
 const officialPaperMonitor = await import("../../../openclaw-config/scripts/official-paper-monitor.mjs");
+
+/** Task 17 (2026-07-30): the REAL stock-analysis renderer, so §9's
+ * comparison runs against the bytes the batch job actually writes to
+ * reports/stock-analysis/<date>.md - not against a report shape authored in
+ * this test file, which would prove only that the author can match the
+ * author. */
+const stockAnalysisMjs = await import("../../../openclaw-config/scripts/stock-analysis.mjs");
+
+const STOCK_BULL_QUOTE = { open: 100, high: 110, low: 90, volume: 1000, last: 110, prev_close: 100 };
+const STOCK_BEAR_QUOTE = { open: 100, high: 110, low: 90, volume: 1000, last: 90, prev_close: 100 };
+
+/** A real batch report: `AAPL.US` gets the bullish verdict, `TSM.US` the
+ * bearish one, both straight out of `buildDeterministicAnalysis`. */
+function realStockAnalysisMarkdown(label: string): string {
+  const record = (symbol: string, quote: Record<string, number>): unknown => ({
+    symbol,
+    quote,
+    news: [],
+    extraData: {},
+    analysis: stockAnalysisMjs.buildDeterministicAnalysis(symbol, quote, [], {}, `${label}T12:00:00Z`)
+  });
+  return stockAnalysisMjs.renderBatchStockAnalysis({
+    label,
+    generatedAt: `${label}T12:00:00Z`,
+    records: [record("AAPL.US", STOCK_BULL_QUOTE), record("TSM.US", STOCK_BEAR_QUOTE)]
+  });
+}
+
+/** Just the §9 card, so an assertion about what THE COMPARISON says cannot be
+ * satisfied by the same words appearing in the rendered report body above it. */
+function comparisonCard(body: string): string {
+  const start = body.indexOf("<h2>我的策略对照");
+  if (start < 0) {
+    return "";
+  }
+  const end = body.indexOf("</section>", start);
+  return body.slice(start, end < 0 ? undefined : end);
+}
+
 
 function memoryDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -494,6 +534,7 @@ describe("reports routes", () => {
       expect(body).not.toContain("旧格式");
     });
 
+
     it("never presents one symbol's box as the whole batch's conclusion on a multi-symbol analysis", async () => {
       writeReport(
         repoRoot,
@@ -914,4 +955,93 @@ describe("reports routes", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------------
+  // §9 我的策略对照 (Task 17, req §3.4: "正文 1-8 段公共；第 9 段为登录者动态
+  // 渲染「我的论点 vs 本次分析」（无论点显示引导）")
+  // -------------------------------------------------------------------------
+  describe("GET /stock-analysis/<date> - §9 我的策略对照", () => {
+    const DATE = "2026-07-14";
+
+    beforeEach(() => {
+      writeReport(repoRoot, "stock-analysis", `${DATE}.md`, realStockAnalysisMarkdown(DATE));
+    });
+
+    it("guides a viewer who has no theses instead of rendering an empty block", async () => {
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("你还没有记过任何论点");
+      expect(card).toContain("飞书单聊");
+      expect(card).toContain("本次分析覆盖了 2 只标的");
+    });
+
+    it("calls the viewer's own 看多 thesis 一致 when this run's box is bullish", async () => {
+      createThesis(db, { ownerId: member.id, symbol: "AAPL.US", direction: "bull" });
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("AAPL.US");
+      expect(card).toContain("一致");
+      expect(card).toContain("短线偏上行");
+      expect(card).not.toContain("冲突 1 条");
+    });
+
+    it("calls it 冲突 when this run's box points the other way", async () => {
+      createThesis(db, { ownerId: member.id, symbol: "TSM.US", direction: "bull" });
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("TSM.US");
+      expect(card).toContain("冲突");
+      expect(card).toContain("短线偏回撤");
+    });
+
+    it("says 无对照 AND why for a symbol this batch never analysed", async () => {
+      createThesis(db, { ownerId: member.id, symbol: "NVDA.US", direction: "bull" });
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("无对照");
+      expect(card).toContain("本次批次没有分析 NVDA.US");
+    });
+
+    // THE PRIVACY ASSERTION. §9 is the one per-viewer part of an artifact two
+    // members open at the same URL; another member's thesis - public档 included,
+    // which is the case a visibility filter would let through - must not be in
+    // either the card or anywhere else on the page.
+    it("never shows another member's theses, not even public ones", async () => {
+      createThesis(db, { ownerId: otherMember.id, symbol: "AAPL.US", direction: "bear", visibility: "public" });
+      createThesis(db, { ownerId: otherMember.id, symbol: "TSM.US", direction: "bull", visibility: "system" });
+      createThesis(db, { ownerId: member.id, symbol: "AAPL.US", direction: "bull" });
+
+      const body = await (await authed(`/stock-analysis/${DATE}`)).text();
+      const card = comparisonCard(body);
+      expect(card).toContain("一致");
+      // One row, one thesis: the viewer's own. Two members hold theses on
+      // AAPL.US and only one of them is counted.
+      expect(card).toContain("你的 1 条在册论点");
+      expect(card).not.toContain(otherMember.displayName);
+      expect(body).not.toContain(otherMember.displayName);
+
+      // ...and the other member's own §9 on the SAME url disagrees with this
+      // one, which is what "per-viewer" means.
+      const otherCard = comparisonCard(await (await authedAsOther(`/stock-analysis/${DATE}`)).text());
+      expect(otherCard).toContain("你的 2 条在册论点");
+      expect(otherCard).not.toContain(member.displayName);
+    });
+
+    it("leaves a withdrawn thesis out of the comparison", async () => {
+      const thesis = createThesis(db, { ownerId: member.id, symbol: "AAPL.US", direction: "bull" });
+      db.prepare("UPDATE theses SET status = 'withdrawn' WHERE id = ?").run(thesis.id);
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("你还没有记过任何论点");
+    });
+
+    it("compares the thesis target range against the run's own 合理价值区间", async () => {
+      createThesis(db, { ownerId: member.id, symbol: "AAPL.US", direction: "bull", targetLow: 500, targetHigh: 600 });
+      const card = comparisonCard(await (await authed(`/stock-analysis/${DATE}`)).text());
+      expect(card).toContain("完全落在本次合理价值区间");
+    });
+
+    it("renders no §9 at all on report kinds that have no ninth section", async () => {
+      createThesis(db, { ownerId: member.id, symbol: "AAPL.US", direction: "bull" });
+      writeReport(repoRoot, "daily", `${DATE}.md`, "# OpenClaw 日报 2026-07-14\n\n首段。\n");
+      const body = await (await authed(`/daily/${DATE}`)).text();
+      expect(body).not.toContain("我的策略对照");
+    });
+  });
+
 });
