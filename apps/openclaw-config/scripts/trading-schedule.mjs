@@ -166,22 +166,79 @@ export function shouldRunReportDelivery(kind, date = new Date()) {
   throw new Error(`Unsupported report kind: ${kind}`);
 }
 
+// Spec 3.4: 个股分析 runs 每 3 天. The cron slot itself is daily at 21:00
+// Asia/Shanghai (= 13:00Z), and this gate decides which of those slots is
+// actually the due one.
+export const STOCK_ANALYSIS_INTERVAL_DAYS = 3;
+
+/**
+ * The report DATE LABEL a stock-analysis run generated at `instant` writes -
+ * byte-identical to stock-analysis.mjs's `const label = generatedAt.slice(0, 10)`,
+ * which is what names `reports/stock-analysis/<label>.md` and what goes into
+ * every `stock_facts.trading_day` row for that batch. Kept here (rather than
+ * inlined at each call site) because the cadence below and the staleness
+ * threshold in stock-analysis-freshness.mjs must agree on what "one batch"
+ * is identified by.
+ */
+export function stockAnalysisReportLabel(date = new Date()) {
+  const value = date instanceof Date ? date : new Date(date);
+  return value.toISOString().slice(0, 10);
+}
+
+/**
+ * Whole calendar days between the last batch's report label and the label a
+ * batch generated at `date` would carry. `null` when `lastRunAt` is absent or
+ * unparseable (caller decides what that means). Negative when `lastRunAt` is
+ * in the future (clock skew / a hand-edited state file) - deliberately NOT
+ * clamped, so the caller sees the anomaly instead of it reading as "0 days".
+ */
+export function stockAnalysisDaysSinceLastRun(date = new Date(), lastRunAt) {
+  if (!lastRunAt) {
+    return null;
+  }
+  const lastRunMs = new Date(lastRunAt).getTime();
+  if (!Number.isFinite(lastRunMs)) {
+    return null;
+  }
+  const lastLabel = stockAnalysisReportLabel(new Date(lastRunMs));
+  const nowLabel = stockAnalysisReportLabel(date);
+  return Math.round((Date.parse(`${nowLabel}T00:00:00Z`) - Date.parse(`${lastLabel}T00:00:00Z`)) / 86_400_000);
+}
+
+// 2026-07-30, measured on the live mini: this gate used to be a wall-clock
+// delta, `date.getTime() - lastRunMs >= 72 * 60 * 60 * 1000`. `lastRunAt` is
+// stamped when a batch GENERATES - the slot instant plus however long the
+// fetch/render took, or minutes-to-hours later if the slot's first attempts
+// failed and a retry (or a manual re-run) is what finally succeeded. So it
+// always lands AFTER the 21:00 slot, which leaves the THIRD day's own 21:00
+// slot permanently short of 72h. That slot is skipped `not_due`, `lastRunAt`
+// is not advanced (a skip writes nothing), and the cadence ratchets out one
+// day - then another, every time a run again finishes past its slot.
+//
+// The live evidence: runtime/stock-analysis-state.json held
+// `lastRunAt: 2026-07-27T16:35:02.483Z`, and the cron runner's own records
+// (runtime/openclaw-cron-runner/*-stock-analysis.json) show the 2026-07-28
+// and 2026-07-29 21:00 slots both printing
+// `{"skipped":true,"reason":"not_due"}` at 20.4h and 44.4h - and 2026-07-30's
+// slot would have printed it again at 68.4h. A pipeline specified to ship
+// every 3 days had shipped nothing for three days while every one of those
+// run records still recorded `ok: true`.
+//
+// The anchor is now the report label, so "每 3 天" means three calendar days
+// between report DATES. How long a run took, and how late a retry landed,
+// can no longer push the next slot out.
 export function shouldRunStockAnalysis(date = new Date(), lastRunAt, options = {}) {
   const parts = getZonedParts(date, SHANGHAI_TIMEZONE);
   if (!options.cronTriggered && (parts.hour !== 21 || parts.minute !== 0)) {
     return false;
   }
 
-  if (!lastRunAt) {
+  const elapsedDays = stockAnalysisDaysSinceLastRun(date, lastRunAt);
+  if (elapsedDays === null) {
     return true;
   }
 
-  const lastRunMs = new Date(lastRunAt).getTime();
-  if (!Number.isFinite(lastRunMs)) {
-    return true;
-  }
-
-  return date.getTime() - lastRunMs >= 72 * 60 * 60 * 1000;
+  return elapsedDays >= STOCK_ANALYSIS_INTERVAL_DAYS;
 }
 
 export function isUsRegularMarketHours(date = new Date()) {

@@ -46,6 +46,88 @@ describe("trading schedule policy", () => {
     )).toBe(false);
   });
 
+  // 2026-07-30 live regression. Every value below was READ OFF THE DEPLOYED
+  // MAC MINI, not invented for this test:
+  //   - runtime/stock-analysis-state.json held
+  //     `"lastRunAt": "2026-07-27T16:35:02.483Z"` (the 07-27 batch's own
+  //     generatedAt, also the created_at of stock_analysis_run_0bf5e0bb-... in
+  //     stock_analysis_runs);
+  //   - the OpenClaw cron job `openclaw-trading-stock-analysis` is registered
+  //     `0 21 * * *` Asia/Shanghai, i.e. 13:00:00Z, and its run records
+  //     (runtime/openclaw-cron-runner/1785243602998-stock-analysis.json and
+  //     1785330030637-stock-analysis.json) show `openclawRunAtMs` 1785243600007
+  //     and 1785330000009 - exactly 2026-07-28T13:00:00Z and 2026-07-29T13:00:00Z.
+  //
+  // Under the old wall-clock `>= 72h` rule those two slots measured 20.4h and
+  // 44.4h, and 07-30's would have measured 68.4h - all three "not due", so the
+  // 每 3 天 pipeline shipped nothing for three days while each of those run
+  // records still recorded ok:true. The third day's slot MUST be due.
+  it("runs on the third day's own 21:00 slot even though the previous batch finished after its slot", () => {
+    const lastRunAt = "2026-07-27T16:35:02.483Z";
+
+    expect(schedule.shouldRunStockAnalysis(new Date(1785243600007), lastRunAt, { cronTriggered: true })).toBe(false);
+    expect(schedule.shouldRunStockAnalysis(new Date(1785330000009), lastRunAt, { cronTriggered: true })).toBe(false);
+    // The slot that used to be lost: 2026-07-30T13:00:00Z, 68.4 wall-clock
+    // hours after lastRunAt but three report-labelled days after 2026-07-27.
+    expect(schedule.shouldRunStockAnalysis(new Date("2026-07-30T13:00:00.000Z"), lastRunAt, { cronTriggered: true })).toBe(true);
+  });
+
+  // The ratchet, in one sentence: batch N is stamped later in the day than
+  // batch N-1 (slower fetch, a retry, a manual re-run), and under the old
+  // wall-clock rule that pushed the next due slot out by a whole day - then
+  // another, and another. Simulated here across 120 daily slots against
+  // durations that bracket what the mini actually does: the observed 07-27
+  // batch ran 13:00:27Z -> 15:52:23Z (2h52m of retries) and the successful
+  // attempt itself took 18 minutes.
+  //
+  // Boundary, stated rather than hidden: the anchor is the batch's report
+  // LABEL, and a batch stamped at 00:30Z carries the NEXT day's label (it also
+  // writes reports/stock-analysis/<that day>.md and stock_facts rows under it -
+  // the label is the batch's identity, so counting 3 days from it is correct,
+  // not drift). Reaching that from a 13:00Z slot takes 11+ hours in one run,
+  // which is itself a broken run; the freshness guard in
+  // stock-analysis-freshness.mjs is what catches THAT.
+  it("holds an exact 3-day cadence for every realistic run duration, with no ratchet", () => {
+    for (const durationMinutes of [1, 18, 45, 172, 300, 600]) {
+      let lastRunAt = "2026-07-01T13:00:00.000Z";
+      const labels: string[] = [];
+      for (let day = 2; day <= 121; day += 1) {
+        const slot = new Date(Date.UTC(2026, 6, day, 13, 0, 0));
+        if (schedule.shouldRunStockAnalysis(slot, lastRunAt, { cronTriggered: true })) {
+          lastRunAt = new Date(slot.getTime() + durationMinutes * 60_000).toISOString();
+          labels.push(schedule.stockAnalysisReportLabel(new Date(lastRunAt)));
+        }
+      }
+
+      expect(labels.length, `duration ${durationMinutes}m produced too few batches`).toBe(40);
+      const gaps = labels.slice(1).map((label, i) => (
+        (Date.parse(`${label}T00:00:00Z`) - Date.parse(`${labels[i]}T00:00:00Z`)) / 86_400_000
+      ));
+      expect(new Set(gaps), `duration ${durationMinutes}m drifted off the 3-day cadence`).toEqual(new Set([3]));
+    }
+  });
+
+  it("labels a batch by the same string stock-analysis.mjs uses for its report filename and stock_facts.trading_day", () => {
+    // stock-analysis.mjs: `const label = generatedAt.slice(0, 10)`. The live
+    // 07-27 batch generated at 2026-07-27T16:35:02.483Z wrote
+    // reports/stock-analysis/2026-07-27.md and stock_facts rows with
+    // trading_day = '2026-07-27' - both verified on the mini.
+    expect(schedule.stockAnalysisReportLabel(new Date("2026-07-27T16:35:02.483Z"))).toBe("2026-07-27");
+    expect(schedule.stockAnalysisDaysSinceLastRun(new Date("2026-07-30T13:00:00.000Z"), "2026-07-27T16:35:02.483Z")).toBe(3);
+    expect(schedule.stockAnalysisDaysSinceLastRun(new Date("2026-07-30T13:00:00.000Z"), undefined)).toBeNull();
+    expect(schedule.stockAnalysisDaysSinceLastRun(new Date("2026-07-30T13:00:00.000Z"), "not-a-date")).toBeNull();
+    // Clock skew / a doctored state file reads as negative, never as "0 days".
+    expect(schedule.stockAnalysisDaysSinceLastRun(new Date("2026-07-27T13:00:00.000Z"), "2026-07-30T13:00:00.000Z")).toBe(-3);
+  });
+
+  it("refuses to run on a future-dated lastRunAt instead of treating it as due", () => {
+    expect(schedule.shouldRunStockAnalysis(
+      new Date("2026-07-27T13:00:00.000Z"),
+      "2026-07-30T16:35:02.483Z",
+      { cronTriggered: true }
+    )).toBe(false);
+  });
+
   it("recognizes US regular market hours across daylight saving time", () => {
     expect(schedule.isUsRegularMarketHours(new Date("2026-07-01T14:00:00.000Z"))).toBe(true);
     expect(schedule.isUsRegularMarketHours(new Date("2026-01-05T15:00:00.000Z"))).toBe(true);
