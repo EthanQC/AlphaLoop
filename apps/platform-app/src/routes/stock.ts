@@ -82,6 +82,11 @@ import {
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
+// The `## <SYMBOL>` slicer used to be a private copy here. It is now the one
+// in reports/strategy-comparison.ts, which the stock-analysis reading page's
+// §9 comparison also needs - two copies of "which bytes belong to this
+// symbol" is a drift seam with nothing watching it.
+import { findSymbolSection } from "../reports/strategy-comparison.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
 import {
   beijingDayAge,
@@ -207,39 +212,6 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
 // ---------------------------------------------------------------------------
 // Per-symbol section extraction from stock-analysis reports (Task 4 scanner)
 // ---------------------------------------------------------------------------
-
-/**
- * Finds the `## <SYMBOL>` section (report-data.mjs/stock-analysis.mjs's
- * per-symbol H2 heading convention - see reports/stock-analysis/*.md) inside
- * a report's raw markdown and returns its body (the lines between that
- * heading and the next H2, exclusive of both), or `null` if the report never
- * mentions this symbol as its own section.
- */
-function findSymbolSection(md: string, symbol: string): string | null {
-  const lines = md.replace(/\r\n/gu, "\n").split("\n");
-  const heading = `## ${symbol}`;
-
-  let start = -1;
-  for (let i = 0; i < lines.length; i += 1) {
-    if ((lines[i] ?? "").trim() === heading) {
-      start = i + 1;
-      break;
-    }
-  }
-  if (start === -1) {
-    return null;
-  }
-
-  let end = lines.length;
-  for (let i = start; i < lines.length; i += 1) {
-    if (/^##\s+/u.test((lines[i] ?? "").trim())) {
-      end = i;
-      break;
-    }
-  }
-
-  return lines.slice(start, end).join("\n");
-}
 
 /**
  * Extracts a one-line summary from a symbol section's body: the first
