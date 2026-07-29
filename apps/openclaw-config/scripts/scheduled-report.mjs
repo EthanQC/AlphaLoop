@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { MemberRepository, deliverReportToFeishu, loadLocalEnv, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import { CONFIDENCE_LABELS, parseReportConclusionBox, renderReportConclusionBox } from "./conclusion-box.mjs";
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
 import { collectL1News } from "./news-sources.mjs";
@@ -179,7 +180,12 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // fix; letting assertReportQuality below throw on it would instead halt the
   // whole scheduled job over a file we know how to rebuild correctly.
   const preparedWithPersonalContent = findPersonalContentLeaks(markdown).length > 0;
-  if (!isPreparedReportMarkdownComplete(markdown) || preparedWithPersonalContent) {
+  // Task 13: same reasoning for a file written before the conclusion box
+  // shipped (every report already on disk on the mini). It is STALE, not
+  // broken - regenerate it instead of letting the report.conclusion_box gate
+  // below throw and kill the scheduled run.
+  const preparedWithoutConclusionBox = markdown !== "" && parseReportConclusionBox(markdown) === null;
+  if (!isPreparedReportMarkdownComplete(markdown) || preparedWithPersonalContent || preparedWithoutConclusionBox) {
     const prepared = await prepareReport(reportKind, info);
     markdown = prepared.markdown;
     alreadyPrepared = true;
@@ -249,6 +255,18 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // rather than swallowed.
   // `reportKind`/`reportDate` are what let the card carry the 查看完整报告
   // button back to /daily/<date> (§1.1).
+  // Task 13: the card's 结论/置信度 are PARSED BACK OUT of the markdown that is
+  // actually being delivered, not recomputed from `data` - the card and the
+  // report then cannot disagree, whatever happened to the file in between
+  // (a URL disclosure appended, a re-render, an operator edit). A file whose
+  // box does not parse hands over no conclusion at all rather than a guessed
+  // one; deliverReportToFeishu falls back to its own bullet extraction.
+  //
+  // Written as a ternary VALUE rather than a conditional spread on purpose: a
+  // spread would make this literal undecidable for check-repository-writes.mjs
+  // (this directory's `pnpm typecheck`), turning a checked call across the
+  // typed boundary into a blind site.
+  const deliveredConclusion = parseReportConclusionBox(markdown);
   const result = await deliverReportToFeishu({
     title: `${titlePrefix} ${info.label}`,
     markdown,
@@ -256,7 +274,14 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
     pdfPath,
     audience: "group",
     reportKind,
-    reportDate: info.label
+    reportDate: info.label,
+    conclusion: deliveredConclusion
+      ? {
+          headline: deliveredConclusion.coreConclusion,
+          confidence: CONFIDENCE_LABELS[deliveredConclusion.confidence],
+          bullets: [`依据：${deliveredConclusion.basis}`, `截至：${deliveredConclusion.asOf}`]
+        }
+      : undefined
   });
 
   // The personal half of §4 (单聊: 个人页摘要). Runs whether or not the public
@@ -692,6 +717,10 @@ export function renderDailyReport(info, data) {
     "",
     "## 1. 今日结论",
     "",
+    renderReportConclusionBlock(data),
+    "",
+    "### 今日要点",
+    "",
     ...renderCoreSummary(data, { period: "今日" }),
     "",
     "## 2. 信息收集与分类",
@@ -743,6 +772,10 @@ export function renderWeeklyReport(info, data) {
     "",
     "## 1. 本周结论",
     "",
+    renderReportConclusionBlock(data),
+    "",
+    "### 本周要点",
+    "",
     ...renderCoreSummary(data, { period: "本周" }),
     "",
     "## 2. 市场主线回顾与分类",
@@ -783,6 +816,157 @@ export function renderWeeklyReport(info, data) {
 // (summarizeOfficialPositions/summarizeOfficialAccount/summarizePaperBudget are
 // exported for exactly that). report-quality.mjs's report.no_personal_content
 // gate fails any public report that grows it back.
+// ---------------------------------------------------------------------------
+// Task 13 (2026-07-28 spec-drift plan) - 结论框: 核心结论 + 置信度 + 依据 + 截至
+// ---------------------------------------------------------------------------
+// 2026-07-12 requirements §1.4「摘要卡先行（核心结论+置信度）」/ §3.5「核心结论
+// （一行观点+置信度三档+"截至"时间）」. Rendered through conclusion-box.mjs so
+// the report, the platform reading page and the Feishu conclusion card share
+// one vocabulary (### 结论框, 核心结论/置信度, 高/中/低).
+//
+// THE TIER IS DERIVED, NEVER DECLARED. It is a statement about how much
+// evidence this particular run actually had, so it is computed from the same
+// data the body renders:
+//
+//   低  - a source the conclusion rests on is missing: the QQQ quote came back
+//         degraded, no news was read at all, or fewer than half the tracked
+//         pool got any coverage. A conclusion drawn on that cannot be asserted
+//         with confidence, and the 依据 line says which piece was missing.
+//   中  - every source answered, but something was disclosed: a news source
+//         degraded, the L2 agent search was unavailable, the macro calendar
+//         warned, part of the pool went uncovered, or the news cap left
+//         symbols unsearched.
+//   高  - quote + news + macro all answered, EVERY tracked symbol got news,
+//         and there was not one degradation to disclose.
+//
+// What is deliberately NOT an input: the official paper account snapshot. The
+// public body carries no account content at all (§3.1, Task 4), so the
+// conclusion does not rest on it and its read failing must not silently move a
+// market/news tier. Account degradation is still disclosed in 证据与来源's
+// 长桥降级 line, and it is the personal page's business.
+const NEWS_COVERAGE_LOW_RATIO = 0.5;
+// How many degradation items the box spells out before it starts counting.
+// The full list is always in 证据与来源 - the box stays a glance surface.
+const MAX_BASIS_DEGRADATIONS = 4;
+
+/**
+ * @param {object} data the same marketData object the renderers receive
+ * @returns {{coreConclusion: string, confidence: 'high'|'medium'|'low', basis: string[], asOf: string, coverage: {covered: number, total: number, missing: string[]}, degradations: string[]}}
+ */
+export function buildReportConclusion(data) {
+  const quote = data.qqqQuote ?? {};
+  const quoteDegraded = quote.degraded === true
+    || toNumber(quote.last ?? quote.last_done ?? quote.lastDone) === undefined;
+  const quoteReason = singleLine(quote.degradedReason ?? "原因未返回", 100);
+  const articles = Array.isArray(data.marketNews) ? data.marketNews : [];
+  const coverage = summarizeNewsCoverage(data);
+  const macroEvents = Array.isArray(data.macroEvents) ? data.macroEvents : [];
+  const macroWarnings = data.macroWarnings ?? [];
+  const newsWarnings = data.newsWarnings ?? [];
+  const beyondLimit = data.symbolsBeyondNewsLimit ?? [];
+
+  const degradations = [];
+  if (data.newsSearchDegraded) {
+    degradations.push(`agent 检索不可用（L1-only 模式）：${singleLine(data.newsSearchReason ?? "原因未知", 100)}`);
+  }
+  for (const warning of newsWarnings) {
+    degradations.push(`新闻源降级：${singleLine(warning, 100)}`);
+  }
+  for (const warning of macroWarnings) {
+    degradations.push(`宏观日历降级：${singleLine(warning, 100)}`);
+  }
+  if (beyondLimit.length > 0) {
+    degradations.push(`标的池截断：${beyondLimit.join("、")} 本次未检索`);
+  }
+
+  // An uncovered symbol IS a degradation for tier purposes, but it is not
+  // repeated in the 降级 clause - the 新闻 clause right above already names
+  // every one of them, and saying it twice in a four-line box is noise.
+  const confidence = quoteDegraded || articles.length === 0 || coverage.ratio < NEWS_COVERAGE_LOW_RATIO
+    ? "low"
+    : degradations.length > 0 || coverage.missing.length > 0
+      ? "medium"
+      : "high";
+
+  const newsSignal = summarizeNewsSignals(articles);
+  const marketClause = quoteDegraded
+    ? `QQQ 行情不可用（${quoteReason}），本次不给出价格位置判断`
+    : summarizeQqqMove(quote);
+  const coreConclusion = `${marketClause}；${newsSignal.bias}，${newsSignal.action}`;
+
+  const basis = [
+    quoteDegraded ? `行情不可用：${quoteReason}` : `行情：QQQ 可用（${formatQuoteTimestamp(quote)}）`,
+    articles.length === 0
+      ? "新闻：本窗口没有读到任何可用新闻"
+      : `新闻：读取 ${articles.length} 条，覆盖 ${coverage.covered}/${coverage.total} 标的${coverage.missing.length > 0 ? `（未覆盖 ${coverage.missing.join("、")}）` : ""}`,
+    macroWarnings.length > 0 ? "宏观：日历读取降级" : `宏观：事件 ${macroEvents.length} 条`,
+    degradations.length === 0
+      ? "降级：本次无降级项"
+      : `降级：${summarizeDegradationList(degradations)}`
+  ];
+
+  const fetchedAt = data.sourceEvidence?.fetchedAt;
+  const asOf = Number.isFinite(new Date(String(fetchedAt ?? "")).getTime())
+    ? `${formatReportDateTime(fetchedAt)}（北京时间）`
+    : "数据时间未知（本次运行没有记录抓取时间）";
+
+  return { coreConclusion, confidence, basis, asOf, coverage, degradations };
+}
+
+function summarizeDegradationList(degradations) {
+  if (degradations.length <= MAX_BASIS_DEGRADATIONS) {
+    return degradations.join("；");
+  }
+  const shown = degradations.slice(0, MAX_BASIS_DEGRADATIONS).join("；");
+  return `${shown}；等共 ${degradations.length} 项（完整清单见「证据与来源」）`;
+}
+
+/**
+ * How much of the tracked pool this run actually has news for. A symbol counts
+ * as covered when an article was fetched FOR it (article.symbol - the per-symbol
+ * feeds) or when a clustered event named it as affected (event.impact.affected -
+ * how a market-wide feed like 财联社 reaches a specific ticker). Both are read
+ * from the same values the body renders; the events come from resolveNewsEvents,
+ * i.e. the exact list the 多源新闻 section shows.
+ */
+function summarizeNewsCoverage(data) {
+  const tracked = Array.from(new Set((data.trackedSymbols ?? []).map((symbol) => String(symbol).toUpperCase()).filter(Boolean)));
+  const covered = new Set();
+  for (const article of data.marketNews ?? []) {
+    const symbol = String(article?.symbol ?? "").toUpperCase();
+    if (symbol && tracked.includes(symbol)) {
+      covered.add(symbol);
+    }
+  }
+  for (const event of resolveNewsEvents(data)) {
+    for (const symbol of event?.impact?.affected ?? []) {
+      const upper = String(symbol).toUpperCase();
+      if (tracked.includes(upper)) {
+        covered.add(upper);
+      }
+    }
+  }
+  const missing = tracked.filter((symbol) => !covered.has(symbol));
+  return {
+    total: tracked.length,
+    covered: covered.size,
+    missing,
+    // An empty pool cannot be under-covered; it fails the low branch on the
+    // "no news at all" test instead of on a 0/0 ratio.
+    ratio: tracked.length === 0 ? 1 : covered.size / tracked.length
+  };
+}
+
+function renderReportConclusionBlock(data) {
+  const conclusion = buildReportConclusion(data);
+  return renderReportConclusionBox({
+    coreConclusion: conclusion.coreConclusion,
+    confidence: conclusion.confidence,
+    basis: conclusion.basis,
+    asOf: conclusion.asOf
+  });
+}
+
 function renderCoreSummary(data, counts) {
   const qqqSummary = summarizeQqqMove(data.qqqQuote);
   const newsSignal = summarizeNewsSignals(data.marketNews);
@@ -842,7 +1026,11 @@ function renderDataSourceSummary(data) {
   return [
     "### 证据与来源",
     "",
-    `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥行情（QQQ 行情）、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}。`,
+    `- 数据底座：本地交易数据库、长桥官方模拟盘账户、长桥行情（QQQ 行情）、美国宏观日历、多源新闻检索；跟踪标的 ${formatTrackedSymbols(data.trackedSymbols)}（全体成员标的池并集 + 全体持仓）。`,
+    // Task 10: an un-searched symbol is disclosed, never silently absent.
+    ...(data.symbolsBeyondNewsLimit?.length
+      ? [`- 标的池截断：本次新闻检索上限 ${data.newsSymbolLimit ?? "未知"} 只，标的池中 ${formatTrackedSymbols(data.symbolsBeyondNewsLimit)} 未纳入本次检索（可调 REPORT_NEWS_SYMBOL_LIMIT）；这些标的本次没有被搜过，而不是没有新闻。`]
+      : []),
     `- 新闻检索：每个标的最多读取 ${Number(process.env.REPORT_NEWS_COUNT_PER_SYMBOL ?? 5)} 条长桥新闻，并补充 Yahoo Finance 搜索、Yahoo Finance RSS 和 Google News RSS；本次共读取 ${data.marketNews.length} 条。`,
     `- 新闻来源分布：${summarizeNewsSourceBreakdown(data.marketNews)}。`,
     ...(data.longbridgeWarnings?.length ? [`- 长桥降级：${data.longbridgeWarnings.join("；")}；报告继续生成，但任何新增动作必须人工复核。`] : []),
@@ -2147,10 +2335,21 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
     fetchedAt,
     warnings: longbridgeWarnings
   });
-  const trackedSymbols = buildTrackedSymbols(
-    officialPaperSnapshot.positions,
-    splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
-  ).slice(0, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
+  // Task 10 (2026-07-28 spec-drift plan): the pool is now the union of every
+  // member's watchlist + held positions (§0.4), read from the db - see
+  // buildTrackedSymbols. The per-run cap stays (each symbol costs 4-5 upstream
+  // fetches and Yahoo already answers 429 on the mini at ONE symbol), but a
+  // capped-out symbol is now DISCLOSED in the report's 证据与来源 block rather
+  // than silently dropped: a reader must be able to tell "no news about TSM"
+  // from "TSM was never searched".
+  const pooledSymbols = buildTrackedSymbols({
+    db,
+    positions: officialPaperSnapshot.positions,
+    extraSymbols: splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
+  });
+  const newsSymbolLimit = Math.max(1, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
+  const trackedSymbols = pooledSymbols.slice(0, newsSymbolLimit);
+  const symbolsBeyondNewsLimit = pooledSymbols.slice(newsSymbolLimit);
   const [marketNewsResult, macroCalendarResult] = await Promise.all([
     fetchMarketNews(trackedSymbols),
     fetchMacroCalendar(info)
@@ -2195,6 +2394,11 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
     officialPaperSnapshot,
     qqqQuote,
     trackedSymbols,
+    // Task 10: what the pool held BEYOND this run's news-fetch cap, and the cap
+    // itself - rendered as a disclosure line, and counted as a degradation by
+    // the conclusion box's confidence tier (Task 13).
+    symbolsBeyondNewsLimit,
+    newsSymbolLimit,
     marketNews,
     newsEvents,
     newsSearchDegraded: newsSearch.degraded,
@@ -2212,6 +2416,8 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
       assetRows: officialPaperSnapshot.assets.length,
       officialPositions: officialPaperSnapshot.positions.length,
       trackedSymbols,
+      symbolsBeyondNewsLimit,
+      newsSymbolLimit,
       newsCount: marketNews.length,
       newsSourceBreakdown: summarizeNewsSourceBreakdown(marketNews),
       newsWarnings: marketNewsResult.warnings,

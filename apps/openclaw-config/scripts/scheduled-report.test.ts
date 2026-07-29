@@ -6,6 +6,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -18,6 +19,7 @@ import {
   normalizeOfficialPaperSnapshot,
   normalizeQuotePayload
 } from "./report-data.mjs";
+import { CONFIDENCE_LABELS, parseReportConclusionBox } from "./conclusion-box.mjs";
 import { validateNarrativeNumbers, validateReportMarkdown } from "./report-quality.mjs";
 
 const scheduledReport = await import("./scheduled-report.mjs");
@@ -33,6 +35,19 @@ afterAll(() => {
     }
   }
 });
+
+/**
+ * Task 10 (2026-07-28): buildTrackedSymbols now REQUIRES the trading db - the
+ * tracked pool is the union of every member's `stock_analysis_targets` plus
+ * held positions (§0.4). Fixtures get a real, empty temp database rather than a
+ * stub, so the fixture's tracked pool is produced by the same code path
+ * production uses.
+ */
+function makeFixtureDb(): DatabaseSync {
+  const dir = mkdtempSync(join(tmpdir(), "alphaloop-scheduled-report-fixture-"));
+  execScopeDirs.push(dir);
+  return openTradingDatabase(join(dir, "trading.sqlite"));
+}
 
 function buildFixtureData() {
   const fetchedAt = "2026-07-14T05:00:00.000Z";
@@ -125,7 +140,7 @@ function buildFixtureData() {
     ]
   });
 
-  const trackedSymbols = buildTrackedSymbols(officialPaperSnapshot.positions);
+  const trackedSymbols = buildTrackedSymbols({ db: makeFixtureDb(), positions: officialPaperSnapshot.positions });
 
   return {
     executionRows: [],
@@ -834,4 +849,129 @@ describe("F4: execution status is classified from the row's structured outcome",
   // word 'failed' in its Chinese prose" already proves the same property by
   // running the actual writer into a temp db and reading its row back out,
   // which is strictly stronger than anything typed in here could be.
+});
+
+// Task 13 (2026-07-28 spec-drift plan) - 2026-07-12 requirements §1.4
+// 「摘要卡先行（核心结论+置信度）」 and §3.5「核心结论（一行观点+置信度三档+
+// "截至"时间）」. The live 2026-07-30 daily report on the mini opens straight
+// into 「- 市场信号：…」: no conclusion, no tier, nothing the platform's summary
+// card or the Feishu conclusion card can read a headline out of.
+//
+// Every case below renders through the REAL renderers and reads the box back
+// with the REAL parser (conclusion-box.mjs) - never by matching a hand-typed
+// string - so the render side and the parse side cannot drift apart.
+describe("Task 13: daily and weekly lead with a conclusion box carrying a derived confidence tier", () => {
+  for (const kind of ["daily", "weekly"] as const) {
+    it(`renders 核心结论/置信度/依据/截至 ahead of the ${kind} body`, () => {
+      const window = scheduledReport.resolveReportWindow(kind, "2026-07-14");
+      const markdown = kind === "daily"
+        ? scheduledReport.renderDailyReport(window, buildFixtureData())
+        : scheduledReport.renderWeeklyReport(window, buildFixtureData());
+
+      const box = parseReportConclusionBox(markdown);
+      expect(box, "the report carries no parseable 结论框").not.toBeNull();
+      expect(box?.coreConclusion).toContain("QQQ 最新价 721.34");
+      expect(Object.keys(CONFIDENCE_LABELS)).toContain(box?.confidence);
+      expect(box?.basis).not.toBe("");
+      // 截至 is the DATA's timestamp (sourceEvidence.fetchedAt = 05:00Z),
+      // not the moment the renderer ran.
+      expect(box?.asOf).toBe("2026-07-14 13:00（北京时间）");
+      // 摘要卡先行: the box sits before the second section.
+      expect(markdown.indexOf("### 结论框")).toBeLessThan(markdown.indexOf("## 2."));
+    });
+  }
+
+  it("claims 高 only when every source answered and every tracked symbol got news", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(window, buildFixtureData());
+
+    const box = parseReportConclusionBox(markdown);
+    expect(box?.confidence).toBe("high");
+    expect(box?.basis).toContain("覆盖 2/2 标的");
+  });
+
+  it("degrades to 中 and names the reason when the agent news search is unavailable", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = { ...buildFixtureData(), newsSearchDegraded: true, newsSearchReason: "openclaw 检索后端未接入" };
+    const box = parseReportConclusionBox(scheduledReport.renderDailyReport(window, data));
+
+    expect(box?.confidence).toBe("medium");
+    expect(box?.basis).toContain("openclaw 检索后端未接入");
+  });
+
+  it("degrades to 中 and names the uncovered symbol when part of the pool got no news", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const fixture = buildFixtureData();
+    const data = { ...fixture, trackedSymbols: [...fixture.trackedSymbols, "TSM.US", "AMZN.US"] };
+    const box = parseReportConclusionBox(scheduledReport.renderDailyReport(window, data));
+
+    expect(box?.confidence).toBe("medium");
+    expect(box?.basis).toContain("覆盖 2/4 标的");
+    expect(box?.basis).toContain("TSM.US");
+    expect(box?.basis).toContain("AMZN.US");
+  });
+
+  it("drops to 低 when fewer than half the tracked pool got any news", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const fixture = buildFixtureData();
+    const data = {
+      ...fixture,
+      trackedSymbols: [...fixture.trackedSymbols, "TSM.US", "AMZN.US", "GOOG.US"],
+      marketNews: fixture.marketNews.filter((article) => article.symbol === "QQQ.US")
+    };
+    const box = parseReportConclusionBox(scheduledReport.renderDailyReport(window, data));
+
+    expect(box?.confidence).toBe("low");
+    expect(box?.basis).toContain("覆盖 1/5 标的");
+  });
+
+  it("drops to 低 when the QQQ quote itself came back degraded", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    // The real degraded-quote producer, not a hand-written {degraded:true}.
+    const degradedQuote = buildDegradedQuoteSnapshot("QQQ.US", {
+      fetchedAt: "2026-07-14T05:00:00.000Z",
+      reason: "Longbridge 行情读取失败：token expired"
+    });
+    const data = { ...buildFixtureData(), qqqQuote: degradedQuote, longbridgeWarnings: ["QQQ 行情读取降级：token expired"] };
+    const box = parseReportConclusionBox(scheduledReport.renderDailyReport(window, data));
+
+    expect(box?.confidence).toBe("low");
+    expect(box?.basis).toContain("行情不可用");
+    expect(box?.basis).toContain("token expired");
+    // And the headline must not pretend a price it never had.
+    expect(box?.coreConclusion).toContain("QQQ 行情不可用");
+    expect(box?.coreConclusion).not.toMatch(/最新价\s*[0-9]/u);
+  });
+
+  it("drops to 低 when no news was read at all", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = { ...buildFixtureData(), marketNews: [], newsWarnings: ["全部新闻源读取失败"] };
+    const box = parseReportConclusionBox(scheduledReport.renderDailyReport(window, data));
+
+    expect(box?.confidence).toBe("low");
+    expect(box?.basis).toContain("新闻");
+    expect(box?.basis).toContain("全部新闻源读取失败");
+  });
+
+  it("counts symbols the news cap left out as a degradation and names them", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const data = { ...buildFixtureData(), symbolsBeyondNewsLimit: ["GOOG.US"], newsSymbolLimit: 2 };
+    const markdown = scheduledReport.renderDailyReport(window, data);
+    const box = parseReportConclusionBox(markdown);
+
+    expect(box?.confidence).toBe("medium");
+    expect(box?.basis).toContain("GOOG.US");
+    // Task 10's disclosure line says the same thing in the evidence block.
+    expect(markdown).toContain("标的池截断");
+    expect(markdown).toContain("这些标的本次没有被搜过，而不是没有新闻");
+  });
+
+  it("is refused by the quality gate when the conclusion box is missing", () => {
+    const window = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+    const markdown = scheduledReport.renderDailyReport(window, buildFixtureData());
+    expect(validateReportMarkdown(markdown, { kind: "daily" })).toEqual({ ok: true, failures: [] });
+
+    const stripped = markdown.split("\n").filter((line) => !/^-\s*置信度：/u.test(line)).join("\n");
+    expect(validateReportMarkdown(stripped, { kind: "daily" }).failures).toContain("report.conclusion_box");
+  });
 });

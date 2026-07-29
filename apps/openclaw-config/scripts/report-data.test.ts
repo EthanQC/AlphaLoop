@@ -1,6 +1,51 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+
+import { afterAll, describe, expect, it } from "vitest";
+
+import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
 
 const helpers = await import("./report-data.mjs");
+// Task 10 (2026-07-28 spec-drift plan): the watchlist rows this suite reads
+// back are written by the REAL writer (stock-analysis.mjs's `targets` command,
+// the same one the Feishu bot and the CLI call), never by a hand-typed INSERT
+// in this file - a test that authors its own row shape can agree with itself
+// while disagreeing with production.
+const stockAnalysis = await import("./stock-analysis.mjs");
+
+// Temp databases only - runtime/trading.sqlite is never touched by a test.
+const tempDirs: string[] = [];
+
+afterAll(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+function makeDb(): { db: DatabaseSync; dbPath: string } {
+  const dir = mkdtempSync(join(tmpdir(), "alphaloop-report-data-"));
+  tempDirs.push(dir);
+  const dbPath = join(dir, "trading.sqlite");
+  return { db: openTradingDatabase(dbPath), dbPath };
+}
+
+function seedMember(db: DatabaseSync, id: string): void {
+  new MemberRepository(db).upsert({
+    id,
+    email: `${id}@example.com`,
+    displayName: id,
+    riskTags: [],
+    stockTags: [],
+    showPerformance: true,
+    status: "active",
+    createdAt: "2026-07-01T00:00:00.000Z"
+  });
+}
 
 describe("report data normalization", () => {
   it("normalizes official Longbridge paper positions without local rows", () => {
@@ -113,10 +158,12 @@ describe("report data normalization", () => {
   });
 
   it("builds a de-duplicated Longbridge watch/news symbol set", () => {
-    const symbols = helpers.buildTrackedSymbols(
-      [{ symbol: "QQQ.US" }, { symbol: "AAPL.US" }],
-      ["qqq.us", "MSFT"]
-    );
+    const { db } = makeDb();
+    const symbols = helpers.buildTrackedSymbols({
+      db,
+      positions: [{ symbol: "QQQ.US" }, { symbol: "AAPL.US" }],
+      extraSymbols: ["qqq.us", "MSFT"]
+    });
 
     expect(symbols).toEqual(["QQQ.US", "AAPL.US", "MSFT.US"]);
   });
@@ -222,4 +269,81 @@ describe("report data normalization", () => {
     expect(() => helpers.normalizeMacroCalendarPayload({ rows: [] })).toThrow(/宏观日历返回格式异常/u);
   });
 
+});
+
+// Task 10 (2026-07-28 spec-drift plan) - 2026-07-12 requirements §0.4:
+// 「平台的新闻抓取与个股分析按全体成员标的池的并集 + 全体持仓生产」. buildTrackedSymbols
+// used to hardcode QQQ + positions + whatever REPORT_NEWS_SYMBOLS happened to
+// carry, so on the live mini (one member, five active targets, no env var) the
+// 2026-07-30 daily report literally reads 「跟踪标的 QQQ.US」 and NONE of that
+// member's watchlist got any news coverage at all.
+describe("buildTrackedSymbols: the pool is the union of every member's watchlist + held positions (§0.4)", () => {
+  it("returns QQQ + held positions + BOTH members' watchlists, with no env var involved", () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA", "TSM"], { dbPath });
+    stockAnalysis.runTargetsCommand(["--owner", "member_2", "AMZN", "GOOG"], { dbPath });
+
+    // Positions come from the real normalizer, not a hand-built row shape.
+    const positions = helpers.normalizeOfficialPaperSnapshot({
+      fetchedAt: "2026-07-30T12:00:00.000Z",
+      check: { session: { token: "valid" }, region: { active: "global", cached: "global" }, connectivity: { global: { ok: true } } },
+      assets: [{ net_assets: "100000", total_cash: "20000", currency: "USD" }],
+      positions: [{ symbol: "MSFT.US", name: "Microsoft", quantity: "3", available: "3", cost_price: "400", currency: "USD", market: "US" }]
+    }).positions;
+
+    const symbols = helpers.buildTrackedSymbols({ db, positions });
+
+    // Benchmark first, then money actually at risk, then the watchlist union
+    // (sorted, so the order cannot depend on which member wrote last).
+    expect(symbols).toEqual(["QQQ.US", "MSFT.US", "AMZN.US", "GOOG.US", "NVDA.US", "TSM.US"]);
+  });
+
+  it("keeps a second member's watchlist even when the first member holds nothing", () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA"], { dbPath });
+    stockAnalysis.runTargetsCommand(["--owner", "member_2", "TSM"], { dbPath });
+
+    expect(helpers.buildTrackedSymbols({ db, positions: [] })).toEqual(["QQQ.US", "NVDA.US", "TSM.US"]);
+  });
+
+  it("ignores watchlist rows a member has deactivated", () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA", "TSM"], { dbPath });
+    // The real writer deactivates everything not named in the new set.
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA"], { dbPath });
+
+    expect(helpers.buildTrackedSymbols({ db, positions: [] })).toEqual(["QQQ.US", "NVDA.US"]);
+  });
+
+  it("treats REPORT_NEWS_SYMBOLS as an addition on top of the union, never as the source of it", () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "NVDA"], { dbPath });
+
+    const symbols = helpers.buildTrackedSymbols({ db, positions: [], extraSymbols: ["amd"] });
+
+    // The env-supplied symbol is present AND the member's watchlist survives:
+    // an operator override must never be able to silence a member's pool.
+    expect(symbols).toEqual(["QQQ.US", "NVDA.US", "AMD.US"]);
+  });
+
+  it("refuses to build a pool without the database instead of silently returning the old hardcoded list", () => {
+    expect(() => helpers.buildTrackedSymbols({ positions: [{ symbol: "NVDA.US" }] })).toThrow(/标的池/u);
+  });
+
+  it("selectWatchlistUnion reads every owner's active rows exactly once", () => {
+    const { db, dbPath } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    // Both members watch TSM - the union must carry it once, not twice.
+    stockAnalysis.runTargetsCommand(["--owner", "member_1", "TSM"], { dbPath });
+    stockAnalysis.runTargetsCommand(["--owner", "member_2", "TSM", "NVDA"], { dbPath });
+
+    expect(helpers.selectWatchlistUnion(db)).toEqual(["NVDA.US", "TSM.US"]);
+  });
 });

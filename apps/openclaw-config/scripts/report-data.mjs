@@ -100,11 +100,63 @@ export function normalizeOfficialPosition(row) {
   };
 }
 
-export function buildTrackedSymbols(officialPositions, extraSymbols = []) {
+// The one benchmark every public report renders on its own (QQQ 固定观察 /
+// QQQ 与美股风险温度), so it is always in the pool regardless of who watches
+// what.
+const BENCHMARK_SYMBOL = "QQQ.US";
+
+/**
+ * Task 10 (2026-07-28 spec-drift plan) - every member's watchlist, unioned.
+ *
+ * 2026-07-12 requirements §0.4: 「标的池：每人各自维护…平台的新闻抓取与个股分析按
+ * 全体成员标的池的并集 + 全体持仓生产」. Reads the WHOLE table (every owner's
+ * active rows), which is the same scope - and the same SQL - as
+ * apps/platform-app/src/data/news.ts's `listFilterSymbols`, the news page's
+ * filter-chip source: the report's news coverage and the page's filter must
+ * describe the same pool, so they read the same rows. DISTINCT collapses a
+ * symbol two members both watch into one entry; ORDER BY symbol keeps the pool
+ * independent of who wrote last.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+export function selectWatchlistUnion(db) {
+  return db
+    .prepare(`SELECT DISTINCT symbol FROM stock_analysis_targets WHERE active = 1 ORDER BY symbol ASC`)
+    .all()
+    .map((row) => normalizeSymbol(row.symbol))
+    .filter(Boolean);
+}
+
+/**
+ * The symbols this run fetches news for: benchmark, then held positions, then
+ * the union of every member's watchlist, then whatever an operator added via
+ * REPORT_NEWS_SYMBOLS.
+ *
+ * `db` is REQUIRED, and the error says why: the pre-Task-10 signature took only
+ * positions + env extras, so on the live mini (one member with five active
+ * targets, no REPORT_NEWS_SYMBOLS set) the 2026-07-30 daily report shipped with
+ * 「跟踪标的 QQQ.US」 and not one of that member's watchlist symbols was ever
+ * searched. Making the database optional would leave that exact failure one
+ * forgotten argument away, so a caller without a db fails loudly instead.
+ *
+ * Order is a priority order, because the caller caps how many symbols one run
+ * may fetch news for (REPORT_NEWS_SYMBOL_LIMIT): the benchmark and money
+ * actually at risk come before watch-only names, and the env extras come last -
+ * an override may ADD to the pool but must never displace a member's watchlist
+ * out of the cap.
+ *
+ * @param {{db: import('node:sqlite').DatabaseSync, positions?: Array<{symbol: string}>, extraSymbols?: string[]}} input
+ */
+export function buildTrackedSymbols({ db, positions = [], extraSymbols = [] } = {}) {
+  if (!db || typeof db.prepare !== "function") {
+    throw new Error("buildTrackedSymbols 需要交易数据库：标的池是全体成员标的池并集 + 全体持仓（§0.4），不是硬编码列表或环境变量。");
+  }
+  const officialPositions = Array.isArray(positions) ? positions : [];
   const candidates = [
-    "QQQ.US",
-    ...officialPositions.map((row) => row.symbol),
-    ...extraSymbols
+    BENCHMARK_SYMBOL,
+    ...officialPositions.map((row) => row?.symbol),
+    ...selectWatchlistUnion(db),
+    ...(Array.isArray(extraSymbols) ? extraSymbols : [])
   ];
   const seen = new Set();
   return candidates

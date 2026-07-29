@@ -93,15 +93,12 @@ function formatValue(value) {
 // section by the caller first - this function always reads only the FIRST
 // box it finds in the text handed to it.
 export function parseConclusionBox(sectionMarkdown) {
-  const text = String(sectionMarkdown ?? "");
-  const headingIndex = text.indexOf(BOX_HEADING);
-  if (headingIndex === -1) {
+  // Task 13: the heading-to-next-heading slice is now shared with
+  // parseReportConclusionBox (see sliceBox) - same scoping rule, one copy.
+  const box = sliceBox(sectionMarkdown);
+  if (box === null) {
     return null;
   }
-
-  const afterHeading = text.slice(headingIndex + BOX_HEADING.length);
-  const nextHeadingMatch = afterHeading.match(/\n#{1,6}\s+/u);
-  const box = nextHeadingMatch ? afterHeading.slice(0, nextHeadingMatch.index) : afterHeading;
 
   const coreConclusion = matchBullet(box, KEYS.coreConclusion);
   const confidenceLabel = matchBullet(box, KEYS.confidence);
@@ -142,6 +139,87 @@ export function parseConclusionBox(sectionMarkdown) {
     reviewTrigger: reviewTriggerParsed.reviewTrigger,
     reviewDate: reviewTriggerParsed.reviewDate
   };
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 (2026-07-28 spec-drift plan) - the DAILY/WEEKLY report's own box.
+// ---------------------------------------------------------------------------
+// 2026-07-12 requirements §1.4「摘要卡先行（核心结论+置信度）」/ §3.5「核心结论
+// （一行观点+置信度三档+"截至"时间）」. Same heading, same 核心结论/置信度 keys,
+// same CONFIDENCE_LABELS - so the report body, the platform reading page and
+// the Feishu conclusion card all speak one vocabulary.
+//
+// It is a DIFFERENT key set from the per-symbol box above, deliberately: a
+// whole-market daily conclusion has no single 合理价值区间/当前价格位置, and
+// rendering one would be fabrication. The two shapes are mutually exclusive
+// (each parser returns null for the other's box - see conclusion-box.test.ts),
+// so a caller can never half-read one as the other and present the result as
+// fact.
+const REPORT_KEYS = {
+  coreConclusion: KEYS.coreConclusion,
+  confidence: KEYS.confidence,
+  // What the tier rests on THIS run: which sources answered, how much of the
+  // tracked pool the news actually covered, which degradations applied.
+  basis: "依据",
+  // §3.5's 「"截至"时间」 - the data's own timestamp, not render time.
+  asOf: "截至"
+};
+
+/**
+ * @param {{coreConclusion: string, confidence: 'high'|'medium'|'low', basis: string|string[], asOf: string}} input
+ */
+export function renderReportConclusionBox({ coreConclusion, confidence, basis, asOf }) {
+  const label = CONFIDENCE_LABELS[confidence];
+  const basisText = Array.isArray(basis) ? basis.filter(Boolean).join("；") : String(basis ?? "");
+  return [
+    BOX_HEADING,
+    "",
+    `- ${REPORT_KEYS.coreConclusion}：${coreConclusion}`,
+    `- ${REPORT_KEYS.confidence}：${label}`,
+    `- ${REPORT_KEYS.basis}：${basisText}`,
+    `- ${REPORT_KEYS.asOf}：${asOf}`
+  ].join("\n");
+}
+
+/**
+ * Same contract as parseConclusionBox: any missing/invalid required key means
+ * null, never a partially-filled object. `basis` comes back as the rendered
+ * string (the renderer joins its parts with "；", and an evidence item may
+ * itself contain "；", so splitting it back apart would invent boundaries).
+ */
+export function parseReportConclusionBox(markdown) {
+  const box = sliceBox(markdown);
+  if (box === null) {
+    return null;
+  }
+
+  const coreConclusion = matchBullet(box, REPORT_KEYS.coreConclusion);
+  const confidenceLabel = matchBullet(box, REPORT_KEYS.confidence);
+  const basis = matchBullet(box, REPORT_KEYS.basis);
+  const asOf = matchBullet(box, REPORT_KEYS.asOf);
+  if (coreConclusion === null || confidenceLabel === null || basis === null || asOf === null) {
+    return null;
+  }
+
+  const confidence = confidenceFromLabel(confidenceLabel);
+  if (!confidence) {
+    return null;
+  }
+
+  return { coreConclusion, confidence, basis, asOf };
+}
+
+// Shared by both parsers: the substring from "### 结论框" to the next heading
+// (or end of text), or null when the heading is absent.
+function sliceBox(sectionMarkdown) {
+  const text = String(sectionMarkdown ?? "");
+  const headingIndex = text.indexOf(BOX_HEADING);
+  if (headingIndex === -1) {
+    return null;
+  }
+  const afterHeading = text.slice(headingIndex + BOX_HEADING.length);
+  const nextHeadingMatch = afterHeading.match(/\n#{1,6}\s+/u);
+  return nextHeadingMatch ? afterHeading.slice(0, nextHeadingMatch.index) : afterHeading;
 }
 
 function matchBullet(box, key) {

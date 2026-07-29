@@ -293,6 +293,21 @@ const GOOD_NEW_FORMAT_REPORT = [
   "",
   "## 1. 今日结论",
   "",
+  // Task 13 (2026-07-28 spec-drift plan): a well-formed new-format report now
+  // LEADS with the conclusion box (req §1.4/§3.5), so the "good" fixture
+  // carries one - these exact bytes are what conclusion-box.mjs's
+  // renderReportConclusionBox emits (see
+  // __fixtures__/report-conclusion-box-samples.json, generated from it and
+  // cross-checked by both conclusion-box suites).
+  "### 结论框",
+  "",
+  "- 核心结论：QQQ 最新价 721.34，较前收上涨 4.22（0.59%）；中性偏多，可以继续观察强势延续，但不因单日新闻直接加仓",
+  "- 置信度：中",
+  "- 依据：行情：QQQ 行情时间 2026-07-14 13:00；新闻：读取 3 条，覆盖 1/1 标的；宏观：事件 1 条；降级：agent 检索不可用（L1-only 模式）",
+  "- 截至：2026-07-14 13:00（北京时间）",
+  "",
+  "### 今日要点",
+  "",
   "- 市场信号：QQQ 最新价 721.34，较前收上涨 4.22（0.59%）。",
   "",
   "## 2. 信息收集与分类",
@@ -400,6 +415,59 @@ describe("Phase 4 Task 6 - era compatibility rule (new gates are strictly opt-in
 
     const numericResult = validateNarrativeNumbers(GOOD_NEW_FORMAT_REPORT, GOOD_SAMPLE_FACTS);
     expect(numericResult).toEqual({ ok: true, failures: [] });
+  });
+});
+
+// Task 13 (2026-07-28 spec-drift plan) - report.conclusion_box. §1.4/§3.5:
+// a daily/weekly report leads with 核心结论 + 置信度（高/中/低）+ 依据 + 截至时间.
+// The gate reads the box with conclusion-box.mjs's own parser - the same one
+// the renderer round-trips through - so it fails for exactly the reasons a
+// reader would see nothing usable.
+describe("Task 13 - report.conclusion_box", () => {
+  it("fails a new-format report with no conclusion box at all", () => {
+    const withoutBox = GOOD_NEW_FORMAT_REPORT.split("\n")
+      .filter((line) => !line.startsWith("### 结论框") && !/^-\s*(核心结论|置信度|依据|截至)：/u.test(line))
+      .join("\n");
+
+    expect(validateReportMarkdown(withoutBox, { kind: "daily" }).failures).toContain("report.conclusion_box");
+  });
+
+  it("fails a box that is missing the 置信度 tier, rather than accepting a headline alone", () => {
+    const withoutTier = GOOD_NEW_FORMAT_REPORT.replace("- 置信度：中\n", "");
+
+    expect(validateReportMarkdown(withoutTier, { kind: "daily" }).failures).toContain("report.conclusion_box");
+  });
+
+  it("fails a tier that is not one of the three (no invented fourth level)", () => {
+    const badTier = GOOD_NEW_FORMAT_REPORT.replace("- 置信度：中", "- 置信度：极高");
+
+    expect(validateReportMarkdown(badTier, { kind: "daily" }).failures).toContain("report.conclusion_box");
+  });
+
+  it("passes the well-formed report, and never fires on a legacy-format one (era rule)", () => {
+    expect(validateReportMarkdown(GOOD_NEW_FORMAT_REPORT, { kind: "daily" }).failures).not.toContain("report.conclusion_box");
+
+    const legacyReport = [
+      "# OpenClaw 日报 2026-06-14",
+      "",
+      "## 1. 今日结论",
+      "",
+      "- 市场信号：QQQ 最新价 721.34。",
+      "",
+      "### 多源新闻（中文摘要与来源）",
+      "",
+      "- 2026-06-14 12:04 QQQ.US：纳指新闻更新；媒体：Longbridge；渠道：Longbridge；标题要点：纳指新闻更新；影响：作为新闻线索纳入观察，先不直接提高仓位；分类：待验证；基本面：更多影响情绪/风险偏好，暂不视为基本面变化；链接：https://longbridge.com/news/1。",
+      "",
+      "### 宏观日历",
+      "",
+      "- 2026-06-18 20:30 美国费城联储制造业指数",
+      "",
+      "## 4. QQQ 固定观察",
+      "",
+      "- 最新价：721.34；前收：717.12；区间涨跌：4.22 / 0.59%"
+    ].join("\n");
+
+    expect(validateReportMarkdown(legacyReport, { kind: "daily" }).failures).not.toContain("report.conclusion_box");
   });
 });
 

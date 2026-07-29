@@ -86,15 +86,12 @@ const KEYS = {
  * function always reads only the FIRST box it finds.
  */
 export function parseConclusionBox(sectionMarkdown: string): ConclusionBox | null {
-  const text = String(sectionMarkdown ?? "");
-  const headingIndex = text.indexOf(BOX_HEADING);
-  if (headingIndex === -1) {
+  // Task 13: the heading-to-next-heading slice is shared with
+  // parseReportConclusionBox below (mirrors conclusion-box.mjs's sliceBox).
+  const box = sliceBox(sectionMarkdown);
+  if (box === null) {
     return null;
   }
-
-  const afterHeading = text.slice(headingIndex + BOX_HEADING.length);
-  const nextHeadingMatch = afterHeading.match(/\n#{1,6}\s+/u);
-  const box = nextHeadingMatch ? afterHeading.slice(0, nextHeadingMatch.index) : afterHeading;
 
   const coreConclusion = matchBullet(box, KEYS.coreConclusion);
   const confidenceLabel = matchBullet(box, KEYS.confidence);
@@ -135,6 +132,74 @@ export function parseConclusionBox(sectionMarkdown: string): ConclusionBox | nul
     reviewTrigger: reviewTriggerParsed.reviewTrigger,
     reviewDate: reviewTriggerParsed.reviewDate
   };
+}
+
+// ---------------------------------------------------------------------------
+// The DAILY/WEEKLY report's own box (Task 13, 2026-07-28 spec-drift plan)
+// ---------------------------------------------------------------------------
+// Port of conclusion-box.mjs's `parseReportConclusionBox`, same convention and
+// same anti-drift mechanism as above: the shared fixture at
+// apps/openclaw-config/scripts/__fixtures__/report-conclusion-box-samples.json
+// is read by BOTH suites. Same heading and same 核心结论/置信度 keys as the
+// per-symbol box; 依据 + 截至 instead of the three per-symbol valuation keys,
+// because a whole-market conclusion has no single price range.
+//
+// The two shapes are mutually exclusive by construction: a per-symbol box has
+// no 依据/截至 bullet and a report box has no 合理价值区间 bullet, so each parser
+// returns null for the other's block. That is what lets routes/reports.ts tell
+// "this is a per-symbol batch" from "this is the report's own conclusion"
+// without guessing.
+export interface ReportConclusionBox {
+  coreConclusion: string;
+  confidence: ConfidenceTier;
+  /** The rendered 依据 string as-is - the renderer joins its parts with "；"
+   * and a part may itself contain "；", so splitting it back would invent
+   * boundaries that were never there. */
+  basis: string;
+  /** §3.5's 「"截至"时间」 - the DATA's timestamp, already formatted. */
+  asOf: string;
+}
+
+const REPORT_KEYS = {
+  coreConclusion: KEYS.coreConclusion,
+  confidence: KEYS.confidence,
+  basis: "依据",
+  asOf: "截至"
+} as const;
+
+export function parseReportConclusionBox(markdown: string): ReportConclusionBox | null {
+  const box = sliceBox(markdown);
+  if (box === null) {
+    return null;
+  }
+
+  const coreConclusion = matchBullet(box, REPORT_KEYS.coreConclusion);
+  const confidenceLabel = matchBullet(box, REPORT_KEYS.confidence);
+  const basis = matchBullet(box, REPORT_KEYS.basis);
+  const asOf = matchBullet(box, REPORT_KEYS.asOf);
+  if (coreConclusion === null || confidenceLabel === null || basis === null || asOf === null) {
+    return null;
+  }
+
+  const confidence = confidenceFromLabel(confidenceLabel);
+  if (!confidence) {
+    return null;
+  }
+
+  return { coreConclusion, confidence, basis, asOf };
+}
+
+/** Shared by both parsers: the substring from "### 结论框" to the next heading
+ * (or end of text), or null when the heading is absent. */
+function sliceBox(sectionMarkdown: string): string | null {
+  const text = String(sectionMarkdown ?? "");
+  const headingIndex = text.indexOf(BOX_HEADING);
+  if (headingIndex === -1) {
+    return null;
+  }
+  const afterHeading = text.slice(headingIndex + BOX_HEADING.length);
+  const nextHeadingMatch = afterHeading.match(/\n#{1,6}\s+/u);
+  return nextHeadingMatch ? afterHeading.slice(0, nextHeadingMatch.index) : afterHeading;
 }
 
 function matchBullet(box: string, key: string): string | null {

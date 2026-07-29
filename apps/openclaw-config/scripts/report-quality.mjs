@@ -13,7 +13,7 @@
 // in any module with project-external side effects at import time (none of
 // conclusion-box.mjs/stock-facts-store.mjs/narrative-engine.mjs touch the
 // filesystem, env, or a db connection merely by being imported).
-import { parseConclusionBox } from "./conclusion-box.mjs";
+import { parseConclusionBox, parseReportConclusionBox } from "./conclusion-box.mjs";
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD } from "./stock-facts-store.mjs";
 import {
   NARRATIVE_BULLET_PREFIX,
@@ -72,9 +72,16 @@ const SECTION_HEADING_PATTERN = /^#{1,3}(?!#)\s+(.+)$/u;
 // prepared report already needed to contain. There is no third, hybrid
 // state: a legacy-format report is judged ONLY by the old gates; a
 // new-format report is judged by the old gates AND the new ones.
-const NEW_FORMAT_SECTION_MARKER = "### 多源新闻（事件聚类）";
+//
+// EXPORTED (2026-07-30, spec-drift Task 12): the platform's report library
+// needs the SAME era boundary this gate uses, so it stops stamping every
+// report - including one generated an hour ago - as a legacy archive. The
+// TS side re-declares the marker locally (apps/platform-app/src/reports/
+// format-era.ts, this codebase's cross-app convention) and a parity test
+// imports THIS constant and THIS function to prove the two agree.
+export const NEW_FORMAT_SECTION_MARKER = "### 多源新闻（事件聚类）";
 
-function isNewFormatReport(text) {
+export function isNewFormatReport(text) {
   return text.includes(NEW_FORMAT_SECTION_MARKER);
 }
 
@@ -237,6 +244,24 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
         failures.push("news.chinese_ratio");
       }
     }
+
+    // Task 13 (2026-07-28 spec-drift plan) - report.conclusion_box.
+    // Requirements §1.4/§3.5: a daily/weekly report leads with 核心结论 + 置信度
+    // （高/中/低）+ 依据 + 截至时间. parseReportConclusionBox is the SAME parser
+    // the renderer's box round-trips through and the platform's summary card
+    // reads, so this gate fails for exactly the reason a reader would see
+    // nothing: no box, a missing required bullet, or a confidence label that is
+    // not one of the three tiers. Era-gated like every other new gate here -
+    // a legacy-format report never had a box and is not retroactively broken;
+    // everything the CURRENT renderer emits carries both markers, so for
+    // anything generated from now on this gate is unconditional in effect.
+    // scheduled-report.mjs's deliverReport treats an already-prepared file
+    // without a box as STALE and re-renders it, exactly as it does for a file
+    // carrying personal content, so this can never halt a scheduled run over a
+    // file we know how to rebuild.
+    if (parseReportConclusionBox(text) === null) {
+      failures.push("report.conclusion_box");
+    }
   }
 
   return buildResult(failures);
@@ -262,9 +287,14 @@ export function assertReportQuality(markdown, options = {}) {
 // daily/weekly era-compatibility rule: a legacy report is judged ONLY by the
 // 8 pre-existing gates below (unchanged); a new-format report is judged by
 // those AND the new ones.
-const STOCK_CONCLUSION_BOX_MARKER = "### 结论框";
+// EXPORTED for the same reason as NEW_FORMAT_SECTION_MARKER above (Task 12):
+// stock-analysis is its OWN report family with its OWN era boundary, so the
+// platform must not judge a stock analysis by the daily/weekly marker (no
+// stock-analysis report has ever contained 多源新闻（事件聚类）, so doing that
+// would call every one of them legacy forever).
+export const STOCK_CONCLUSION_BOX_MARKER = "### 结论框";
 
-function isNewFormatStockReport(text) {
+export function isNewFormatStockReport(text) {
   return text.includes(STOCK_CONCLUSION_BOX_MARKER);
 }
 
