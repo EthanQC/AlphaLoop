@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import {
   AuditLogRepository,
   MemberRepository,
+  STRATEGY_DEMOTION_NOTICE,
   openTradingDatabase,
   resolveRuntimePaths
 } from "../../../packages/shared-types/dist/index.js";
@@ -54,6 +55,8 @@ import {
   getThesisById,
   listCardsForOwner,
   listRulesForOwner,
+  demoteThesisVisibility,
+  demoteVisibility,
   promoteThesisVisibility,
   promoteVisibility,
   setStatus,
@@ -90,6 +93,7 @@ const COMMAND_FLAGS = {
   ]),
   "thesis judge": new Set(["owner", "thesis", "note", "source"]),
   "thesis promote": new Set(["owner", "thesis"]),
+  "thesis demote": new Set(["owner", "thesis"]),
   "thesis withdraw": new Set(["owner", "thesis"]),
   "thesis from-conclusion": new Set(["owner", "report", "symbol"]),
   "rule create": new Set(["owner", "text", "enforcement", "strategy"]),
@@ -99,6 +103,7 @@ const COMMAND_FLAGS = {
   "card create": new Set(["owner", "name", "scene", "entry", "risk", "exit", "visibility"]),
   "card status": new Set(["owner", "card", "to"]),
   "card promote": new Set(["owner", "card"]),
+  "card demote": new Set(["owner", "card"]),
   "card list": new Set(["owner"])
 };
 
@@ -329,6 +334,23 @@ export async function runThesisPromote(flags, options = {}) {
     new AuditLogRepository(db).write("strategy_memory", "thesis promote", { thesisId, ownerId });
 
     return { ok: true, thesis };
+  });
+}
+
+// Task 15: the demote half of §2.1's 三档可见性. Same owner gate, same audit
+// category as promote, plus the `notice` every demote face returns - the row
+// stops being visible to other members, and NOTHING already generated while it
+// was public is retracted.
+export async function runThesisDemote(flags, options = {}) {
+  const ownerId = requireFlag(flags, "owner");
+  const thesisId = requireFlag(flags, "thesis");
+
+  return withDb(options, async (db) => {
+    const thesis = demoteThesisVisibility(db, thesisId, ownerId);
+
+    new AuditLogRepository(db).write("strategy_memory", "thesis demote", { thesisId, ownerId });
+
+    return { ok: true, thesis, notice: STRATEGY_DEMOTION_NOTICE };
   });
 }
 
@@ -638,6 +660,19 @@ export async function runCardPromote(flags, options = {}) {
   });
 }
 
+export async function runCardDemote(flags, options = {}) {
+  const ownerId = requireFlag(flags, "owner");
+  const cardId = requireFlag(flags, "card");
+
+  return withDb(options, async (db) => {
+    const card = demoteVisibility(db, cardId, ownerId);
+
+    new AuditLogRepository(db).write("strategy_memory", "card demote", { cardId, ownerId });
+
+    return { ok: true, card, notice: STRATEGY_DEMOTION_NOTICE };
+  });
+}
+
 // Read-only - no audit_log row.
 export async function runCardList(flags, options = {}) {
   const ownerId = requireFlag(flags, "owner");
@@ -654,6 +689,7 @@ const COMMANDS = {
   "thesis create": runThesisCreate,
   "thesis judge": runThesisJudge,
   "thesis promote": runThesisPromote,
+  "thesis demote": runThesisDemote,
   "thesis withdraw": runThesisWithdraw,
   "thesis from-conclusion": runThesisFromConclusion,
   "rule create": runRuleCreate,
@@ -663,6 +699,7 @@ const COMMANDS = {
   "card create": runCardCreate,
   "card status": runCardStatus,
   "card promote": runCardPromote,
+  "card demote": runCardDemote,
   "card list": runCardList
 };
 

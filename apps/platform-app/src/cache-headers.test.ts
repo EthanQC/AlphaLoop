@@ -346,9 +346,12 @@ const PROBES: Probe[] = [
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/theses", anonymous: true, expectStatus: 401 },
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/theses/t1/judgments", bearer: true, expectStatus: 404 },
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/theses/t1/promote", bearer: true, expectStatus: 404 },
+  { module: "routes/api-strategy.ts", method: "POST", path: "/api/theses/t1/demote", bearer: true, expectStatus: 404 },
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/rules", bearer: true, expectStatus: 400 },
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/rules/r1/disable", bearer: true, expectStatus: 404 },
   { module: "routes/api-strategy.ts", method: "POST", path: "/api/cards", bearer: true, expectStatus: 400 },
+  { module: "routes/api-strategy.ts", method: "POST", path: "/api/cards/c1/promote", bearer: true, expectStatus: 404 },
+  { module: "routes/api-strategy.ts", method: "POST", path: "/api/cards/c1/demote", bearer: true, expectStatus: 404 },
 
   // routes/api-research.ts - identity-gated JSON writes.
   { module: "routes/api-research.ts", method: "POST", path: "/api/research", anonymous: true, expectStatus: 401 },

@@ -23,12 +23,22 @@
 //     setStatus('retired') instead of a delete. None of the three tables get
 //     a delete/remove export from this module.
 //
-// Visibility promotion (theses.visibility / strategy_cards.visibility) is a
-// ONE-WAY, single-step ratchet for both tables today: 'system' -> 'public'
-// only (neither table has a 'private' tier - see the plan's Global
-// Constraints: "私有...theses/strategy_cards 无此档"). Promoting an
-// already-public row is idempotent (returns the row unchanged, does not
-// throw) - re-clicking "公开" in a future UI must never be an error.
+// Visibility (theses.visibility / strategy_cards.visibility) moves BOTH ways
+// between the two tiers these tables carry: 'system' <-> 'public' (neither
+// table has a 'private' tier - see the plan's Global Constraints:
+// "私有...theses/strategy_cards 无此档"; ①私有 lives in the member's own local
+// workbench, never here). Promoting an already-public row, or demoting an
+// already-system one, is idempotent (returns the row unchanged, does not
+// throw) - re-clicking "公开"/"收回公开" in a UI must never be an error.
+//
+// Task 15 (2026-07-28 spec-drift plan) added the demote direction. It was a
+// one-way ratchet until then, which contradicted 2026-07-12 requirements §2.1
+// (「一键升档（①→②→③）；降档时已生成的历史内容不回收（如实告知）」): a member who
+// published a thesis had no way to take it off other members' 名片 again. What
+// demotion does NOT do is retract anything already generated - see
+// STRATEGY_DEMOTION_NOTICE (shared-types), the sentence both write faces
+// return, and note that thesis_history is untouched here exactly as
+// withdrawThesis leaves it untouched.
 
 import { createId, nowIso } from "../../../packages/shared-types/dist/index.js";
 
@@ -146,6 +156,30 @@ export function promoteThesisVisibility(db, thesisId, ownerId) {
 
   const now = nowIso();
   db.prepare(`UPDATE theses SET visibility = 'public', updated_at = ? WHERE id = ?`).run(now, thesisId);
+  return getThesisById(db, thesisId);
+}
+
+/**
+ * public -> system, the demote direction of the same two-tier ladder
+ * promoteThesisVisibility climbs. Non-owner: rejected (assertOwner throws, the
+ * same 403-shaped refusal every other mutator here raises). Already system:
+ * idempotent no-op.
+ *
+ * Nothing is retracted. A report, a 名片 or a Feishu card produced while this
+ * thesis was public keeps whatever it already printed; what changes from here
+ * on is that listPublicTheses/listPublicCards stop returning the row to other
+ * members. The caller is expected to say so - STRATEGY_DEMOTION_NOTICE.
+ */
+export function demoteThesisVisibility(db, thesisId, ownerId) {
+  const thesis = requireThesis(db, thesisId);
+  assertOwner(thesis, ownerId, "论点");
+
+  if (thesis.visibility === "system") {
+    return thesis;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE theses SET visibility = 'system', updated_at = ? WHERE id = ?`).run(now, thesisId);
   return getThesisById(db, thesisId);
 }
 
@@ -367,6 +401,25 @@ export function promoteVisibility(db, cardId, ownerId) {
 
   const now = nowIso();
   db.prepare(`UPDATE strategy_cards SET visibility = 'public', updated_at = ? WHERE id = ?`).run(now, cardId);
+  return getCardById(db, cardId);
+}
+
+/** public -> system, non-owner rejected, already-system idempotent - the
+ * demote direction of promoteVisibility above, with the same
+ * "nothing already generated is retracted" semantics
+ * (STRATEGY_DEMOTION_NOTICE). listPublicCards stops returning the row to other
+ * members from here on; listCardsForOwner (the owner's own view) is unaffected,
+ * because it filters on owner, not visibility. */
+export function demoteVisibility(db, cardId, ownerId) {
+  const card = requireCard(db, cardId);
+  assertOwner(card, ownerId, "策略卡");
+
+  if (card.visibility === "system") {
+    return card;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE strategy_cards SET visibility = 'system', updated_at = ? WHERE id = ?`).run(now, cardId);
   return getCardById(db, cardId);
 }
 

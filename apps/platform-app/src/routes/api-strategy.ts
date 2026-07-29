@@ -49,7 +49,14 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { methodNotAllowed, readJsonBody, sendJson, type Member } from "@packages/shared-types";
+import {
+  AuditLogRepository,
+  STRATEGY_DEMOTION_NOTICE,
+  methodNotAllowed,
+  readJsonBody,
+  sendJson,
+  type Member
+} from "@packages/shared-types";
 
 import { resolveBearerIdentity } from "../identity.js";
 import { guardAsyncWrite } from "./async-guard.js";
@@ -59,9 +66,13 @@ import {
   createCard,
   createRule,
   createThesis,
+  demoteCardVisibilityToSystem,
+  demoteThesisVisibilityToSystem,
   disableRule,
+  getCardById,
   getRuleById,
   getThesisById,
+  promoteCardVisibilityToPublic,
   promoteThesisVisibilityToPublic,
   type CreateCardInput,
   type CreateRuleInput,
@@ -340,6 +351,114 @@ async function handlePromoteThesis(
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/theses/:id/demote  ·  POST /api/cards/:id/demote
+// POST /api/cards/:id/promote
+//
+// Task 15 (2026-07-28 spec-drift plan). §2.1's ladder is 「一键升档（①→②→③）；
+// 降档时已生成的历史内容不回收（如实告知）」 - both directions, with an honest
+// notice on the way down. This surface only had `promote`, and only for a
+// thesis, so ③公开 was a trapdoor: publish once and other members' 名片 kept the
+// row forever.
+//
+// Same gate as every other mutation on an existing row here: resolve the row by
+// id FIRST, 404 if it does not exist, 403 if it exists and belongs to somebody
+// else - never an ownerId read off the request body. The 403 is what stops one
+// member from un-publishing another member's card.
+//
+// `notice` is STRATEGY_DEMOTION_NOTICE, shared with the CLI face so the two
+// cannot describe the same operation differently. It is on the DEMOTE
+// responses only: promotion retracts nothing, so it has nothing to disclose.
+//
+// Every demote writes an audit_log row (category `strategy_memory`, mirroring
+// strategy.mjs's own audit categories) - taking content back out of the
+// circle's view is exactly the kind of change a member may later need to prove
+// happened, and when.
+// ---------------------------------------------------------------------------
+
+async function handleDemoteThesis(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ApiStrategyRouteDeps,
+  thesisId: string
+): Promise<void> {
+  const identity = requireBearerIdentity(req, res, deps.db);
+  if (!identity) {
+    return;
+  }
+
+  const thesis = getThesisById(deps.db, thesisId);
+  if (!thesis) {
+    sendJson(res, 404, { ok: false, error: `未找到论点：${thesisId}` });
+    return;
+  }
+  if (thesis.ownerId !== identity.id) {
+    sendJson(res, 403, { ok: false, error: "无权操作：该论点属于其他成员" });
+    return;
+  }
+
+  const updated = demoteThesisVisibilityToSystem(deps.db, thesisId);
+  new AuditLogRepository(deps.db).write("strategy_memory", "thesis demote", {
+    thesisId,
+    ownerId: identity.id
+  });
+  sendJson(res, 200, { ok: true, thesis: updated, notice: STRATEGY_DEMOTION_NOTICE });
+}
+
+async function handleDemoteCard(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ApiStrategyRouteDeps,
+  cardId: string
+): Promise<void> {
+  const identity = requireBearerIdentity(req, res, deps.db);
+  if (!identity) {
+    return;
+  }
+
+  const card = getCardById(deps.db, cardId);
+  if (!card) {
+    sendJson(res, 404, { ok: false, error: `未找到策略卡：${cardId}` });
+    return;
+  }
+  if (card.ownerId !== identity.id) {
+    sendJson(res, 403, { ok: false, error: "无权操作：该策略卡属于其他成员" });
+    return;
+  }
+
+  const updated = demoteCardVisibilityToSystem(deps.db, cardId);
+  new AuditLogRepository(deps.db).write("strategy_memory", "card demote", {
+    cardId,
+    ownerId: identity.id
+  });
+  sendJson(res, 200, { ok: true, card: updated, notice: STRATEGY_DEMOTION_NOTICE });
+}
+
+async function handlePromoteCard(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ApiStrategyRouteDeps,
+  cardId: string
+): Promise<void> {
+  const identity = requireBearerIdentity(req, res, deps.db);
+  if (!identity) {
+    return;
+  }
+
+  const card = getCardById(deps.db, cardId);
+  if (!card) {
+    sendJson(res, 404, { ok: false, error: `未找到策略卡：${cardId}` });
+    return;
+  }
+  if (card.ownerId !== identity.id) {
+    sendJson(res, 403, { ok: false, error: "无权操作：该策略卡属于其他成员" });
+    return;
+  }
+
+  const updated = promoteCardVisibilityToPublic(deps.db, cardId);
+  sendJson(res, 200, { ok: true, card: updated });
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/rules
 // ---------------------------------------------------------------------------
 
@@ -528,6 +647,33 @@ export function handleApiStrategyRoute(
       return true;
     }
     guardAsyncWrite(handlePromoteThesis(req, res, deps, segments[2] as string), req, res, "api-strategy");
+    return true;
+  }
+
+  if (segments.length === 4 && segments[1] === "theses" && segments[3] === "demote") {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    guardAsyncWrite(handleDemoteThesis(req, res, deps, segments[2] as string), req, res, "api-strategy");
+    return true;
+  }
+
+  if (segments.length === 4 && segments[1] === "cards" && segments[3] === "promote") {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    guardAsyncWrite(handlePromoteCard(req, res, deps, segments[2] as string), req, res, "api-strategy");
+    return true;
+  }
+
+  if (segments.length === 4 && segments[1] === "cards" && segments[3] === "demote") {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    guardAsyncWrite(handleDemoteCard(req, res, deps, segments[2] as string), req, res, "api-strategy");
     return true;
   }
 

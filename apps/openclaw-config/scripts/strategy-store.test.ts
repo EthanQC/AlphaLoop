@@ -193,6 +193,86 @@ describe("promoteThesisVisibility (three-tier promote: system -> public)", () =>
   });
 });
 
+// Task 15 (2026-07-28 spec-drift plan): §2.1 promises both directions
+// (「一键升档（①→②→③）；降档时已生成的历史内容不回收（如实告知）」) and the store only
+// climbed. These pin the way back down, including the part that must NOT
+// happen: judgments already recorded stay recorded.
+describe("demoteThesisVisibility (three-tier demote: public -> system)", () => {
+  it("demotes public -> system for the owner", () => {
+    const db = makeDb();
+    seedMember(db);
+    const thesis = store.createThesis(db, {
+      ownerId: "owner_1",
+      symbol: "AAPL.US",
+      direction: "bull",
+      visibility: "public"
+    });
+
+    const demoted = store.demoteThesisVisibility(db, thesis.id, "owner_1");
+    expect(demoted.visibility).toBe("system");
+    expect(store.getThesisById(db, thesis.id)?.visibility).toBe("system");
+  });
+
+  it("rejects demotion by a non-owner, leaving visibility unchanged", () => {
+    const db = makeDb();
+    seedMember(db, "owner_1");
+    seedMember(db, "owner_2");
+    const thesis = store.createThesis(db, {
+      ownerId: "owner_1",
+      symbol: "AAPL.US",
+      direction: "bull",
+      visibility: "public"
+    });
+
+    expect(() => store.demoteThesisVisibility(db, thesis.id, "owner_2")).toThrow(/无权操作/);
+    expect(store.getThesisById(db, thesis.id)?.visibility).toBe("public");
+  });
+
+  it("demoting an already-system thesis is idempotent (no throw, unchanged result)", () => {
+    const db = makeDb();
+    seedMember(db);
+    const thesis = store.createThesis(db, { ownerId: "owner_1", symbol: "AAPL.US", direction: "bull" });
+
+    const result = store.demoteThesisVisibility(db, thesis.id, "owner_1");
+    expect(result.visibility).toBe("system");
+  });
+
+  it("throws for an unknown thesis id", () => {
+    const db = makeDb();
+    expect(() => store.demoteThesisVisibility(db, "thesis_missing", "owner_1")).toThrow(/未找到论点/);
+  });
+
+  it("does NOT retract the judgment history recorded while the thesis was public", () => {
+    const db = makeDb();
+    seedMember(db);
+    const thesis = store.createThesis(db, {
+      ownerId: "owner_1",
+      symbol: "AAPL.US",
+      direction: "bull",
+      visibility: "public"
+    });
+    store.appendThesisJudgment(db, thesis.id, { note: "公开期间的判断", source: "self" });
+
+    store.demoteThesisVisibility(db, thesis.id, "owner_1");
+
+    const history = store.listThesisJudgments(db, thesis.id);
+    expect(history).toHaveLength(1);
+    expect(history[0]?.note).toBe("公开期间的判断");
+  });
+
+  it("round-trips: promote then demote leaves the row exactly where it started", () => {
+    const db = makeDb();
+    seedMember(db);
+    const thesis = store.createThesis(db, { ownerId: "owner_1", symbol: "AAPL.US", direction: "bull" });
+
+    store.promoteThesisVisibility(db, thesis.id, "owner_1");
+    expect(store.getThesisById(db, thesis.id)?.visibility).toBe("public");
+
+    store.demoteThesisVisibility(db, thesis.id, "owner_1");
+    expect(store.getThesisById(db, thesis.id)?.visibility).toBe("system");
+  });
+});
+
 describe("withdrawThesis (status -> withdrawn, history preserved)", () => {
   it("withdraws an owner's own thesis, preserving thesis_history rows", () => {
     const db = makeDb();
@@ -398,6 +478,52 @@ describe("promoteVisibility (three-tier promote: system -> public)", () => {
 
     const result = store.promoteVisibility(db, card.id, "owner_1");
     expect(result.visibility).toBe("public");
+  });
+});
+
+describe("demoteVisibility (three-tier demote: public -> system)", () => {
+  it("demotes public -> system for the owner", () => {
+    const db = makeDb();
+    seedMember(db);
+    const card = store.createCard(db, { ownerId: "owner_1", name: "趋势跟随", visibility: "public" });
+
+    const demoted = store.demoteVisibility(db, card.id, "owner_1");
+    expect(demoted.visibility).toBe("system");
+  });
+
+  it("rejects demotion by a non-owner", () => {
+    const db = makeDb();
+    seedMember(db, "owner_1");
+    seedMember(db, "owner_2");
+    const card = store.createCard(db, { ownerId: "owner_1", name: "趋势跟随", visibility: "public" });
+
+    expect(() => store.demoteVisibility(db, card.id, "owner_2")).toThrow(/无权操作/);
+    expect(store.getCardById(db, card.id)?.visibility).toBe("public");
+  });
+
+  it("demoting an already-system card is idempotent", () => {
+    const db = makeDb();
+    seedMember(db);
+    const card = store.createCard(db, { ownerId: "owner_1", name: "趋势跟随" });
+
+    const result = store.demoteVisibility(db, card.id, "owner_1");
+    expect(result.visibility).toBe("system");
+  });
+
+  // The point of demotion, asserted through the reader other members actually
+  // see (listPublicCards excludes the viewer's own rows in SQL).
+  it("takes the card out of another member's circle view, while the owner keeps seeing it", () => {
+    const db = makeDb();
+    seedMember(db, "owner_1");
+    seedMember(db, "owner_2");
+    const card = store.createCard(db, { ownerId: "owner_1", name: "趋势跟随", visibility: "public" });
+
+    expect(store.listPublicCards(db, "owner_2").map((entry) => entry.id)).toEqual([card.id]);
+
+    store.demoteVisibility(db, card.id, "owner_1");
+
+    expect(store.listPublicCards(db, "owner_2")).toEqual([]);
+    expect(store.listCardsForOwner(db, "owner_1").map((entry) => entry.id)).toEqual([card.id]);
   });
 });
 

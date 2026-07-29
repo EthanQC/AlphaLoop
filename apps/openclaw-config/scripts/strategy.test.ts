@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MemberRepository, openTradingDatabase } from "../../../packages/shared-types/dist/index.js";
+import {
+  MemberRepository,
+  STRATEGY_DEMOTION_NOTICE,
+  openTradingDatabase
+} from "../../../packages/shared-types/dist/index.js";
 
 import { renderConclusionBox } from "./conclusion-box.mjs";
 
@@ -537,6 +541,81 @@ describe("runCardCreate / runCardStatus / runCardPromote / runCardList", () => {
     const result = await cli.runCardList({ owner: "owner_1" }, options);
     expect(result.cards).toHaveLength(1);
     expect(auditRows(db, "card list")).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// thesis demote / card demote (Task 15: §2.1's ladder goes both ways)
+// ===========================================================================
+
+describe("runThesisDemote / runCardDemote", () => {
+  const publicCardFlags = {
+    owner: "owner_1",
+    name: "趋势跟随",
+    scene: "单边趋势",
+    entry: "突破20日线",
+    risk: "止损5%",
+    exit: "跌破10日线",
+    visibility: "public"
+  };
+
+  it("demotes public -> system for the owner, audits it, and returns the no-recall notice", async () => {
+    const { db, options } = makeDb();
+    seedMember(db);
+    const thesis = (await cli.runThesisCreate(
+      { owner: "owner_1", symbol: "AAPL.US", direction: "bull", visibility: "public" },
+      options
+    )).thesis;
+
+    const result = await cli.runThesisDemote({ owner: "owner_1", thesis: thesis.id }, options);
+
+    expect(result.thesis.visibility).toBe("system");
+    // The exact sentence, not a paraphrase: it is the one place the member is
+    // told that demotion does not reach back into what was already generated.
+    expect(result.notice).toBe(STRATEGY_DEMOTION_NOTICE);
+    expect(result.notice).toContain("不回收");
+    expect(auditRows(db, "thesis demote")).toHaveLength(1);
+  });
+
+  it("rejects demotion by a non-owner and writes no audit row", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, "owner_1");
+    seedMember(db, "owner_2");
+    const thesis = (await cli.runThesisCreate(
+      { owner: "owner_1", symbol: "AAPL.US", direction: "bull", visibility: "public" },
+      options
+    )).thesis;
+
+    await expect(cli.runThesisDemote({ owner: "owner_2", thesis: thesis.id }, options)).rejects.toThrow(/无权操作/);
+    expect(auditRows(db, "thesis demote")).toHaveLength(0);
+  });
+
+  it("card demote: public -> system for the owner, rejected for anyone else", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, "owner_1");
+    seedMember(db, "owner_2");
+    const card = (await cli.runCardCreate(publicCardFlags, options)).card;
+
+    await expect(cli.runCardDemote({ owner: "owner_2", card: card.id }, options)).rejects.toThrow(/无权操作/);
+
+    const result = await cli.runCardDemote({ owner: "owner_1", card: card.id }, options);
+    expect(result.card.visibility).toBe("system");
+    expect(result.notice).toBe(STRATEGY_DEMOTION_NOTICE);
+    expect(auditRows(db, "card demote")).toHaveLength(1);
+  });
+
+  it("routes 'card demote' through buildCliResult with the same flag allowlist as promote", async () => {
+    const { db, options } = makeDb();
+    seedMember(db);
+    const card = (await cli.runCardCreate(publicCardFlags, options)).card;
+
+    const result = await cli.buildCliResult(["card", "demote", "--owner", "owner_1", "--card", card.id], options);
+    expect(result.ok).toBe(true);
+    expect(result.card.visibility).toBe("system");
+
+    expect(() => cli.parseFlags(["--owner", "o", "--card", "c", "--symbol", "x"], "card demote")).toThrow(
+      /未知参数：--symbol/
+    );
   });
 });
 

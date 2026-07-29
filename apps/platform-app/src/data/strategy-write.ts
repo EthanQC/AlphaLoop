@@ -12,11 +12,13 @@
  * (test-only exceptions, e.g. routes/news.seam.test.ts, are excluded from
  * this app's tsconfig project and don't count). Any change to the SQL/
  * semantics of createThesis / appendThesisJudgment /
- * promoteThesisVisibilityToPublic (system -> public) / createRule /
- * disableRule / createCard here MUST be mirrored in strategy-store.mjs (or
- * vice versa).
+ * promoteThesisVisibilityToPublic (system -> public) /
+ * demoteThesisVisibilityToSystem (public -> system) / createRule /
+ * disableRule / createCard / demoteCardVisibilityToSystem here MUST be
+ * mirrored in strategy-store.mjs (or vice versa).
  *
- * Ownership enforcement for a mutation on an EXISTING row (promote/disable)
+ * Ownership enforcement for a mutation on an EXISTING row (promote/demote/
+ * disable)
  * is intentionally NOT duplicated in this module - the bearer-gated route
  * (routes/api-strategy.ts) already resolves the row and compares
  * `row.ownerId === identity.id` itself BEFORE calling into these functions
@@ -217,6 +219,31 @@ export function promoteThesisVisibilityToPublic(db: DatabaseSync, thesisId: stri
   return getThesisById(db, thesisId) as ThesisRecord;
 }
 
+/**
+ * public -> system; idempotent if already system. Same ownership split as
+ * promote above (the route has already checked).
+ *
+ * Task 15 (2026-07-28 spec-drift plan): §2.1 promises 「一键升档…降档时已生成的
+ * 历史内容不回收（如实告知）」 and the ladder only climbed. This is the way back
+ * down, and it only flips the column: judgments (thesis_history) stay, and so
+ * does anything a report or 名片 printed while the row was public. The route
+ * returns STRATEGY_DEMOTION_NOTICE so the member is told that rather than
+ * left to assume a recall happened.
+ */
+export function demoteThesisVisibilityToSystem(db: DatabaseSync, thesisId: string): ThesisRecord {
+  const thesis = getThesisById(db, thesisId);
+  if (!thesis) {
+    throw new Error(`未找到论点 ${thesisId}`);
+  }
+  if (thesis.visibility === "system") {
+    return thesis;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE theses SET visibility = 'system', updated_at = ? WHERE id = ?`).run(now, thesisId);
+  return getThesisById(db, thesisId) as ThesisRecord;
+}
+
 // ---------------------------------------------------------------------------
 // discipline_rules
 // ---------------------------------------------------------------------------
@@ -341,4 +368,53 @@ export function createCard(db: DatabaseSync, input: CreateCardInput): StrategyCa
   );
 
   return getCardById(db, id) as StrategyCardRecord;
+}
+
+/**
+ * public -> system for a strategy card; idempotent if already system. Same
+ * ownership split as the thesis mutators above (the route has already
+ * checked), and the same "nothing already generated is retracted" semantics -
+ * see demoteThesisVisibilityToSystem.
+ *
+ * The visible effect is on OTHER members: data/strategy.ts's circle view
+ * selects `visibility = 'public' AND owner_id != ?`, so a demoted card leaves
+ * their 名片 immediately. The owner's own list is filtered by owner, not
+ * visibility, so it stays where it was.
+ */
+export function demoteCardVisibilityToSystem(db: DatabaseSync, cardId: string): StrategyCardRecord {
+  const card = getCardById(db, cardId);
+  if (!card) {
+    throw new Error(`未找到策略卡 ${cardId}`);
+  }
+  if (card.visibility === "system") {
+    return card;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE strategy_cards SET visibility = 'system', updated_at = ? WHERE id = ?`).run(now, cardId);
+  return getCardById(db, cardId) as StrategyCardRecord;
+}
+
+/**
+ * public -> system's mirror image for a card: system -> public, idempotent if
+ * already public.
+ *
+ * Added alongside the demote path (Task 15) because a card could only ever be
+ * published at CREATE time through this face - `createCard` took a visibility
+ * and there was no promote export at all, so the platform/skill API could
+ * demote a card it had no way to re-publish. strategy-store.mjs's
+ * `promoteVisibility` is the CLI-side original this mirrors.
+ */
+export function promoteCardVisibilityToPublic(db: DatabaseSync, cardId: string): StrategyCardRecord {
+  const card = getCardById(db, cardId);
+  if (!card) {
+    throw new Error(`未找到策略卡 ${cardId}`);
+  }
+  if (card.visibility === "public") {
+    return card;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE strategy_cards SET visibility = 'public', updated_at = ? WHERE id = ?`).run(now, cardId);
+  return getCardById(db, cardId) as StrategyCardRecord;
 }

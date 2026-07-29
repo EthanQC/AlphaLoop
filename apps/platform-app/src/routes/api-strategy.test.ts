@@ -6,7 +6,13 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, migrate, type Member } from "@packages/shared-types";
+import {
+  ApiTokenRepository,
+  MemberRepository,
+  STRATEGY_DEMOTION_NOTICE,
+  migrate,
+  type Member
+} from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
 import type { MemorydBackend } from "../data/memoryd-mirror.js";
@@ -319,6 +325,129 @@ describe("bearer-gated strategy write API (POST /api/*)", () => {
       expect(response.status).toBe(200);
       const body = (await response.json()) as { thesis: { visibility: string } };
       expect(body.thesis.visibility).toBe("public");
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // POST /api/theses/:id/demote  ·  POST /api/cards/:id/{promote,demote}
+  //
+  // Task 15 (2026-07-28 spec-drift plan): §2.1's 三档可见性 promises 「一键升档
+  // …降档时已生成的历史内容不回收（如实告知）」. This surface could only promote, and
+  // only a thesis, so publishing was a one-way door.
+  // ---------------------------------------------------------------------
+
+  describe("POST /api/theses/:id/demote and /api/cards/:id/demote", () => {
+    async function createCardAs(
+      token: string,
+      overrides: Record<string, unknown> = {}
+    ): Promise<{ id: string; ownerId: string; visibility: string }> {
+      const response = await post("/api/cards", { name: "趋势跟随", ...overrides }, token);
+      expect(response.status).toBe(201);
+      const payload = (await response.json()) as { card: { id: string; ownerId: string; visibility: string } };
+      return payload.card;
+    }
+
+    it("demotes a public thesis back to system for the owner and says nothing is recalled", async () => {
+      const thesis = await createThesisAs(tokenA, { visibility: "public" });
+
+      const response = await post(`/api/theses/${thesis.id}/demote`, {}, tokenA);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; thesis: { visibility: string }; notice: string };
+      expect(body.ok).toBe(true);
+      expect(body.thesis.visibility).toBe("system");
+      expect(body.notice).toBe(STRATEGY_DEMOTION_NOTICE);
+      expect(body.notice).toContain("不回收");
+    });
+
+    it("writes an audit_log row naming the row and the member who demoted it", async () => {
+      const thesis = await createThesisAs(tokenA, { visibility: "public" });
+      await post(`/api/theses/${thesis.id}/demote`, {}, tokenA);
+
+      const rows = db
+        .prepare(`SELECT payload FROM audit_log WHERE category = 'strategy_memory' AND action = 'thesis demote'`)
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      expect(JSON.parse(rows[0]?.payload ?? "{}")).toEqual({ thesisId: thesis.id, ownerId: memberA.id });
+    });
+
+    it("403s a non-owner's demote attempt and leaves the row public", async () => {
+      const thesis = await createThesisAs(tokenA, { visibility: "public" });
+
+      const response = await post(`/api/theses/${thesis.id}/demote`, {}, tokenB);
+      expect(response.status).toBe(403);
+
+      const row = db.prepare(`SELECT visibility FROM theses WHERE id = ?`).get(thesis.id) as { visibility: string };
+      expect(row.visibility).toBe("public");
+      expect(
+        db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'thesis demote'`).get() as { n: number }
+      ).toEqual({ n: 0 });
+    });
+
+    it("404s an unknown thesis id", async () => {
+      const response = await post(`/api/theses/does-not-exist/demote`, {}, tokenA);
+      expect(response.status).toBe(404);
+    });
+
+    it("is idempotent on an already-system thesis", async () => {
+      const thesis = await createThesisAs(tokenA);
+      const response = await post(`/api/theses/${thesis.id}/demote`, {}, tokenA);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { thesis: { visibility: string } };
+      expect(body.thesis.visibility).toBe("system");
+    });
+
+    it("takes a demoted card out of the other member's circle view", async () => {
+      const card = await createCardAs(tokenA, { visibility: "public" });
+
+      // Before: member B's circle query (the same SQL data/strategy.ts runs)
+      // returns member A's card.
+      const visibleBefore = db
+        .prepare(`SELECT id FROM strategy_cards WHERE visibility = 'public' AND owner_id != ?`)
+        .all(memberB.id) as Array<{ id: string }>;
+      expect(visibleBefore.map((row) => row.id)).toContain(card.id);
+
+      const response = await post(`/api/cards/${card.id}/demote`, {}, tokenA);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { card: { visibility: string }; notice: string };
+      expect(body.card.visibility).toBe("system");
+      expect(body.notice).toBe(STRATEGY_DEMOTION_NOTICE);
+
+      const visibleAfter = db
+        .prepare(`SELECT id FROM strategy_cards WHERE visibility = 'public' AND owner_id != ?`)
+        .all(memberB.id) as Array<{ id: string }>;
+      expect(visibleAfter.map((row) => row.id)).not.toContain(card.id);
+    });
+
+    it("403s a non-owner's card demote and 404s an unknown card id", async () => {
+      const card = await createCardAs(tokenA, { visibility: "public" });
+
+      expect((await post(`/api/cards/${card.id}/demote`, {}, tokenB)).status).toBe(403);
+      expect((await post(`/api/cards/no-such-card/demote`, {}, tokenA)).status).toBe(404);
+
+      const row = db.prepare(`SELECT visibility FROM strategy_cards WHERE id = ?`).get(card.id) as {
+        visibility: string;
+      };
+      expect(row.visibility).toBe("public");
+    });
+
+    it("re-publishes a demoted card through /promote, so the ladder climbs again", async () => {
+      const card = await createCardAs(tokenA, { visibility: "public" });
+      await post(`/api/cards/${card.id}/demote`, {}, tokenA);
+
+      const response = await post(`/api/cards/${card.id}/promote`, {}, tokenA);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { card: { visibility: string }; notice?: string };
+      expect(body.card.visibility).toBe("public");
+      // Promotion retracts nothing, so it carries no no-recall notice.
+      expect(body.notice).toBeUndefined();
+    });
+
+    it("405s a GET on a demote path instead of treating it as a write", async () => {
+      const thesis = await createThesisAs(tokenA, { visibility: "public" });
+      const response = await fetch(`${baseUrl}/api/theses/${thesis.id}/demote`, {
+        headers: { Authorization: `Bearer ${tokenA}` }
+      });
+      expect(response.status).toBe(405);
     });
   });
 

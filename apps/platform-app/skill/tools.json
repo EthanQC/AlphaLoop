@@ -1,17 +1,19 @@
 {
-  "$schema": "AlphaLoop skill tool->endpoint map (Phase 7 Task 4)",
-  "version": "2026-07-15",
+  "$schema": "AlphaLoop skill tool->endpoint map",
+  "version": "2026-07-30",
+  "baseUrl": "https://reports.qingverse.com",
   "auth": {
     "type": "bearer",
     "header": "Authorization: Bearer <api.token>",
-    "note": "Bearer-token-only. A request carrying only Cf-Access-Authenticated-User-Email (no bearer) is 401 for every endpoint below - see apps/platform-app/src/routes/api-strategy.ts. The owner of every write is always the token's resolved member.id; a body `ownerId` field is ignored, never honored."
+    "note": "Every endpoint below accepts a bearer token. The `/api/theses`, `/api/rules` and `/api/cards` writes are bearer-ONLY (apps/platform-app/src/routes/api-strategy.ts calls resolveBearerIdentity); everything else goes through resolveIdentity, which accepts a bearer token OR the browser's own alphaloop_session cookie. The owner of every write is always the token's resolved member.id; a body `ownerId` field is ignored, never honored.",
+    "browserLogin": "Browsers do not use this token. They sign in at GET /login with an email code delivered over Feishu (apps/platform-app/src/routes/login.ts) and get a signed alphaloop_session cookie. Cloudflare Access was never activated and is not part of the login path."
   },
   "tools": [
     {
       "name": "thesis.create",
       "method": "POST",
       "path": "/api/theses",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {
         "symbol": "string, required",
         "direction": "\"bull\" | \"bear\" | \"neutral\", required",
@@ -22,7 +24,9 @@
         "bearPoints": "string[], optional, default []",
         "visibility": "\"system\" | \"public\", optional, default \"system\""
       },
-      "response": { "201": "{ ok: true, thesis, mirror }" },
+      "response": {
+        "201": "{ ok: true, thesis, mirror }"
+      },
       "errors": {
         "400": "{ ok: false, error, field } - missing/invalid symbol, direction, visibility, targetLow/targetHigh/invalidationPrice, bullPoints/bearPoints",
         "401": "{ ok: false, error } - missing/invalid bearer token"
@@ -32,12 +36,14 @@
       "name": "thesis.judgment.append",
       "method": "POST",
       "path": "/api/theses/:id/judgments",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {
         "note": "string, required",
         "source": "string, optional, default \"self\""
       },
-      "response": { "201": "{ ok: true, judgment, mirror }" },
+      "response": {
+        "201": "{ ok: true, judgment, mirror }"
+      },
       "errors": {
         "400": "{ ok: false, error, field } - missing note",
         "401": "missing/invalid bearer token",
@@ -50,27 +56,47 @@
       "name": "thesis.promote",
       "method": "POST",
       "path": "/api/theses/:id/promote",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {},
-      "response": { "200": "{ ok: true, thesis }" },
+      "response": {
+        "200": "{ ok: true, thesis }"
+      },
       "errors": {
         "401": "missing/invalid bearer token",
         "403": "thesis exists but is owned by another member",
         "404": "no thesis with that id"
       },
-      "notes": "One-way ratchet: system -> public only. Idempotent if already public. No downgrade endpoint exists."
+      "notes": "system -> public. Idempotent if already public. Reversible since 2026-07-30: thesis.demote takes it back to system (2026-07-12 requirements §2.1 - 「一键升档（①→②→③）；降档时已生成的历史内容不回收（如实告知）」)."
+    },
+    {
+      "name": "thesis.demote",
+      "method": "POST",
+      "path": "/api/theses/:id/demote",
+      "auth": "bearer-only",
+      "body": {},
+      "response": {
+        "200": "{ ok: true, thesis, notice }"
+      },
+      "errors": {
+        "401": "missing/invalid bearer token",
+        "403": "thesis exists but is owned by another member",
+        "404": "no thesis with that id"
+      },
+      "notes": "public -> system, owner-only. Idempotent if already system. `notice` is the verbatim 「降档已生效；此前已生成的报告/名片内容不回收。」 - demotion removes the row from other members' 名片 from now on and retracts NOTHING already generated while it was public (reports, cards, Feishu messages keep what they printed). Writes an audit_log row (category strategy_memory)."
     },
     {
       "name": "rule.create",
       "method": "POST",
       "path": "/api/rules",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {
         "ruleText": "string, required",
         "enforcement": "\"hard\" | \"proposal_check\" | \"self\", required",
         "linkedStrategy": "string, optional"
       },
-      "response": { "201": "{ ok: true, rule, mirror }" },
+      "response": {
+        "201": "{ ok: true, rule, mirror }"
+      },
       "errors": {
         "400": "{ ok: false, error, field } - missing ruleText, invalid enforcement",
         "401": "missing/invalid bearer token"
@@ -80,9 +106,11 @@
       "name": "rule.disable",
       "method": "POST",
       "path": "/api/rules/:id/disable",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {},
-      "response": { "200": "{ ok: true, rule }" },
+      "response": {
+        "200": "{ ok: true, rule }"
+      },
       "errors": {
         "401": "missing/invalid bearer token",
         "403": "rule exists but is owned by another member",
@@ -94,7 +122,7 @@
       "name": "card.create",
       "method": "POST",
       "path": "/api/cards",
-      "auth": "bearer",
+      "auth": "bearer-only",
       "body": {
         "name": "string, required",
         "scene": "string, optional",
@@ -103,11 +131,115 @@
         "exitRule": "string, optional",
         "visibility": "\"system\" | \"public\", optional, default \"system\""
       },
-      "response": { "201": "{ ok: true, card, mirror }" },
+      "response": {
+        "201": "{ ok: true, card, mirror }"
+      },
       "errors": {
         "400": "{ ok: false, error, field } - missing name, invalid visibility",
         "401": "missing/invalid bearer token"
       }
+    },
+    {
+      "name": "card.promote",
+      "method": "POST",
+      "path": "/api/cards/:id/promote",
+      "auth": "bearer-only",
+      "body": {},
+      "response": {
+        "200": "{ ok: true, card }"
+      },
+      "errors": {
+        "401": "missing/invalid bearer token",
+        "403": "card exists but is owned by another member",
+        "404": "no card with that id"
+      },
+      "notes": "system -> public, owner-only. Idempotent if already public. Until 2026-07-30 a card could only be published at create time."
+    },
+    {
+      "name": "card.demote",
+      "method": "POST",
+      "path": "/api/cards/:id/demote",
+      "auth": "bearer-only",
+      "body": {},
+      "response": {
+        "200": "{ ok: true, card, notice }"
+      },
+      "errors": {
+        "401": "missing/invalid bearer token",
+        "403": "card exists but is owned by another member",
+        "404": "no card with that id"
+      },
+      "notes": "public -> system, owner-only. Idempotent if already system. `notice` is the verbatim 「降档已生效；此前已生成的报告/名片内容不回收。」 - demotion removes the row from other members' 名片 from now on and retracts NOTHING already generated while it was public (reports, cards, Feishu messages keep what they printed). Writes an audit_log row (category strategy_memory)."
+    },
+    {
+      "name": "research.submit",
+      "method": "POST",
+      "path": "/api/research",
+      "auth": "bearer",
+      "body": {
+        "question": "string, required - the research question, in Chinese"
+      },
+      "response": {
+        "201": "{ ok: true, taskId, redirect }"
+      },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing question",
+        "401": "missing/invalid identity",
+        "429": "{ ok: false, error, used, limit } - the member's per-trading-day research quota is spent; it resets at the US Eastern trading-day boundary"
+      },
+      "notes": "`redirect` is the task's own reading page (/research/<id>), where the step stream and the finished verdict appear. The verdict is also pushed to the member's Feishu DM when it completes."
+    },
+    {
+      "name": "research.promote",
+      "method": "POST",
+      "path": "/api/research/:id/promote",
+      "auth": "bearer",
+      "body": {},
+      "response": {
+        "200": "{ ok: true, task }"
+      },
+      "errors": {
+        "401": "missing/invalid identity",
+        "403": "the research task belongs to another member",
+        "404": "no research task with that id"
+      },
+      "notes": "One-way, owner-only: a private verdict becomes visible to the circle. Idempotent on an already-public task (and a repeat writes no second audit entry). No downgrade endpoint exists."
+    },
+    {
+      "name": "research.thesis",
+      "method": "POST",
+      "path": "/api/research/:id/thesis",
+      "auth": "bearer",
+      "body": {
+        "symbol": "string, required",
+        "direction": "\"bull\" | \"bear\" | \"neutral\", required"
+      },
+      "response": {
+        "201": "{ ok: true, thesis }"
+      },
+      "errors": {
+        "400": "{ ok: false, error, field } - missing symbol, invalid direction, or the task has no conclusion to save",
+        "401": "missing/invalid identity",
+        "403": "the research task belongs to another member",
+        "404": "no research task with that id"
+      },
+      "notes": "存为论点: turns a finished verdict into one of the caller's own theses, carrying that verdict's conclusion as the evidence point. The new thesis lands at `system` visibility - saving is not publishing."
+    },
+    {
+      "name": "review.confirm",
+      "method": "POST",
+      "path": "/api/reviews/:id/confirm",
+      "auth": "bearer",
+      "body": {},
+      "response": {
+        "200": "{ ok: true, review, mirror, notify }"
+      },
+      "errors": {
+        "401": "missing/invalid identity",
+        "403": "the review belongs to another member",
+        "404": "no review with that id"
+      },
+      "notes": "draft -> confirmed, one-way and idempotent. Confirming mirrors the conclusion into the member's private memory and sends their own Feishu confirmation card."
     }
   ],
   "read_only_pages": [
@@ -116,7 +248,7 @@
       "method": "GET",
       "path": "/strategy",
       "format": "html",
-      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "auth": "bearer OR alphaloop_session cookie",
       "note": "My discipline rules + my theses/strategy cards (every visibility) + the circle's public-only section."
     },
     {
@@ -124,7 +256,7 @@
       "method": "GET",
       "path": "/member/:id",
       "format": "html",
-      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "auth": "bearer OR alphaloop_session cookie",
       "note": "A member's public card: public strategy cards + public theses only."
     },
     {
@@ -132,36 +264,138 @@
       "method": "GET",
       "path": "/stock/:symbol",
       "format": "html",
-      "auth": "bearer OR Cf-Access-Authenticated-User-Email"
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "Public stock analysis for that symbol, plus a 我的论点卡 section holding the CALLER's own theses and other members' PUBLIC ones - another member's private thesis never appears."
     },
     {
       "name": "proposal.detail",
       "method": "GET",
       "path": "/proposal/:id",
       "format": "html",
-      "auth": "bearer OR Cf-Access-Authenticated-User-Email",
+      "auth": "bearer OR alphaloop_session cookie",
       "note": "Owner-only, 403 for a non-owner's real id, 404 for an unknown id."
+    },
+    {
+      "name": "research.detail",
+      "method": "GET",
+      "path": "/research/:id",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "One research task: live step stream while it runs, then the verdict. Owner-only unless the task was promoted to public."
+    },
+    {
+      "name": "review.detail",
+      "method": "GET",
+      "path": "/review/:id",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "Owner-only monthly review, draft or confirmed - a non-owner gets 403 unconditionally."
+    },
+    {
+      "name": "reports.index",
+      "method": "GET",
+      "path": "/reports",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The report list, newest first: the circle-visible daily / weekly / stock-analysis reports, plus the caller's OWN official-paper snapshots. Another member's official-paper artifacts are never listed, and the ones withheld are disclosed as a count, not silently dropped."
+    },
+    {
+      "name": "stock-analysis.report",
+      "method": "GET",
+      "path": "/stock-analysis/:date",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "One batch of the public stock analysis, by YYYY-MM-DD date."
+    },
+    {
+      "name": "official-paper.report",
+      "method": "GET",
+      "path": "/official-paper/:date",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "Owner-only: the paper account's post-open P&L artifact for that date, readable only by the member it is attributed to."
+    },
+    {
+      "name": "daily.report",
+      "method": "GET",
+      "path": "/daily/:date",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The public daily report for a YYYY-MM-DD date. Carries no per-member holdings or P&L."
+    },
+    {
+      "name": "weekly.report",
+      "method": "GET",
+      "path": "/weekly/:date",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The public weekly report for a YYYY-MM-DD date."
+    },
+    {
+      "name": "daily.personal",
+      "method": "GET",
+      "path": "/daily/:date/me",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The CALLER's own daily page (holdings, discipline check, alert review). Owner-scoped: there is no way to read anyone else's."
+    },
+    {
+      "name": "weekly.personal",
+      "method": "GET",
+      "path": "/weekly/:date/me",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The CALLER's own weekly page - same owner scoping as the daily one."
+    },
+    {
+      "name": "news.page",
+      "method": "GET",
+      "path": "/news",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie"
+    },
+    {
+      "name": "paper.page",
+      "method": "GET",
+      "path": "/paper",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie",
+      "note": "The official Longbridge paper account's equity curve and allocation."
+    },
+    {
+      "name": "home.page",
+      "method": "GET",
+      "path": "/",
+      "format": "html",
+      "auth": "bearer OR alphaloop_session cookie"
+    },
+    {
+      "name": "health",
+      "method": "GET",
+      "path": "/health",
+      "format": "json",
+      "auth": "none",
+      "note": "{ ok: true, service: \"platform-app\" }. The only unauthenticated route besides the login pages."
     }
   ],
   "existing_but_not_yet_http": [
     {
       "name": "alert.crud",
-      "status": "P2 shipped",
-      "surface": "local CLI only (apps/openclaw-config/scripts/market-alerts.mjs: add/remove/pause/resume/feedback/list)",
-      "note": "No bearer-gated HTTP endpoint exists yet - a skill cannot call this remotely today."
+      "status": "shipped, CLI only",
+      "surface": "local CLI (apps/openclaw-config/scripts/market-alerts.mjs: add/remove/pause/resume/feedback/list), or ask the Feishu bot - its route table drives that same CLI",
+      "note": "No bearer-gated HTTP endpoint exists - a skill cannot call this over HTTP today."
     },
     {
       "name": "proposal.request",
-      "status": "P6 shipped",
-      "surface": "local CLI only for creation (proposals.mjs run create); GET /proposal/:id (above) is the only HTTP surface, and it is read-only",
-      "note": "No bearer-gated HTTP write endpoint exists yet for submitting a new proposal from a skill."
-    }
-  ],
-  "forthcoming": [
+      "status": "shipped, CLI only",
+      "surface": "local CLI for creation (proposals.mjs create), or ask the Feishu bot; GET /proposal/:id above is the only HTTP surface and it is read-only",
+      "note": "No bearer-gated HTTP write endpoint exists for submitting a new proposal from a skill. Approval itself is only ever the member's own tap on their Feishu card."
+    },
     {
-      "name": "research.submit",
-      "status": "P8 not yet built",
-      "note": "research_tasks has no writer of any kind yet (CLI or HTTP); GET /research/:id today only ever renders the honest '研究执行 P8 上线' placeholder."
+      "name": "stock.analyze",
+      "status": "shipped, CLI only",
+      "surface": "local CLI (stock-analysis.mjs analyze <SYMBOL>), or ask the Feishu bot for an on-demand single-symbol analysis",
+      "note": "Read-only and non-publishing: it renders one symbol's analysis for the asker and writes nothing to the public analysis library. The published batch lives behind GET /stock/:symbol above."
     }
   ]
 }

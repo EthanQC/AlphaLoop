@@ -399,3 +399,18 @@ export function assertOrderTicket(value: unknown): asserts value is OrderTicket 
     throw new Error("Order ticket missing required proposalId.");
   }
 }
+
+/**
+ * What a member is told when they demote a strategy card or thesis from ③公开
+ * back to ②系统可用.
+ *
+ * The second clause is the honest part and the reason this string is shared
+ * rather than typed twice: 2026-07-12 requirements §2.1 says 「降档时已生成的
+ * 历史内容不回收（如实告知）」. Demotion flips one column. It does not reach into
+ * reports, cards or Feishu messages that were produced while the content was
+ * public, and claiming otherwise - or saying nothing and letting the member
+ * assume it - would be the lie. Both write faces (the platform's
+ * routes/api-strategy.ts and the CLI's strategy.mjs) return this exact
+ * sentence, so the two cannot tell a member different stories.
+ */
+export const STRATEGY_DEMOTION_NOTICE = "降档已生效；此前已生成的报告/名片内容不回收。";
