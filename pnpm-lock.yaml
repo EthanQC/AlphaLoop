@@ -36,6 +36,8 @@ importers:
         specifier: 4.3.3
         version: 4.3.3
 
+  apps/openclaw-config: {}
+
   apps/platform-app:
     dependencies:
       '@packages/shared-types':
