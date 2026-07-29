@@ -33,8 +33,11 @@ import { describeVerdictForInstaller, isHandoverHealthy, judgeLaunchdRuntime, pa
 // THE RULE THIS MODULE ENFORCES
 // -----------------------------
 //   1. Nothing is ever deleted. A retired plist is MOVED into
-//      ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/, the same
-//      archive install-system-daemons.sh uses, and can be bootstrapped back.
+//      ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/ and can be
+//      bootstrapped back. Same parent directory and same naming as
+//      install-system-daemons.sh (see archiveDirectoryName), NOT the same
+//      directory: <ts> has second resolution and each script stamps its own, so
+//      one deploy normally leaves two or three sibling backup directories.
 //   2. A label whose service was taken over by a system daemon is only
 //      retired once that daemon is verified RUNNING (round 6: not merely
 //      "answers `launchctl print`" - a daemon that bootstrapped and died

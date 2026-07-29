@@ -29,9 +29,16 @@ import { MANAGED_REPORT_LAUNCHD_LABELS } from "./openclaw-report-launchd-jobs.mj
 // just DELIBERATELY kept for services whose daemon failed to come up - three
 // of which cannot be recreated from this repo at all. Both halves now go
 // through launchd-agent-archive.mjs: the system-owned labels are only touched
-// once their replacement daemon answers `launchctl print`, and every retired
-// plist is MOVED into ~/Library/LaunchAgents.disabled/openclaw-system-backup-
-// <ts>/ rather than deleted. See that module's header for the measurement.
+// once their replacement daemon passes the SAME residency contract the shell
+// installer and the doctor use (`isHandoverHealthy` over `judgeLaunchdRuntime`
+// - a resident daemon must report `state = running`), and every retired plist
+// is MOVED into ~/Library/LaunchAgents.disabled/openclaw-system-backup-<ts>/
+// rather than deleted. See that module's header for the measurement.
+//
+// Until 2026-07-29 this paragraph said "once their replacement daemon answers
+// `launchctl print`", which round-6 finding S3e had already replaced in the
+// code: a daemon that bootstrapped and died answers `print` with exit 0, so
+// that rule would archive the fallback of a service that is not running.
 //
 // Task H7 (2026-07-14 legacy audit) context, still true: the daily/weekly
 // report and stock-analysis jobs are owned by the openclaw cron channel

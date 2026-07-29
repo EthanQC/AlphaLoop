@@ -125,11 +125,19 @@ export const LAUNCHD_SERVICE_HEALTH = {
 // a crash-looping job at runs = 3 went back to runs = 1 after
 // `launchctl bootout` + `launchctl bootstrap`. install-system-daemons.sh boots
 // every label out and back in on every run, so this counter cannot accumulate
-// across deploys, and 20 means 19 deaths since the last install.
+// across deploys, and 20 means 19 RELAUNCHES since the last install.
 //
-// A healthy install leaves runs = 2 (RunAtLoad spawns it once, then
-// `kickstart -k` restarts it) - which is exactly what the mini reports today
-// for platform-app and broker-executor, with 10 for gateway and cron-runner.
+// Relaunches, not deaths - a distinction this comment blurred until 2026-07-29
+// and the paragraph below already disproved: a healthy install leaves runs = 2
+// (RunAtLoad spawns it once, then the installer's own `kickstart -k` restarts
+// it), which is one relaunch and zero deaths. `runs` counts every start after
+// the first whatever caused it, so at the threshold at most 18 of the 19 can
+// be crashes, and on a machine an operator has kickstarted by hand, fewer. The
+// count is evidence of churn, and it is only called a crash loop together with
+// the window below - which is exactly what round-7 K6 was about.
+//
+// runs = 2 is what the mini reports today for platform-app and broker-executor,
+// with 10 for gateway and cron-runner.
 export const RESIDENT_CRASH_LOOP_RUNS = 20;
 
 // Round-7 finding K6: a COUNT is not a loop. Everything the comment above says
@@ -141,8 +149,8 @@ export const RESIDENT_CRASH_LOOP_RUNS = 20;
 // been alive 10 days 6 hours at the time of the reading. A machine left alone
 // for a few more weeks crosses 20 through ordinary occasional restarts, and a
 // rule with no time dimension would then light a permanent red claiming it
-// "died 19 times since the last install" - true, and yet a lie about what is
-// happening now.
+// "died 19 times since the last install" - not even true, per the relaunch /
+// death distinction above, and a lie about what is happening now regardless.
 //
 // So a crash loop needs both halves: the count AND a window it happened in. A
 // day is the window, and it is deliberately generous in the direction of not

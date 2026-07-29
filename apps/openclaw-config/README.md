@@ -16,8 +16,8 @@
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
-- `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没加载时干脆不动，见下面「谁拥有哪个标签」）。
-- `scripts/launchd-agent-archive.mjs`：上面那条规则的唯一实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它。
+- `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没通过 `launchd-health.mjs` 的 residency 判定时干脆不动，见下面「谁拥有哪个标签」第 2 条）。
+- `scripts/launchd-agent-archive.mjs`：上面那条规则的 **node 侧**实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它（shell 安装器另有一份自己的实现，见下面「谁拥有哪个标签」）。
 - `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 - `scripts/install-cloudflared-tunnel.mjs`：给**还没有 connector 的机器**安装用户级 cloudflared 隧道（token 模式）。mini 上已经跑着系统级的 `com.cloudflare.cloudflared`，所以这条脚本在那里会拒绝执行，见下面「公网入口」。
@@ -72,7 +72,7 @@ pnpm official-paper:pnl
 | --- | --- | --- |
 | `system` | `/Library/LaunchDaemons`，开机即起、不需要图形登录 | `install-system-daemons.sh`（**sudo**） |
 | `user` | `~/Library/LaunchAgents`，需要用户登录会话 | `install-launchd.sh`（`pnpm launchd:install-backup-alerts`） |
-| `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉，并**统一移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（三个脚本共用同一个归档目录，谁都不删除） | — |
+| `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉，并**统一移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（同一个父目录、同一套时间戳命名，每次运行各建各的子目录；谁都不删除） | — |
 | `external` | 由 `openclaw` CLI 自己拥有，本仓库不碰 | — |
 
 当前只有 `com.alphaloop.rsshub` 是 `user`：它整个任务体就是 `docker start rsshub`，而它依赖的容器运行时（`homebrew.mxcl.colima`）本身就是用户级 LaunchAgent，socket 和 context 都在用户家目录下。系统 daemon 会赶在那个 socket 存在之前启动然后报 "Cannot connect to the Docker daemon"——把它提升到系统域只会让新闻源更不可靠。
@@ -112,10 +112,10 @@ pnpm launchd:install-user
 
 以前这里还有第二条：「`launchd:install-user` 最好排在 daemon 安装之后，因为前者 `rmSync` 直接删、后者移进备份目录」。那条约束**是靠文档执行的，而文档执行不了**——第 5 轮 D1 实测到的正是它失效的样子：`install-system-daemons.sh` 因为某个 daemon 起不来而有意保留了它的用户级 plist、退出码 1，紧接着的 `pnpm launchd:install-user` 把这份 plist 无备份删掉、退出码 0。`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 三个标签在本仓库里没有任何模板（`apps/openclaw-config/launchd/` 只有 platform-app / market-alerts / daily-backup / rsshub 四个模板加两个历史 plist），删掉就再也生成不出来，而 mini 上这三份 plist 现在都还在。
 
-现在这条约束由代码保证，不再由顺序保证：两个 node 安装器和 shell 安装器共用 `scripts/launchd-agent-archive.mjs` 的同一条规则——
+现在这条约束由代码保证，不再由顺序保证。三个安装器遵守同一条规则，但**不是同一份代码**：两个 node 安装器共用 `scripts/launchd-agent-archive.mjs`；shell 安装器（`install-system-daemons.sh`）是独立的 zsh 实现，只在「daemon 到底算不算起来了」这一步上和它们、和 doctor 共用 `scripts/launchd-health.mjs`，另外它的 `supersedes()` 与该模块的 `SYSTEM_DAEMON_SUPERSEDING` 由 `install-launchd.test.ts` 断言相等——
 
-1. **谁都不删除。** 退役 = 移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`，三个脚本用同一个归档目录。归档目录建不出来（mini 上它是早期 sudo 运行留下的 `root staff`）时，plist 原地保留并报错退出，不会退化成删除。
-2. **接管者没起来就不动它。** 对 system/retired 标签，node 安装器先问 `launchctl print system/<接管它的 daemon>`；没加载就说明这份用户级副本正是机器现在跑的那份，于是原地不动、打印 `keptLaunchAgent` 并以退出码 1 结束。
+1. **谁都不删除。** 退役 = 移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`。三个脚本用的是同一个父目录 `~/Library/LaunchAgents.disabled` 和同一套命名（`date +%Y%m%d%H%M%S`，node 侧由 `launchd-agent-archive.mjs` 的 `archiveDirectoryName` 生成、shell 侧直接调 `date`）——**不是**同一个子目录：时间戳精确到秒，每次运行各建各的，所以一次部署会留下两三个并排的备份目录，都能 `launchctl bootstrap` 回去。归档目录建不出来（mini 上它是早期 sudo 运行留下的 `root staff`）时，plist 原地保留并报错退出，不会退化成删除。
+2. **接管者没【真的在跑】就不动它。** 对 system/retired 标签，node 安装器跑 `launchctl print system/<接管它的 daemon>`，再把输出交给 `scripts/launchd-health.mjs` 判定——和 shell 安装器、doctor 用的是同一份 residency 契约（常驻服务必须 `state = running`，不是「launchctl 认得它」）。不通过就说明这份用户级副本很可能正是机器现在跑的那份，于是原地不动、打印 `keptLaunchAgent` 并以退出码 1 结束。<br>2026-07-29 之前这一条写的是「问 `launchctl print`，没加载就不动」，那是第 6 轮 S3e 已经在代码里改掉的旧规则：bootstrap 之后当场死掉的 daemon，`print` 一样退出 0。
 3. **shell 安装器按服务逐个交接。** 停旧 → 起新 → **确认它真的在跑** → 才归档；起不来就把刚停掉的 agent 立刻 `bootstrap gui/<uid>` 回去。所以单个服务的停机窗口是「一次 bootout + settle」（默认 2 秒，本机实测最坏 2.1 秒），其余服务不受影响，任何服务都不会同时跑两份。
 
    第三步在 2026-07-29 之前是 `launchctl print system/<label>` 的退出码，而那只能证明**注册过**。实测（真实安装脚本 + 沙箱 root + launchctl stub）：platform-app / broker-executor / market-alerts 三个 daemon bootstrap 成功、`print` 退出 0，但 job 报 `state = not running` + `last exit code = 1`——脚本把 8 个标签全部打印成 `loaded`、把每一份用户级 plist 都归档掉、退出 0。现在它调 `launchd-health.mjs`（doctor 的同一份 residency 契约）：常驻服务必须 `state = running`，周期任务的首次运行不能异常退出，`runs ≥ 20` 也不放行（安装脚本这一侧不区分崩溃重启循环和「攒了很多次重启」——刚 bootstrap 完的服务两者都不该出现）。不满足 → 不归档、把旧 agent 立刻拉回来、以退出码 1 汇总，并把这次失败写进部署收据。

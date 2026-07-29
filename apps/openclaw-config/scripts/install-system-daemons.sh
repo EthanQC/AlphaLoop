@@ -31,12 +31,12 @@ if [ "${TARGET_USER}" = "root" ]; then
   echo "install-system-daemons: refusing to install daemons that run as root." >&2
   echo "install-system-daemons: run this as 'sudo zsh $0' from the operator's shell," >&2
   echo "install-system-daemons: or pass TARGET_USER=<operator> explicitly." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 if ! id -u "${TARGET_USER}" >/dev/null 2>&1; then
   echo "install-system-daemons: no such user '${TARGET_USER}' on this machine." >&2
   echo "install-system-daemons: pass TARGET_USER=<operator> to install for someone else." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 # Ask the directory service where that user's home actually is instead of
 # assuming /Users/<name>; the fallback keeps the previous behaviour for the
@@ -167,13 +167,15 @@ AGENTS_DIR="${TARGET_HOME}/Library/LaunchAgents"
 # moved into it, and nothing creates it otherwise.
 BACKUP_PARENT="${TARGET_HOME}/Library/LaunchAgents.disabled"
 BACKUP_DIR="${BACKUP_PARENT}/openclaw-system-backup-$(date +%Y%m%d%H%M%S)"
-# TMP_DIR is deliberately NOT created here: the PRINT_CONFIG_ONLY preflight and
-# the "needs root" refusal below both exit before it, and both promise to leave
-# nothing behind. `mktemp -d` on this line would have made that promise false.
+# TMP_DIR is deliberately NOT created here: every exit that can happen before
+# `trap 'on_exit' EXIT` is installed (they are marked `# pre-trap exit` on the
+# `exit` line itself) happens ABOVE the `mktemp -d`, and each one promises to
+# leave nothing behind. `mktemp -d` on this line would have made that promise
+# false for all of them.
 
 if [ ! -f "${OWNERSHIP_FILE}" ]; then
   echo "install-system-daemons: ownership manifest not found at ${OWNERSHIP_FILE}" >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 
 # Round 6: this script's own exit code becomes a deploy-ledger receipt for
@@ -193,10 +195,25 @@ fi
 # come up". The doctor closes the same hole from its own side with
 # `deploy-ledger.unwritable`.
 #
-# Not covered: the two refusals above (running as root, TARGET_USER does not
-# exist) exit before this point and leave no receipt. They also change nothing
-# on the machine, and `deploy.sh` records step 3's exit code itself whichever
-# way this script exits.
+# Not covered: every exit that happens before the EXIT trap is installed leaves
+# no receipt. There are EIGHT of them, not the two this comment claimed until
+# 2026-07-29 - three above this line (TARGET_USER=root, no such user, no
+# ownership manifest) and five below it (no pnpm, the PRINT_CONFIG_ONLY
+# preflight, needs-root, no node, no health checker). Each is marked on its own
+# `exit` line, and the count is re-run by the claim guard rather than trusted:
+#
+# @claim-count 8 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+\s+# pre-trap exit
+# @claim-count 13 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+
+#
+# The second directive is the part that cannot be gamed: it counts EVERY `exit`
+# in the file, so adding one anywhere fails the suite until whoever added it
+# says which side of the trap it is on. The `|| true` miscount round 5 found
+# here is exactly what happens without that.
+#
+# The two facts the original sentence got right are unchanged: none of these
+# eight paths changes anything on the machine (they are all above the `mktemp
+# -d`), and `deploy.sh` records step 3's exit code itself whichever way this
+# script exits.
 INSTALL_RESULT_RECORDED=""
 LEDGER_WRITE_FAILED=""
 record_install_result() {
@@ -271,7 +288,7 @@ fi
 if [ -z "${PNPM_BIN}" ]; then
   echo "install-system-daemons: cannot resolve a pnpm binary under ${PATH_ENV}." >&2
   echo "install-system-daemons: install pnpm for ${TARGET_USER} or pass PNPM_BIN=/path/to/pnpm." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 
 daemon_uses_proxy() {
@@ -289,6 +306,13 @@ daemon_uses_proxy() {
 # as the thing to run before the real `sudo` invocation, because every value
 # below is derived rather than typed and getting TARGET_USER wrong installs
 # eight daemons pointing at a home directory that isn't yours.
+#
+# "Eight" is this script's most-repeated number (README, the run summary, the
+# gateway warning below), it is not written down anywhere in this file, and it
+# would go stale the day a ninth `system` row is added to the manifest. So it
+# is re-counted from the manifest itself on every `pnpm test`:
+#
+# @claim-count 8 :: apps/openclaw-config/scripts/install-launchd-ownership.txt :: ^system\s
 #
 # ⚠ WHAT THIS SCRIPT INTERRUPTS THAT IS NOT OURS (round 6).
 #
@@ -331,7 +355,7 @@ if [ -n "${PRINT_CONFIG_ONLY:-}" ]; then
   else
     echo "running_as_root=no"
   fi
-  exit 0
+  exit 0  # pre-trap exit: no deploy receipt is written for this path
 fi
 
 # /Library/LaunchDaemons is root-owned, and so is the system launchd domain
@@ -344,7 +368,7 @@ if [ "${SYSTEM_DIR}" = "/Library/LaunchDaemons" ] && [ "$(id -u)" -ne 0 ]; then
   echo "install-system-daemons: writing ${SYSTEM_DIR} and bootstrapping the system launchd domain needs root." >&2
   echo "install-system-daemons: re-run as: sudo zsh $0" >&2
   echo "install-system-daemons: (the daemons themselves still run as ${TARGET_USER}, via UserName in each plist)." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 
 # Same rule as PNPM_BIN, and for a stronger reason: NODE_BIN is written into
@@ -357,17 +381,19 @@ if [ ! -x "${NODE_BIN}" ]; then
   echo "install-system-daemons: three of the daemons run node by this exact path, so installing them now" >&2
   echo "install-system-daemons: would produce services that load and then fail every run with ENOENT." >&2
   echo "install-system-daemons: install node there for ${TARGET_USER}, or pass NODE_BIN=/path/to/node." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 if [ ! -f "${HEALTH_CHECKER}" ]; then
   echo "install-system-daemons: health checker not found at ${HEALTH_CHECKER}." >&2
   echo "install-system-daemons: without it this script could only prove daemons are REGISTERED, not that they" >&2
   echo "install-system-daemons: are running - which is the exact check finding S3e added. Refusing to run." >&2
-  exit 1
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 
 # Past this point the script does write. The staging directory is created here
-# rather than at the top so the two exits above leave the machine untouched,
+# rather than at the top so the eight pre-trap exits above leave the machine
+# untouched (they are counted, not asserted - see the @claim-count directives
+# next to record_install_result),
 # and the trap removes it on every path out - including the manifest-drift
 # abort below, which used to leak one directory per failed run.
 # An explicit template rather than a bare `mktemp -d`: BSD mktemp ignores
@@ -887,11 +913,25 @@ EOF
 #
 # Round-5 finding D7: the comment that used to sit here claimed this construct
 # was correct "HERE and only here". That was never true - `grep '|| true'` on
-# this file has always returned several live sites (the .env.local read, the
-# pnpm lookup, the obsolete-label bootout/disable, the system-domain bootout,
-# the three `grep -c` counters in the summary), each defensible for its own
-# reason. No count is quoted this time on purpose: a number in a comment is a
-# claim that rots on the next edit, which is exactly how the false one got here.
+# this file has always returned several live sites, each defensible for its own
+# reason.
+#
+# D7's replacement then said "no count is quoted this time on purpose: a number
+# in a comment is a claim that rots on the next edit", and paired that with a
+# parenthetical enumeration (.env.local read, pnpm lookup, obsolete-label
+# bootout/disable, system-domain bootout, three `grep -c` counters) that read as
+# exhaustive and was not - it left out the ledger-directory `chown`, this very
+# bootout, and the `launchctl print` capture in verify_daemon: 8 named, 11
+# there. Refusing to write the number did not make the sentence honest, it just
+# moved the false claim into the list.
+#
+# So the number is written down and re-counted by the claim guard on every
+# `pnpm test` (test/claim-guard.ts), which is the thing that was missing:
+#
+# @claim-count 11 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^[^#]*\|\| true
+#
+# Eleven live sites. Adding or removing one fails the suite here until this
+# paragraph is re-read.
 # Round-6 finding S3f. This used to print a warning about a label that survived
 # bootout, `return 0` with NOTHING on stdout, and let the caller carry on -
 # so the loop bootstrapped the daemon anyway, archived the plist, and the run
