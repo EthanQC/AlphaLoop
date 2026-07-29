@@ -12,7 +12,7 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
-- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先查报告投递需要的两个变量（缺就退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
+- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先跑两道预检（都退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）：报告投递需要的两个变量，以及「第 3 步的 sudo 要密码但这次运行没有终端」——后者不拦的话第 0/1/2 步会成功、第 3 步必然失败，而第 2 步装上的用户级 gateway 正要靠第 3 步接管走，于是 18789 上留下两个 gateway 抢端口。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。

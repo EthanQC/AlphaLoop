@@ -33,7 +33,9 @@ set -euo pipefail
 #   0  every step this run was asked to execute exited 0, doctor included
 #   1  a step failed; the machine is half-deployed and the ledger says so
 #   2  called wrong, or the gateway restart was never acknowledged - NOTHING ran
-#   3  配置未就绪: a required variable is unset, refused BEFORE step 0 - NOTHING ran
+#   3  未就绪，refused BEFORE step 0 - NOTHING ran. Two causes: a required
+#      variable is unset (配置未就绪), or sudo needs a password and this run has
+#      no tty to ask on, which would strand step 3 (see the sudo pre-flight)
 #   4  a step's receipt could not be written; the acceptance gate cannot see
 #      this deploy at all, so nothing it says about it can be trusted
 #   129/130/143  the run was INTERRUPTED by SIGHUP / SIGINT / SIGTERM - see the
@@ -248,6 +250,63 @@ if [ -n "${MISSING_CONFIG}" ]; then
   esac
 fi
 
+# ---------------------------------------------------------------------------
+# ⚙ sudo 预检（round 8, finding L6）。
+#
+# 第 3 步是 `sudo zsh install-system-daemons.sh`。只读实测（mini，2026-07-29）：
+# `sudo -n true` 返回「sudo: a password is required」——那台机器的 sudo 要密码。
+# 而 README 自己推荐的抗断线写法 `nohup zsh deploy.sh > log 2>&1 &`，以及控制器
+# 常用的 `ssh host '<命令>'`，给到的 stdin 都不是终端，sudo 没有地方问密码。
+#
+# 实测这个组合（真 deploy.sh、真账本、要密码的 sudo、stdin 不是 tty）：
+#   第 0/1/2 步全部成功 → 第 3 步 `sudo: no tty present` 退出 1 → 部署停在这里，
+#   收据 0:0,1:0,2:0,3:1，验收门确实报红。
+# 门是诚实的，但机器已经被改坏了：第 2 步【已经装上了用户级 ai.openclaw.gateway】，
+# 而把它 bootout 的正是没跑成的第 3 步。于是 18789 上同时存在用户级和系统级两个
+# gateway——那个端口正是操作者 185 个 agent 的唯一入口。
+#
+# 也就是说：这条路必然失败，而且失败点恰好在「已经动了 gateway、还没接管」的中间。
+# 所以在第 0 步之前就把它拦掉——拦下来的时候机器一点没动。
+#
+# 三个条件同时成立才拦：第 3 步这次真的会跑、sudo 确实要密码、而且没有终端可问。
+# 任何一个不成立都放行（NOPASSWD 的机器、前台跑的会话、DEPLOY_FROM_STEP=4 跳过第 3 步）。
+# ---------------------------------------------------------------------------
+check_sudo_preflight() {
+  [ "${FROM_STEP}" -le 3 ] || return 0
+  [ ! -t 0 ] || return 0
+  if ! "${SUDO}" -n true >/dev/null 2>&1; then
+    case "${DEPLOY_ALLOW_SUDO_PROMPT:-}" in
+      yes|YES|1|true)
+        echo "deploy: 已按 DEPLOY_ALLOW_SUDO_PROMPT 继续——如果 sudo 在第 3 步问不到密码，那一步会失败。" >&2
+        ;;
+      *)
+        {
+          echo "================================================================================"
+          echo "环境未就绪：sudo 要密码，但这次运行没有终端可以问 —— 什么都还没有动。"
+          echo ""
+          echo "第 3 步是 sudo zsh install-system-daemons.sh。现在这样跑下去，第 0/1/2 步会成功，"
+          echo "第 3 步会以「sudo: no tty present and no askpass program specified」失败——"
+          echo "而第 2 步【已经装上了用户级 ai.openclaw.gateway】，把它清掉的正是没跑成的第 3 步。"
+          echo "结果是 18789 上两个 gateway 抢同一个端口，那正是你 185 个 agent 的唯一入口。"
+          echo ""
+          echo "改成下面任一种跑法（都能让 sudo 有地方问密码，也都不怕 ssh 断线）："
+          echo "  · 在 mini 上开 tmux，再在里面前台跑（推荐，断线不会带走它）："
+          echo "      tmux new -s deploy"
+          echo "      cd ${REPO_ROOT} && DEPLOY_ACK_GATEWAY_RESTART=yes zsh ${SCRIPT_PATH}"
+          echo "  · 或者先把 sudo 凭据缓存起来，再用原来的写法："
+          echo "      sudo -v && DEPLOY_ACK_GATEWAY_RESTART=yes zsh ${SCRIPT_PATH}"
+          echo "    （sudo 的缓存默认只有 5 分钟，而第 1 步 pnpm install 可能比这久，所以更推荐 tmux。）"
+          echo ""
+          echo "确认这台机器的 sudo 不需要密码（NOPASSWD），就显式写出来："
+          echo "  DEPLOY_ALLOW_SUDO_PROMPT=yes DEPLOY_ACK_GATEWAY_RESTART=yes zsh ${SCRIPT_PATH}"
+          echo "================================================================================"
+        } >&2
+        exit 3
+        ;;
+    esac
+  fi
+}
+
 print_gateway_warning
 case "${ACK}" in
   yes|YES|1|true) ;;
@@ -256,6 +315,11 @@ case "${ACK}" in
     exit 2
     ;;
 esac
+
+# Deliberately AFTER the ack: the ack is a string comparison that runs nothing,
+# and it is the gate a human most needs to see first. Probing sudo before it
+# would mean an unacknowledged run had already invoked something.
+check_sudo_preflight
 
 HEAD_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 FAILED_STEP=""
@@ -485,8 +549,15 @@ report_and_exit() {
     echo "被打断的部署不会在下一次验收时装作没发生过。" >&2
     echo "确认这台机器上没有残留的子进程之后，从这一步继续：" >&2
     echo "  DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${PENDING_STEP} zsh ${SCRIPT_PATH}" >&2
-    echo "如果是 ssh 断线打断的，下一次让它跑在会话之外，别再被 SIGHUP 带走：" >&2
-    echo "  DEPLOY_ACK_GATEWAY_RESTART=yes nohup zsh ${SCRIPT_PATH} > ~/alphaloop-deploy.log 2>&1 &" >&2
+    # Round-8 finding L6: this used to recommend `nohup … &`. That does survive
+    # a dropped ssh - and it also takes the terminal away, which on a machine
+    # whose sudo needs a password (the mini, measured) makes step 3 fail every
+    # time, right after step 2 has installed the user-level gateway that step 3
+    # was going to take over. tmux survives the drop AND keeps a real tty.
+    echo "如果是 ssh 断线打断的，下一次在 tmux 里跑——断线不会带走它，第 3 步的 sudo 也还有地方问密码：" >&2
+    echo "  tmux new -s deploy" >&2
+    echo "  DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${PENDING_STEP} zsh ${SCRIPT_PATH}" >&2
+    echo "（断线后回来：tmux attach -t deploy）" >&2
     echo "════════════════════════════════════════════════════════════════"
     exit "${INTERRUPT_EXIT}"
   fi

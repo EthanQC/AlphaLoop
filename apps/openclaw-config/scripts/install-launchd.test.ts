@@ -1569,7 +1569,32 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
       'if [ "$FAIL_PNPM_SCRIPT" = "$1" ]; then echo "pnpm $1 failed" >&2; exit 1; fi'
     ].join("\n"));
     stub("node", 'if [ "$FAIL_NODE" = "1" ]; then echo "node script failed" >&2; exit 1; fi');
-    stub("sudo", 'if [ "$FAIL_SUDO" = "1" ]; then echo "install-system-daemons: FAILED - 3 of 8 daemons did not come up" >&2; exit 1; fi');
+    // `-n` is answered separately from FAIL_SUDO on purpose. The pre-flight
+    // (finding L6) asks `sudo -n true` to mean "can I sudo WITHOUT being asked
+    // for a password"; FAIL_SUDO means "the installer this sudo runs fails".
+    // Conflating them made an injected installer failure look like an
+    // authentication gap - so this stub stands in for a NOPASSWD machine whose
+    // installer fails, which is the case these tests are actually about.
+    // sudo is written by hand rather than through stub(), because the `-n`
+    // probe must answer BEFORE anything is appended to the call log. `sudo -n
+    // true` asks a question and runs `true`: it changes nothing, so letting it
+    // land in the log would read as "the deploy invoked sudo" and break the
+    // cases that assert nothing ran.
+    //
+    // `-n` is also answered independently of FAIL_SUDO on purpose. The
+    // pre-flight (finding L6) asks `sudo -n true` to mean "can I sudo without
+    // being asked for a password"; FAIL_SUDO means "the installer that sudo
+    // runs fails". Conflating the two made an injected installer failure look
+    // like an authentication gap. This stub therefore stands in for a NOPASSWD
+    // machine whose installer fails, which is what these cases are about.
+    writeFileSync(join(binDir, "sudo"), [
+      "#!/bin/sh",
+      'if [ "$1" = "-n" ]; then exit 0; fi',
+      `echo "sudo $@" >> "${callLog}"`,
+      'if [ "$FAIL_SUDO" = "1" ]; then echo "install-system-daemons: FAILED - 3 of 8 daemons did not come up" >&2; exit 1; fi',
+      "exit 0"
+    ].join("\n") + "\n");
+    chmodSync(join(binDir, "sudo"), 0o755);
     // Stands in for the login shell of step 7 (`zsh -lc "docker start ..."`).
     stub("loginshell", 'if [ "$FAIL_DOCKER" = "1" ]; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi');
 
@@ -2123,5 +2148,110 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     // PLATFORM_PUBLIC_BASE_URL is real and is read as configured.
     expect(output).toMatch(/· FEISHU_GROUP_CHAT_ID\n/u);
     expect(output).not.toMatch(/· PLATFORM_PUBLIC_BASE_URL\n/u);
+  });
+
+  // =========================================================================
+  // ROUND 8, finding L6: A PASSWORD-REQUIRING sudo WITH NO tty STRANDED THE
+  // DEPLOY EXACTLY WHERE IT HURTS MOST.
+  //
+  // Measured read-only on the mini (2026-07-29): `sudo -n true` answers
+  // 「sudo: a password is required」. Step 3 is `sudo zsh
+  // install-system-daemons.sh`, and BOTH recommended ways to drive this deploy
+  // hand the script a stdin that is not a terminal - README's own
+  // `nohup zsh deploy.sh > log 2>&1 &`, and the controller's
+  // `ssh host '<command>'`.
+  //
+  // MEASURED with the real deploy.sh, the real ledger and a sudo stub shaped
+  // like a real one (refuses when stdin is not a tty):
+  //   steps 0/1/2 succeed -> step 3 exits 1 with "sudo: no tty present"
+  //   -> receipts 0:0,1:0,2:0,3:1, gate red.
+  //
+  // The gate was honest; the machine was not fine. Step 2 installs the
+  // USER-LEVEL ai.openclaw.gateway and the step that boots it back out is the
+  // one that just failed - so 18789 is left with two gateways contending, and
+  // that port is the only entrance to the operator's 185-agent fleet. The path
+  // fails deterministically, and it fails after the gateway has been touched
+  // and before it has been handed over.
+  //
+  // So it is refused up front, where refusing costs nothing.
+  // =========================================================================
+  function requirePasswordForSudo(runbook: Runbook): void {
+    const sudo = join(runbook.root, "bin", "sudo");
+    writeFileSync(sudo, [
+      "#!/bin/sh",
+      // `-n` is what the pre-flight asks with: "could you run without being
+      // asked for a password?" - answered before the log line, same as the
+      // stock stub, because asking changes nothing.
+      'if [ "$1" = "-n" ]; then echo "sudo: a password is required" >&2; exit 1; fi',
+      `echo "sudo $@" >> "${runbook.callLog}"`,
+      'if [ ! -t 0 ]; then echo "sudo: no tty present and no askpass program specified" >&2; exit 1; fi',
+      "exit 0"
+    ].join("\n") + "\n");
+    chmodSync(sudo, 0o755);
+  }
+
+  it("refuses before step 0 when sudo needs a password and there is no tty to ask on", () => {
+    const runbook = makeRunbook("alphaloop-r8-sudo-notty-");
+    requirePasswordForSudo(runbook);
+
+    // spawnSync gives the child a pipe for stdin - the same thing `nohup ... &`
+    // and a non-interactive ssh both produce.
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(3);
+    expect(output).toMatch(/sudo 要密码，但这次运行没有终端可以问 —— 什么都还没有动/u);
+    // The whole point: the user-level gateway of step 2 is never installed, so
+    // nothing ends up contending for 18789.
+    expect(calls(runbook)).not.toMatch(/launchd:install-backup-alerts/u);
+    expect(receipts(runbook)).toEqual([]);
+  });
+
+  it("tells the operator why this is worse than an ordinary failed step, and how to run it instead", () => {
+    const runbook = makeRunbook("alphaloop-r8-sudo-advice-");
+    requirePasswordForSudo(runbook);
+
+    const { output } = runDeploy(runbook);
+
+    expect(output).toMatch(/用户级 ai\.openclaw\.gateway/u);
+    expect(output).toMatch(/18789/u);
+    expect(output).toMatch(/tmux new -s deploy/u);
+    expect(output).toMatch(/sudo -v &&/u);
+    expect(output).toMatch(/DEPLOY_ALLOW_SUDO_PROMPT=yes/u);
+  });
+
+  it("does not refuse when step 3 is not part of this run", () => {
+    const runbook = makeRunbook("alphaloop-r8-sudo-skipped-");
+    requirePasswordForSudo(runbook);
+    runbook.env.DEPLOY_FROM_STEP = "4";
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(0);
+    expect(output).not.toMatch(/sudo 要密码/u);
+  });
+
+  it("does not refuse on a NOPASSWD machine", () => {
+    // makeRunbook's stock sudo stub exits 0 for everything, `-n` included -
+    // i.e. it stands in for a machine that never prompts.
+    const runbook = makeRunbook("alphaloop-r8-sudo-nopasswd-");
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(0);
+    expect(output).not.toMatch(/sudo 要密码/u);
+  });
+
+  it("proceeds when the operator explicitly overrides the sudo pre-flight", () => {
+    const runbook = makeRunbook("alphaloop-r8-sudo-override-");
+    requirePasswordForSudo(runbook);
+    runbook.env.DEPLOY_ALLOW_SUDO_PROMPT = "yes";
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(output).toMatch(/已按 DEPLOY_ALLOW_SUDO_PROMPT 继续/u);
+    // The override is honoured, and the deploy then fails at step 3 exactly as
+    // the refusal predicted - which is the evidence that the prediction is real.
+    expect(status).toBe(1);
+    expect(receipts(runbook).at(-1)).toMatchObject({ step: 3, exitCode: 1 });
   });
 });

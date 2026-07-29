@@ -69,7 +69,7 @@ pnpm platform:start
 
 跑之前请：①确认没有正在跑的会话（`openclaw cron status`，以及看一眼 gateway 的子进程），等它跑完或手动停掉；②把重要的 codex 会话结果落盘；③挑一个你自己不用 agent 的时间窗口。确认了才带上 `DEPLOY_ACK_GATEWAY_RESTART=yes`——没有这个确认，部署脚本会在**什么都还没做**的时候停下来。
 
-### 跑之前先确认这四件事
+### 跑之前先确认这几件事
 
 开发机（代码写在哪台就是哪台）：
 
@@ -77,7 +77,7 @@ pnpm platform:start
 git rev-list --count origin/main..HEAD    # 必须是 0
 ```
 
-不是 0 就先 `git push origin main`。部署机只认 `origin`，本地没 push 的 commit 它拉不到。
+不是 0 就先 `git push origin main`。部署机只认 `origin`，本地没 push 的 commit 它拉不到。**这一条是硬前提，不是提醒**：2026-07-29 实测，把一个停在 `14b1202` 的检出配上一个还停在 `a4e39c1` 的 origin，照下面那条命令跑，结果是 `git pull` 成功把机器推到 `a4e39c1`、然后 `zsh: can't open input file: apps/openclaw-config/scripts/deploy.sh` 退出 127——因为 `deploy.sh` 是 `43a4336` 才进仓库的，`a4e39c1` 里没有它。机器的检出被换掉了，dist 和八个 daemon 还是旧的，一条部署收据都没有。**push 之后再开始。**
 
 部署机（下面按 mini 的实际布局写成 `~/AlphaLoop`，换机器时替换成实际检出路径）：
 
@@ -85,9 +85,15 @@ git rev-list --count origin/main..HEAD    # 必须是 0
 id -un                                                   # 记下这个用户名，第 3 步的 daemon 以他的身份运行
 git -C ~/AlphaLoop status --porcelain | grep -v '^??'    # 必须无输出（未跟踪的 reports/ 产物不算）
 zsh -lc 'command -v pnpm node docker'                    # 三个都要有
+sudo -n true                                             # 见下面「sudo 要不要密码」
+grep -E '^(FEISHU_GROUP_CHAT_ID|PLATFORM_PUBLIC_BASE_URL)=' ~/AlphaLoop/.env.local
 ```
 
-最后一条必须走 login shell：mini 上 `ssh … 'command -v docker'` 什么都不返回，`ssh … zsh -lc 'command -v docker'` 才返回 `/opt/homebrew/bin/docker`。Homebrew 的 PATH 只在 login shell 里，第 7 步会踩到这一点。
+第三条必须走 login shell：mini 上 `ssh … 'command -v docker'` 什么都不返回，`ssh … zsh -lc 'command -v docker'` 才返回 `/opt/homebrew/bin/docker`。Homebrew 的 PATH 只在 login shell 里，第 7 步会踩到这一点。
+
+**sudo 要不要密码，决定你能怎么跑。** 第 3 步是 `sudo zsh install-system-daemons.sh`。`sudo -n true` 打印「a password is required」就说明这台机器的 sudo 要密码（mini 上 2026-07-29 只读实测就是这样），那么**这次部署必须跑在一个有终端的会话里**。原因不是麻烦，是实测出来的后果：要密码的 sudo + 没有终端（`nohup … &`、`ssh host '<命令>'` 都是这种），第 0/1/2 步会全部成功，第 3 步以 `sudo: no tty present` 失败——而第 2 步**已经装上了用户级 `ai.openclaw.gateway`**，把它清掉的正是没跑成的第 3 步。结果是 18789 上两个 gateway 抢同一个端口，而那是你 185 个 agent 的唯一入口。脚本现在会在第 0 步之前就以退出码 3 拦住这种跑法（什么都不动），但知道为什么比被拦住更有用。
+
+**最后一条是配置。** `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL` 没配时，`deploy.sh` 会以退出码 3 拒绝启动。注意它拒绝的是**脚本自己**——下面那条命令里手敲的 `git pull` 排在它前面，已经把检出换成新代码了。所以要么先把这两个变量补进 `.env.local` 再开始，要么明确接受「新代码 + 旧 dist + 旧 daemon」这个中间态并带上 `DEPLOY_ALLOW_MISSING_CONFIG=yes`。
 
 工作区有已跟踪文件的本地改动时，第 0 步的 `git pull --ff-only` 会中止——部署脚本会**先**检查这一点并把文件名打出来，而不是让 git 报一句看不出后果的话。
 
@@ -106,12 +112,14 @@ cd ~/AlphaLoop && \
 
 `&&` 串起来是有意的：`git pull` 中止（工作区脏是最常见的原因）时，后面那句根本不会执行，你看到的是 git 自己的错误，而不是一句看不出所以然的 `no such file or directory`——那句话的真正含义是"pull 没成功"，不是"runbook 写错了"。
 
-**别让 ssh 断线把它带走。** 部署被 SIGHUP/SIGINT/SIGTERM 打断时，脚本会把当前那一步按 129/130/143 记进账本（验收门因此报红），并打印从哪一步续跑；但 `kill -9` 谁也拦不住。连接不稳时让它跑在会话之外：
+**别让 ssh 断线把它带走。** 部署被 SIGHUP/SIGINT/SIGTERM 打断时，脚本会把当前那一步按 129/130/143 记进账本（验收门因此报红），并打印从哪一步续跑；但 `kill -9` 谁也拦不住。连接不稳时，用 tmux（mini 上 `/opt/homebrew/bin/tmux` 已经有了）：
 
 ```bash
-cd ~/AlphaLoop && DEPLOY_ACK_GATEWAY_RESTART=yes nohup zsh apps/openclaw-config/scripts/deploy.sh > ~/alphaloop-deploy.log 2>&1 &
-tail -f ~/alphaloop-deploy.log
+tmux new -s deploy          # 断线后回来：tmux attach -t deploy
+cd ~/AlphaLoop && DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh
 ```
+
+**这里刻意不用 `nohup … &`。** 它确实能挡住 SIGHUP，但同时也把终端拿走了，而第 3 步的 sudo 要密码就得有终端——实测的结果是第 3 步必然失败在「已经动了 gateway、还没接管」的中间态（见上面那一节）。tmux 两头都占：断线不会带走它，里面又有真正的终端可以问密码。sudo 确实不要密码（NOPASSWD）的机器上 `nohup` 才是安全的，那时脚本的 sudo 预检也不会拦你。
 
 它按顺序跑第 0 到第 8 步，**任何一步非零退出就立刻停下**，并且把每一步的退出码写进 `runtime/deploy/steps.jsonl`。失败时它会告诉你：哪一步失败、后面哪些步骤因此没有执行、以及怎么从那一步继续：
 
@@ -128,11 +136,13 @@ DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=3 zsh apps/openclaw-config/scrip
 | 0 | 本次要求执行的步骤全部退出 0（含第 8 步 doctor） | 是 |
 | 1 | 某一步失败，后面的步骤没有执行 | 半完成 |
 | 2 | 参数写错，或没确认 gateway 重启 | 否 |
-| 3 | **配置未就绪**（见下一节），在第 0 步之前就拒绝 | 否 |
+| 3 | **未就绪**，在第 0 步之前就拒绝：配置缺变量，或 sudo 要密码而这次运行没有终端 | 否 |
 | 4 | 某一步的收据写不进账本——验收门看不见这次部署 | 半完成 |
 | 129 / 130 / 143 | 被 SIGHUP / SIGINT / SIGTERM 中断（ssh 断线、Ctrl-C、`kill`） | 半完成 |
 
-**被打断的部署也会留下证据。** 2026-07-29 之前脚本没有任何信号 trap，实测三次：SIGINT 打断第 0 步 → 退出 130、账本里一条收据都没有；SIGHUP / SIGTERM 打断第 1 步 → 屏幕上最后一行是「── 第 1 步 安装依赖并构建 ──」然后脚本就没了，没有小结、没有失败行、没有续跑命令——而验收门在这三种情况下**全是绿的**（只有一条 warn）。控制器是通过 ssh 驱动这次部署的，掉线产生的正是这个形状。现在：被打断的那一步（或正要开始的那一步）会按 129/130/143 写进账本，验收门因此报 error，屏幕上照常打印小结、续跑命令和 `nohup` 建议。两个说明白的边界：信号只发给脚本 pid（而不是整个进程组）时，shell 会等当前这一步的子进程返回才处理它，收据是晚、不是丢；`kill -9` 无法被任何程序拦截，那种情况下只剩 doctor 的 `deploy-ledger.incomplete`（warn）。
+**被打断的部署也会留下证据。** 2026-07-29 之前脚本没有任何信号 trap，实测三次：SIGINT 打断第 0 步 → 退出 130、账本里一条收据都没有；SIGHUP / SIGTERM 打断第 1 步 → 屏幕上最后一行是「── 第 1 步 安装依赖并构建 ──」然后脚本就没了，没有小结、没有失败行、没有续跑命令——而验收门在这三种情况下**全是绿的**（只有一条 warn）。控制器是通过 ssh 驱动这次部署的，掉线产生的正是这个形状。现在：被打断的那一步（或正要开始的那一步）会按 129/130/143 写进账本，验收门因此报 error，屏幕上照常打印小结、续跑命令和「下次在 tmux 里跑」的建议。两个说明白的边界：信号只发给脚本 pid（而不是整个进程组）时，shell 会等当前这一步的子进程返回才处理它，收据是晚、不是丢；`kill -9` 无法被任何程序拦截，那种情况下只剩 doctor 的 `deploy-ledger.incomplete`（warn）。
+
+**第 0 步之前的 sudo 预检。** 三个条件同时成立时，脚本以退出码 3 拒绝启动、**一步都不跑**：这次运行会跑到第 3 步、`sudo -n true` 说要密码、并且 stdin 不是终端。任何一个不成立都放行（NOPASSWD 的机器、tmux/前台会话、`DEPLOY_FROM_STEP=4` 跳过第 3 步）。拦它的理由是实测出来的：这三条同时成立时第 3 步必然失败，而失败点恰好落在第 2 步已经装上用户级 gateway、第 3 步还没把它接管走的中间——18789 上于是有两个 gateway 抢同一个端口。确认这台机器不要密码就显式写 `DEPLOY_ALLOW_SUDO_PROMPT=yes`。
 
 **第 0 步之前的配置预检。** 脚本会先看 `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL`（进程环境优先，其次 `.env.local`，解析规则和 daemon 用的 `loadLocalEnv` 一致）。缺任何一个就以退出码 3 停下，**一步都不跑**。判空和 doctor 一样是 `trim()` 之后再看长度：`FEISHU_GROUP_CHAT_ID="   "` 算**没配**（2026-07-29 之前它能通过预检，九步跑完之后第 8 步才报 `no_group_chat`）；"环境里导出了但值是空的"也算没配，因为 doctor 那边 `process.env` 会盖掉 `.env.local` 的值。原因是这两个变量正是 doctor 会报 error 的那两个：mini 上它们今天都没配，所以第 0-7 步可以全部成功而第 8 步照样退出 1——语义没错，但读日志的人会把它当成"部署回退了"。想先装服务、稍后补配置，就显式写 `DEPLOY_ALLOW_MISSING_CONFIG=yes`：第 0-7 步照跑，第 8 步仍然会红，红的是配置。
 
