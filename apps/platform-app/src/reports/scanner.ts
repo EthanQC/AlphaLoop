@@ -10,6 +10,8 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+import { detectReportFormatEra } from "./format-era.js";
+
 /** The four report kinds this task scans. `official-paper` is the disk name
  * for what the UI labels "模拟盘快照" (see routes/reports.ts's TYPE_LABELS). */
 export type ReportType = "daily" | "weekly" | "stock-analysis" | "official-paper";
@@ -40,7 +42,13 @@ export interface ReportIndexEntry {
   mdPath: string;
   /** First `# ` heading line in the file, else the filename (without ext). */
   title: string;
-  /** See ALL_CURRENT_REPORTS_ARE_LEGACY below. */
+  /**
+   * `true` ONLY when this file's own contents were read and found to LACK its
+   * report family's current-format marker (reports/format-era.ts). It is a
+   * positive, evidence-backed claim - every surface that renders 历史存档
+   * keys off it - so the one case with no evidence either way (the file could
+   * not be read at all) is `false`: no claim, no banner. See `scanDirectory`.
+   */
   legacy: boolean;
 }
 
@@ -53,21 +61,6 @@ const REPORT_TYPES: readonly ReportType[] = ["daily", "weekly", "stock-analysis"
 const CIRCLE_VISIBLE_REPORT_TYPES: readonly ReportType[] = REPORT_TYPES.filter(
   (type) => !OWNER_SCOPED_REPORT_TYPES.includes(type)
 );
-
-/**
- * Every report file scanReports can see today predates the public/personal
- * report split (P4 news engine / P5 confidence-tier writes) - the current
- * `reports/` tree is entirely 2026-05~06 material written before that format
- * existed, some of it (daily/weekly) embedding what was then a single shared
- * paper-trading account's positions. There is no per-file marker yet that
- * could distinguish "old format" from "new format" - P4 owns defining that
- * marker (frontmatter field or similar) when it starts writing the new
- * format. Until then, the simplest CORRECT rule is "everything is legacy",
- * encoded as this named constant (never a scattered `true` literal) so the
- * day P4 lands a real marker, this is the one place that needs to become a
- * per-file check instead of a blanket value.
- */
-const ALL_CURRENT_REPORTS_ARE_LEGACY = true;
 
 const PLAIN_DATE_RE = /^(\d{4}-\d{2}-\d{2})\.md$/u;
 const OFFICIAL_PAPER_RE = /^(\d{4}-\d{2}-\d{2})-post-open\.md$/u;
@@ -95,13 +88,7 @@ function parseFilename(type: ReportType, filename: string): string | undefined {
   return PLAIN_DATE_RE.exec(filename)?.[1];
 }
 
-function extractTitle(mdPath: string, fallback: string): string {
-  let content: string;
-  try {
-    content = readFileSync(mdPath, "utf8");
-  } catch {
-    return fallback;
-  }
+function extractTitle(content: string, fallback: string): string {
   for (const line of content.split(/\r?\n/u)) {
     const match = HEADING_RE.exec(line.trim());
     if (match) {
@@ -109,6 +96,31 @@ function extractTitle(mdPath: string, fallback: string): string {
     }
   }
   return fallback;
+}
+
+/**
+ * Title + era from ONE read of the file (Task 12). Both derive from the same
+ * bytes, so reading twice would only create a window in which they could
+ * disagree about the same file.
+ *
+ * Unreadable file -> filename as the title and `legacy: false`. `legacy` is
+ * the positive claim "this file lacks its family's format marker", and a file
+ * whose contents could not be read is not evidence for that claim (nor
+ * against it); the honest response is to make no era claim at all, which is
+ * what `false` renders as - no pill, no banner, no 旧格式 note.
+ */
+function readEntryMetadata(
+  type: ReportType,
+  mdPath: string,
+  fallbackTitle: string
+): { title: string; legacy: boolean } {
+  let content: string;
+  try {
+    content = readFileSync(mdPath, "utf8");
+  } catch {
+    return { title: fallbackTitle, legacy: false };
+  }
+  return { title: extractTitle(content, fallbackTitle), legacy: detectReportFormatEra(type, content) === "legacy" };
 }
 
 function scanDirectory(repoRoot: string, type: ReportType): ReportIndexEntry[] {
@@ -138,13 +150,8 @@ function scanDirectory(repoRoot: string, type: ReportType): ReportIndexEntry[] {
     }
     const mdPath = join(dir, filename);
     const fallbackTitle = filename.replace(/\.md$/u, "");
-    entries.push({
-      type,
-      date,
-      mdPath,
-      title: extractTitle(mdPath, fallbackTitle),
-      legacy: ALL_CURRENT_REPORTS_ARE_LEGACY
-    });
+    const { title, legacy } = readEntryMetadata(type, mdPath, fallbackTitle);
+    entries.push({ type, date, mdPath, title, legacy });
   }
 
   entries.sort((a, b) => b.date.localeCompare(a.date));

@@ -41,6 +41,18 @@ function writeReport(repoRoot: string, type: string, filename: string, content: 
   writeFileSync(join(dir, filename), content, "utf8");
 }
 
+/** Just the reading page's 摘要 card, so an assertion about what the SUMMARY
+ * says cannot be satisfied by the same words appearing in the rendered report
+ * body further down the page. */
+function summaryCard(body: string): string {
+  const start = body.indexOf("<h2>摘要");
+  if (start < 0) {
+    return "";
+  }
+  const end = body.indexOf("</section>", start);
+  return body.slice(start, end < 0 ? undefined : end);
+}
+
 /** A real `renderPnlReport` shaped body (official-paper-monitor.mjs): the
  * account's net assets, cash, position valuation and per-symbol holdings.
  * These exact numbers are what the B1 assertions below prove a non-owner
@@ -401,9 +413,146 @@ describe("reports routes", () => {
       expect(body).toContain(
         '<a href="https://example.com/source" rel="noreferrer" target="_blank">原文</a>'
       ); // sources list entry
-      expect(body).toContain("历史存档"); // legacy archive banner
-      expect(body).toContain("旧格式无置信度");
+      expect(body).toContain("历史存档"); // legacy archive banner - this file really is pre-marker
+      expect(body).toContain("旧版格式");
       expect(body).toContain("延迟"); // not today -> delayed freshness
+    });
+
+    // -----------------------------------------------------------------------
+    // Task 12 (2026-07-30): 历史存档 is now decided per file. Before this, a
+    // report generated minutes ago wore the same 旧版格式 banner as a
+    // 2026-05 archive, and its summary card claimed 旧格式无置信度.
+    // -----------------------------------------------------------------------
+
+    it("does NOT call a report carrying its family's current-format marker an archive", async () => {
+      writeReport(
+        repoRoot,
+        "daily",
+        "2026-07-14.md",
+        ["# OpenClaw 日报 2026-07-14", "", "今天的摘要首段。", "", "### 多源新闻（事件聚类）", "", "- 事件：X。"].join("\n")
+      );
+
+      const body = await (await authed("/daily/2026-07-14")).text();
+
+      expect(body).not.toContain("历史存档");
+      expect(body).not.toContain("旧版格式");
+      expect(body).not.toContain("旧格式");
+    });
+
+    it("says the conclusion box is MISSING - not that the report is old - for a new-format report without one", async () => {
+      writeReport(
+        repoRoot,
+        "daily",
+        "2026-07-14.md",
+        ["# OpenClaw 日报 2026-07-14", "", "今天的摘要首段。", "", "### 多源新闻（事件聚类）", "", "- 事件：X。"].join("\n")
+      );
+
+      const body = await (await authed("/daily/2026-07-14")).text();
+
+      expect(body).toContain("该报告未提供结论框");
+      expect(body).not.toContain("旧格式无置信度");
+    });
+
+    it("renders the conclusion box itself - core conclusion + confidence - when the report carries one", async () => {
+      writeReport(
+        repoRoot,
+        "weekly",
+        "2026-07-14.md",
+        [
+          "# OpenClaw 周报 2026-07-14",
+          "",
+          "无关紧要的首段。",
+          "",
+          "### 多源新闻（事件聚类）",
+          "",
+          "- 事件：X。",
+          "",
+          // Bullet shape copied from a REAL rendered box (reports/
+          // stock-analysis/2026-07-27.md on the deployed machine); the
+          // parser's own contract test lives in reports/conclusion-box.test.ts
+          // against the shared fixture.
+          "### 结论框",
+          "",
+          "- 核心结论：科技股短期偏强，仓位不动。",
+          "- 置信度：中",
+          "- 合理价值区间：380.00–420.00 美元（依据：近20日支撑位与阻力位）",
+          "- 当前价格位置：现价 400.00 美元，位于合理区间内（380.00–420.00 美元）",
+          "- 复盘触发：跌破 380.00 美元需重新评估（复盘日期：2026-08-01）"
+        ].join("\n")
+      );
+
+      const body = await (await authed("/weekly/2026-07-14")).text();
+      // Scoped to the summary card - the same words appear in the rendered
+      // report body regardless, so a whole-page match would pass even if the
+      // summary card ignored the box entirely.
+      const summary = summaryCard(body);
+
+      expect(summary).toContain("科技股短期偏强，仓位不动。");
+      expect(summary).toContain("置信度 中");
+      expect(summary).not.toContain("无关紧要的首段。");
+      expect(body).not.toContain("该报告未提供结论框");
+      expect(body).not.toContain("旧格式");
+    });
+
+    it("never presents one symbol's box as the whole batch's conclusion on a multi-symbol analysis", async () => {
+      writeReport(
+        repoRoot,
+        "stock-analysis",
+        "2026-07-14.md",
+        [
+          "# OpenClaw 个股分析 2026-07-14",
+          "",
+          "本批次覆盖两只标的。",
+          "",
+          "## AMZN.US",
+          "",
+          "### 结论框",
+          "",
+          "- 核心结论：AMZN 维持观望。",
+          "- 置信度：低",
+          "- 合理价值区间：180.00–220.00 美元（依据：近20日支撑位与阻力位）",
+          "- 当前价格位置：现价 185.00 美元，位于合理区间内（180.00–220.00 美元）",
+          "- 复盘触发：跌破 180.00 美元需重新评估（复盘日期：2026-08-01）",
+          "",
+          "## GOOG.US",
+          "",
+          "### 结论框",
+          "",
+          "- 核心结论：GOOG 小幅加仓。",
+          "- 置信度：高",
+          "- 合理价值区间：150.00–190.00 美元（依据：近20日支撑位与阻力位）",
+          "- 当前价格位置：现价 175.00 美元，位于合理区间内（150.00–190.00 美元）",
+          "- 复盘触发：跌破 150.00 美元需重新评估（复盘日期：2026-08-01）"
+        ].join("\n")
+      );
+
+      const body = await (await authed("/stock-analysis/2026-07-14")).text();
+
+      // The batch summary must not silently become the first symbol's verdict.
+      expect(body).toContain("本报告含 2 个逐标的结论框");
+      expect(body).toContain("本批次覆盖两只标的。");
+      expect(body).not.toContain("该报告未提供结论框");
+    });
+
+    it("says a legacy archive has no conclusion box BECAUSE of its era", async () => {
+      writeReport(repoRoot, "daily", "2026-06-19.md", "# 日报\n\n旧的首段。\n");
+
+      const body = await (await authed("/daily/2026-06-19")).text();
+
+      expect(body).toContain("历史存档");
+      expect(body).toContain("旧版格式");
+      expect(body).not.toContain("该报告未提供结论框");
+    });
+
+    it("states the ACTUAL legacy difference per report family, not the daily/weekly one for all", async () => {
+      writeReport(repoRoot, "stock-analysis", "2026-06-19.md", "# 个股分析\n\n旧的首段。\n");
+
+      const body = await (await authed("/stock-analysis/2026-06-19")).text();
+
+      expect(body).toContain("历史存档");
+      // A stock analysis never carried the shared paper account - claiming it
+      // did was the daily/weekly banner text leaking onto every kind.
+      expect(body).not.toContain("共享模拟盘账户");
     });
 
     it("marks a report dated today (Beijing time) as 最新", async () => {

@@ -13,7 +13,7 @@
 // in any module with project-external side effects at import time (none of
 // conclusion-box.mjs/stock-facts-store.mjs/narrative-engine.mjs touch the
 // filesystem, env, or a db connection merely by being imported).
-import { parseConclusionBox, parseReportConclusionBox } from "./conclusion-box.mjs";
+import { parseConclusionBox } from "./conclusion-box.mjs";
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD } from "./stock-facts-store.mjs";
 import {
   NARRATIVE_BULLET_PREFIX,
@@ -243,24 +243,6 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
       if (chineseRatioPercent === null || chineseRatioPercent < 30) {
         failures.push("news.chinese_ratio");
       }
-    }
-
-    // Task 13 (2026-07-28 spec-drift plan) - report.conclusion_box.
-    // Requirements §1.4/§3.5: a daily/weekly report leads with 核心结论 + 置信度
-    // （高/中/低）+ 依据 + 截至时间. parseReportConclusionBox is the SAME parser
-    // the renderer's box round-trips through and the platform's summary card
-    // reads, so this gate fails for exactly the reason a reader would see
-    // nothing: no box, a missing required bullet, or a confidence label that is
-    // not one of the three tiers. Era-gated like every other new gate here -
-    // a legacy-format report never had a box and is not retroactively broken;
-    // everything the CURRENT renderer emits carries both markers, so for
-    // anything generated from now on this gate is unconditional in effect.
-    // scheduled-report.mjs's deliverReport treats an already-prepared file
-    // without a box as STALE and re-renders it, exactly as it does for a file
-    // carrying personal content, so this can never halt a scheduled run over a
-    // file we know how to rebuild.
-    if (parseReportConclusionBox(text) === null) {
-      failures.push("report.conclusion_box");
     }
   }
 

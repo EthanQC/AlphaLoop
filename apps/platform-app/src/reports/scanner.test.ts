@@ -121,12 +121,69 @@ describe("scanReports", () => {
     expect(entries[0]?.title).toBe("2026-06-19");
   });
 
-  it("marks every current report as legacy (pre-P4/P5 format)", () => {
-    writeReport("daily", "2026-06-19.md", "# 日报\n");
+  // Task 12 (2026-07-30): `legacy` is decided PER FILE, from its own family's
+  // format marker (reports/format-era.ts - whose test proves the markers are
+  // the producers' own), not from a module-level "everything is old" constant.
+  // The markers here come from that module's documented sources; format-era's
+  // own suite is what pins them to report-quality.mjs / renderPnlReport.
+  it("marks a report carrying its family's current-format marker as NOT legacy", () => {
+    writeReport("daily", "2026-07-30.md", "# 日报\n\n### 多源新闻（事件聚类）\n\n- 事件：X。\n");
+    writeReport("weekly", "2026-07-28.md", "# 周报\n\n### 多源新闻（事件聚类）\n\n- 事件：X。\n");
+    writeReport("stock-analysis", "2026-07-27.md", "# 个股分析\n\n## AMZN.US\n\n### 结论框\n\n- 核心结论：持有。\n");
 
     const entries = scanReports(repoRoot);
 
-    expect(entries[0]?.legacy).toBe(true);
+    expect(entries).toHaveLength(3);
+    expect(entries.every((entry) => entry.legacy)).toBe(false);
+    for (const entry of entries) {
+      expect(entry.legacy, entry.type).toBe(false);
+    }
+  });
+
+  it("still marks a genuinely old report legacy - and judges each family by ITS own marker", () => {
+    writeReport("daily", "2026-06-19.md", "# 日报\n\n## 1. 今日结论\n");
+    // A stock analysis never contains the daily/weekly news marker; judging it
+    // by that marker is exactly the bug this replaced, so the new-format stock
+    // report above must not depend on it.
+    writeReport("stock-analysis", "2026-06-19.md", "# 个股分析\n\n## 本批次结论\n");
+
+    const entries = scanReports(repoRoot);
+
+    expect(entries).toHaveLength(2);
+    for (const entry of entries) {
+      expect(entry.legacy, entry.type).toBe(true);
+    }
+  });
+
+  it("decides owner-scoped official-paper entries per file too", () => {
+    writeReport(
+      "official-paper",
+      "2026-07-29-post-open.md",
+      "# 模拟盘收支变化\n\n## 收支变化表\n\n| 对比项 | 该行净资产 | 该行现金 | 该行持仓估值 | 净资产变化（当前 − 该行） | 现金变化（当前 − 该行） |\n"
+    );
+    writeReport(
+      "official-paper",
+      "2026-05-31-post-open.md",
+      "# 模拟盘收支变化\n\n## 收支变化表\n\n| 对比项 | 净资产 | 现金 | 持仓估值 | 净资产变化 | 现金变化 |\n"
+    );
+
+    const entries = scanOwnerScopedReports(repoRoot);
+
+    expect(entries.find((entry) => entry.date === "2026-07-29")?.legacy).toBe(false);
+    expect(entries.find((entry) => entry.date === "2026-05-31")?.legacy).toBe(true);
+  });
+
+  it("makes no legacy claim about a file it could not read", () => {
+    writeReport("daily", "2026-06-19.md", "# 日报\n");
+    // Directory entry present, file gone by the time contents are read.
+    rmSync(join(reportsDir("daily"), "2026-06-19.md"));
+    mkdirSync(join(reportsDir("daily"), "2026-06-19.md"));
+
+    const entries = scanReports(repoRoot);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.legacy).toBe(false);
+    expect(entries[0]?.title).toBe("2026-06-19");
   });
 
   it("sorts entries by date descending", () => {

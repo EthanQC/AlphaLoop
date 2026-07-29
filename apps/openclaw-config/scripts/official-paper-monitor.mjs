@@ -651,6 +651,22 @@ function renderPositionsBullet(snapshot, degradedCount) {
  * header, and a missing baseline says 无可比快照 in every cell plus a note under
  * the table giving the reason - never a number and never 基准.
  */
+/**
+ * The 收支变化表 header row this renderer emits, hoisted out of the template
+ * below so it is a NAMED thing the platform can check a file against rather
+ * than a literal duplicated in two apps (2026-07-30, spec-drift Task 12).
+ *
+ * It doubles as this report family's ERA MARKER: the pre-2026-07-28 renderer
+ * (see the R4/F8 note above) wrote `| 对比项 | 净资产 | 现金 | 持仓估值 |
+ * 净资产变化 | 现金变化 |`, whose columns 2-4 meant something else entirely,
+ * so a file carrying THIS header was written by the current renderer and a
+ * file carrying the old one was not. `official-paper` has no quality gate of
+ * its own (report-quality.mjs judges daily/weekly/stock-analysis only), so
+ * this is the only per-file era evidence that exists for it.
+ */
+export const PNL_TABLE_HEADER =
+  "| 对比项 | 该行净资产 | 该行现金 | 该行持仓估值 | 净资产变化（当前 − 该行） | 现金变化（当前 − 该行） |";
+
 export function renderPnlReport(current, previousDay, previousWeek) {
   const currentAsset = summarizeAsset(current);
   const reflection = buildStrategyReflection(current);
@@ -675,7 +691,7 @@ export function renderPnlReport(current, previousDay, previousWeek) {
     "",
     "## 收支变化表",
     "",
-    "| 对比项 | 该行净资产 | 该行现金 | 该行持仓估值 | 净资产变化（当前 − 该行） | 现金变化（当前 − 该行） |",
+    PNL_TABLE_HEADER,
     "| --- | ---: | ---: | ---: | ---: | ---: |",
     renderTableRow([
       "当前",

@@ -70,7 +70,7 @@ import { ResearchTaskRepository, methodNotAllowed, type Member, type ResearchTas
 
 import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-review.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
-import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
+import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { renderMarkdown, type MarkdownRenderResult } from "../reports/markdown.js";
 import {
   OWNER_SCOPED_REPORT_TYPES,
@@ -638,13 +638,85 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
   });
 }
 
-function renderLegacyBanner(): Html {
+/**
+ * What being "legacy" ACTUALLY means, per report family (Task 12). The single
+ * sentence this replaced - 「历史存档：旧版格式，含当时共享模拟盘账户内容」 -
+ * was written for daily/weekly and then shown on every kind, so a 2026-06
+ * stock analysis (which never carried an account) and an official-paper
+ * statement (which is nothing BUT an account, in every era) both told the
+ * reader something untrue about themselves.
+ */
+const LEGACY_REASON_BY_TYPE: Record<ReportType, string> = {
+  daily: "历史存档：旧版格式（没有事件聚类新闻段与置信度），且当时的日报正文里带有共享模拟盘账户内容。",
+  weekly: "历史存档：旧版格式（没有事件聚类新闻段与置信度），且当时的周报正文里带有共享模拟盘账户内容。",
+  "stock-analysis": "历史存档：旧版格式，没有结论框，也没有置信度与合理价值区间。",
+  "official-paper": "历史存档：旧版收支变化表格式——那时表格第 2-4 列填的是当前快照而不是该行自己的快照，读法与现在不同。"
+};
+
+function renderLegacyBanner(type: ReportType): Html {
   return html`<div class="bento" style="padding-bottom:0">
     <section class="card w2 dt-w4 amber" role="alert" aria-label="历史存档提示">
       <h2 style="color:var(--amber)">历史存档</h2>
-      <p style="margin:0;font-size:13px;color:var(--ink)">历史存档：旧版格式，含当时共享模拟盘账户内容。</p>
+      <p style="margin:0;font-size:13px;color:var(--ink)">${LEGACY_REASON_BY_TYPE[type]}</p>
     </section>
   </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 摘要卡的结论行 (Task 12)
+// ---------------------------------------------------------------------------
+
+/** conclusion-box.ts's own BOX_HEADING - counted here to tell "this report has
+ * no box" apart from "this report has several, one per symbol", which
+ * `parseConclusionBox` (first box only) cannot distinguish on its own. */
+const CONCLUSION_BOX_HEADING = "### 结论框";
+
+function countConclusionBoxes(md: string): number {
+  let count = 0;
+  for (const line of md.replace(/\r\n/gu, "\n").split("\n")) {
+    if (line.trim() === CONCLUSION_BOX_HEADING) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * The summary card's lead (req §1.4: 摘要卡先行，核心结论 + 置信度).
+ *
+ * Four honest outcomes, never a fifth that guesses:
+ *   1. exactly one parseable box -> the box's own 核心结论 + 置信度 tier.
+ *   2. several boxes (a multi-symbol analysis batch) -> say how many and send
+ *      the reader to the per-symbol sections. Showing the FIRST symbol's
+ *      verdict as if it were the batch's would be a fabricated summary.
+ *   3. no box -> say so, and say WHY in the file's own terms: a legacy-format
+ *      report never had one; a current-format report simply did not carry
+ *      one this time (daily/weekly's own box is Task 13, still unshipped -
+ *      until it lands this is the branch every fresh daily takes, and it is
+ *      accurate).
+ *   4. box present but unparseable (a required bullet missing) -> say THAT,
+ *      rather than reporting it as absent.
+ */
+function renderSummaryLead(entry: ReportIndexEntry, rawMd: string): Html {
+  const boxCount = countConclusionBoxes(rawMd);
+  const box = boxCount === 1 ? parseConclusionBox(rawMd) : null;
+
+  if (box) {
+    return html`<p style="font-size:13.5px;line-height:1.7">${box.coreConclusion}</p>
+      <p style="margin-top:6px;font-size:12px;color:var(--sub)">置信度 ${CONFIDENCE_LABELS[box.confidence]} · 复盘触发：${box.reviewTrigger}</p>`;
+  }
+
+  const note =
+    boxCount > 1
+      ? `本报告含 ${boxCount} 个逐标的结论框，各自的核心结论与置信度见正文对应标的段落。`
+      : boxCount === 1
+        ? "该报告的结论框缺少必填项，未能解析。"
+        : entry.legacy
+          ? "旧版格式报告：没有结论框，也没有置信度分档。"
+          : "该报告未提供结论框。";
+
+  return html`<p style="font-size:13.5px;line-height:1.7">${extractFirstParagraph(rawMd)}</p>
+    <p style="margin-top:6px;font-size:12px;color:var(--sub)">${note}</p>`;
 }
 
 /** Heuristic "first paragraph" extraction for the summary card: the first
@@ -726,10 +798,6 @@ function renderReadingBody(
   rendered: MarkdownRenderResult,
   now: Date
 ): Html {
-  const legacyNote = entry.legacy
-    ? html`<p style="margin-top:6px;font-size:12px;color:var(--sub)">旧格式无置信度</p>`
-    : trustedHtml("");
-
   // U2: a reader who lands on a deep link has no idea how old the report is
   // until they read the date and subtract. The summary card says it outright,
   // and an old report says so in amber before its first sentence.
@@ -744,8 +812,7 @@ function renderReadingBody(
       age ? html` <span class="pill ${age.stale ? "warn" : "ok"}">${age.ago}</span>` : trustedHtml("")
     }</h2>
     ${staleNote}
-    <p style="font-size:13.5px;line-height:1.7">${extractFirstParagraph(rawMd)}</p>
-    ${legacyNote}
+    ${renderSummaryLead(entry, rawMd)}
   </section>`;
 
   const tocSection =
@@ -777,7 +844,7 @@ function renderReadingBody(
         </section>`
       : trustedHtml("");
 
-  return html`${entry.legacy ? renderLegacyBanner() : trustedHtml("")}
+  return html`${entry.legacy ? renderLegacyBanner(entry.type) : trustedHtml("")}
     <div class="bento">${summarySection}</div>
     ${renderPersonalPageEntry(entry)}
     <div class="bento" style="margin-top:10px">
