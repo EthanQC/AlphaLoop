@@ -12,7 +12,7 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
-- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先查报告投递需要的两个变量（缺就退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）。
+- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先查报告投递需要的两个变量（缺就退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 8 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
@@ -169,6 +169,14 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 - `deploy-ledger.mjs record` 写失败时退出 3（成功仍是 0），三个写入方——`deploy.sh`、`install-system-daemons.sh`、`install-openclaw-cron.mjs`——都会因此以退出码 **4** 停下，并说清楚「验收门看到的是上一次部署的收据」。步骤本身的退出码仍然不被记账覆盖，它在这之前就已经被记下来了。
 - doctor 有独立的一条 `deploy-ledger.unwritable`（已部署的机器上是 error），只问内核「当前用户能不能往这个路径追加」，不依赖那个失败的写入方还能报告什么，自己也不写任何东西。
+
+**读不出来 / 被删掉，同样不能等于"没部署过"。** 上面那条只堵住了写的一半。读的一半原来是：`readDeployLedger` 遇到任何读失败都返回 `[]`，而 `[]` 会被判成 `deployed:false`——顶多一条 warn。实测两次（起点都是一次第 3 步失败的真部署，`3:1` 就在盘上）：`chmod 0222 steps.jsonl` → 门 `ok=true` 且**一条 `deploy-ledger` findings 都没有**（连 `absent` 都没有，因为 `deployFootprint` 的第一个信号当时也是"收据条数 > 0"）；`rm steps.jsonl` → 门 `ok=true`，只剩一条 warn。删一个文件就抹掉一次失败的部署。现在分成三种，各说各的：
+
+- 账本在、读不出来 → `deploy-ledger.unreadable`（error），并且下面关于步骤的结论一条都不再输出——读不到就是没有证据。
+- 账本没了但 `runtime/deploy/` 还在，或者文件在却一条可用收据都没有 → `deploy-ledger.lost`（error）。那个目录只有写收据时才会被建出来（`recordDeployStep` 的 `mkdirSync` 是全仓唯一建它的地方），所以"目录在、文件没了"不是任何机器的正常状态。
+- 从来没有过账本（`runtime/deploy/` 也不存在）→ 仍然是 `deploy-ledger.absent`（warn）。照 README 手敲的机器就是这个形状，「没有证据」不等于「失败」。
+
+同时 `deployFootprint` 的第一个信号从"收据条数 > 0"改成"账本文件或它的目录存在"：否则 `chmod`/`rm` 不只是藏起收据，还会顺手把"这是台部署机"的判定一起抹掉，而其它检查项的 error/warn 等级正是从它派生的。
 
 ### ⚠ 第 3 步会打断操作者自己的 agent
 

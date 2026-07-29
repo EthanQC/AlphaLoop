@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2662,26 +2662,71 @@ describe("round 6 - deploy-path checks", () => {
       expect(analysis.ok).toBe(false);
     });
 
-    it("says it could not reach origin instead of treating silence as agreement", async () => {
+    // Round-8 finding L4. K7's own fix had the round-5/6/7 shape inside it: when
+    // `ls-remote` cannot answer, the check fell straight back to `behind`,
+    // computed from the very local ref K7 had just proved untrustworthy, and
+    // said so as a WARN. MEASURED with the deploy target's exact git state plus
+    // an unreachable origin: gate ok=TRUE, zero errors, two warns - a machine
+    // running code that was never fetched passed whenever the network was down.
+    //
+    // The severity now depends on whether anything corroborates the local ref.
+    // Step 0's receipt is the only thing that can: it IS `git fetch origin &&
+    // git pull --ff-only`, so an exit-0 step-0 receipt at the commit checked out
+    // now proves a real fetch reached origin and landed here.
+    const UNREACHABLE_ORIGIN = {
+      head: "14b1202",
+      remoteHead: "14b1202",
+      behind: 0,
+      ahead: 0,
+      dirtyFiles: [],
+      remoteTip: null,
+      remoteTipError: "ssh: connect to host github.com port 22: Network is unreachable",
+      remoteTipKnownLocally: null,
+      behindRemoteTip: null
+    };
+
+    it("fails the gate when origin cannot be reached and nothing corroborates the local ref", async () => {
+      // The mini's shape today: a heavy deploy footprint, no ledger at all.
       const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
-        deployLedger: INSTALLED_AN_HOUR_AGO,
-        git: {
-          head: "14b1202",
-          remoteHead: "14b1202",
-          behind: 0,
-          ahead: 0,
-          dirtyFiles: [],
-          remoteTip: null,
-          remoteTipError: "ssh: connect to host github.com port 22: Network is unreachable",
-          remoteTipKnownLocally: null,
-          behindRemoteTip: null
-        }
+        deployLedger: [],
+        gitHead: "14b1202",
+        git: UNREACHABLE_ORIGIN
+      }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-checkout.remote_unverified");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/Network is unreachable/u);
+      expect(finding?.message).toMatch(/没有】任何一条"在当前检出 14b1202 上成功跑过第 0 步"的收据/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("downgrades to a warning when a step-0 receipt for THIS commit corroborates it", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: [
+          ...INSTALLED_AN_HOUR_AGO,
+          { attempt: "a1", step: 0, key: "pull", exitCode: 0, head: "14b1202", finishedAt: "2026-07-29T02:00:00Z" }
+        ],
+        gitHead: "14b1202",
+        git: UNREACHABLE_ORIGIN
       }));
 
       const finding = analysis.findings.find((f) => f.code === "deploy-checkout.remote_unverified");
       expect(finding?.severity).toBe("warn");
-      expect(finding?.message).toMatch(/Network is unreachable/u);
       expect(finding?.message).toMatch(/只基于本地那份 origin\/main 引用/u);
+      expect(finding?.message).toMatch(/那一次 fetch \+ pull 确实连上了 origin/u);
+    });
+
+    it("does not accept a step-0 receipt from a different commit as corroboration", async () => {
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({
+        deployLedger: [
+          { attempt: "a1", step: 0, key: "pull", exitCode: 0, head: "deadbee", finishedAt: "2026-07-01T02:00:00Z" }
+        ],
+        gitHead: "14b1202",
+        git: UNREACHABLE_ORIGIN
+      }));
+
+      expect(analysis.findings.find((f) => f.code === "deploy-checkout.remote_unverified")?.severity).toBe("error");
+      expect(analysis.ok).toBe(false);
     });
   });
 
@@ -2742,6 +2787,83 @@ describe("round 6 - deploy-path checks", () => {
       expect(finding?.message).toMatch(/第 0 步/u);
       expect(finding?.message).not.toMatch(/第 3 步/u);
       expect(analysis.ok).toBe(true);
+    });
+
+    // =====================================================================
+    // Round-8 finding L3: THE READ HALF. K1 closed the write half (a receipt
+    // that cannot be APPENDED aborts the deploy and reddens the gate). Reading
+    // still answered `[]` for every kind of failure, and `[]` means
+    // `deployed: false`, which is at most a warn.
+    //
+    // MEASURED, both starting from a real deploy whose step 3 had failed - the
+    // receipt `3:1` was on disk in each case:
+    //   `chmod 0222 steps.jsonl` -> gate ok=TRUE with ZERO deploy-ledger
+    //       findings, not even `absent`, because deployFootprint's own first
+    //       signal was "readLedgerEntries().length > 0" too;
+    //   `rm steps.jsonl`         -> gate ok=TRUE, one warn.
+    // A failed deploy erased by deleting one file.
+    // =====================================================================
+    const ledgerOnDisk = (prefix: string, lines: string[]): string => {
+      const runtimeRoot = join(makeTempDir(prefix), "runtime");
+      mkdirSync(join(runtimeRoot, "deploy"), { recursive: true });
+      writeFileSync(join(runtimeRoot, "deploy", "steps.jsonl"), lines.map((line) => `${line}\n`).join(""));
+      return runtimeRoot;
+    };
+
+    const FAILED_STEP_3 = JSON.stringify({
+      attempt: "a1", step: 3, key: "install-system-daemons", exitCode: 1, head: "a4e39c1", finishedAt: "2026-07-29T01:00:00Z"
+    });
+
+    it("fails the gate when the ledger is there and cannot be read", async () => {
+      const runtimeRoot = ledgerOnDisk("alphaloop-r8-ledger-unreadable-", [FAILED_STEP_3]);
+      const ledgerPath = join(runtimeRoot, "deploy", "steps.jsonl");
+      chmodSync(ledgerPath, 0o222);
+      try {
+        const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({ runtimeRoot, gitHead: "a4e39c1" }));
+
+        const finding = analysis.findings.find((f) => f.code === "deploy-ledger.unreadable");
+        expect(finding?.severity).toBe("error");
+        expect(finding?.message).toMatch(/EACCES/u);
+        expect(analysis.ok).toBe(false);
+      } finally {
+        chmodSync(ledgerPath, 0o644);
+      }
+    });
+
+    it("fails the gate when the ledger was deleted but its directory is still there", async () => {
+      const runtimeRoot = ledgerOnDisk("alphaloop-r8-ledger-removed-", [FAILED_STEP_3]);
+      rmSync(join(runtimeRoot, "deploy", "steps.jsonl"));
+
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({ runtimeRoot, gitHead: "a4e39c1" }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-ledger.lost");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/那个目录只有写收据的时候才会被建出来/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    it("fails the gate when the ledger file survives with nothing usable in it", async () => {
+      const runtimeRoot = ledgerOnDisk("alphaloop-r8-ledger-emptied-", []);
+
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({ runtimeRoot, gitHead: "a4e39c1" }));
+
+      const finding = analysis.findings.find((f) => f.code === "deploy-ledger.lost");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/一条可用的收据都没有/u);
+      expect(analysis.ok).toBe(false);
+    });
+
+    // The other side of the same rule, so it cannot be satisfied by turning
+    // every quiet machine red: a runtime tree that never had a ledger at all is
+    // the hand-run runbook, and that is still a warn.
+    it("still only warns when no ledger was ever written on this machine", async () => {
+      const runtimeRoot = join(makeTempDir("alphaloop-r8-ledger-never-"), "runtime");
+      mkdirSync(runtimeRoot, { recursive: true });
+
+      const analysis = await doctor.analyzeOpenClawRuntimeSnapshot(baseline({ runtimeRoot, gitHead: "a4e39c1" }));
+
+      expect(analysis.findings.find((f) => f.code === "deploy-ledger.absent")?.severity).toBe("warn");
+      expect(analysis.findings.filter((f) => f.code === "deploy-ledger.lost")).toEqual([]);
     });
   });
 });

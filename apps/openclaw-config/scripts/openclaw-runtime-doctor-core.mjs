@@ -9,7 +9,7 @@ import {
   judgeDeployLedger,
   lastSuccessfulInstallAt,
   probeDeployLedgerWritable,
-  readDeployLedger,
+  readDeployLedgerResult,
   REQUIRED_DEPLOY_STEPS
 } from "./deploy-ledger.mjs";
 import { readLaunchdOwnership } from "./install-launchd-ownership.mjs";
@@ -785,8 +785,17 @@ function probeSeverityFor(snapshot, label) {
 export function deployFootprint(snapshot) {
   const reasons = [];
 
-  if (readLedgerEntries(snapshot).length > 0) {
+  // Round-8 finding L3: this used to be `entries.length > 0`, so `chmod 0222`
+  // or `rm` on the ledger did not merely hide the receipts - it unmade the
+  // footprint, and with it the severity every other check derives from being on
+  // a deploy target. The file (or the directory that only recordDeployStep
+  // creates) EXISTING is the signal; whether it can be read is a separate
+  // question that checkDeployLedger answers on its own.
+  const ledger = readLedgerState(snapshot);
+  if (ledger.entries.length > 0) {
     reasons.push("这台机器上有部署收据（runtime/deploy/steps.jsonl）");
+  } else if (ledger.fileExists || ledger.dirExists) {
+    reasons.push("这台机器上有部署账本留下的痕迹（runtime/deploy/），只是现在读不出收据");
   }
 
   const rows = Array.isArray(snapshot.launchdJobs) ? snapshot.launchdJobs : [];
@@ -819,16 +828,29 @@ function describeDeployFootprint(snapshot) {
 // The ledger, from wherever the caller supplies it: an explicit array (tests,
 // and any future caller that has already read it) or the real file under the
 // runtime root. Reading is failure-tolerant by construction - see
-// readDeployLedger - so a corrupt line degrades to "fewer receipts", never to
-// a throw inside a health check.
+// readDeployLedgerResult - so a corrupt line degrades to "fewer receipts",
+// never to a throw inside a health check.
+//
+// `fromFile` is what lets the caller tell "there is no ledger file" from "this
+// caller handed me the rows directly": a snapshot carrying `deployLedger` says
+// nothing about any file, so the file-shaped findings below stay silent for it.
+function readLedgerState(snapshot) {
+  if (Array.isArray(snapshot.deployLedger) || !snapshot.runtimeRoot) {
+    return {
+      entries: Array.isArray(snapshot.deployLedger) ? snapshot.deployLedger : [],
+      path: null,
+      fileExists: false,
+      dirExists: false,
+      readable: null,
+      error: null,
+      fromFile: false
+    };
+  }
+  return { ...readDeployLedgerResult(snapshot.runtimeRoot), fromFile: true };
+}
+
 function readLedgerEntries(snapshot) {
-  if (Array.isArray(snapshot.deployLedger)) {
-    return snapshot.deployLedger;
-  }
-  if (!snapshot.runtimeRoot) {
-    return [];
-  }
-  return readDeployLedger(snapshot.runtimeRoot);
+  return readLedgerState(snapshot).entries;
 }
 
 // Round-6, the mechanism check: "a step of this deploy failed" is a fact that
@@ -839,7 +861,8 @@ function readLedgerEntries(snapshot) {
 // See deploy-ledger.mjs's judgeDeployLedger for the severity split and why
 // missing/stale receipts are reported without being called failures.
 function checkDeployLedger(snapshot) {
-  const entries = readLedgerEntries(snapshot);
+  const ledger = readLedgerState(snapshot);
+  const entries = ledger.entries;
   const findings = [];
 
   // Round-7 finding K1, and it is deliberately the FIRST thing said here: if
@@ -872,8 +895,45 @@ function checkDeployLedger(snapshot) {
     ));
   }
 
+  // Round-8 finding L3, the read half. `readDeployLedger` answered `[]` for a
+  // ledger it could not open, and `[]` means `deployed: false`, which is at
+  // most a warn - so `chmod 0222` on one file turned a recorded failure
+  // (receipt `3:1`) into a green gate with ZERO deploy-ledger findings.
+  // Reported before anything else and on its own: the rows cannot be read, so
+  // there is nothing else here to say.
+  if (ledger.readable === false) {
+    findings.push(error(
+      "deploy-ledger.unreadable",
+      `部署账本存在但读不出来：${ledger.error}（文件是 ${ledger.path}）。`
+        + `这台机器上每一步部署的成败都记在这个文件里，读不到它就等于这道门看不见【任何一次部署】——`
+        + `包括刚刚失败的那一次。先修权限再重跑本体检：`
+        + `ls -l ${ledger.path}；sudo chown -R "$(id -un)":staff ${dirname(String(ledger.path))}。`
+    ));
+    return findings;
+  }
+
   const verdict = judgeDeployLedger(entries, { head: snapshot.gitHead ?? null });
   if (!verdict.deployed) {
+    // Round-8 finding L3, the other way a ledger becomes "no receipts": it was
+    // deleted or emptied. `runtime/deploy/` exists on this machine only because
+    // recordDeployStep's mkdirSync created it to append a receipt, so the
+    // directory outliving the file is not the normal state of anything - and a
+    // ledger file that parses to zero rows is not either. MEASURED: `rm
+    // steps.jsonl` after a deploy whose step 3 failed left the gate green with
+    // one warn. Deleting one file must not be a way to pass.
+    if (ledger.fromFile && (ledger.fileExists || ledger.dirExists)) {
+      findings.push(error(
+        "deploy-ledger.lost",
+        `${ledger.fileExists
+          ? `部署账本 ${ledger.path} 在，但里面一条可用的收据都没有（空文件，或每一行都不是合法 JSON）。`
+          : `部署账本 ${ledger.path} 不见了，但它的目录 ${join(String(snapshot.runtimeRoot ?? "runtime"), "deploy")} 还在——`
+            + `那个目录只有写收据的时候才会被建出来，所以这台机器写过账本，现在文件没了。`}`
+          + `账本是"上一次部署到底成没成"唯一还留着的证据，它没了，这道门就无法否认一次失败的部署——`
+          + `删掉一个文件不该等于通过验收。`
+          + `请重跑一遍完整部署把每一步的收据补上：DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh`
+      ));
+      return findings;
+    }
     // No receipts at all. On a machine with a deploy footprint this is worth
     // saying (the runbook was followed by hand, or predates the ledger); on a
     // dev box it is simply the normal state and nothing is reported.
@@ -893,6 +953,10 @@ function checkDeployLedger(snapshot) {
     findings.push(error(
       `deploy-ledger.step_${step.step}_failed`,
       `部署第 ${step.step} 步（${step.title}）以退出码 ${step.exitCode} 失败，时间 ${step.finishedAt ?? "未知"}，commit ${step.head ?? "未知"}。`
+        // The writer's own note, when it left one. deploy.sh's signal traps put
+        // 「SIGHUP 中断：…」 here, and without it an operator reading 「退出码
+        // 129 失败」 has no way to tell a crashed step from a dropped ssh.
+        + (step.detail ? `收据备注：${step.detail}。` : "")
         + `失败之后没有任何一条成功记录覆盖它，所以这台机器现在是"部署到一半"的状态。`
         + `请照那一步自己打印的原因修掉再重跑：DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${step.step} zsh apps/openclaw-config/scripts/deploy.sh`
     ));
@@ -923,6 +987,25 @@ function checkDeployLedger(snapshot) {
     ));
   }
   return findings;
+}
+
+/**
+ * The newest receipt that proves this machine's checkout came from origin: step
+ * 0 is `git fetch origin && git pull --ff-only origin main`, so an exit-0
+ * receipt for it, recorded against the commit that is checked out NOW, is the
+ * only evidence in the ledger that a real conversation with origin produced
+ * this working tree. A receipt from another commit proves nothing about this
+ * one (and raises deploy-ledger.stale on its own).
+ *
+ * @returns {Record<string, any>|null}
+ */
+function lastVerifiedPull(snapshot, head) {
+  if (!head) {
+    return null;
+  }
+  const receipts = readLedgerEntries(snapshot).filter((entry) =>
+    Number(entry?.step) === 0 && Number(entry?.exitCode) === 0 && String(entry?.head ?? "") === String(head));
+  return receipts.length === 0 ? null : receipts.at(-1);
 }
 
 // Round-6 finding S3b: `git pull --ff-only` aborting is the one failure that
@@ -972,14 +1055,37 @@ function checkDeployCheckout(snapshot) {
     return findings;
   }
   if (!git.remoteTip && git.remoteTipError && deployFootprint(snapshot).deployed) {
-    // Honest disclosure with the reason, rather than either silence or a red
-    // light: we asked origin and origin did not answer, so the only thing left
-    // is the local ref, which cannot see commits this machine never fetched.
-    findings.push(warn(
+    // Round-8 finding L4: K7 replaced the untrustworthy local ref with a live
+    // `ls-remote`, and then fell straight back to that same ref - as a WARN -
+    // whenever ls-remote could not answer. MEASURED with the deploy target's
+    // exact git state (HEAD = local origin/main = 14b1202, behind = 0, tree
+    // clean, real origin five commits ahead) plus an unreachable origin: gate
+    // ok=TRUE, zero errors, two warns. A machine running code that was never
+    // fetched passed the gate whenever the network was down.
+    //
+    // So the severity now depends on whether anything CORROBORATES the local
+    // ref. Step 0's receipt does exactly that and nothing else does: it is
+    // `git fetch origin && git pull --ff-only origin main`, so an exit-0
+    // receipt for step 0 recorded at the commit checked out right now is proof
+    // that a real fetch reached origin and landed here. Without one, "not
+    // behind" is a statement about a ref of unknown age, and this is the one
+    // check whose entire job is 「跑的不是你 push 的代码」.
+    const verifiedPull = lastVerifiedPull(snapshot, git.head);
+    findings.push((verifiedPull ? warn : error)(
       "deploy-checkout.remote_unverified",
       `没能向 origin 核对 main 的真实位置（${git.remoteTipError}），所以下面这些结论只基于本地那份 origin/main 引用`
         + `（${git.remoteHead ?? "无"}）——它可能比真正的 origin/main 旧很多，而那种情况下"没落后"是假的。`
-        + `网络/凭据恢复后重跑本体检，或先手动 git fetch origin。`
+        + (verifiedPull
+          ? `不过账本里有一条第 0 步的成功收据，就是在当前这个检出 ${git.head} 上跑的`
+            + `（${verifiedPull.finishedAt ?? "时间未知"}）：那一次 fetch + pull 确实连上了 origin，`
+            + `所以截至那一刻这里就是 origin/main。之后 origin 有没有再往前走，这次核不了。`
+            + `网络/凭据恢复后重跑本体检，或先手动 git fetch origin。`
+          : `而这台机器上【没有】任何一条"在当前检出 ${git.head} 上成功跑过第 0 步"的收据，`
+            + `也就是说没有任何证据表明这个检出是真的从 origin 拉下来的。`
+            + `第 7 轮在部署目标上实测到的正是这种：本地 origin/main 和 HEAD 都停在 14b1202、算出来"落后 0 个提交"，`
+            + `而真正的 origin/main 已经在五个提交之后。这种状态不能给绿灯。`
+            + `恢复到 origin 的连接后重跑本体检；或者直接跑一次完整部署，第 0 步会 fetch + pull，`
+            + `后面的步骤才会把新代码真正装上去。`)
     ));
   }
 

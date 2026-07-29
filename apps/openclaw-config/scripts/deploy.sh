@@ -36,6 +36,8 @@ set -euo pipefail
 #   3  配置未就绪: a required variable is unset, refused BEFORE step 0 - NOTHING ran
 #   4  a step's receipt could not be written; the acceptance gate cannot see
 #      this deploy at all, so nothing it says about it can be trusted
+#   129/130/143  the run was INTERRUPTED by SIGHUP / SIGINT / SIGTERM - see the
+#      signal traps below. Half-deployed, and the ledger says so.
 #
 # Test seams (used by the sandbox suite, never in production): REPO_ROOT,
 # DEPLOY_RUNTIME_ROOT, DEPLOY_SUDO, DEPLOY_LOGIN_SHELL, DEPLOY_NODE.
@@ -159,10 +161,14 @@ ENV_FILE="${REPO_ROOT}/.env.local"
 
 config_value() {
   local name="$1"
-  local from_env
-  from_env="$(printenv "${name}" 2>/dev/null || true)"
-  if [ -n "${from_env}" ]; then
-    printf "%s" "${from_env}"
+  # PRESENCE, not non-emptiness. The doctor builds its view as
+  # `{...loadLocalEnv(), ...process.env}`, so a variable that is exported but
+  # empty SHADOWS the file's value there. Testing `-n` here instead read the
+  # file's value and called the machine configured, while every daemon and the
+  # doctor saw the empty one. `printenv` exits 0 for a set-but-empty variable
+  # and 1 for an unset one, which is exactly the question.
+  if printenv "${name}" >/dev/null 2>&1; then
+    printenv "${name}"
     return 0
   fi
   [ -f "${ENV_FILE}" ] || return 0
@@ -187,9 +193,26 @@ config_value() {
   ' "${ENV_FILE}"
 }
 
+# Mirrors the doctor's own test, which is `String(value).trim().length > 0`
+# (readNotificationRouting's `configured`), NOT `[ -z ]`.
+#
+# Round-8 finding L5, measured with the real scripts: `.env.local` carrying
+# `FEISHU_GROUP_CHAT_ID="   "` passed this pre-flight, all nine steps ran, and
+# step 8 then failed with notification-routing.no_group_chat - the exact
+# 「配置缺口被读成部署回退」 that the pre-flight exists to prevent. A value that
+# is only spaces is unset to every consumer of it; it has to be unset here too.
+configured() {
+  local value
+  value="$(config_value "$1")"
+  # POSIX trim: drop the leading run of whitespace, then the trailing one.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  [ -n "${value}" ]
+}
+
 MISSING_CONFIG=""
 for required in FEISHU_GROUP_CHAT_ID PLATFORM_PUBLIC_BASE_URL; do
-  if [ -z "$(config_value "${required}")" ]; then
+  if ! configured "${required}"; then
     MISSING_CONFIG="${MISSING_CONFIG}${required}
 "
   fi
@@ -242,6 +265,19 @@ LEDGER_FAILED_REASON=""
 EXECUTED_STEPS=""
 SKIPPED_STEPS=""
 SUMMARY=""
+
+# --- state the signal traps need (round-8 finding L1) ------------------------
+# PENDING_STEP is, at every instant between the first trap being armed and the
+# last step returning, the step that is RUNNING or the one that is about to
+# start. That is what makes an interruption recordable no matter when it lands:
+# a signal arriving between two steps is still a deploy that stopped somewhere,
+# and the step it stopped in front of is the one to resume from.
+PENDING_STEP="${FROM_STEP}"
+PENDING_NAME=""
+PENDING_STARTED=""
+STEP_IN_FLIGHT=0
+INTERRUPTED_BY=""
+INTERRUPT_EXIT=0
 
 # Round-7 finding K1. This used to end in `>/dev/null 2>&1 || true`: the
 # writer's stdout, its stderr and its exit code were all discarded.
@@ -298,11 +334,16 @@ run_step() {
 
   echo ""
   echo "── 第 ${number} 步 ${name} ─────────────────────────────────────"
+  PENDING_STEP="${number}"
+  PENDING_NAME="${name}"
+  PENDING_STARTED="${started}"
+  STEP_IN_FLIGHT=1
   # NOT `status`: that is a read-only special parameter in zsh (an alias for
   # $?), and this script's shebang is zsh - assigning to it aborted run_step
   # with "read-only variable: status" before any step could be judged.
   local step_status=0
   "$@" || step_status=$?
+  STEP_IN_FLIGHT=0
   EXECUTED_STEPS="${EXECUTED_STEPS}${number} "
 
   # The receipt first: a step whose outcome was not recorded is worse than a
@@ -327,7 +368,76 @@ run_step() {
   fi
   SUMMARY="${SUMMARY}  第 ${number} 步 ${name}：退出码 0
 "
+  # This step is done; from here until the next one starts, the deploy's
+  # resume point is the step AFTER it. Its name is deliberately cleared rather
+  # than guessed - the trap prints 「第 N 步」 alone in that window, and the
+  # doctor renders the title from DEPLOY_STEPS when it reads the receipt.
+  PENDING_STEP=$((number + 1))
+  PENDING_NAME=""
+  PENDING_STARTED=""
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Round-8 finding L1. AN INTERRUPTED DEPLOY USED TO LEAVE A GREEN GATE.
+#
+# There was no INT/TERM/HUP trap at all. MEASURED (real deploy.sh, real ledger,
+# real analyzer, three runs):
+#
+#   SIGINT during step 0  -> exit 130, receipts []       -> gate ok=TRUE, warn only
+#   SIGHUP during step 1  -> exit 1,   receipts ["0:0"]  -> gate ok=TRUE, warn only
+#   SIGTERM during step 1 -> killed,   receipts ["0:0"]  -> gate ok=TRUE, warn only
+#
+# The last thing on the SIGHUP run's screen was 「── 第 1 步 安装依赖并构建 ──」
+# and then the script was simply gone: no summary, no failed-step line, no
+# resume command. That is the most likely way THIS deploy dies, because the
+# controller drives it over ssh and a dropped connection is exactly a SIGHUP to
+# the foreground process group.
+#
+# So an interruption is now recorded the same way a failure is: a receipt for
+# the step the run stopped in (or in front of), carrying the signal's
+# conventional exit code, which the gate reads as `deploy-ledger.step_N_failed`
+# - an error. The receipt is the durable half and it is written FIRST, because
+# on a dropped ssh the terminal that the summary below goes to is already gone.
+#
+# What this cannot do, stated plainly (measured with the real script):
+#   · a signal aimed at THIS PID ALONE (`kill <pid>`) while a step's child is
+#     running is deferred by the shell until that child exits - 10s of `sleep`
+#     measured as 10s of deferral. The receipt is still written, just later.
+#     A signal to the process group (ssh drop, Ctrl-C) reaches the child too,
+#     so the trap runs in milliseconds.
+#   · SIGKILL cannot be trapped by anything, so `kill -9` still leaves the
+#     silent gap. The doctor's own deploy-ledger.incomplete warn is all that is
+#     left there, and it is a warn.
+# ---------------------------------------------------------------------------
+on_interrupt() {
+  local signal="$1"
+  local code="$2"
+  # A second signal must not re-enter this and start a second report.
+  if [ -n "${INTERRUPTED_BY}" ]; then
+    return 0
+  fi
+  INTERRUPTED_BY="${signal}"
+  INTERRUPT_EXIT="${code}"
+  trap - INT TERM HUP ERR
+
+  if [ "${PENDING_STEP}" -le "${LAST_STEP}" ]; then
+    local phase
+    if [ "${STEP_IN_FLIGHT}" -eq 1 ]; then
+      phase="执行到一半被 ${signal} 打断"
+    else
+      phase="被 ${signal} 打断时这一步还没有开始"
+    fi
+    local started="${PENDING_STARTED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+    if record_step "${PENDING_STEP}" "${code}" "${HEAD_SHA}" "${started}" "${signal} 中断：${phase}"; then
+      SUMMARY="${SUMMARY}  第 ${PENDING_STEP} 步 ${PENDING_NAME}：${phase}，已按退出码 ${code} 记进账本
+"
+    else
+      SUMMARY="${SUMMARY}  第 ${PENDING_STEP} 步 ${PENDING_NAME}：${phase}，而且这条收据没能写进账本
+"
+    fi
+  fi
+  report_and_exit "${code}"
 }
 
 report_and_exit() {
@@ -335,6 +445,9 @@ report_and_exit() {
   echo ""
   echo "════════════════════════════════════════════════════════════════"
   echo "本次部署 attempt=${ATTEMPT_ID}，commit=${HEAD_SHA}"
+  if [ -n "${INTERRUPTED_BY}" ]; then
+    echo "本次部署【被 ${INTERRUPTED_BY} 中断】——不是跑完了，是被打断了。"
+  fi
   printf "%s" "${SUMMARY}"
 
   # The ledger failure is reported FIRST and on its own, because it changes what
@@ -356,6 +469,26 @@ report_and_exit() {
     echo "（doctor 自己也会报 deploy-ledger.unwritable —— 账本写不进去的机器不会拿到绿灯。）" >&2
     echo "════════════════════════════════════════════════════════════════"
     exit 4
+  fi
+
+  if [ -n "${INTERRUPTED_BY}" ]; then
+    echo ""
+    if [ "${PENDING_STEP}" -gt "${LAST_STEP}" ]; then
+      echo "部署被 ${INTERRUPTED_BY} 中断，但九步已经全部跑完了——中断落在收尾阶段，机器状态是完整的。" >&2
+      echo "保险起见再跑一遍验收：pnpm openclaw:runtime:doctor" >&2
+      echo "════════════════════════════════════════════════════════════════"
+      exit "${INTERRUPT_EXIT}"
+    fi
+    echo "部署被 ${INTERRUPTED_BY} 中断在第 ${PENDING_STEP} 步，后面的步骤【一步都没有执行】。" >&2
+    echo "ssh 断线、Ctrl-C、kill 都会走到这里。这台机器现在处于半完成状态。" >&2
+    echo "这一步已经按退出码 ${INTERRUPT_EXIT} 写进了部署账本，所以验收门（第 8 步）会因此报红——" >&2
+    echo "被打断的部署不会在下一次验收时装作没发生过。" >&2
+    echo "确认这台机器上没有残留的子进程之后，从这一步继续：" >&2
+    echo "  DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${PENDING_STEP} zsh ${SCRIPT_PATH}" >&2
+    echo "如果是 ssh 断线打断的，下一次让它跑在会话之外，别再被 SIGHUP 带走：" >&2
+    echo "  DEPLOY_ACK_GATEWAY_RESTART=yes nohup zsh ${SCRIPT_PATH} > ~/alphaloop-deploy.log 2>&1 &" >&2
+    echo "════════════════════════════════════════════════════════════════"
+    exit "${INTERRUPT_EXIT}"
   fi
 
   if [ -n "${FAILED_STEP}" ]; then
@@ -389,6 +522,14 @@ report_and_exit() {
 }
 
 trap 'report_and_exit $?' ERR
+# Armed HERE and not earlier, on purpose: everything above this line is the
+# pre-flight (argument parsing, the config check, the gateway ack) and it has
+# touched nothing, so a Ctrl-C up there really is 「什么都还没做」 and must not
+# manufacture a failure receipt. From this line on, every exit path leads
+# through report_and_exit. 130/129/143 are the conventional 128+signal codes.
+trap 'on_interrupt SIGINT 130' INT
+trap 'on_interrupt SIGHUP 129' HUP
+trap 'on_interrupt SIGTERM 143' TERM
 
 # --- 0. the only step that brings new code to this machine -------------------
 # Idempotent: `--ff-only` prints "Already up to date" and exits 0 when there is
@@ -465,5 +606,5 @@ run_step 6 "部署 control agent 人设" step_persona
 run_step 7 "启动 rsshub 容器" step_rsshub
 run_step 8 "验收 doctor" step_acceptance
 
-trap - ERR
+trap - ERR INT HUP TERM
 report_and_exit 0

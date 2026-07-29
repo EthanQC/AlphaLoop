@@ -23,7 +23,7 @@
 // that only satisfies our string matching but not launchd's parser would be
 // worthless. This file already lives in vitest.config.ts's serial lane, which
 // is where subprocess-spawning suites belong.
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -1540,8 +1540,18 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
 
     // Each stub logs what it was asked to do and honours one injection env
     // var. `$1` is enough to identify the subcommand for all of them.
+    //
+    // Round 8 adds `block()`: a stub can be made to sit inside a step until the
+    // test releases it, which is the only way to deliver a signal while a step
+    // is genuinely in flight rather than racing the script's start-up.
     const stub = (name: string, body: string) => {
-      writeFileSync(join(binDir, name), `#!/bin/sh\necho "${name} $@" >> "${callLog}"\n${body}\nexit 0\n`);
+      writeFileSync(join(binDir, name), [
+        "#!/bin/sh",
+        `echo "${name} $@" >> "${callLog}"`,
+        'block() { touch "$BLOCK_READY"; while [ ! -f "$BLOCK_RELEASE" ]; do sleep 0.05; done; }',
+        body,
+        "exit 0"
+      ].join("\n") + "\n");
       chmodSync(join(binDir, name), 0o755);
     };
 
@@ -1549,11 +1559,15 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
       'if [ "$1" = "-C" ]; then shift 2; fi',
       'case "$1" in',
       '  status) [ "$FAIL_GIT_DIRTY" = "1" ] && echo " M README.md"; exit 0 ;;',
-      '  pull) if [ "$FAIL_GIT_PULL" = "1" ]; then echo "error: Your local changes would be overwritten" >&2; exit 1; fi; echo "Already up to date." ;;',
+      '  pull) [ "$BLOCK_ON" = "git pull" ] && block',
+      '        if [ "$FAIL_GIT_PULL" = "1" ]; then echo "error: Your local changes would be overwritten" >&2; exit 1; fi; echo "Already up to date." ;;',
       '  rev-parse) echo "cafe123" ;;',
       "esac"
     ].join("\n"));
-    stub("pnpm", 'if [ "$FAIL_PNPM_SCRIPT" = "$1" ]; then echo "pnpm $1 failed" >&2; exit 1; fi');
+    stub("pnpm", [
+      '[ "$BLOCK_ON" = "pnpm $1" ] && block',
+      'if [ "$FAIL_PNPM_SCRIPT" = "$1" ]; then echo "pnpm $1 failed" >&2; exit 1; fi'
+    ].join("\n"));
     stub("node", 'if [ "$FAIL_NODE" = "1" ]; then echo "node script failed" >&2; exit 1; fi');
     stub("sudo", 'if [ "$FAIL_SUDO" = "1" ]; then echo "install-system-daemons: FAILED - 3 of 8 daemons did not come up" >&2; exit 1; fi');
     // Stands in for the login shell of step 7 (`zsh -lc "docker start ..."`).
@@ -1590,7 +1604,67 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
   }
 
-  function receipts(runbook: Runbook): Array<{ step: number; exitCode: number }> {
+  // Round-8 finding L1. Runs the REAL deploy.sh, waits until the injected step
+  // is actually inside its stub, then signals it - the deploy's own process
+  // group by default, which is what an ssh drop (SIGHUP) and a Ctrl-C (SIGINT)
+  // both hit, or the script's pid alone for a plain `kill`.
+  //
+  // `detached: true` is what makes the group form possible at all: it puts the
+  // deploy in its own process group, so `process.kill(-pid, ...)` cannot reach
+  // the test runner.
+  async function runDeployAndSignal(
+    runbook: Runbook,
+    options: { blockOn: string; signal: NodeJS.Signals; target?: "group" | "pid" }
+  ): Promise<{ status: number | null; killedBy: NodeJS.Signals | null; output: string }> {
+    const ready = join(runbook.root, "step-blocked");
+    const release = join(runbook.root, "step-release");
+    const child = spawn("zsh", [deployScript], {
+      env: { ...runbook.env, BLOCK_ON: options.blockOn, BLOCK_READY: ready, BLOCK_RELEASE: release },
+      detached: true
+    });
+    let output = "";
+    child.stdout?.on("data", (chunk) => { output += String(chunk); });
+    child.stderr?.on("data", (chunk) => { output += String(chunk); });
+    const closed = new Promise<{ status: number | null; killedBy: NodeJS.Signals | null }>((resolve) => {
+      child.on("close", (code, signal) => resolve({ status: code, killedBy: signal }));
+    });
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    try {
+      const deadline = Date.now() + 20_000;
+      while (!existsSync(ready)) {
+        if (Date.now() > deadline) {
+          throw new Error(`step never reached ${options.blockOn}; output so far:\n${output}`);
+        }
+        await wait(25);
+      }
+      await wait(100);
+      const pid = child.pid;
+      if (!pid) {
+        throw new Error("deploy.sh did not start");
+      }
+      process.kill(options.target === "pid" ? pid : -pid, options.signal);
+      if (options.target === "pid") {
+        // A signal aimed at the shell alone is deferred by the shell until the
+        // foreground child returns (measured: 10s of `sleep` = 10s of
+        // deferral), so the stub has to be let go for the trap to run at all.
+        await wait(300);
+        writeFileSync(release, "go\n");
+      }
+      return { ...(await closed), output };
+    } finally {
+      writeFileSync(release, "go\n");
+      if (child.exitCode === null && child.signalCode === null && child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  }
+
+  function receipts(runbook: Runbook): Array<{ step: number; exitCode: number; detail?: string }> {
     const path = join(runbook.runtimeRoot, "deploy", "steps.jsonl");
     if (!existsSync(path)) {
       return [];
@@ -1930,5 +2004,124 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     expect(output).toMatch(/部署在第 8 步（验收 doctor）失败/u);
     expect(output).not.toMatch(/全部退出 0/u);
     expect(receipts(runbook).at(-1)).toMatchObject({ step: 8, exitCode: 1 });
+  });
+
+  // =========================================================================
+  // ROUND 8, finding L1: AN INTERRUPTED DEPLOY LEFT A GREEN GATE.
+  //
+  // deploy.sh had no INT/TERM/HUP trap. MEASURED against the version at HEAD,
+  // with these same real scripts, the real ledger writer and the real analyzer:
+  //
+  //   SIGINT during step 0  -> exit 130, receipts []      -> gate ok=TRUE, warn only
+  //   SIGHUP during step 1  -> exit 1,   receipts ["0:0"] -> gate ok=TRUE, warn only
+  //   SIGTERM during step 1 -> killed,   receipts ["0:0"] -> gate ok=TRUE, warn only
+  //
+  // The controller drives this deploy over ssh, and a dropped connection is
+  // precisely a SIGHUP to the foreground process group - so this was the single
+  // most likely way the real deployment could end while still looking fine.
+  // =========================================================================
+  const interruptions: Array<[NodeJS.Signals, number, string, number]> = [
+    ["SIGHUP", 129, "pnpm build", 1],
+    ["SIGINT", 130, "git pull", 0],
+    ["SIGTERM", 143, "pnpm build", 1]
+  ];
+
+  it.each(interruptions)(
+    "%s (exit %d) while %s is running: a receipt, a resume command, and a red gate at step %d",
+    async (signal, exitCode, blockOn, step) => {
+      const runbook = makeRunbook(`alphaloop-r8-signal-${signal}-`);
+
+      const { status, output } = await runDeployAndSignal(runbook, { blockOn, signal });
+
+      // 128 + signal number: the conventional code, and distinct from every
+      // other exit this script has, so a controller can tell an interruption
+      // from a failed step without reading the text.
+      expect(status).toBe(exitCode);
+      // The half that survives a terminal that is already gone.
+      const recorded = receipts(runbook);
+      expect(recorded.at(-1)).toMatchObject({ step, exitCode });
+      expect(recorded.at(-1)?.detail).toMatch(new RegExp(`${signal} 中断`, "u"));
+      // The half the operator reads when the terminal is still there.
+      expect(output).toMatch(new RegExp(`本次部署【被 ${signal} 中断】`, "u"));
+      expect(output).toMatch(new RegExp(`部署被 ${signal} 中断在第 ${step} 步`, "u"));
+      expect(output).toMatch(new RegExp(`DEPLOY_FROM_STEP=${step} zsh /.*/deploy\\.sh`, "u"));
+      expect(output).not.toMatch(/全部退出 0/u);
+
+      const analysis = await gateFromLedger(runbook);
+      expect(analysis.ok).toBe(false);
+      const finding = analysis.findings.find((f) => f.code === `deploy-ledger.step_${step}_failed`);
+      expect(finding?.severity).toBe("error");
+      // Without the receipt's own note, 「以退出码 129 失败」 is unreadable.
+      expect(finding?.message).toMatch(new RegExp(`收据备注：${signal} 中断`, "u"));
+    },
+    40_000
+  );
+
+  // The measured limit, asserted rather than described: a signal aimed at the
+  // script's pid alone cannot be handled while a step's child is running - the
+  // shell defers it. The receipt is not lost, it is late.
+  it("still records the interruption when the signal was deferred behind a running step", async () => {
+    const runbook = makeRunbook("alphaloop-r8-signal-deferred-");
+
+    const { status } = await runDeployAndSignal(runbook, {
+      blockOn: "pnpm build",
+      signal: "SIGTERM",
+      target: "pid"
+    });
+
+    expect(status).toBe(143);
+    expect(receipts(runbook).at(-1)).toMatchObject({ step: 1, exitCode: 143 });
+  }, 40_000);
+
+  // The other side of the rule: the traps are armed only after the pre-flight,
+  // so a Ctrl-C while the script is still refusing to start must not invent a
+  // failure receipt for a machine nothing has touched.
+  it("does not manufacture a failed step out of an interruption before step 0", async () => {
+    const runbook = makeRunbook("alphaloop-r8-signal-preflight-");
+    delete runbook.env.DEPLOY_ACK_GATEWAY_RESTART;
+
+    const { status } = runDeploy(runbook);
+
+    expect(status).toBe(2);
+    expect(receipts(runbook)).toEqual([]);
+  });
+
+  // L5. `config_value` stripped the quotes and then tested `[ -z ]`, so a value
+  // of only spaces passed the pre-flight - while the doctor's own `configured()`
+  // is `String(value).trim().length > 0`. MEASURED: `.env.local` carrying
+  // `FEISHU_GROUP_CHAT_ID="   "` ran all nine steps and exited 0, and step 8
+  // then errored with notification-routing.no_group_chat. That is exactly the
+  // 「配置缺口被读成部署回退」 the pre-flight exists to prevent.
+  it("treats a whitespace-only value as unset, the way the daemons do", () => {
+    const runbook = makeRunbook("alphaloop-r8-preflight-blank-");
+    writeFileSync(
+      join(runbook.root, ".env.local"),
+      "FEISHU_GROUP_CHAT_ID=\"   \"\nPLATFORM_PUBLIC_BASE_URL=\"https://alphaloop.invalid\"\n"
+    );
+    delete runbook.env.FEISHU_GROUP_CHAT_ID;
+    delete runbook.env.PLATFORM_PUBLIC_BASE_URL;
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(3);
+    expect(output).toMatch(/FEISHU_GROUP_CHAT_ID/u);
+    expect(calls(runbook)).toBe("");
+  });
+
+  // The same rule from the environment's side. The doctor merges
+  // `{...loadLocalEnv(), ...process.env}`, so an exported-but-empty variable
+  // SHADOWS the file - the pre-flight has to read it that way too, or it
+  // approves a machine on a value no daemon will ever see.
+  it("lets an exported-but-empty variable shadow the file, exactly as the doctor does", () => {
+    const runbook = makeRunbook("alphaloop-r8-preflight-shadow-");
+    runbook.env.FEISHU_GROUP_CHAT_ID = "  ";
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(3);
+    // The list of what is missing names one variable, not both: the file's
+    // PLATFORM_PUBLIC_BASE_URL is real and is read as configured.
+    expect(output).toMatch(/· FEISHU_GROUP_CHAT_ID\n/u);
+    expect(output).not.toMatch(/· PLATFORM_PUBLIC_BASE_URL\n/u);
   });
 });

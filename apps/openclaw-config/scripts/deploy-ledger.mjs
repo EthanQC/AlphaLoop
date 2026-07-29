@@ -166,19 +166,49 @@ export function probeDeployLedgerWritable(runtimeRoot) {
   return { writable: null, path, checked: null };
 }
 
-/** Every receipt on this machine, oldest first. Malformed lines are dropped. */
-export function readDeployLedger(runtimeRoot) {
+/**
+ * Round-8 finding L3, the READ half of K1 (which only closed the write half).
+ *
+ * `readDeployLedger` answers `[]` for three completely different machines, and
+ * `judgeDeployLedger` short-circuits `[]` to `deployed: false`, which is at most
+ * a warn. MEASURED, both starting from a real deploy whose step 3 had failed
+ * (receipt `3:1` sitting on disk):
+ *
+ *   · `chmod 0222 steps.jsonl` -> gate ok=TRUE with ZERO deploy-ledger findings,
+ *     not even `absent` - because the old `deployFootprint`'s first signal was
+ *     also "readLedgerEntries().length > 0", so an unreadable ledger unmade the
+ *     footprint that would have raised the severity;
+ *   · `rm steps.jsonl` -> gate ok=TRUE, one warn.
+ *
+ * A failed deploy erased by deleting one file. So the reader now reports WHICH
+ * of the three it is, and the doctor keeps them apart:
+ *
+ *   fileExists=false, dirExists=false  no ledger was ever written here
+ *   fileExists=false, dirExists=true   there WAS one - `runtime/deploy/` exists
+ *                                      only because a receipt was appended into
+ *                                      it (recordDeployStep's mkdirSync is the
+ *                                      only thing in this repo that creates it)
+ *   readable=false                     it is there and this process cannot read
+ *                                      it; nothing below is evidence
+ *
+ * @returns {{entries: Array<Record<string, unknown>>, path: string,
+ *            dir: string, fileExists: boolean, dirExists: boolean,
+ *            readable: boolean|null, error: string|null}}
+ */
+export function readDeployLedgerResult(runtimeRoot) {
   const path = deployLedgerPath(runtimeRoot);
-  if (!existsSync(path)) {
-    return [];
+  const dir = dirname(path);
+  const base = { entries: [], path, dir, dirExists: existsSync(dir), fileExists: existsSync(path) };
+  if (!base.fileExists) {
+    return { ...base, readable: null, error: null };
   }
   let text;
   try {
     text = readFileSync(path, "utf8");
-  } catch {
-    return [];
+  } catch (error) {
+    return { ...base, readable: false, error: error instanceof Error ? error.message : String(error) };
   }
-  return text
+  const entries = text
     .split(/\r?\n/u)
     .map((line) => line.trim())
     .filter(Boolean)
@@ -191,6 +221,12 @@ export function readDeployLedger(runtimeRoot) {
       }
     })
     .filter(Boolean);
+  return { ...base, entries, readable: true, error: null };
+}
+
+/** Every receipt on this machine, oldest first. Malformed lines are dropped. */
+export function readDeployLedger(runtimeRoot) {
+  return readDeployLedgerResult(runtimeRoot).entries;
 }
 
 /** The newest receipt for each step, keyed by step number. */

@@ -16,6 +16,7 @@ import {
   lastSuccessfulInstallAt,
   probeDeployLedgerWritable,
   readDeployLedger,
+  readDeployLedgerResult,
   recordDeployStep
 } from "./deploy-ledger.mjs";
 
@@ -193,5 +194,30 @@ describe("reading a ledger nobody can be sure is well-formed", () => {
       expect.objectContaining({ step: 0, exitCode: 0 }),
       [1, 2, 3]
     ]);
+  });
+
+  // Round-8 finding L3: `[]` used to be the answer for "no ledger here", "the
+  // ledger was deleted" and "the ledger cannot be read", and only the first of
+  // those is a machine that never deployed. The doctor's severity split needs
+  // them apart, so the reader has to hand back which one it is.
+  it("tells 'never had one' apart from 'deleted' and from 'cannot read it'", () => {
+    const untouched = makeRuntimeRoot();
+    expect(readDeployLedgerResult(untouched)).toMatchObject({
+      entries: [], fileExists: false, dirExists: false, readable: null
+    });
+
+    const deleted = makeRuntimeRoot();
+    recordDeployStep({ runtimeRoot: deleted, attempt: "a", step: 0, exitCode: 0 });
+    rmSync(deployLedgerPath(deleted));
+    expect(readDeployLedgerResult(deleted)).toMatchObject({
+      entries: [], fileExists: false, dirExists: true, readable: null
+    });
+
+    const unreadable = makeRuntimeRoot();
+    recordDeployStep({ runtimeRoot: unreadable, attempt: "a", step: 3, exitCode: 1 });
+    chmodSync(deployLedgerPath(unreadable), 0o222);
+    const result = readDeployLedgerResult(unreadable);
+    expect(result).toMatchObject({ entries: [], fileExists: true, readable: false });
+    expect(result.error).toMatch(/EACCES/u);
   });
 });

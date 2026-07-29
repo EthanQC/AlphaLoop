@@ -91,11 +91,26 @@ zsh -lc 'command -v pnpm node docker'                    # 三个都要有
 
 工作区有已跟踪文件的本地改动时，第 0 步的 `git pull --ff-only` 会中止——部署脚本会**先**检查这一点并把文件名打出来，而不是让 git 报一句看不出后果的话。
 
-### 部署：一条命令
+### 部署：先把脚本本身弄上机器，再让脚本接管
 
 ```bash
-cd ~/AlphaLoop
-DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh
+cd ~/AlphaLoop && \
+  git fetch origin && \
+  git pull --ff-only origin main && \
+  DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh
+```
+
+**为什么前面要手敲那两条 git。** `deploy.sh` 是 2026-07-29 才进仓库的（commit `43a4336`），而部署机上的检出停在 `14b1202`——只读实测（mini，2026-07-29）：`~/AlphaLoop/apps/openclaw-config/scripts/deploy.sh` **在那台机器上不存在**。直接照着「一条命令」跑，得到的是 `zsh: no such file or directory`。而第 0 步（`git pull`）是全流程唯一把代码搬上机器的一步，它偏偏就写在这个还不存在的文件里面。
+
+所以第一次部署到任何"比 `deploy.sh` 更旧的检出"上时，那两条 git 必须由人手敲一次——它们和第 0 步做的事**逐字相同**，脚本接手后还会再跑一遍（`--ff-only` 在已经最新时打印 `Already up to date.` 并退出 0，并把第 0 步的收据补上）。之后每次部署都可以整条命令原样再用。
+
+`&&` 串起来是有意的：`git pull` 中止（工作区脏是最常见的原因）时，后面那句根本不会执行，你看到的是 git 自己的错误，而不是一句看不出所以然的 `no such file or directory`——那句话的真正含义是"pull 没成功"，不是"runbook 写错了"。
+
+**别让 ssh 断线把它带走。** 部署被 SIGHUP/SIGINT/SIGTERM 打断时，脚本会把当前那一步按 129/130/143 记进账本（验收门因此报红），并打印从哪一步续跑；但 `kill -9` 谁也拦不住。连接不稳时让它跑在会话之外：
+
+```bash
+cd ~/AlphaLoop && DEPLOY_ACK_GATEWAY_RESTART=yes nohup zsh apps/openclaw-config/scripts/deploy.sh > ~/alphaloop-deploy.log 2>&1 &
+tail -f ~/alphaloop-deploy.log
 ```
 
 它按顺序跑第 0 到第 8 步，**任何一步非零退出就立刻停下**，并且把每一步的退出码写进 `runtime/deploy/steps.jsonl`。失败时它会告诉你：哪一步失败、后面哪些步骤因此没有执行、以及怎么从那一步继续：
@@ -115,8 +130,11 @@ DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=3 zsh apps/openclaw-config/scrip
 | 2 | 参数写错，或没确认 gateway 重启 | 否 |
 | 3 | **配置未就绪**（见下一节），在第 0 步之前就拒绝 | 否 |
 | 4 | 某一步的收据写不进账本——验收门看不见这次部署 | 半完成 |
+| 129 / 130 / 143 | 被 SIGHUP / SIGINT / SIGTERM 中断（ssh 断线、Ctrl-C、`kill`） | 半完成 |
 
-**第 0 步之前的配置预检。** 脚本会先看 `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL`（进程环境优先，其次 `.env.local`，解析规则和 daemon 用的 `loadLocalEnv` 一致）。缺任何一个就以退出码 3 停下，**一步都不跑**。原因是这两个变量正是 doctor 会报 error 的那两个：mini 上它们今天都没配，所以第 0-7 步可以全部成功而第 8 步照样退出 1——语义没错，但读日志的人会把它当成"部署回退了"。想先装服务、稍后补配置，就显式写 `DEPLOY_ALLOW_MISSING_CONFIG=yes`：第 0-7 步照跑，第 8 步仍然会红，红的是配置。
+**被打断的部署也会留下证据。** 2026-07-29 之前脚本没有任何信号 trap，实测三次：SIGINT 打断第 0 步 → 退出 130、账本里一条收据都没有；SIGHUP / SIGTERM 打断第 1 步 → 屏幕上最后一行是「── 第 1 步 安装依赖并构建 ──」然后脚本就没了，没有小结、没有失败行、没有续跑命令——而验收门在这三种情况下**全是绿的**（只有一条 warn）。控制器是通过 ssh 驱动这次部署的，掉线产生的正是这个形状。现在：被打断的那一步（或正要开始的那一步）会按 129/130/143 写进账本，验收门因此报 error，屏幕上照常打印小结、续跑命令和 `nohup` 建议。两个说明白的边界：信号只发给脚本 pid（而不是整个进程组）时，shell 会等当前这一步的子进程返回才处理它，收据是晚、不是丢；`kill -9` 无法被任何程序拦截，那种情况下只剩 doctor 的 `deploy-ledger.incomplete`（warn）。
+
+**第 0 步之前的配置预检。** 脚本会先看 `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL`（进程环境优先，其次 `.env.local`，解析规则和 daemon 用的 `loadLocalEnv` 一致）。缺任何一个就以退出码 3 停下，**一步都不跑**。判空和 doctor 一样是 `trim()` 之后再看长度：`FEISHU_GROUP_CHAT_ID="   "` 算**没配**（2026-07-29 之前它能通过预检，九步跑完之后第 8 步才报 `no_group_chat`）；"环境里导出了但值是空的"也算没配，因为 doctor 那边 `process.env` 会盖掉 `.env.local` 的值。原因是这两个变量正是 doctor 会报 error 的那两个：mini 上它们今天都没配，所以第 0-7 步可以全部成功而第 8 步照样退出 1——语义没错，但读日志的人会把它当成"部署回退了"。想先装服务、稍后补配置，就显式写 `DEPLOY_ALLOW_MISSING_CONFIG=yes`：第 0-7 步照跑，第 8 步仍然会红，红的是配置。
 
 **为什么必须是脚本而不是粘贴命令块。** 2026-07-29 之前这一节就是一段可以整体复制的命令序列——没有 `&&`、没有 `set -e`、没有任何守卫（这一点看那段文本本身就能确认）。第 5 轮实测到的后果：让第 0 步的 `git pull --ff-only` 因为一个改动过的 README 中止，第 1 到第 8 步照样全部跑完，跑的全是**旧 commit 的代码**，最后第 8 步还给了绿灯。同一个形状对每一步都成立：第 3 步退出 1 拦不住第 4 步去动它刚刚有意保留的退路。粘进交互式 shell 的命令块没法 fail-fast（`set -e` 会把操作者的 ssh 会话一起杀掉），所以 runbook 变成了这个脚本。
 
@@ -196,8 +214,10 @@ pnpm openclaw:runtime:doctor
 
 - **部署收据里有失败的步骤**（`deploy-ledger.step_N_failed`，error）。`deploy.sh` 和 `install-system-daemons.sh` 会把每一步的退出码写进 `runtime/deploy/steps.jsonl`；修好那一步再重跑，成功的新收据会覆盖它。**收据缺失**只报 warn——"没有证据"不等于"失败"。
 - **收据对应的是别的 commit**（`deploy-ledger.stale`，error，2026-07-29 从 warn 提上来）。之前把它当 warn 的理由是「检出旧不旧由 `deploy-checkout` 判」，那句话是错的：`deploy-checkout` 只在**落后 origin** 时报错。实测（真的本地 origin + 两个真 commit）：在 A 部署 → origin 前进到 B → 操作者手动 `git pull` 成功、但没有重跑 `deploy.sh` → 落后 0、只有一条 warn、门是绿的，而 dist 产物和八个 daemon 跑的全是 A。手动 pull 不会更新收据，也不会重启任何服务。
+- **收据被打断在半路**（`deploy-ledger.step_N_failed`，error）。`deploy.sh` 现在 trap 了 SIGHUP/SIGINT/SIGTERM，被打断时把当时那一步按 129/130/143 写进账本，收据的 `detail` 里写明是哪个信号——所以 ssh 掉线打断的部署，验收门看得见。之前实测的三种打断（SIGINT@第 0 步、SIGHUP@第 1 步、SIGTERM@第 1 步）在门上**全是绿的**。
+- **收据读不出来或被删掉**（`deploy-ledger.unreadable` / `deploy-ledger.lost`，error）。`chmod 0222` 和 `rm steps.jsonl` 之前都会被读成"这台机器没部署过"，各自换来一次绿灯：前者连 `absent` 都不报（`deployFootprint` 的第一个信号当时也是"收据条数 > 0"），后者只剩一条 warn。判据是文件/目录**在不在**，而不是"能读出几条"：`runtime/deploy/` 只有写收据的时候才会被建出来，所以"目录在、文件没了"是被删过。从来没有过账本的机器仍然只报 warn `deploy-ledger.absent`。
 - **收据写不进去**（`deploy-ledger.unwritable`，已部署的机器上是 error）。判据是「当前用户能不能往那个文件追加」，只问内核、不写任何东西。它堵的是这条路：账本被某次 sudo 跑变成 root 属主之后，新的失败记录写不进去，而上一次部署的九条 `exitCode: 0` 还躺在那儿——门读到的就是那九条绿灯。`deploy.sh`、`install-system-daemons.sh`、`install-openclaw-cron.mjs` 三个写入方现在也都会因为写失败而以退出码 4 停下。
-- **这台机器的检出不是你 push 的代码**（`deploy-checkout.behind_origin` / `deploy-checkout.never_fetched`，error）：用 `git ls-remote` 直接问 origin 的 main 现在在哪（只读：不更新 ref、不下载对象、不动工作区），再看这台机器上有没有那个 commit。之前只比 `HEAD` 和**本地那份** `origin/main` ref，而 mini 上实测：`HEAD` = 14b1202、本地 ref 也 = 14b1202、落后 0、工作区干净，真正的 `origin/main` 却是 a4e39c1。这条检查存在的意义就是回答「跑的不是你 push 的代码」，它却在一台五个 commit 没跟上、且从没 fetch 过的机器上答「没事」。问不到 origin（断网/凭据）时报 warn `deploy-checkout.remote_unverified`，并说明结论只基于本地 ref。
+- **这台机器的检出不是你 push 的代码**（`deploy-checkout.behind_origin` / `deploy-checkout.never_fetched`，error）：用 `git ls-remote` 直接问 origin 的 main 现在在哪（只读：不更新 ref、不下载对象、不动工作区），再看这台机器上有没有那个 commit。之前只比 `HEAD` 和**本地那份** `origin/main` ref，而 mini 上实测：`HEAD` = 14b1202、本地 ref 也 = 14b1202、落后 0、工作区干净，真正的 `origin/main` 却是 a4e39c1。这条检查存在的意义就是回答「跑的不是你 push 的代码」，它却在一台五个 commit 没跟上、且从没 fetch 过的机器上答「没事」。问不到 origin（断网/凭据）时报 `deploy-checkout.remote_unverified`，说明结论只基于本地 ref——**等级取决于有没有旁证**：账本里有一条"在当前这个检出上成功跑过第 0 步"的收据（第 0 步就是 `git fetch origin && git pull --ff-only`，成功过就说明真的连上过 origin，而且拉下来的就是现在这份）→ warn；没有 → error。原来这里无条件是 warn，于是断网时它又退回到那份本地 ref——正是上一句刚证明不可信的那份。拿 mini 的真实 git 状态 + 一个连不上的 origin 实测：门 `ok=true`、零条 error。
 - **某个标签一个域都没装**（`launchd-jobs.<name>.not_loaded`）。这在**已经部署过的机器**上是 error（判据：有部署收据、或者已有别的受管标签处于加载状态、或者磁盘上已经有受管标签的 plist）；在完全没有部署痕迹的开发机上仍然只是 warn。
 - **常驻服务在崩溃重启循环**（`crash_looping`，error）：`runs ≥ 20` **且**距上一次装系统 daemon 不到 24 小时。不再要求"上次退出码非零"。原因是 `runs` 只在服务死掉时增加、而且每次重新 bootstrap 都会清零（本机实测：同一个标签 bootout+bootstrap 之后 runs 从 3 回到 1），所以它累计不到部署次数上去；但它在**两次安装之间**照样累加——mini 上今天 gateway 就是 `runs = 10` + `state = running` + 进程活了 10 天，只数次数的规则迟早会给一台正常机器挂上永久红灯，还说它「自上次安装以来死了 19 次」。次数够了而窗口不明（没有第 3 步的成功收据）或跨度远超一天时，报的是 warn `restarted_many_times`，并把缺的那一半事实直说。旧规则挂在 `last exit code` 上，而**被信号杀死的 job 根本不打印这一行**（mini 上的 platform-app 现在就是这样：只有 `last terminating signal = Terminated: 15`），于是整个分支对这类死法不可达。信号本身也纳入判定，但 SIGTERM/SIGKILL 除外——那正是 `launchctl bootout` 和 `kickstart -k` 发的信号，也就是这套安装脚本每次都会对每个 daemon 做的事。
 - **`~/Library/LaunchAgents` 里还留着系统域标签的用户级 plist**（`launchd-plists.stray_user_copy`，error）。此刻它们没有加载，所以 launchd 任务表看不出问题；但下次登录时 launchd 会把它们全部 bootstrap 起来，同一个服务就有两份在抢同一个端口和同一份 `trading.sqlite`。通常是归档目录写不进去留下的。
