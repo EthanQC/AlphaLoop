@@ -353,6 +353,7 @@ const PROBES: Probe[] = [
   // routes/api-research.ts - identity-gated JSON writes.
   { module: "routes/api-research.ts", method: "POST", path: "/api/research", anonymous: true, expectStatus: 401 },
   { module: "routes/api-research.ts", method: "POST", path: "/api/research/rt1/promote", expectStatus: 404 },
+  { module: "routes/api-research.ts", method: "POST", path: "/api/research/rt1/thesis", expectStatus: 404 },
 
   // routes/review.ts - reading page + confirm endpoint.
   { module: "routes/review.ts", method: "GET", path: "/review/rev1", expectStatus: 404 },
