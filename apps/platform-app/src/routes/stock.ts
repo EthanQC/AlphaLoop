@@ -100,7 +100,7 @@ import {
   type DataAge
 } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { renderPage, type Freshness } from "../render/layout.js";
+import { renderPage, unknownDataTime, type Freshness } from "../render/layout.js";
 
 export interface StockRouteDeps {
   db: DatabaseSync;
@@ -860,8 +860,15 @@ function renderStockPage(
     // U2: the topbar states the DATA's time, not the request's. The quote
     // sheet is this page's freshest dated content, so it names the data
     // time; with no quotes at all we fall back to the newest analysis's
-    // date, and with neither there is honestly no data time to state.
-    dataAsOf: describeStockDataAsOf(factSheet, latest, now),
+    // date.
+    //
+    // Task 19: with NEITHER, the page is still not empty - the viewer's own
+    // 论点卡 and 提醒历史 render from the database below - so it says the data
+    // time is unknown and why, instead of leaving the request clock as the
+    // only timestamp on a page that does show content.
+    dataAsOf:
+      describeStockDataAsOf(factSheet, latest, now) ??
+      unknownDataTime(`没有抓到 ${symbol} 的行情，也没有任何一期个股分析`),
     degraded: buildStockDegradations(factSheet, latest, now),
     bodyHtml,
     nonce,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { trustedHtml } from "./html.js";
-import { formatBeijingGeneratedAt, renderPage } from "./layout.js";
+import { formatBeijingGeneratedAt, renderPage, unknownDataTime } from "./layout.js";
 
 const SAMPLE_BODY = trustedHtml('<section class="card"><h2>示例</h2></section>');
 
@@ -232,5 +232,22 @@ describe("renderPage: the topbar's data time vs request time (2026-07-30, U2)", 
     const out = renderSample({ dataAsOf: "<script>x</script>" });
     expect(out).toContain("&lt;script&gt;");
     expect(out).not.toContain("数据时间 <script>");
+  });
+
+  // Task 19: the third state. "no data at all" (null, above) and "has data,
+  // could not date it" used to render identically, which hid the second one.
+  it("with unknownDataTime, says 数据时间未知 and names the reason", () => {
+    const out = renderSample({ dataAsOf: unknownDataTime("本页新闻的来源都没有提供发布时间") });
+    expect(out).toContain("数据时间未知");
+    expect(out).toContain("本页新闻的来源都没有提供发布时间");
+    expect(out).toContain("页面生成于 07-14 周二 20:05");
+    // It must not read as a resolved time.
+    expect(out).not.toContain("数据时间 ");
+  });
+
+  it("escapes an unknownDataTime reason like any other interpolated text", () => {
+    const out = renderSample({ dataAsOf: unknownDataTime("<script>x</script>") });
+    expect(out).toContain("&lt;script&gt;");
+    expect(out).not.toContain("<script>x</script>");
   });
 });

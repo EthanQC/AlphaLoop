@@ -13,6 +13,39 @@ export interface RenderPageMember {
   displayName: string;
 }
 
+/**
+ * `dataAsOf`'s third state: THIS PAGE SHOWS DATA AND ITS TIME CANNOT BE
+ * DETERMINED.
+ *
+ * WHY IT IS NOT JUST `null` (2026-07-30, Task 19). `null` means "this page
+ * has no data time because it has no data" - a 404 shell, a 403, a bare
+ * form - and the topbar then says nothing about data, correctly. A page that
+ * IS showing content whose time it could not resolve is a different fact, and
+ * rendering it the same way hides a hole: the reader sees a list of rows and
+ * a 页面生成于 clock, and the only timestamp on screen belongs to their own
+ * request. So this state renders 「数据时间未知」 with the reason, per the
+ * Global Constraint that unavailable data gets an honest disclosure naming
+ * why (a silently absent number is a fabrication too).
+ */
+export interface UnknownDataTime {
+  /** Reader-facing, names the reason - it is rendered in the topbar. */
+  readonly unknownReason: string;
+}
+
+/** Builds the `dataAsOf` value for "has data, time unresolvable". */
+export function unknownDataTime(reason: string): UnknownDataTime {
+  return { unknownReason: reason };
+}
+
+function isUnknownDataTime(value: DataAsOf): value is UnknownDataTime {
+  return typeof value === "object" && value !== null && "unknownReason" in value;
+}
+
+/** What the topbar can be told about when this page's content is from:
+ * a pre-formatted string (known), an `UnknownDataTime` (has data, no time),
+ * or `null` (no data at all). */
+export type DataAsOf = string | UnknownDataTime | null;
+
 export interface RenderPageOptions {
   title: string;
   nav: NavId;
@@ -32,8 +65,11 @@ export interface RenderPageOptions {
    * silently misled by three days. Making the field required forces every
    * one of this app's pages to state, in its own render call, where its data
    * time comes from; there is no default that could be wrong.
+   *
+   * `unknownDataTime(reason)` is the third answer, for a page that HAS
+   * content but could not date it - see UnknownDataTime above.
    */
-  dataAsOf: string | null;
+  dataAsOf: DataAsOf;
   /** Non-empty => render the degradation banner (req §1.1: never silent). */
   degraded: string[];
   /** Page content. Must be pre-built `Html` - never a raw string - so every
@@ -212,10 +248,13 @@ export function renderPage(options: RenderPageOptions): string {
   const pillClass = freshnessPillClass(freshness);
   // The data time is the PROMINENT half; the request time keeps its own,
   // explicitly-labelled slot so it can never be mistaken for the data's.
-  const timeBar = dataAsOf
-    ? html`<span><b>${member.displayName}</b> · 数据时间 ${dataAsOf}</span
+  const timeBar = isUnknownDataTime(dataAsOf)
+    ? html`<span><b>${member.displayName}</b> · <span class="a">数据时间未知</span>（${dataAsOf.unknownReason}）</span
         ><span style="color:var(--sub);margin-left:8px">页面生成于 ${generatedAt}</span>`
-    : html`<span><b>${member.displayName}</b> · 页面生成于 ${generatedAt}</span>`;
+    : dataAsOf
+      ? html`<span><b>${member.displayName}</b> · 数据时间 ${dataAsOf}</span
+          ><span style="color:var(--sub);margin-left:8px">页面生成于 ${generatedAt}</span>`
+      : html`<span><b>${member.displayName}</b> · 页面生成于 ${generatedAt}</span>`;
 
   const sidenavItems = joinHtml(
     NAV_ITEMS.map((item) => renderNavItem(item, item.id === nav, "nav-item"))

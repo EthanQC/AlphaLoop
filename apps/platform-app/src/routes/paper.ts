@@ -69,7 +69,7 @@ import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderEmptyState } from "../render/empty-state.js";
 import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { freshnessPillClass, renderPage, type Freshness } from "../render/layout.js";
+import { freshnessPillClass, renderPage, unknownDataTime, type Freshness } from "../render/layout.js";
 
 export interface PaperRouteDeps {
   db: DatabaseSync;
@@ -771,7 +771,14 @@ function renderPaperPage(
     freshness,
     // U2: the snapshot behind the KPI row / curve / positions IS this page's
     // data; the topbar states its fetch time rather than the request's.
-    dataAsOf: freshnessSnapshot ? describeDataInstant(freshnessSnapshot.fetchedAt, now) : null,
+    //
+    // Task 19: with no snapshot the page still renders - the member switcher
+    // and the viewer's own 提案历史 are database-backed content - so it says
+    // the data time is unknown and why, rather than silently falling back to
+    // the request clock.
+    dataAsOf: freshnessSnapshot
+      ? describeDataInstant(freshnessSnapshot.fetchedAt, now)
+      : unknownDataTime("还没有抓到过这个账户的模拟盘快照"),
     degraded,
     bodyHtml,
     nonce,

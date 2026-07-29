@@ -268,4 +268,34 @@ describe("news route (GET /news)", () => {
     });
     expect(response.status).toBe(405);
   });
+
+  // Task 19 (2026-07-30): a page full of headlines whose sources carry no
+  // publication time used to render a topbar with the REQUEST clock as its
+  // only timestamp - indistinguishable from a page with no data at all.
+  describe("topbar data time", () => {
+    it("states the newest published time when the news has one", async () => {
+      const eventId = insertEvent(db, {
+        clusterKey: "dated",
+        titleZh: "有发布时间的事件",
+        lastPublishedAt: "2026-07-14T09:00:00.000Z"
+      });
+      insertSource(db, {
+        eventId,
+        origin: "rss",
+        publisher: "某来源",
+        titleRaw: "Dated headline",
+        publishedAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const body = await (await fetch(`${baseUrl}/news`, { headers: { authorization: `Bearer ${token}` } })).text();
+      expect(body).toContain("数据时间 07-14 17:00");
+      expect(body).not.toContain("数据时间未知");
+    });
+
+    it("claims no data time at all on an empty feed - an empty page is not an undated page", async () => {
+      const body = await (await fetch(`${baseUrl}/news`, { headers: { authorization: `Bearer ${token}` } })).text();
+      expect(body).not.toContain("数据时间");
+      expect(body).toContain("页面生成于");
+    });
+  });
 });

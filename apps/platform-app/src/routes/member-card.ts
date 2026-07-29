@@ -61,7 +61,7 @@ import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
 import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { renderPage, snapshotFreshness } from "../render/layout.js";
+import { renderPage, snapshotFreshness, unknownDataTime } from "../render/layout.js";
 
 export interface MemberCardRouteDeps {
   db: DatabaseSync;
@@ -467,7 +467,18 @@ function renderMemberCardPage(
     // the 战绩 block actually was. The card's only time-varying content is
     // that snapshot, so it decides both the pill and the topbar's 数据时间.
     freshness: performanceView.fetchedAt ? snapshotFreshness(performanceView.fetchedAt, now) : "部分缺失",
-    dataAsOf: performanceView.fetchedAt ? describeDataInstant(performanceView.fetchedAt, now) : null,
+    // Task 19: without a snapshot the card is still full of content (策略卡 /
+    // 论点 / 公开研判, each row carrying its own time), so the topbar states
+    // that the PAGE's data time is unknown and which of the two reasons it
+    // is - a hidden 战绩 block and an account with no snapshot yet are
+    // different facts and must not read the same.
+    dataAsOf: performanceView.fetchedAt
+      ? describeDataInstant(performanceView.fetchedAt, now)
+      : unknownDataTime(
+          performanceView.visible
+            ? `${subject.displayName}还没有任何模拟盘快照，本页内容各自带自己的时间`
+            : `${subject.displayName}未公开战绩，本页内容各自带自己的时间`
+        ),
     degraded: [],
     bodyHtml,
     nonce,

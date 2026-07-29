@@ -286,7 +286,10 @@ export function renderNewsPage(
     member: { displayName: member.displayName },
     freshness: computeFreshness(events, now),
     // U2: the newest event's own published time IS this page's data time -
-    // the news feed has no separate generation step of its own.
+    // the news feed has no separate generation step of its own. There is no
+    // "listed but undated" case to disclose here: data/news.ts's
+    // `listNewsEvents` filters on `last_published_at IS NOT NULL`, so an
+    // event with no known time is never on this page in the first place.
     dataAsOf: newestPublishedAt ? describeDataInstant(newestPublishedAt, now) : null,
     degraded: [],
     bodyHtml: renderNewsBody(events, symbols, activeSymbol, activeTopic, now),
