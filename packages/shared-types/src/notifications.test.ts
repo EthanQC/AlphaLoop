@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { buildProposalDecisionEnvelope } from "./card-actions.js";
 import { NotificationTargetRepository, openTradingDatabase } from "./database.js";
+import type { Proposal } from "./domain.js";
+import { composeProposalCard } from "./proposal-cards.js";
 import {
   allowReportFallbackDelivery,
   buildFeishuCardPayload,
@@ -489,6 +492,72 @@ describe("buildFeishuCardPayload", () => {
     // This card is the one the old substring guard would have rejected: it
     // contains `"value":` and is nonetheless valid 2.0.
     expect(findCard1_0Constructs(payload)).toEqual([]);
+  });
+
+  // 2026-07-28 (spec drift C7): a button carrying a structured ocf1 envelope.
+  // Both consumers of a click read `event.action.value` AS the envelope
+  // (OpenClaw's decoder requires `value.oc === "ocf1"` at the top level, and
+  // so does parseProposalDecisionEnvelope), so the envelope must sit directly
+  // under the behavior's `value`, not nested one level down.
+  it("puts a structured callbackValue under the callback behavior verbatim, unwrapped", () => {
+    const envelope = buildProposalDecisionEnvelope({
+      decision: "approved",
+      token: "approval_x",
+      ownerOpenId: "ou_owner",
+      expiresAtMs: 1_800_000_000_000
+    });
+    const card: InteractiveCard = {
+      title: "审批",
+      lines: ["是否批准这笔交易？"],
+      buttons: [
+        {
+          text: "批准",
+          value: "批准 approval_x",
+          callbackValue: envelope as unknown as Record<string, unknown>,
+          style: "primary"
+        }
+      ]
+    };
+
+    const payload = buildFeishuCardPayload(card);
+    const button = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements.find(
+      (element) => element.tag === "button"
+    );
+
+    expect(button?.behaviors).toEqual([{ type: "callback", value: envelope }]);
+    expect(findCard1_0Constructs(payload)).toEqual([]);
+  });
+
+  // THE guard check the approval work had to clear: the narrowed 1.0 scan must
+  // accept the payload the REAL approval card produces, envelope and all.
+  it("accepts the real approval card composeProposalCard produces", () => {
+    const proposal: Proposal = {
+      id: "proposal_1",
+      ownerId: "member_owner",
+      symbol: "TSM.US",
+      side: "buy",
+      quantity: 10,
+      orderType: "limit",
+      limitPrice: 375,
+      reason: "回踩 20 日线",
+      evidence: [],
+      disciplineReport: [],
+      status: "pending",
+      approvalToken: "approval_x",
+      createdAt: "2026-07-28T00:00:00.000Z",
+      expiresAt: "2026-07-29T00:00:00.000Z"
+    };
+
+    const payload = buildFeishuCardPayload(composeProposalCard(proposal, [], { ownerOpenId: "ou_owner" }));
+    const buttons = (payload as { body: { elements: Array<Record<string, unknown>> } }).body.elements.filter(
+      (element) => element.tag === "button"
+    );
+
+    expect(findCard1_0Constructs(payload)).toEqual([]);
+    expect(buttons).toHaveLength(3);
+    expect(
+      buttons.map((button) => (button.behaviors as Array<{ value: { q?: string } }>)[0]?.value.q)
+    ).toEqual(["批准 approval_x", "减半批准 approval_x", "拒绝 approval_x"]);
   });
 
   it("keeps a link button alongside callback buttons, both in 2.0 syntax", () => {

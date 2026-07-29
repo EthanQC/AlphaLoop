@@ -2164,6 +2164,26 @@ export class ProposalRepository {
     return rows.map(mapProposal);
   }
 
+  // THE 减半批准 rule, in one place. The 07-15 plan's Global Constraint fixes
+  // it as `Math.max(1, Math.floor(quantity/2))` - explicitly including the
+  // documented qty=1 case, which halves to 1 rather than to 0. It lives on
+  // the repository (not in each caller) because there are now TWO deciders:
+  // the CLI's `approve-half` (apps/openclaw-config/scripts/proposals.mjs)
+  // and a Feishu button click (apps/platform-app/src/routes/
+  // feishu-callback.ts). From this point on the row's `quantity` means "what
+  // will actually be sent to the executor", not "originally requested"; the
+  // pre-halving number stays recoverable from the audit_log row written at
+  // creation time.
+  applyHalfQuantity(id: string): number {
+    const existing = this.getById(id);
+    if (!existing) {
+      throw new Error(`Proposal ${id} not found.`);
+    }
+    const halved = Math.max(1, Math.floor(existing.quantity / 2));
+    this.db.prepare(`UPDATE proposals SET quantity = ? WHERE id = ?`).run(halved, id);
+    return halved;
+  }
+
   updateCardMessageId(id: string, messageId: string): void {
     const result = this.db
       .prepare(`UPDATE proposals SET card_message_id = ? WHERE id = ?`)

@@ -7,6 +7,7 @@ import { applySecurityHeaders, createNonce } from "./security.js";
 import type { MemorydBackend } from "./data/memoryd-mirror.js";
 import { handleApiResearchRoute, type ResearchWorkerLike } from "./routes/api-research.js";
 import { handleApiStrategyRoute } from "./routes/api-strategy.js";
+import { handleFeishuCallbackRoute, type FeishuCallbackRouteDeps } from "./routes/feishu-callback.js";
 import { handleHomeRoute } from "./routes/home.js";
 import { handleLoginRoute, type LoginRouteDeps } from "./routes/login.js";
 import { handleMemberCardRoute } from "./routes/member-card.js";
@@ -60,6 +61,11 @@ export interface PlatformServerDeps {
    * degrades to `{delivered:false}` today) when the real entrypoint
    * (index.ts) doesn't supply one. */
   feishuNotifier?: FeishuReviewNotifier;
+  /** Card transport used by the Feishu approval callback (routes/
+   * feishu-callback.ts) to re-render a decided card in place. Unset in
+   * production, where updateInteractiveCard uses the real tenant-token HTTP
+   * transport; tests inject a fake that records the payload. */
+  cardTransport?: FeishuCallbackRouteDeps["cardTransport"];
 }
 
 // Process-level crash guard (2026-07 audit fix): the outer try/catch inside the request
@@ -131,6 +137,22 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
         return;
       }
       sendJson(res, 200, { ok: true, service: "platform-app" });
+      return;
+    }
+
+    // Feishu card-action callback (2026-07-28, routes/feishu-callback.ts).
+    // Dispatches HERE - beside /health, ahead of even the login route -
+    // because its caller is Feishu's server, which carries no Access header,
+    // no session cookie and no bearer token. Its own gate is the
+    // X-Lark-Signature check, and it fails closed when no signing key is
+    // configured; it never falls back to an unauthenticated accept.
+    if (
+      handleFeishuCallbackRoute(req, res, url, {
+        db: deps.db,
+        ...(deps.now ? { now: deps.now } : {}),
+        ...(deps.cardTransport ? { cardTransport: deps.cardTransport } : {})
+      })
+    ) {
       return;
     }
 

@@ -88,10 +88,51 @@ describe("composeProposalCard", () => {
       "预算影响: 占模拟盘预算 6.8%",
       expect.stringMatching(/^过期时间: .+ 后自动作废$/)
     ]);
+    // Each button carries BOTH faces of the same command: the plain text a
+    // human/log reads, and the ocf1 envelope a click actually delivers as
+    // `event.action.value` (packages/shared-types/src/card-actions.ts). The
+    // envelope's own wire contract is cross-checked against the installed
+    // OpenClaw decoder in card-actions.openclaw-contract.test.ts; here we
+    // only pin that the card carries it and that the two faces agree.
+    const envelope = (decision: string) => ({
+      oc: "ocf1",
+      k: "quick",
+      a: "alphaloop.proposal.decide",
+      q: `${decision} ${proposal.approvalToken}`,
+      c: { e: Date.parse(proposal.expiresAt) }
+    });
     expect(card.buttons).toEqual([
-      { text: "批准", value: `批准 ${proposal.approvalToken}`, style: "primary" },
-      { text: "减半批准", value: `减半批准 ${proposal.approvalToken}` },
-      { text: "拒绝", value: `拒绝 ${proposal.approvalToken}`, style: "danger" }
+      {
+        text: "批准",
+        value: `批准 ${proposal.approvalToken}`,
+        callbackValue: envelope("批准"),
+        style: "primary"
+      },
+      {
+        text: "减半批准",
+        value: `减半批准 ${proposal.approvalToken}`,
+        callbackValue: envelope("减半批准")
+      },
+      {
+        text: "拒绝",
+        value: `拒绝 ${proposal.approvalToken}`,
+        callbackValue: envelope("拒绝"),
+        style: "danger"
+      }
+    ]);
+  });
+
+  it("binds the envelope to the owner's open_id when the caller supplies one", () => {
+    const db = makeDb();
+    seedMember(db);
+    const proposal = fullProposal(db);
+
+    const card = composeProposalCard(proposal, DISCIPLINE_REPORT, { ownerOpenId: "ou_owner_1" });
+
+    expect(card.buttons?.map((button) => button.callbackValue?.c)).toEqual([
+      { u: "ou_owner_1", e: Date.parse(proposal.expiresAt) },
+      { u: "ou_owner_1", e: Date.parse(proposal.expiresAt) },
+      { u: "ou_owner_1", e: Date.parse(proposal.expiresAt) }
     ]);
   });
 

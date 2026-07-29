@@ -340,7 +340,17 @@ export async function runCreate(flags, options = {}) {
       expiresAt
     });
 
-    const card = composeProposalCard(proposal, report);
+    // The owner's open_id becomes the ocf1 envelope's `c.u` binding hint on
+    // every button (packages/shared-types/src/card-actions.ts), so a gateway
+    // can reject someone else's click before it ever reaches the callback
+    // endpoint. It is a HINT only: the endpoint re-derives the clicker from
+    // the signed event and compares against proposals.owner_id itself.
+    // Missing (member has no open_id on file) is not an error here -
+    // deliverProposalCard reports that case as `skipped: no_open_id`.
+    const ownerOpenId = new MemberRepository(db).getById(ownerId)?.feishuOpenId;
+    const card = composeProposalCard(proposal, report, {
+      ...(ownerOpenId ? { ownerOpenId } : {})
+    });
     // A card-send failure must never roll back the just-created proposal -
     // the proposal stands, the failure surfaces as a warning (see the
     // task brief: "发送失败 → proposal stands, warning in output").
@@ -425,9 +435,10 @@ async function runDecision(decision, flags, options = {}) {
     let updated = consumeResult.proposal ?? proposals.getByToken(token);
 
     if (decision === "approved_half" && updated) {
-      const halvedQuantity = Math.max(1, Math.floor(updated.quantity / 2));
-      db.prepare(`UPDATE proposals SET quantity = ? WHERE id = ?`).run(halvedQuantity, updated.id);
-      updated = { ...updated, quantity: halvedQuantity };
+      // The halving rule itself lives on ProposalRepository.applyHalfQuantity
+      // (packages/shared-types) since the Feishu callback endpoint decides
+      // the same way - see that method's comment.
+      updated = { ...updated, quantity: proposals.applyHalfQuantity(updated.id) };
     }
 
     new AuditLogRepository(db).write("proposals", decision, {

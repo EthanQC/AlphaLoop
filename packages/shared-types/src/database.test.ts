@@ -1576,6 +1576,41 @@ describe("ProposalRepository", () => {
     });
   });
 
+  // The 减半批准 rule has two deciders now (the CLI and a Feishu button
+  // click), so it lives here rather than in either of them.
+  describe("applyHalfQuantity", () => {
+    it("halves the row's quantity, rounding down", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal({ quantity: 9 }));
+
+      expect(repo.applyHalfQuantity(proposal.id)).toBe(4);
+      expect(repo.getById(proposal.id)?.quantity).toBe(4);
+    });
+
+    it("never goes to zero - one share halves to one (the plan's documented case)", () => {
+      const db = memoryDb();
+      migrate(db);
+      seedMember(db, "mem_owner");
+      const repo = new ProposalRepository(db);
+
+      const proposal = repo.create(baseNewProposal({ quantity: 1 }));
+
+      expect(repo.applyHalfQuantity(proposal.id)).toBe(1);
+      expect(repo.getById(proposal.id)?.quantity).toBe(1);
+    });
+
+    it("refuses an unknown proposal instead of silently writing nothing", () => {
+      const db = memoryDb();
+      migrate(db);
+
+      expect(() => new ProposalRepository(db).applyHalfQuantity("proposal_nope")).toThrow(/not found/u);
+    });
+  });
+
   describe("consumeApproval", () => {
     it("atomically transitions pending -> approved, sets consumed_at/decided_at/decided_by, and returns the reloaded proposal", () => {
       const db = memoryDb();

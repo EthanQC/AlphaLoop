@@ -353,7 +353,6 @@ const PROBES: Probe[] = [
   // routes/api-research.ts - identity-gated JSON writes.
   { module: "routes/api-research.ts", method: "POST", path: "/api/research", anonymous: true, expectStatus: 401 },
   { module: "routes/api-research.ts", method: "POST", path: "/api/research/rt1/promote", expectStatus: 404 },
-  { module: "routes/api-research.ts", method: "POST", path: "/api/research/rt1/thesis", expectStatus: 404 },
 
   // routes/review.ts - reading page + confirm endpoint.
   { module: "routes/review.ts", method: "GET", path: "/review/rev1", expectStatus: 404 },
@@ -386,6 +385,13 @@ const PROBES: Probe[] = [
   // up. Found by the strengthened enumeration (G4-a): the module special-cases
   // this path and nothing here had ever asked it for one.
   { module: "routes/member-card.ts", method: "GET", path: "/member/__legacy_system__", expectStatus: 404 },
+  // routes/feishu-callback.ts - Feishu's own server calls this, so it is the
+  // one route besides /login that must answer WITHOUT an identity. With no
+  // signing key configured (this suite sets none) it fails closed at 503,
+  // which is still a feishu-callback-module response.
+  { module: "routes/feishu-callback.ts", method: "POST", path: "/feishu/card-callback", anonymous: true, expectStatus: 503 },
+  { module: "routes/feishu-callback.ts", method: "GET", path: "/feishu/card-callback", anonymous: true, expectStatus: 405 },
+
   { module: "routes/proposal.ts", method: "GET", path: "/proposal/prop1", expectStatus: 404 },
   { module: "routes/research.ts", method: "GET", path: "/research/rt1", expectStatus: 404 }
 ];

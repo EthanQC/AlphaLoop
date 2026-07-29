@@ -69,9 +69,17 @@ describe("G3: every repository write in apps/openclaw-config carries the fields 
     // Object literals containing a spread: what the spread contributes is not
     // known here. Listed exactly, so a NEW undecidable site is a visible change
     // to this file rather than a quiet reduction in coverage.
+    // proposals.mjs:531 joined the list on 2026-07-28 without any code moving
+    // into a blind spot: `composeDecisionUpdate` moved from a local .mjs
+    // function (invisible to this guard, since it crosses no typed boundary)
+    // into packages/shared-types, so the sweep's
+    // `composeDecisionUpdate({ ...updated, decidedByDisplayName })` call is
+    // now a boundary call whose spread this file cannot resolve. More of the
+    // file is checked than before, not less.
     expect(real.unverifiable.map((entry: string) => entry.split(":").slice(0, 2).join(":"))).toEqual([
       "apps/openclaw-config/scripts/members.mjs:198",
-      "apps/openclaw-config/scripts/proposals.mjs:326"
+      "apps/openclaw-config/scripts/proposals.mjs:326",
+      "apps/openclaw-config/scripts/proposals.mjs:531"
     ]);
   });
 

@@ -251,8 +251,22 @@ export interface ReportDeliveryResult {
 
 export interface InteractiveCardButton {
   text: string;
+  /**
+   * The button's plain-text command: what a human reads in a log, and what a
+   * gateway falls back to dispatching as text for a button carrying no
+   * structured envelope.
+   */
   value: string;
   style?: "primary" | "danger" | "default";
+  /**
+   * Structured callback payload (an ocf1 envelope - see card-actions.ts).
+   * When present it REPLACES `{value}` as the card 2.0 callback behavior's
+   * `value`, so `event.action.value` arrives at a callback consumer as the
+   * envelope itself. Absent, the button keeps the legacy `{value: "<text>"}`
+   * shape, which OpenClaw's decoder classifies as `legacy` and dispatches as
+   * text.
+   */
+  callbackValue?: Record<string, unknown>;
 }
 
 export interface InteractiveCard {
@@ -1701,10 +1715,16 @@ export function buildFeishuCardPayload(card: InteractiveCard): unknown {
       tag: "button",
       text: { tag: "plain_text", content: button.text },
       type: button.style ?? "default",
-      // The callback data the OpenClaw approval handler reads is unchanged
-      // (`action.value` stays `{value: "<token>"}`); in 2.0 it travels inside
-      // the behavior rather than as a top-level `value` field.
-      behaviors: [{ type: "callback", value: { value: button.value } }]
+      // In 2.0 the callback payload travels inside the behavior rather than
+      // as a top-level `value` field. A button carrying a structured
+      // `callbackValue` (an ocf1 envelope - card-actions.ts) puts THAT here
+      // verbatim, because both consumers of a click read `event.action.value`
+      // as the envelope itself: OpenClaw's `decodeFeishuCardAction` requires
+      // `value.oc === "ocf1"` at the top level, and so does this repo's own
+      // `parseProposalDecisionEnvelope`. Wrapping it in `{value: …}` would
+      // hide the envelope one level down and demote every click to the
+      // decoder's `legacy` text branch.
+      behaviors: [{ type: "callback", value: button.callbackValue ?? { value: button.value } }]
     });
   }
 
