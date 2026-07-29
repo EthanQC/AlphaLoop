@@ -13,9 +13,16 @@
 //
 // Platform-side sibling: apps/platform-app/src/data/feishu-review-notifier.ts
 // - NOT an import, the same cross-app-boundary mirroring convention as
-// memoryd-mirror.mjs vs data/memoryd-mirror.ts. Any change to the card
+// memoryd-mirror.mjs vs data/memoryd-mirror.ts. Any change to the CONFIRM card
 // composition or the degrade semantics here MUST be mirrored there (and vice
 // versa).
+//
+// The DRAFT composers (composeReviewDraftCardLines/Body, Task 15's sibling
+// Task 16) deliberately have no counterpart there, and that is not an
+// oversight: MonthlyReviewRepository.upsertDraft has exactly one caller in the
+// tree - reviews.mjs's generateForOwner - so the platform never produces a
+// draft and a mirrored copy would be code no producer can reach. If a platform
+// route ever generates one, the composer moves or is mirrored then.
 //
 // Fire-and-forget discipline (unchanged from the placeholder era): an
 // EXPECTED miss - unknown member, or a member with no feishu_open_id on file
@@ -36,6 +43,12 @@ import {
 const CARD_DISCLAIMER = "以上改进建议仅供参考；任何策略/纪律变更须本人另行确认后生效。";
 // Shown in place of the platform link when no public base url is configured.
 const NO_LINK_LINE = "完整复盘请在平台复盘页查看。";
+// Closing line of the DRAFT card. A draft is not a decision - it waits for the
+// owner's 确认 (the one human gate in this phase), so the card says so rather
+// than reading like a finished verdict.
+const DRAFT_CONFIRM_LINE = "这是草稿：确认后结论才会写入你的个人记忆；改进建议仅供参考。";
+// 高/中/低 for the confidence tiers the review engine grades.
+const TIER_LABELS = { high: "高", medium: "中", low: "低" };
 
 function asRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -139,6 +152,94 @@ export function composeReviewConfirmCardLines(review) {
   }
   lines.push(CARD_DISCLAIMER);
   return lines;
+}
+
+/**
+ * The 置信度校准 line, for the DRAFT card only.
+ *
+ * `systemConfidenceCalibration` is an array of per-tier rows the review engine
+ * built with a MIN_SAMPLE_SIZE gate, so each tier is one of three honest
+ * states: a measured hit rate, 样本不足 (rows exist but fewer than the gate), or
+ * 暂无 (no graded predictions in that tier at all). None of them is rendered as
+ * a 0% - "no sample" and "never right" are different facts.
+ *
+ * The 「全平台口径，非本人」 qualifier is not decoration: analysis_predictions has
+ * no owner column (individual-stock analysis is a shared asset), so this
+ * number is the SYSTEM's calibration appearing on a personal card, and saying
+ * whose it is prevents the member reading it as their own.
+ *
+ * @param {unknown} result the review row's parsed result_json
+ * @returns {string}
+ */
+function confidenceCalibrationLine(result) {
+  const tiers = asRecord(result?.predictionReview)?.systemConfidenceCalibration;
+  if (!Array.isArray(tiers) || tiers.length === 0) {
+    return "系统置信度校准：暂无数据（全平台口径，非本人）";
+  }
+
+  const parts = tiers.map((entry) => {
+    const row = asRecord(entry);
+    const label = TIER_LABELS[String(row?.tier)] ?? String(row?.tier ?? "?");
+    if (row?.sample === "ok" && typeof row.hitFraction === "number" && typeof row.n === "number") {
+      return `${label} ${formatPct(row.hitFraction)}（n=${row.n}）`;
+    }
+    if (row?.sample === "insufficient") {
+      return `${label} 样本不足（n=${Number(row.n ?? 0)}）`;
+    }
+    return `${label} 暂无`;
+  });
+
+  return `系统置信度校准（全平台口径，非本人）：${parts.join("；")}`;
+}
+
+/**
+ * Composes the 月度复盘草稿 card body: the same headline metrics the confirm
+ * card carries, plus the 置信度校准 line, plus a plain statement that this is a
+ * DRAFT waiting for the owner - a draft that notified nobody was the drift
+ * this composer exists to fix (§3.4 「发本人单聊」).
+ *
+ * PURE - no IO, reads result_json defensively, degrades instead of throwing,
+ * exactly like composeReviewConfirmCardLines above.
+ *
+ * @param {{id: string, period: string, generatedAt?: string|null, result?: unknown}} review
+ * @returns {string[]}
+ */
+export function composeReviewDraftCardLines(review) {
+  const result = asRecord(review.result);
+  const lines = [
+    `复盘周期：${review.period}`,
+    `生成时间：${review.generatedAt ?? ""}`,
+    selfThesisLine(result),
+    decisionLine(result),
+    complianceLine(result),
+    alertQualityLine(result),
+    confidenceCalibrationLine(result)
+  ];
+
+  const oneLineLesson = typeof result?.oneLineLesson === "string" ? result.oneLineLesson.trim() : "";
+  if (oneLineLesson) {
+    lines.push(`一句话教训：${oneLineLesson}`);
+  }
+
+  if (!buildDeepLink("review", review.id)) {
+    lines.push(NO_LINK_LINE);
+  }
+  lines.push(DRAFT_CONFIRM_LINE);
+  return lines;
+}
+
+/**
+ * The draft card body (lines + the `/review/<id>` button when this deployment
+ * has a public base url). Same shape and same spread-into-the-notifier usage
+ * as composeReviewConfirmCardBody.
+ *
+ * @param {{id: string, period: string, generatedAt?: string|null, result?: unknown}} review
+ * @returns {{lines: string[], url?: {text: string, href: string}}}
+ */
+export function composeReviewDraftCardBody(review) {
+  const lines = composeReviewDraftCardLines(review);
+  const href = buildDeepLink("review", review.id);
+  return href ? { lines, url: { text: "查看复盘草稿", href } } : { lines };
 }
 
 /**
