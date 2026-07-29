@@ -379,4 +379,68 @@ describe("every reading surface: no raw values, honest staleness, informative em
       expect(visibleText(body), `${path} must not show the stored ratio`).not.toContain("-0.0332390201626266");
     }
   });
+
+
+  // -------------------------------------------------------------------------
+  // Task 23 (2026-07-30): a report reading page must confine a wide table's
+  // overflow to the table, and its TOC must highlight while you scroll -
+  // under this site's nonce-only script CSP. Driven end to end through the
+  // real server, because the CSP header and the page markup come from two
+  // different modules and the whole point is that they agree.
+  // -------------------------------------------------------------------------
+  it("T23: a wide report table gets its own horizontal scroll container", async () => {
+    writeReport(
+      "daily",
+      TODAY,
+      "# 日报\n\n## 数据表\n\n| 标的 | 现价 | 涨跌 | 成交量 | 市值 | PE | 目标价 |\n| --- | --- | --- | --- | --- | --- | --- |\n| TSM.US | 375.10 | -1.2% | 12.3M | 1.9T | 28.4 | 420.00 |\n"
+    );
+    const body = await (await get(`/daily/${TODAY}`)).text();
+
+    expect(body).toContain('<div class="table-scroll"');
+    expect(body).toContain(".report-body .table-scroll{overflow-x:auto");
+    expect(body).toMatch(/<div class="table-scroll"[^>]*><table>/u);
+  });
+
+  it("T23: the TOC's scroll-highlighting script carries the response's own CSP nonce", async () => {
+    writeReport("daily", TODAY, "# 日报\n\n## 一、市场概览\n\n正文\n\n## 二、宏观日历\n\n正文\n");
+    const response = await get(`/daily/${TODAY}`);
+    const nonce = /nonce-([^']+)/u.exec(response.headers.get("content-security-policy") ?? "")?.[1];
+    const body = await response.text();
+
+    expect(nonce).toBeTruthy();
+    expect(body).toContain(`<script nonce="${nonce}">`);
+    expect(body).toContain("new IntersectionObserver");
+    expect(body).toContain('data-toc-link="');
+    // Every script on the page must be nonce'd, or the CSP blocks it.
+    for (const tag of body.match(/<script[^>]*>/gu) ?? []) {
+      expect(tag, `unnonced script: ${tag}`).toContain(`nonce="${nonce}"`);
+    }
+  });
+
+  it("T23: the TOC script defers, because it really is emitted above the .report-body it queries", async () => {
+    writeReport("daily", TODAY, "# 日报\n\n## 一、市场概览\n\n正文\n\n## 二、宏观日历\n\n正文\n");
+    const body = await (await get(`/daily/${TODAY}`)).text();
+
+    // The order that made the first version of this feature dead on arrival:
+    // the script executes while `.report-body` is still unparsed, so a
+    // synchronous querySelectorAll finds no headings and it silently gives up.
+    // Caught only by driving the real page in a browser.
+    const scriptAt = body.indexOf("new IntersectionObserver");
+    const reportBodyAt = body.indexOf('class="report-body"');
+    expect(scriptAt).toBeGreaterThan(-1);
+    expect(reportBodyAt).toBeGreaterThan(-1);
+    expect(scriptAt).toBeLessThan(reportBodyAt);
+    expect(body).toContain('if (document.readyState === "loading")');
+  });
+
+  it("T23: the TOC links resolve to anchors that exist in the rendered body", async () => {
+    writeReport("daily", TODAY, "# 日报\n\n## 一、市场概览\n\n正文\n\n## 二、宏观日历\n\n正文\n");
+    const body = await (await get(`/daily/${TODAY}`)).text();
+
+    const targets = Array.from(body.matchAll(/data-toc-link="([^"]+)"/gu)).map((match) => match[1] as string);
+    expect(targets.length).toBe(2);
+    for (const id of targets) {
+      expect(body).toContain(`<h2 id="${id}">`);
+    }
+  });
 });

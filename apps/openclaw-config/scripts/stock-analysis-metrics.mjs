@@ -298,6 +298,61 @@ export function insufficientSampleReason(windowDays, sampleDays) {
   return `${INSUFFICIENT_SAMPLE_PREFIX} ${windowDays} 日，实际仅 ${sampleDays} 个交易日`;
 }
 
+// ---------------------------------------------------------------------------
+// 多路径概率的诚实呈现 (Task 23, 2026-07-30)
+// ---------------------------------------------------------------------------
+//
+// The three-path numbers stock-analysis.mjs computes are a HAND-WRITTEN
+// arithmetic rule, not a model output and not a historical frequency:
+//
+//   bullish = round(clamp(35 + 当日涨跌幅 + trendScore, 20, 60))
+//   bearish = round(clamp(32 - 当日涨跌幅 - trendScore, 20, 55))
+//   neutral = max(0, 100 - bullish - bearish)
+//
+// Two separate honesty defects were live in the shipped reports until this
+// task (verified against reports/stock-analysis/2026-07-27.md on the mini):
+//
+//   1. They were rendered by `formatPercent`, the SIGNED two-decimal
+//      formatter meant for price CHANGE (`上行路径（约 +31.00%）`). A
+//      probability is not signed and is not measured to a hundredth of a
+//      percent; the `+` in front of it reads like a return.
+//   2. Nothing anywhere said where the number came from, so a reader had no
+//      way to tell this heuristic apart from a model probability.
+//
+// `formatPathProbability` is the unsigned integer-percent form ("31%"), and
+// `PATH_PROBABILITY_DISCLOSURE` is the one line every renderer that prints
+// these numbers must print alongside them. Both live here (not in
+// stock-analysis.mjs) so the report renderer, the conclusion box and the
+// tests all quote the SAME literal instead of hand-typed copies.
+//
+// The clamp bounds in the sentence are read from the constants below, which
+// stock-analysis.mjs imports for the arithmetic itself - the disclosure
+// therefore cannot drift from the computation it describes.
+export const PATH_PROBABILITY_BOUNDS = {
+  bullishBase: 35,
+  bullishMin: 20,
+  bullishMax: 60,
+  bearishBase: 32,
+  bearishMin: 20,
+  bearishMax: 55
+};
+
+export const PATH_PROBABILITY_DISCLOSURE =
+  `概率口径：确定性启发式，不是模型概率也不是历史频率——` +
+  `输入只有当日涨跌幅与 6 个月趋势分，` +
+  `上行=${PATH_PROBABILITY_BOUNDS.bullishBase}+涨跌幅+趋势分并钳制在 ${PATH_PROBABILITY_BOUNDS.bullishMin}-${PATH_PROBABILITY_BOUNDS.bullishMax}%，` +
+  `回撤=${PATH_PROBABILITY_BOUNDS.bearishBase}-涨跌幅-趋势分并钳制在 ${PATH_PROBABILITY_BOUNDS.bearishMin}-${PATH_PROBABILITY_BOUNDS.bearishMax}%，` +
+  `震荡取 100% 减去两者的余量。`;
+
+/**
+ * Unsigned, integer-percent rendering of a path probability ("31%").
+ * A non-finite input renders 暂无 rather than "NaN%" or a fabricated 0.
+ */
+export function formatPathProbability(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${Math.round(number)}%` : "暂无";
+}
+
 // 2026-07-27 (second adversarial pass, defect 6): `目标价隐含空间` needs BOTH a
 // one-year target and a usable current price, so it can be unavailable for
 // three unrelated reasons. Naming the true one is the difference between "the

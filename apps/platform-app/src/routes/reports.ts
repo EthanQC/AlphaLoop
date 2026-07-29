@@ -69,9 +69,15 @@ import type { DatabaseSync } from "node:sqlite";
 import { ResearchTaskRepository, methodNotAllowed, type Member, type ResearchTask } from "@packages/shared-types";
 
 import { loadOwnerReviews, type TypedMonthlyReview } from "../data/monthly-review.js";
+import { loadOwnTheses } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { renderMarkdown, type MarkdownRenderResult } from "../reports/markdown.js";
+import {
+  compareThesesWithReport,
+  listAnalysedSymbols,
+  type ThesisComparison
+} from "../reports/strategy-comparison.js";
 import {
   OWNER_SCOPED_REPORT_TYPES,
   scanOwnerScopedReports,
@@ -83,6 +89,7 @@ import { renderEmptyState } from "../render/empty-state.js";
 import { beijingDayAge, describeDataDay } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
+import { renderReportToc } from "../render/toc.js";
 
 export interface ReportsRouteDeps {
   db: DatabaseSync;
@@ -761,7 +768,9 @@ export const REPORT_BODY_STYLE = trustedHtml(`<style>
 .report-body p{margin:8px 0;font-size:13.5px;line-height:1.7}
 .report-body ul,.report-body ol{margin:8px 0 10px 20px}
 .report-body li{margin:4px 0}
-.report-body table{border-collapse:collapse;width:100%;margin:10px 0 14px;font-size:12.5px}
+.report-body .table-scroll{overflow-x:auto;margin:10px 0 14px;-webkit-overflow-scrolling:touch}
+.report-body .table-scroll:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.report-body table{border-collapse:collapse;width:100%;min-width:max-content;margin:0;font-size:12.5px}
 .report-body th,.report-body td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
 .report-body th{background:var(--card2)}
 .report-body pre{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;font-size:12px}
@@ -792,11 +801,162 @@ function renderPersonalPageEntry(entry: ReportIndexEntry): Html {
   </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// §9 我的策略对照 (Task 17, req §3.4) - the ONE per-viewer section of an
+// otherwise circle-wide artifact.
+// ---------------------------------------------------------------------------
+
+// 无对照 gets NO colour class on purpose: ok/warn are verdicts, and "we did
+// not compare" is not a verdict about the position.
+const COMPARISON_PILL: Record<ThesisComparison["verdict"], { text: string; cls: string }> = {
+  aligned: { text: "一致", cls: "pill ok" },
+  conflict: { text: "冲突", cls: "pill warn" },
+  none: { text: "无对照", cls: "pill" }
+};
+
+const THESIS_DIRECTION_LABELS: Record<"bull" | "bear" | "neutral", string> = {
+  bull: "看多",
+  bear: "看空",
+  neutral: "中性"
+};
+
+const THESIS_VISIBILITY_LABELS: Record<"system" | "public", string> = {
+  system: "系统可用",
+  public: "公开"
+};
+
+interface ComparisonRowThesis {
+  direction: "bull" | "bear" | "neutral";
+  targetLow: number | null;
+  targetHigh: number | null;
+  invalidationPrice: number | null;
+  visibility: "system" | "public";
+}
+
+/** One row: the viewer's own thesis, this run's verdict for the same symbol,
+ * and - always - the sentence saying which of the two facts the reader is
+ * looking at. A 无对照 row states its reason; it never renders as a blank. */
+function renderComparisonRow(comparison: ThesisComparison, thesis: ComparisonRowThesis): Html {
+  const pill = COMPARISON_PILL[comparison.verdict];
+  const range =
+    thesis.targetLow !== null && thesis.targetHigh !== null
+      ? html` · 目标区间 <span class="mono">${thesis.targetLow} - ${thesis.targetHigh}</span>`
+      : trustedHtml("");
+  const invalidation =
+    thesis.invalidationPrice !== null
+      ? html` · 失效价 <span class="mono">${thesis.invalidationPrice}</span>`
+      : trustedHtml("");
+  const conclusionLine = comparison.box
+    ? html`<p style="margin:4px 0 0;font-size:12.5px;color:var(--sub)">本次结论：${comparison.box.coreConclusion}（置信度 ${CONFIDENCE_LABELS[comparison.box.confidence]}）</p>`
+    : trustedHtml("");
+  const rangeLine = comparison.rangeNote
+    ? html`<p style="margin:4px 0 0;font-size:12.5px;color:var(--sub)">${comparison.rangeNote}</p>`
+    : trustedHtml("");
+
+  return html`<div class="disc" style="margin-bottom:10px;padding-bottom:8px;border-bottom:1px dashed var(--line)">
+    <b class="mono">${comparison.symbol}</b>
+    <span class="${pill.cls}" style="margin-left:6px">${pill.text}</span>
+    <span class="pill" style="margin-left:6px;background:var(--card2);color:var(--sub)">${THESIS_VISIBILITY_LABELS[thesis.visibility]}</span>
+    <p style="margin:6px 0 0;font-size:13px">我的论点：${THESIS_DIRECTION_LABELS[thesis.direction]}${range}${invalidation}</p>
+    ${conclusionLine}
+    <p style="margin:4px 0 0;font-size:12.5px">${comparison.reason}</p>
+    ${rangeLine}
+  </div>`;
+}
+
+/**
+ * Renders §9 for ONE viewer, or nothing at all on a report kind that has no
+ * §9 (only 个股分析 carries the eight public sections this ninth belongs to).
+ *
+ * PRIVACY: the theses come from `loadOwnTheses(db, viewerId)`, whose
+ * `owner_id = ?` is in the WHERE clause, so another member's rows - public
+ * ones included - cannot reach this section. Two members opening the same
+ * URL get the same eight public sections and two different ninth sections;
+ * neither can see the other's. `status = 'active'` filtering happens here
+ * because a withdrawn or superseded thesis is not a position the reader
+ * still holds, and comparing it would put a verdict on a judgement they
+ * already retired.
+ */
+function renderStrategyComparisonSection(
+  deps: ReportsRouteDeps,
+  entry: ReportIndexEntry,
+  rawMd: string,
+  viewerId: string
+): Html {
+  if (entry.type !== "stock-analysis") {
+    return trustedHtml("");
+  }
+
+  const analysedSymbols = listAnalysedSymbols(rawMd);
+  const theses = loadOwnTheses(deps.db, viewerId).filter((row) => row.status === "active");
+  const scopeNote = html`<p style="margin:0 0 10px;font-size:12.5px;color:var(--sub)">
+    这一段按登录者动态生成：只读<b>你自己</b>的论点（系统可用 + 公开两档）。其他成员的论点不会出现在这里，你的论点也不会出现在他们打开的同一份报告里。前 8 段是公共内容，对所有成员一致。
+  </p>`;
+
+  if (theses.length === 0) {
+    // The worked example names a symbol THIS batch actually analysed, so
+    // following it produces a comparison on the very next run rather than one
+    // more 无对照 row for a symbol nobody is covering.
+    const exampleSymbol = analysedSymbols[0] ?? "TSM.US";
+    return html`<div class="bento" style="margin-top:10px">
+      <section class="card w2 dt-w4">
+        <h2>我的策略对照 <span class="pill">仅你可见</span></h2>
+        ${scopeNote}
+        ${renderEmptyState(
+          `你还没有记过任何论点，所以这一段没有可对照的内容（本次分析覆盖了 ${analysedSymbols.length} 只标的）。`,
+          `论点卡记的是「看多/看空 + 目标区间 + 失效价 + 依据」。在飞书单聊里说一句「记一条 ${exampleSymbol} 的看多论点，目标 400 到 480，跌破 380 失效」就能创建；默认「系统可用」档（只有你看得见），之后每一轮个股分析都会在这一段告诉你它和本轮结论是一致还是冲突。`
+        )}
+      </section>
+    </div>`;
+  }
+
+  const thesisById = new Map(theses.map((row) => [row.id, row]));
+  const comparisons = compareThesesWithReport(
+    theses.map((row) => ({
+      id: row.id,
+      symbol: row.symbol,
+      direction: row.direction,
+      targetLow: row.targetLow,
+      targetHigh: row.targetHigh,
+      invalidationPrice: row.invalidationPrice,
+      visibility: row.visibility
+    })),
+    rawMd
+  );
+
+  const counts = {
+    aligned: comparisons.filter((row) => row.verdict === "aligned").length,
+    conflict: comparisons.filter((row) => row.verdict === "conflict").length,
+    none: comparisons.filter((row) => row.verdict === "none").length
+  };
+
+  const rows = joinHtml(
+    comparisons.map((comparison) => {
+      const thesis = thesisById.get(comparison.thesisId);
+      return thesis ? renderComparisonRow(comparison, thesis) : trustedHtml("");
+    })
+  );
+
+  return html`<div class="bento" style="margin-top:10px">
+    <section class="card w2 dt-w4">
+      <h2>我的策略对照 <span class="pill">仅你可见</span></h2>
+      ${scopeNote}
+      <p style="margin:0 0 10px;font-size:12.5px;color:var(--sub)">
+        本次分析覆盖 ${analysedSymbols.length} 只标的；你的 ${comparisons.length} 条在册论点里，一致 ${counts.aligned} 条、冲突 ${counts.conflict} 条、无对照 ${counts.none} 条。
+      </p>
+      ${rows}
+    </section>
+  </div>`;
+}
+
 function renderReadingBody(
+  deps: ReportsRouteDeps,
+  member: Member,
   entry: ReportIndexEntry,
   rawMd: string,
   rendered: MarkdownRenderResult,
-  now: Date
+  now: Date,
+  nonce: string
 ): Html {
   // U2: a reader who lands on a deep link has no idea how old the report is
   // until they read the date and subtract. The summary card says it outright,
@@ -815,19 +975,9 @@ function renderReadingBody(
     ${renderSummaryLead(entry, rawMd)}
   </section>`;
 
-  const tocSection =
-    rendered.toc.length > 0
-      ? html`<details>
-          <summary style="cursor:pointer;font-size:13px;color:var(--sub);padding:4px 0">目录</summary>
-          <ul style="margin:6px 0 0 18px;font-size:13px">
-            ${joinHtml(
-              rendered.toc.map(
-                (item) => html`<li style="margin:4px 0"><a href="#${item.id}" style="color:var(--accent)">${item.text}</a></li>`
-              )
-            )}
-          </ul>
-        </details>`
-      : trustedHtml("");
+  // Task 23 (2026-07-30): moved to render/toc.ts, which adds scroll
+  // highlighting under this page's nonce CSP - see that module's header.
+  const tocSection = renderReportToc(rendered.toc, nonce);
 
   const sourcesSection =
     rendered.sources.length > 0
@@ -853,6 +1003,7 @@ function renderReadingBody(
         <div class="report-body" style="margin-top:10px">${rendered.html}</div>
       </section>
     </div>
+    ${renderStrategyComparisonSection(deps, entry, rawMd, member.id)}
     <div class="bento" style="margin-top:10px">${sourcesSection}</div>
     ${REPORT_BODY_STYLE}`;
 }
@@ -970,7 +1121,7 @@ function renderReadingPage(
     // request clock told a reader a 3-day-old report was "生成于" just now.
     dataAsOf: describeDataDay(entry.date, now),
     degraded: [],
-    bodyHtml: renderReadingBody(entry, rawMd, rendered, now),
+    bodyHtml: renderReadingBody(deps, member, entry, rawMd, rendered, now, nonce),
     nonce,
     now
   });
