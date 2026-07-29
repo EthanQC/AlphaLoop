@@ -845,47 +845,105 @@ function extractChineseRatioPercent(markdown) {
 // (no NEW_FORMAT_SECTION_MARKER) are skipped entirely - this is a NEW gate
 // only meaningful once Task 7's event-clustering section (with its per-event
 // "原文链接" URLs) exists to sample from.
-// 2026-07-28 OUTAGE FIX (four consecutive weekly runs died on
-// `news.url_reachability:https://wallstreetcn.com/livenews/3140449`, after
-// which the cron-runner halted the weekly job entirely). The gate used to
-// treat ANY single sampled URL that did not answer `ok` right now as a hard
-// failure, and deliverReport threw the finished report away over it. That is
-// the wrong test for what this gate actually exists to catch.
+// 2026-07-28 OUTAGE FIX, round 2 (2026-07-30). Round 1 replaced "any single
+// unreachable URL fails" with an aggregate judgement, and the daily report
+// STILL died every single day. Measured 2026-07-30 against the exact URLs in
+// the crash logs - the HEAD/GET status pairs on the mini AND the dev box
+// (identical), the response bodies from the dev box:
 //
-// What it exists to catch: a FABRICATED link (an LLM inventing a
-// plausible-looking URL). What it kept catching instead: the external world -
-// publisher rate-limiting (429), a transient 5xx, a China-network
-// reachability quirk, a request that timed out. None of those say anything
-// about whether the link is real.
+//   https://wallstreetcn.com/livenews/3141798 (real, cited by the mini's own
+//        2026-07-30 daily report)
+//        HEAD -> 404
+//        GET  -> 200, <title>意大利和沙特重申支持落实“两国方案” - 华尔街见闻</title>
+//   https://wallstreetcn.com/livenews/999999999 (invented)
+//        HEAD -> 404
+//        GET  -> 200, <title>404 Not Found - 华尔街见闻</title>
+//   https://finance.sina.com.cn/nope-not-real-123 (invented) HEAD/GET 404/404
+//   https://www.reuters.com/nonexistent-article-xyz (invented) HEAD/GET 401/401
 //
-// New semantics - classify, then judge on the aggregate:
-//   - reachable          : the origin answered about this specific resource
-//                          (any status < 400, plus 401/403 - "you may not
-//                          read it" still proves the resource exists).
-//   - hard   (404/410)   : the origin says this resource does not exist.
-//                          This is exactly what a fabricated link looks like.
-//   - transient (429/5xx/network error/timeout/no-fetch-in-runtime): we
-//                          learned nothing about the link.
+// Two independent lessons, and the gate got both backwards:
 //
-// FAIL policy (URL_HARD_FAILURE_THRESHOLD):
-//   - >= 2 hard failures in the sample -> fail. One 404 is ordinary link rot
-//     (news orgs unpublish and re-slug constantly); two independent "this
-//     does not exist" answers in a 5-link sample is the fabrication signal.
-//   - zero reachable URLs while at least one was actually probed -> fail.
-//     A wholly invented source list resolves nowhere; this is the case where
-//     "everything failed" IS evidence.
-//   - otherwise pass, but report `unverified` so the caller can DISCLOSE it.
+//   1. A HEAD RESPONSE IS NEVER EVIDENCE THAT A RESOURCE DOES NOT EXIST.
+//      wallstreetcn answers HEAD with 404 for every path it has, live
+//      articles included. The old probe sent HEAD and only fell back to GET
+//      on 405, so every wallstreetcn citation was classified "does not
+//      exist" - fabrication-grade evidence - and two of them per day crossed
+//      the threshold and destroyed the report. Nothing is called missing now
+//      unless a GET said so.
+//
+//   2. A 200 IS NOT EVIDENCE THAT IT DOES. wallstreetcn is a SPA that serves
+//      HTTP 200 with its own "404 Not Found" page for invented paths, so
+//      status alone cannot tell a real citation from a fabricated one at the
+//      publisher this pipeline cites most. The body's <title> can, and that
+//      is the only extra thing read (see NOT_FOUND_TITLE_MARKERS).
+//
+// Evidence model - only the first tier may block delivery:
+//
+//   missing  (blocks)   a GET returned 404/410, or a GET returned <400 whose
+//                       <title> is the origin's own not-found page. Both are
+//                       the origin stating, over the method that actually
+//                       serves the resource, that it is not there. This is
+//                       what a fabricated link looks like.
+//   exists   (passes)   a GET returned <400 and the title is a real one.
+//   unverified (discloses, NEVER blocks) everything else: HEAD-only answers,
+//                       401/403 auth walls (reuters answers 401 for invented
+//                       paths too, so it proves neither direction), 405,
+//                       429, 5xx, other 4xx, network errors, timeouts, an
+//                       exhausted time budget, a runtime with no fetch, a
+//                       body we could not read.
+//
+// FAIL policy - `missing` is the only input:
+//   - >= URL_HARD_FAILURE_THRESHOLD confirmed-missing links -> fail. One is
+//     ordinary link rot (news orgs unpublish and re-slug constantly); two
+//     independent confirmed "not there" answers in a 5-link sample is the
+//     fabrication signal.
+//   - every link we managed to probe came back confirmed-missing (and at
+//     least one did) -> fail. A wholly invented source list resolves nowhere.
+//     This deliberately no longer fires on transient outcomes: under the old
+//     rule a 10-second network blip that timed out all 5 probes destroyed the
+//     report, which is the same bug in a different costume.
+//   - otherwise pass, and report `unverified` so the caller DISCLOSES it.
 //     Never let "we could not check" print as "verified".
-//
-// The one deliberate exception to the all-failed rule is a runtime with no
-// fetch at all (`unverifiable: true`): nothing was probed, so there is no
-// evidence of anything. It does not hard-fail a report over an environment
-// quirk, and it does not silently pass either - it forces the disclosure.
 export const URL_HARD_FAILURE_THRESHOLD = 2;
+
+// The whole check runs inside deliverReport, so it gets a wall-clock ceiling:
+// 5 URLs x 2 attempts x a 5s timeout is already 50s of a delivery path,
+// before the plain-GET retry below is counted. Once the budget is spent the
+// remaining URLs are left unprobed and disclosed as such - honest, and it can
+// never block, because only a GET that actually answered can produce
+// `missing`.
+export const URL_CHECK_BUDGET_MS = 20000;
+
+// Bodies are read only to spot an origin's own not-found page, and only the
+// <title> is inspected - matching anywhere in the document would misfire on
+// any article that merely discusses a 404. The GET asks for the first 64KB,
+// which is far past </title> on every publisher this pipeline cites.
+//
+// What this does NOT catch, stated plainly so nobody reads more into a clean
+// gate than it earned: a publisher that answers an invented path with a
+// success status and no not-found label. Measured 2026-07-30, cls.cn answers
+// an invented /detail/ path with 200 and an EMPTY <title> - it never says
+// "not found" - so a fabricated cls.cn link classifies `exists` here. An
+// empty title is deliberately NOT treated as evidence of absence: plenty of
+// real pages render one. The gate catches publishers that return a real 404
+// and soft-404 pages that label themselves; it is not a universal
+// fabrication detector.
+const URL_BODY_SNIFF_BYTES = 65536;
+const URL_MAX_SNIFF_CONTENT_LENGTH = 5000000;
+const NOT_FOUND_TITLE_MARKERS = [
+  /(?<!\d)404(?!\d)/u,
+  /not\s*found/iu,
+  /page\s+not\s+available/iu,
+  /页面?不存在/u,
+  /内容不存在/u,
+  /文章不存在/u,
+  /页面走丢/u,
+  /找不到(该|这|此)?(页面|内容|文章)/u
+];
 
 export async function validateReportUrls(
   markdown,
-  { fetchImpl, sampleSize = 5, timeoutMs = 5000, retryDelayMs = 400 } = {}
+  { fetchImpl, sampleSize = 5, timeoutMs = 5000, retryDelayMs = 400, budgetMs = URL_CHECK_BUDGET_MS } = {}
 ) {
   const text = normalizeText(markdown);
   if (!isNewFormatReport(text)) {
@@ -894,41 +952,44 @@ export async function validateReportUrls(
 
   const urls = extractReportUrls(text);
   const sample = urls.length <= sampleSize ? urls : urls.slice(0, sampleSize);
-  const hard = [];
+  const missing = [];
   const unverified = [];
-  let reachableCount = 0;
   let probedCount = 0;
+  const deadline = Date.now() + budgetMs;
   for (const url of sample) {
     // eslint-disable-next-line no-await-in-loop -- sequential checks keep the
     // failure list deterministically ordered and keep this trivially testable
     // with a simple fake fetchImpl; at most `sampleSize` (5) of them run.
-    const verdict = await classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs });
-    if (verdict.status !== "no_fetch") {
+    const verdict = await classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs, deadline });
+    if (verdict.probed) {
       probedCount += 1;
     }
-    if (verdict.status === "reachable") {
-      reachableCount += 1;
+    if (verdict.status === "exists") {
       continue;
     }
-    if (verdict.status === "hard") {
-      hard.push(`news.url_reachability:${url}`);
+    if (verdict.status === "missing") {
+      missing.push(`news.url_reachability:${url}`);
     }
-    unverified.push({ url, reason: verdict.reason });
+    unverified.push({ url, reason: verdict.reason, status: verdict.status });
   }
 
   const unverifiable = probedCount === 0 && sample.length > 0;
-  const allFailed = probedCount > 0 && reachableCount === 0;
-  const failures = hard.length >= URL_HARD_FAILURE_THRESHOLD || allFailed ? [...hard] : [];
-  if (allFailed && failures.length === 0) {
-    failures.push("news.url_reachability:all_sampled_unreachable");
-  }
+  // Only confirmed-missing links can block. `allConfirmedMissing` is the
+  // wholly-invented-source-list case: EVERY sampled link came back confirmed
+  // missing. It is deliberately not "every link that answered", which would
+  // let one 404 plus two timeouts destroy a report on the strength of a
+  // single data point; if anything went unverified, "it all resolves nowhere"
+  // has not been established. In practice this only adds reach beyond the
+  // threshold for a one-link sample - which is exactly the gap it is for.
+  const allConfirmedMissing = missing.length > 0 && missing.length === sample.length;
+  const failures = missing.length >= URL_HARD_FAILURE_THRESHOLD || allConfirmedMissing ? [...missing] : [];
 
   return buildUrlResult({
     failures,
     unverified,
     sampled: sample.length,
     probed: probedCount,
-    hardCount: hard.length,
+    hardCount: missing.length,
     unverifiable
   });
 }
@@ -953,10 +1014,25 @@ function buildUrlResult({ failures, unverified, sampled, probed, hardCount = 0, 
 // 中文源占比 / 事件稀少提示): a single "- <label>：<facts>。" line.
 export const URL_DISCLOSURE_PREFIX = "- 链接核验";
 
+// The two things a reader must be able to tell apart: a link we could not
+// check, and a link we checked and found dead. Lumping them together was the
+// old text's flaw - "未核验不等于已确认失效" is true of the first and false of
+// the second.
 function buildUrlDisclosure({ sampled, unverified, unverifiable }) {
-  const reasons = Array.from(new Set(unverified.map((entry) => entry.reason)));
-  const why = unverifiable ? "运行环境不具备联网核验能力" : reasons.join("、");
-  return `${URL_DISCLOSURE_PREFIX}：抽样 ${sampled} 条原文链接，其中 ${unverified.length} 条未能核验（${why}），未核验不等于链接已确认有效，也不等于已确认失效。`;
+  const confirmedDead = unverified.filter((entry) => entry.status === "missing");
+  const stillOpen = unverified.filter((entry) => entry.status !== "missing");
+  const parts = [];
+  if (stillOpen.length > 0) {
+    const reasons = Array.from(new Set(stillOpen.map((entry) => entry.reason)));
+    const onlyNoFetch = reasons.length === 1 && reasons[0] === URL_NO_FETCH_REASON;
+    const why = unverifiable && onlyNoFetch ? "运行环境不具备联网核验能力" : reasons.join("、");
+    parts.push(`${stillOpen.length} 条未能核验（${why}），未核验不等于链接已确认有效，也不等于已确认失效`);
+  }
+  if (confirmedDead.length > 0) {
+    const reasons = Array.from(new Set(confirmedDead.map((entry) => entry.reason)));
+    parts.push(`${confirmedDead.length} 条经 GET 复核确认打不开（${reasons.join("、")}），原文可能已下线或改址`);
+  }
+  return `${URL_DISCLOSURE_PREFIX}：抽样 ${sampled} 条原文链接，其中 ${parts.join("；")}。`;
 }
 
 function extractReportUrls(markdown) {
@@ -967,31 +1043,68 @@ function extractReportUrls(markdown) {
   return Array.from(urls);
 }
 
-// 401/403 mean "this resource exists, you just may not read it" - a
-// fabricated URL does not get an auth challenge, it gets a 404. 405 means the
-// origin rejects HEAD as a method, which says nothing about the resource;
-// that case falls through to the GET-with-Range fallback below.
+// 404/410 from a GET is the only status that means "this resource is not
+// here". The same status from a HEAD means nothing: wallstreetcn.com answers
+// HEAD 404 for its own live articles (measured above), so this gate never
+// sends HEAD - the GET a reader's browser would send is the only probe whose
+// answer it acts on.
 const HARD_MISSING_STATUSES = new Set([404, 410]);
-const EXISTS_DESPITE_ERROR_STATUSES = new Set([401, 403]);
+// A ranged GET is the polite default, but some origins reject Range outright
+// (405 on the ranged form, 416, 501). Retry those once as a plain GET before
+// concluding anything.
+const RANGE_REJECTED_STATUSES = new Set([405, 416, 501]);
+export const URL_NO_FETCH_REASON = "运行时无 fetch";
+const URL_BUDGET_SPENT_REASON = "核验预算耗尽";
 
-async function classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs }) {
+// A TRUTHFUL user agent, and the measurement that argues for it. The obvious
+// move is to pretend to be a browser, on the theory that publishers serve
+// bots worse. Measured on 2026-07-30 the opposite is true where it matters -
+// same URLs, same second, only the UA differing:
+//
+//   wallstreetcn.com/livenews/3141798 (real)     browser UA -> 200, 2871 B,
+//       <title>华尔街见闻</title>          (an empty client-rendered shell)
+//                                                bot UA     -> 200, 19357 B,
+//       <title>意大利和沙特重申支持落实“两国方案” - 华尔街见闻</title>
+//   wallstreetcn.com/livenews/999999999 (invented) bot UA   -> 200, 13051 B,
+//       <title>404 Not Found - 华尔街见闻</title>
+//
+// wallstreetcn server-renders for crawlers and ships a JS shell to browsers,
+// so a browser UA erases the ONLY signal that separates a real citation from
+// an invented one there. cls.cn answered identically to both; sina and
+// reuters answered by status alone. So: say who we are, take the SSR page.
+const URL_PROBE_HEADERS = {
+  "User-Agent": "OpenClawReportLinkCheck/1.0 (+citation verification for OpenClaw trading reports)",
+  Accept: "*/*"
+};
+
+async function classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs, deadline = Infinity }) {
   const impl = fetchImpl ?? globalThis.fetch;
   if (typeof impl !== "function") {
-    return { status: "no_fetch", reason: "运行时无 fetch" };
+    return { status: "unverified", reason: URL_NO_FETCH_REASON, probed: false };
+  }
+  if (Date.now() >= deadline) {
+    return { status: "unverified", reason: URL_BUDGET_SPENT_REASON, probed: false };
   }
   // One retry with backoff: rate-limits and transient 5xx/network blips are
   // overwhelmingly one-shot, and a second attempt is cheap at sampleSize 5.
-  // A hard 404/410 is never retried - the origin already gave a definitive
-  // answer, and retrying it only burns the delivery budget.
-  let last = { status: "transient", reason: "网络异常" };
+  // A confirmed answer - exists OR missing - is never retried; the origin
+  // already told us, and retrying only burns the delivery budget.
+  let last = { status: "unverified", reason: "网络异常", probed: true };
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (attempt > 0 && retryDelayMs > 0) {
-      // eslint-disable-next-line no-await-in-loop -- deliberate backoff
-      await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+    if (attempt > 0) {
+      if (Date.now() >= deadline) {
+        return last;
+      }
+      if (retryDelayMs > 0) {
+        // eslint-disable-next-line no-await-in-loop -- deliberate backoff
+        await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+      }
     }
+    const budgetLeft = deadline - Date.now();
+    const attemptTimeoutMs = Number.isFinite(budgetLeft) ? Math.max(1, Math.min(timeoutMs, budgetLeft)) : timeoutMs;
     // eslint-disable-next-line no-await-in-loop -- sequential by design
-    last = await probeUrlOnce(url, { impl, timeoutMs });
-    if (last.status === "reachable" || last.status === "hard") {
+    last = await probeUrlOnce(url, { impl, timeoutMs: attemptTimeoutMs });
+    if (last.status === "exists" || last.status === "missing") {
       return last;
     }
   }
@@ -999,37 +1112,42 @@ async function classifyUrl(url, { fetchImpl, timeoutMs, retryDelayMs }) {
 }
 
 async function probeUrlOnce(url, { impl, timeoutMs }) {
-  const head = await requestUrl(url, { impl, timeoutMs, method: "HEAD" });
-  if (head.status === "http" && head.code === 405) {
-    // Some publishers reject HEAD outright. Retry as a ranged GET so we pull
-    // one byte instead of the whole article.
-    const ranged = await requestUrl(url, {
-      impl,
-      timeoutMs,
-      method: "GET",
-      headers: { Range: "bytes=0-0" }
-    });
-    return interpret(ranged);
+  let outcome = await requestUrl(url, {
+    impl,
+    timeoutMs,
+    method: "GET",
+    headers: { ...URL_PROBE_HEADERS, Range: `bytes=0-${URL_BODY_SNIFF_BYTES - 1}` }
+  });
+  if (outcome.status === "http" && RANGE_REJECTED_STATUSES.has(outcome.code)) {
+    outcome = await requestUrl(url, { impl, timeoutMs, method: "GET", headers: { ...URL_PROBE_HEADERS } });
   }
-  return interpret(head);
+  return interpret(outcome);
 }
 
 function interpret(outcome) {
   if (outcome.status === "error") {
-    return { status: "transient", reason: outcome.reason };
-  }
-  if (outcome.ok || (outcome.code > 0 && outcome.code < 400) || EXISTS_DESPITE_ERROR_STATUSES.has(outcome.code)) {
-    return { status: "reachable" };
+    return { status: "unverified", reason: outcome.reason, probed: true };
   }
   if (!(outcome.code > 0)) {
-    // A response object that is neither ok nor carries a status code tells us
-    // nothing definitive - classify it transient, never as "does not exist".
-    return { status: "transient", reason: "无状态码响应" };
+    // A response carrying no usable status tells us nothing definitive -
+    // never read it as "does not exist".
+    return { status: "unverified", reason: "无状态码响应", probed: true };
   }
   if (HARD_MISSING_STATUSES.has(outcome.code)) {
-    return { status: "hard", reason: `HTTP ${outcome.code}` };
+    return { status: "missing", reason: `HTTP ${outcome.code}`, probed: true };
   }
-  return { status: "transient", reason: `HTTP ${outcome.code}` };
+  if (outcome.code < 400) {
+    if (outcome.notFoundBody) {
+      // A soft 404: the origin served its own not-found page under a success
+      // status. wallstreetcn.com does exactly this for invented paths.
+      return { status: "missing", reason: `HTTP ${outcome.code} + 站内“未找到”页`, probed: true };
+    }
+    return { status: "exists", probed: true };
+  }
+  // 401/403 auth walls land here too: reuters.com answers 401 for invented
+  // paths as well as real ones, so an auth challenge proves neither
+  // direction and must not count as proof the resource exists.
+  return { status: "unverified", reason: `HTTP ${outcome.code}`, probed: true };
 }
 
 async function requestUrl(url, { impl, timeoutMs, method, headers }) {
@@ -1043,12 +1161,43 @@ async function requestUrl(url, { impl, timeoutMs, method, headers }) {
       return { status: "error", reason: "无响应" };
     }
     const code = typeof response.status === "number" ? response.status : (response.ok ? 200 : 0);
-    return { status: "http", ok: Boolean(response.ok), code };
+    const notFoundBody = code > 0 && code < 400 ? await detectNotFoundBody(response) : false;
+    return { status: "http", ok: Boolean(response.ok), code, notFoundBody };
   } catch (error) {
     return { status: "error", reason: error?.name === "AbortError" ? "请求超时" : "网络异常" };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Returns true ONLY when the body was actually read and its <title> is the
+// origin's own not-found page. Every other path returns false, including a
+// body we could not read: not reading something is never evidence about what
+// it said, and this value is the one thing that can turn a 200 into
+// fabrication-grade evidence.
+async function detectNotFoundBody(response) {
+  if (typeof response.text !== "function") {
+    return false;
+  }
+  const declaredLength = Number(response.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > URL_MAX_SNIFF_CONTENT_LENGTH) {
+    return false;
+  }
+  let body;
+  try {
+    body = await response.text();
+  } catch {
+    return false;
+  }
+  if (typeof body !== "string" || body.length === 0) {
+    return false;
+  }
+  const match = /<title[^>]*>([\s\S]{0,300}?)<\/title>/iu.exec(body.slice(0, URL_BODY_SNIFF_BYTES));
+  if (!match) {
+    return false;
+  }
+  const title = match[1].trim();
+  return NOT_FOUND_TITLE_MARKERS.some((pattern) => pattern.test(title));
 }
 
 // Phase 4 Task 6 - facts.numeric_match. A separate function (like

@@ -198,17 +198,27 @@ async function deliverReport(reportKind, info, alreadyPrepared) {
   // match daily_facts is OUR OWN output being wrong, and shipping it would
   // ship a false claim.
   //
-  // validateReportUrls no longer throws for every unreachable link. 2026-07-28
-  // outage: four consecutive weekly runs died on a single wallstreetcn.com
-  // link that did not answer, the cron-runner halted the weekly job after 3
-  // same-class failures, and weekly reports stopped shipping. Reachability of
-  // a third-party news URL is not something this pipeline controls, so the
-  // gate now judges the aggregate (see URL_HARD_FAILURE_THRESHOLD in
-  // report-quality.mjs): fabrication-grade evidence still blocks delivery,
-  // while a link we merely could not verify is DISCLOSED in the report
-  // instead of destroying it. The disclosure is appended before the PDF is
-  // rendered and before delivery, so the file on disk, the PDF and the
-  // Feishu message all carry the same honest text.
+  // validateReportUrls does not throw over a link this pipeline cannot
+  // verify. The rule it enforces (see report-quality.mjs, which owns the
+  // evidence model and the measurements behind it): only a GET that came back
+  // 404/410, or a GET whose body is the origin's own not-found page, is
+  // fabrication-grade evidence and may block delivery. Everything else - a
+  // timeout, a 429, a 5xx, an auth wall, an exhausted budget - is DISCLOSED
+  // in the report instead of destroying it.
+  //
+  // Both halves of that rule are outage scar tissue. 2026-07-28: four weekly
+  // runs died on one wallstreetcn.com link and the cron-runner halted the
+  // weekly job. 2026-07-30: the daily job had been dead for days because the
+  // check sent HEAD, and wallstreetcn answers HEAD 404 for its own LIVE
+  // articles - so two real citations per day were being read as invented and
+  // the finished report was thrown away. Measured against the mini's own
+  // 2026-07-30 daily report, the old check failed it on
+  // livenews/3141798 + /3141797 (both live, both GET 200) and the current one
+  // passes it.
+  //
+  // The disclosure is appended before the PDF is rendered and before
+  // delivery, so the file on disk, the PDF and the Feishu message all carry
+  // the same honest text.
   const db = openTradingDatabase(dbPath);
   const urlCheck = await validateReportUrls(markdown, { timeoutMs: 5000 });
   const dailyFacts = getDailyFacts(db, info.label);

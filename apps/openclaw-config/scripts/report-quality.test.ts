@@ -475,55 +475,208 @@ describe("Phase 4 Task 6 - news.chinese_ratio", () => {
   });
 });
 
-// 2026-07-28 outage fix. The gate used to fail on ANY single unreachable
-// sampled URL, and deliverReport threw the finished report away over it - four
-// consecutive weekly runs died on one wallstreetcn.com link and the cron
-// runner halted the weekly job. These tests pin the threshold+disclosure
-// semantics that replaced it.
-describe("validateReportUrls - threshold + disclosure (news.url_reachability)", () => {
+
+// ---------------------------------------------------------------------------
+// 2026-07-30, round 2 of the url_reachability outage fix.
+//
+// WHY THIS BLOCK WAS REWRITTEN. The tests that stood here were green for two
+// days while the daily report was destroyed every single day. They were green
+// because their stubs answered `{ ok: false, status: 404 }` to a HEAD and the
+// block called that shape "unreachable" - and HEAD 404 is exactly what
+// wallstreetcn.com answers for its own LIVE articles. The input shape was
+// authored here rather than measured, so the suite agreed with the code
+// instead of with the world.
+//
+// Every stub below now reproduces a shape MEASURED on 2026-07-30 (curl and
+// node fetch, dev box and the mini agreeing), using the exact URLs from the
+// mini's crash log:
+//
+//   wallstreetcn.com/livenews/3141798 and /3141797 - REAL, cited by the
+//     mini's own 2026-07-30 daily report:
+//        HEAD -> 404
+//        GET  -> 200, 19357 B, <title>意大利和沙特重申支持落实“两国方案” - 华尔街见闻</title>
+//   wallstreetcn.com/livenews/999999999 - INVENTED:
+//        HEAD -> 404
+//        GET  -> 200, 13051 B, <title>404 Not Found - 华尔街见闻</title>
+//   finance.sina.com.cn/nope-not-real-123 - INVENTED:  HEAD -> 404, GET -> 404
+//   reuters.com/nonexistent-article-xyz  - INVENTED:  HEAD -> 401, GET -> 401
+//   cls.cn/detail/99999999999            - INVENTED:  GET  -> 200, empty <title>
+//
+// The two directions this block has to prove: the real pair SHIPS, the
+// invented pair BLOCKS.
+// ---------------------------------------------------------------------------
+
+const WSCN_REAL_TITLE = "意大利和沙特重申支持落实“两国方案” - 华尔街见闻";
+const WSCN_SOFT_404_TITLE = "404 Not Found - 华尔街见闻";
+
+/** An HTML response shaped like the real ones: status + a readable body. */
+function htmlResponse(status: number, title: string) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => null },
+    text: async () =>
+      `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body><div id="app"></div></body></html>`
+  };
+}
+
+/** A response with no readable body, e.g. an error page we do not parse. */
+function bareResponse(status: number) {
+  return { ok: status >= 200 && status < 300, status };
+}
+
+function abortError() {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+describe("validateReportUrls - what blocks vs what is disclosed (news.url_reachability)", () => {
   const fast = { retryDelayMs: 0 } as const;
 
-  it("fails when every sampled URL is unreachable (a wholly invented source list resolves nowhere)", async () => {
+  // --- direction 1: real links must ship -----------------------------------
+
+  it("SHIPS the report whose live wallstreetcn links killed it for days (HEAD 404 + GET 200)", async () => {
+    // The precise production shape: the origin 404s HEAD for a live article
+    // and serves it under GET. The old gate read the HEAD and threw the day's
+    // report away.
+    const methods: string[] = [];
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async () => ({ ok: false, status: 404 })
-    });
-
-    expect(result.ok).toBe(false);
-    expect(result.failures.length).toBeGreaterThan(0);
-    expect(result.failures.every((failure) => failure.startsWith("news.url_reachability:"))).toBe(true);
-  });
-
-  it("fails when a whole-network outage leaves nothing reachable, even with zero hard 404s", async () => {
-    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      ...fast,
-      fetchImpl: async () => {
-        throw new Error("network down");
-      }
-    });
-
-    expect(result.ok).toBe(false);
-    expect(result.failures).toContain("news.url_reachability:all_sampled_unreachable");
-  });
-
-  it("PASSES with a disclosure when a single link times out (the production outage case)", async () => {
-    const flaky = "https://wallstreetcn.com/live/2";
-    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      ...fast,
-      fetchImpl: async (url: string) => {
-        if (url === flaky) {
-          const error = new Error("aborted");
-          error.name = "AbortError";
-          throw error;
+      fetchImpl: async (url: string, init: { method: string }) => {
+        methods.push(init.method);
+        if (init.method === "HEAD") {
+          return bareResponse(404);
         }
-        return { ok: true, status: 200 };
+        return htmlResponse(200, WSCN_REAL_TITLE);
       }
     });
 
     expect(result.ok).toBe(true);
     expect(result.failures).toEqual([]);
-    expect(result.unverified).toEqual([{ url: flaky, reason: "请求超时" }]);
-    expect(result.disclosure).toContain("链接核验");
+    expect(result.hardCount).toBe(0);
+    expect(result.disclosure).toBeNull();
+    // The HEAD branch above is never taken - and that is the fix. Reinstating
+    // a HEAD probe turns this stub's 404s back into "does not exist" and
+    // fails this test, which is exactly what the outage needed someone to
+    // notice.
+    expect(methods).not.toContain("HEAD");
+  });
+
+  it("never sends HEAD at all - a HEAD answer is not evidence either way", async () => {
+    const methods: string[] = [];
+    await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string, init: { method: string }) => {
+        methods.push(init.method);
+        return htmlResponse(200, "某条真实新闻 - 财联社");
+      }
+    });
+
+    expect(methods.length).toBeGreaterThan(0);
+    expect(methods).not.toContain("HEAD");
+    expect(new Set(methods)).toEqual(new Set(["GET"]));
+  });
+
+  it("identifies itself truthfully instead of impersonating a browser", async () => {
+    // Measured 2026-07-30: wallstreetcn server-renders for a bot UA (19357 B,
+    // real title) and ships an empty 2871 B shell to a browser UA, which
+    // erases the only signal that separates a real citation from an invented
+    // one. So the probe says who it is.
+    const agents: string[] = [];
+    await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string, init: { headers?: Record<string, string> }) => {
+        agents.push(init.headers?.["User-Agent"] ?? "");
+        return htmlResponse(200, "某条真实新闻 - 财联社");
+      }
+    });
+
+    expect(agents.length).toBeGreaterThan(0);
+    for (const agent of agents) {
+      expect(agent).toContain("OpenClaw");
+      expect(agent).not.toContain("Mozilla");
+    }
+  });
+
+  // --- direction 2: fabricated links must still block ----------------------
+
+  it("BLOCKS invented wallstreetcn links: GET 200 carrying the origin's own not-found title", async () => {
+    const invented = ["https://cls.cn/telegraph/1", "https://wallstreetcn.com/live/2"];
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) =>
+        htmlResponse(200, invented.includes(url) ? WSCN_SOFT_404_TITLE : WSCN_REAL_TITLE)
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.hardCount).toBe(2);
+    for (const url of invented) {
+      expect(result.failures).toContain(`news.url_reachability:${url}`);
+    }
+  });
+
+  it("BLOCKS invented links a publisher answers with a real 404 on GET (the sina shape)", async () => {
+    const invented = ["https://cls.cn/telegraph/1", "https://reuters.com/example-3"];
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) =>
+        invented.includes(url) ? bareResponse(404) : htmlResponse(200, WSCN_REAL_TITLE)
+    });
+
+    expect(result.ok).toBe(false);
+    for (const url of invented) {
+      expect(result.failures).toContain(`news.url_reachability:${url}`);
+    }
+  });
+
+  it("BLOCKS a one-link sample whose only citation is confirmed missing", async () => {
+    const singleLinkReport = GOOD_NEW_FORMAT_REPORT
+      .replace("https://wallstreetcn.com/live/2", "https://cls.cn/telegraph/1")
+      .replace("https://reuters.com/example-3", "https://cls.cn/telegraph/1");
+    const result = await validateReportUrls(singleLinkReport, {
+      ...fast,
+      fetchImpl: async () => bareResponse(410)
+    });
+
+    expect(result.sampled).toBe(1);
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("news.url_reachability:https://cls.cn/telegraph/1");
+  });
+
+  // --- everything else is disclosed, never fatal ---------------------------
+
+  it("discloses a single confirmed-dead link without destroying the report (ordinary link rot)", async () => {
+    const dead = "https://reuters.com/example-3";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) =>
+        url === dead ? bareResponse(404) : htmlResponse(200, WSCN_REAL_TITLE)
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(1);
+    // The reader is told this one was CHECKED and found dead - not that it
+    // merely went unchecked.
+    expect(result.disclosure).toContain("经 GET 复核确认打不开");
+    expect(result.disclosure).toContain("HTTP 404");
+  });
+
+  it("PASSES with a disclosure when a single link times out", async () => {
+    const flaky = "https://wallstreetcn.com/live/2";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) => {
+        if (url === flaky) {
+          throw abortError();
+        }
+        return htmlResponse(200, WSCN_REAL_TITLE);
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.unverified).toEqual([{ url: flaky, reason: "请求超时", status: "unverified" }]);
     expect(result.disclosure).toContain("1 条未能核验");
     expect(result.disclosure).toContain("请求超时");
   });
@@ -531,48 +684,117 @@ describe("validateReportUrls - threshold + disclosure (news.url_reachability)", 
   it("PASSES with a disclosure for a single 429 rate-limit", async () => {
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 429 : 200 })
+      fetchImpl: async (url: string) =>
+        url.includes("cls.cn") ? bareResponse(429) : htmlResponse(200, WSCN_REAL_TITLE)
     });
 
     expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(0);
     expect(result.disclosure).toContain("HTTP 429");
   });
 
   it("PASSES with a disclosure for a single transient 5xx", async () => {
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 503 : 200 })
+      fetchImpl: async (url: string) =>
+        url.includes("cls.cn") ? bareResponse(503) : htmlResponse(200, WSCN_REAL_TITLE)
     });
 
     expect(result.ok).toBe(true);
     expect(result.disclosure).toContain("HTTP 503");
   });
 
-  it("counts a 404 as a HARD failure but does not fail the gate on one (ordinary link rot)", async () => {
-    const dead = "https://reuters.com/example-3";
+  it("a whole-network outage is disclosed, NOT fatal - nothing answered, so nothing was proven", async () => {
+    // The old rule failed the report when zero URLs came back reachable, even
+    // with zero 404s. A 10-second network blip therefore destroyed the day,
+    // which is the same bug this fix exists to end, in a different costume.
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async (url: string) => ({ ok: url !== dead, status: url === dead ? 404 : 200 })
+      fetchImpl: async () => {
+        throw new Error("network down");
+      }
     });
 
-    expect(result.hardCount).toBe(1);
     expect(result.ok).toBe(true);
-    expect(result.disclosure).toContain("HTTP 404");
+    expect(result.failures).toEqual([]);
+    expect(result.hardCount).toBe(0);
+    expect(result.disclosure).toContain("3 条未能核验");
+    expect(result.disclosure).toContain("网络异常");
   });
 
-  it("fails once HARD failures reach the threshold (two independent 'does not exist' answers)", async () => {
-    const dead = ["https://reuters.com/example-3", "https://cls.cn/telegraph/1"];
+  it("every link timing out is disclosed, not fatal", async () => {
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async (url: string) => ({ ok: !dead.includes(url), status: dead.includes(url) ? 410 : 200 })
+      fetchImpl: async () => {
+        throw abortError();
+      }
     });
 
-    expect(result.ok).toBe(false);
-    expect(result.failures).toContain(`news.url_reachability:${dead[0]}`);
-    expect(result.failures).toContain(`news.url_reachability:${dead[1]}`);
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toContain("请求超时");
   });
 
-  it("retries once with backoff before classifying a URL as unreachable", async () => {
+  it("treats a 401 auth wall as proof of NEITHER direction (measured: reuters 401s invented paths too)", async () => {
+    const walled = "https://reuters.com/example-3";
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string) =>
+        url === walled ? bareResponse(401) : htmlResponse(200, WSCN_REAL_TITLE)
+    });
+
+    // Not fatal - an auth challenge is not evidence of fabrication.
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(0);
+    // But not silently "verified" either.
+    expect(result.disclosure).toContain("HTTP 401");
+  });
+
+  // cls.cn answers an invented /detail/ path with 200 and an empty <title>
+  // (measured 2026-07-30). It never labels the page "not found", so this gate
+  // cannot call it missing - and an empty title must not be promoted into
+  // evidence of absence, since real pages render one too.
+  it("does not treat an empty <title> as a soft 404", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async () => htmlResponse(200, "")
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(0);
+  });
+
+  it("does not call an article a soft 404 because its headline mentions 404", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async () => htmlResponse(200, "纳指收涨 4040 点，报 14042 点 - 财联社")
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(0);
+  });
+
+  // --- request shaping and budget ------------------------------------------
+
+  it("falls back to a plain GET when the origin rejects the ranged GET (405/416)", async () => {
+    const picky = "https://wallstreetcn.com/live/2";
+    const ranges: (string | undefined)[] = [];
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async (url: string, init: { method: string; headers?: Record<string, string> }) => {
+        if (url !== picky) {
+          return htmlResponse(200, WSCN_REAL_TITLE);
+        }
+        ranges.push(init.headers?.Range);
+        return init.headers?.Range ? bareResponse(405) : htmlResponse(200, WSCN_REAL_TITLE);
+      }
+    });
+
+    expect(ranges).toEqual(["bytes=0-65535", undefined]);
+    expect(result.ok).toBe(true);
+    expect(result.disclosure).toBeNull();
+  });
+
+  it("retries once with backoff before giving up on a transient failure", async () => {
     const attempts: string[] = [];
     const flaky = "https://cls.cn/telegraph/1";
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
@@ -580,9 +802,9 @@ describe("validateReportUrls - threshold + disclosure (news.url_reachability)", 
       fetchImpl: async (url: string) => {
         attempts.push(url);
         if (url === flaky && attempts.filter((entry) => entry === flaky).length === 1) {
-          return { ok: false, status: 503 };
+          return bareResponse(503);
         }
-        return { ok: true, status: 200 };
+        return htmlResponse(200, WSCN_REAL_TITLE);
       }
     });
 
@@ -591,51 +813,44 @@ describe("validateReportUrls - threshold + disclosure (news.url_reachability)", 
     expect(result.disclosure).toBeNull();
   });
 
-  it("does not retry a definitive 404", async () => {
+  it("never retries a confirmed answer, in either direction", async () => {
     const dead = "https://reuters.com/example-3";
     const attempts: string[] = [];
     await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
       fetchImpl: async (url: string) => {
         attempts.push(url);
-        return { ok: url !== dead, status: url === dead ? 404 : 200 };
+        return url === dead ? bareResponse(404) : htmlResponse(200, WSCN_REAL_TITLE);
       }
     });
 
+    // 3 sampled URLs, one request each: a 404 and a 200 are both final.
+    expect(attempts).toHaveLength(3);
     expect(attempts.filter((entry) => entry === dead)).toHaveLength(1);
   });
 
-  it("falls back to a ranged GET when the publisher rejects HEAD with 405, and counts it reachable", async () => {
-    const picky = "https://wallstreetcn.com/live/2";
-    const methods: string[] = [];
+  it("stops probing once the wall-clock budget is spent, and discloses the rest", async () => {
+    const probed: string[] = [];
     const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
       ...fast,
-      fetchImpl: async (url: string, init: { method: string; headers?: Record<string, string> }) => {
-        if (url !== picky) {
-          return { ok: true, status: 200 };
-        }
-        methods.push(init.method);
-        if (init.method === "HEAD") {
-          return { ok: false, status: 405 };
-        }
-        expect(init.headers?.Range).toBe("bytes=0-0");
-        return { ok: true, status: 200 };
+      budgetMs: 0,
+      fetchImpl: async (url: string) => {
+        probed.push(url);
+        return htmlResponse(200, WSCN_REAL_TITLE);
       }
     });
 
-    expect(methods).toEqual(["HEAD", "GET"]);
+    expect(probed).toEqual([]);
     expect(result.ok).toBe(true);
-    expect(result.disclosure).toBeNull();
+    expect(result.probed).toBe(0);
+    expect(result.disclosure).toContain("核验预算耗尽");
   });
 
-  it("treats 401/403 as reachable - an auth wall proves the resource exists", async () => {
-    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
-      ...fast,
-      fetchImpl: async (url: string) => ({ ok: false, status: url.includes("cls.cn") ? 403 : 200 })
-    });
+  it("an exhausted budget can never block, even when the report is full of links", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, { ...fast, budgetMs: 0 });
 
     expect(result.ok).toBe(true);
-    expect(result.disclosure).toBeNull();
+    expect(result.failures).toEqual([]);
   });
 
   it("in a runtime with no fetch: does not silently pass (forces a disclosure) and does not hard-fail the report", async () => {
@@ -664,12 +879,48 @@ describe("validateReportUrls - threshold + disclosure (news.url_reachability)", 
       ...fast,
       fetchImpl: async (url: string) => {
         checked.push(url);
-        return { ok: true, status: 200 };
+        return htmlResponse(200, WSCN_REAL_TITLE);
       },
       sampleSize: 5
     });
 
     expect(checked).toHaveLength(3);
+  });
+
+  it("does not read a body the origin declares enormous", async () => {
+    let textRead = false;
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: (name: string) => (name.toLowerCase() === "content-length" ? "900000000" : null) },
+        text: async () => {
+          textRead = true;
+          return `<title>${WSCN_SOFT_404_TITLE}</title>`;
+        }
+      })
+    });
+
+    expect(textRead).toBe(false);
+    expect(result.ok).toBe(true);
+  });
+
+  it("treats an unreadable body as no evidence rather than as a missing resource", async () => {
+    const result = await validateReportUrls(GOOD_NEW_FORMAT_REPORT, {
+      ...fast,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => {
+          throw new Error("stream closed");
+        }
+      })
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hardCount).toBe(0);
   });
 });
 
