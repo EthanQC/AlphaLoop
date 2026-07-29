@@ -44,6 +44,8 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { MemberRepository, methodNotAllowed, type Member } from "@packages/shared-types";
 
+import { loadProposalHistory, type ProposalHistoryRow } from "../data/overview.js";
+
 import {
   computeMaxDrawdownSegment,
   computePaperKpis,
@@ -56,6 +58,8 @@ import {
   type SnapshotSeriesPoint
 } from "../data/snapshots.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { freshnessPillClass, renderPage, type Freshness } from "../render/layout.js";
 
@@ -334,7 +338,10 @@ function renderCurveCard(
   if (series.length === 0) {
     return html`<section class="card w2 dt-w2">
       <h2>净值曲线</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无净值曲线数据——模拟盘接入后显示</p>
+      ${renderEmptyState(
+        "还没有任何模拟盘快照，画不出净值曲线。",
+        "快照由 mini 上的长桥模拟盘监控每交易日抓取；开好模拟盘账户并把凭据交给平台托管后，下一个交易日起才会有点。"
+      )}
     </section>`;
   }
 
@@ -342,11 +349,19 @@ function renderCurveCard(
   if (selfUsable.length < 2) {
     return html`<section class="card w2 dt-w2">
       <h2>净值曲线</h2>
-      <p style="font-size:13px;color:var(--sub)">数据点不足，暂无法绘制曲线</p>
+      ${renderEmptyState(
+        "只有一个可用数据点，画不出曲线。",
+        "曲线至少要两个带净值的快照；再跑一个交易日就会出现。这里不会用单点插值出一条假曲线。"
+      )}
     </section>`;
   }
 
-  const benchmarkNote = html`<div class="vs">基准对比（vs QQQ）：<span style="color:var(--sub)">基准对比 P6 完善</span></div>`;
+  // Honest note, not a phase name: `daily_facts` does carry `qqq.price` /
+  // `qqq.changePct` per trading day, but nothing in this page reads them into
+  // a second series yet, so there is no benchmark line to draw. Saying
+  // "基准对比 P6 完善" claimed the gap was a shipping phase (P6 shipped weeks
+  // ago); saying so plainly is the honest form. 2026-07-30.
+  const benchmarkNote = html`<div class="vs">基准对比（vs QQQ）：<span style="color:var(--sub)">基准曲线尚未接入本页——QQQ 每日收盘数据已入库，但这条曲线还没画上来</span></div>`;
 
   if (!compare) {
     const range = { min: Math.min(...selfUsable.map((p) => p.value)), max: Math.max(...selfUsable.map((p) => p.value)) };
@@ -426,7 +441,10 @@ function renderPositionsTableCard(snapshot: OwnerSnapshot | null): Html {
   if (!snapshot || snapshot.positions.length === 0) {
     return html`<section class="card w2 dt-w4">
       <h2>持仓</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无持仓数据</p>
+      ${renderEmptyState(
+        "最近一次快照里没有持仓。",
+        "空仓和「没抓到快照」是两回事：这里显示的是最近一次成功抓取的快照内容，它当时确实是空仓。"
+      )}
     </section>`;
   }
 
@@ -526,7 +544,7 @@ function renderPositionDonutCard(snapshot: OwnerSnapshot | null): Html {
   if (shares.length === 0) {
     return html`<section class="card w2 dt-w2">
       <h2>仓位分布</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无仓位分布数据</p>
+      ${renderEmptyState("没有可分布的仓位。", "环图按最近一次快照里的持仓市值切分；空仓时没有可画的份额。")}
     </section>`;
   }
   return html`<section class="card w2 dt-w2">
@@ -539,14 +557,67 @@ function renderPositionDonutCard(snapshot: OwnerSnapshot | null): Html {
 }
 
 // ---------------------------------------------------------------------------
-// 提案与成交历史 - always P6 placeholder (no writes exist yet, regardless of
-// whose account is being viewed - not a privacy gate, just "not built yet").
+// 提案与成交历史 (req §1.6: 五态徽章 + 点击进提案详情页). Until 2026-07-30 this
+// card rendered a hard-coded "提案与成交历史 P6 上线" placeholder - a claim
+// that outlived P6 by weeks and told a reader with real proposals in the
+// database that the feature did not exist.
+//
+// PRIVACY: proposals are owner-private (routes/proposal.ts 403s on someone
+// else's). This card therefore ALWAYS renders the VIEWER's own proposals and
+// says so in its subtitle - it is never re-pointed at the member being
+// viewed, so switching to another member's paper view cannot leak theirs.
 // ---------------------------------------------------------------------------
 
-function renderProposalsHistoryCard(): Html {
+const PROPOSAL_HISTORY_LIMIT = 20;
+
+/** The five states req §1.6 asks for badges on, plus the two terminal
+ * execution states the proposals CHECK constraint also allows. */
+const PROPOSAL_STATUS_LABELS: Record<string, string> = {
+  pending: "待审批",
+  approved: "已批准",
+  approved_half: "减半批准",
+  rejected: "已拒绝",
+  expired: "已作废",
+  executed: "已成交",
+  failed: "执行失败"
+};
+
+const PROPOSAL_STATUS_PILL: Record<string, string> = {
+  pending: "warn",
+  approved: "ok",
+  approved_half: "ok",
+  rejected: "",
+  expired: "",
+  executed: "ok",
+  failed: "warn"
+};
+
+const PROPOSAL_SIDE_LABELS: Record<string, string> = { buy: "买入", sell: "卖出" };
+
+function renderProposalHistoryRow(row: ProposalHistoryRow): Html {
+  const statusLabel = PROPOSAL_STATUS_LABELS[row.status] ?? row.status;
+  const pillClass = PROPOSAL_STATUS_PILL[row.status] ?? "";
+  const side = PROPOSAL_SIDE_LABELS[row.side] ?? row.side;
+  const when = row.decidedAt ?? row.createdAt;
+  return html`<div class="alert">
+    <time class="mono" title="${when}">${formatBeijingShortTime(when)}</time>
+    <span><a href="/proposal/${row.id}" style="color:var(--accent)">${row.symbol} ${side} ${formatOptionalNumber(row.quantity)} 股</a></span>
+    <span class="pill ${pillClass}" style="${pillClass === "" ? "background:var(--card2);color:var(--sub)" : ""}">${statusLabel}</span>
+  </div>`;
+}
+
+function renderProposalsHistoryCard(proposals: ProposalHistoryRow[]): Html {
+  const body =
+    proposals.length > 0
+      ? joinHtml(proposals.map(renderProposalHistoryRow))
+      : renderEmptyState(
+          "你还没有任何提案记录。",
+          "提案在收盘后自动生成（每次 0-2 条，0 条也是合法结果），也可以在飞书里直接说「给我出一条 NVDA 的提案」；审批卡发到你的飞书单聊，24 小时无操作自动作废。无已批准提案的下单请求会被服务端拒绝。"
+        );
   return html`<section class="card w2 dt-w4">
-    <h2>提案与成交历史 <span class="pill warn">P6 上线</span></h2>
-    <p style="font-size:13px;color:var(--sub)">提案与成交历史 P6 上线</p>
+    <h2>提案与成交历史</h2>
+    <p style="font-size:11.5px;color:var(--sub);margin:-2px 0 6px">始终只显示你自己的提案——提案是各人私有的，切换成员视图不会显示对方的。</p>
+    ${body}
   </section>`;
 }
 
@@ -583,6 +654,10 @@ function renderPaperPage(
   let bodyHtml: Html;
   let freshnessSnapshot: OwnerSnapshot | null;
 
+  // Always the VIEWER's own proposals - never `requested`'s. See
+  // renderProposalsHistoryCard's PRIVACY note.
+  const proposalHistory = loadProposalHistory(deps.db, viewer.id, PROPOSAL_HISTORY_LIMIT);
+
   if (compareRequested) {
     // Main content always pinned to the viewer's own account (see module doc).
     const self = loadPaperViewData(deps.db, viewer, true);
@@ -602,7 +677,7 @@ function renderPaperPage(
       <div class="bento" style="margin-top:10px">${renderKpiRowCard(self.kpis)}</div>
       <div class="bento" style="margin-top:10px">${curveCard}${renderDailyMoveBarsCard()}</div>
       <div class="bento" style="margin-top:10px">${renderPositionsTableCard(self.snapshot)}</div>
-      <div class="bento" style="margin-top:10px">${renderPositionDonutCard(self.snapshot)}${renderProposalsHistoryCard()}</div>
+      <div class="bento" style="margin-top:10px">${renderPositionDonutCard(self.snapshot)}${renderProposalsHistoryCard(proposalHistory)}</div>
       ${PAPER_PAGE_STYLE}`;
   } else {
     const viewed = requested ?? viewer;
@@ -615,9 +690,9 @@ function renderPaperPage(
       ? html`<div class="bento" style="margin-top:10px">${renderKpiRowCard(data.kpis)}</div>
         <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown)}${renderDailyMoveBarsCard()}</div>
         <div class="bento" style="margin-top:10px">${renderPositionsTableCard(data.snapshot)}</div>
-        <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${renderProposalsHistoryCard()}</div>`
+        <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${renderProposalsHistoryCard(proposalHistory)}</div>`
       : html`<div class="bento" style="margin-top:10px">${renderHiddenPerformanceCard(viewed)}</div>
-        <div class="bento" style="margin-top:10px">${renderProposalsHistoryCard()}</div>`;
+        <div class="bento" style="margin-top:10px">${renderProposalsHistoryCard(proposalHistory)}</div>`;
 
     bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewed.id)}</div>
       ${contentHtml}
@@ -632,6 +707,9 @@ function renderPaperPage(
     nav: "paper",
     member: { displayName: viewer.displayName },
     freshness,
+    // U2: the snapshot behind the KPI row / curve / positions IS this page's
+    // data; the topbar states its fetch time rather than the request's.
+    dataAsOf: freshnessSnapshot ? describeDataInstant(freshnessSnapshot.fetchedAt, now) : null,
     degraded,
     bodyHtml,
     nonce,

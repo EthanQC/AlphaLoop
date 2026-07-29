@@ -1,3 +1,4 @@
+import { formatBeijingWeekdayTime } from "./format.js";
 import { html, joinHtml, trustedHtml, type Html } from "./html.js";
 import { COLOR_SCHEME_CSS, STRUCTURAL_CSS, THEME_DARK_CSS, THEME_LIGHT_CSS } from "./tokens.js";
 
@@ -17,6 +18,22 @@ export interface RenderPageOptions {
   nav: NavId;
   member: RenderPageMember;
   freshness: Freshness;
+  /**
+   * WHEN THE CONTENT ON THIS PAGE IS FROM, already formatted for a reader by
+   * render/format.ts's `describeDataDay`/`describeDataInstant` (e.g.
+   * `07-27（3 天前）`). REQUIRED - `null` is a legal value but must be chosen
+   * deliberately, and means "this page has no data time" (a 404, a
+   * forbidden page, a pure form): the topbar then shows only 页面生成于.
+   *
+   * WHY REQUIRED (2026-07-30, U2): the topbar used to read `生成于 07-30 周四
+   * 00:18` on a page whose entire content was from 07-27. That timestamp
+   * described the REQUEST, and a reader who assumes it describes the data -
+   * which is the only reason a "生成于" line is on a data page at all - was
+   * silently misled by three days. Making the field required forces every
+   * one of this app's pages to state, in its own render call, where its data
+   * time comes from; there is no default that could be wrong.
+   */
+  dataAsOf: string | null;
   /** Non-empty => render the degradation banner (req §1.1: never silent). */
   degraded: string[];
   /** Page content. Must be pre-built `Html` - never a raw string - so every
@@ -119,41 +136,38 @@ Array.prototype.forEach.call(document.querySelectorAll('.theme-btn'), function(b
   btn.addEventListener('click', toggleTheme);
 });`;
 
-const CN_WEEKDAY_BY_EN: Record<string, string> = {
-  Sun: "日",
-  Mon: "一",
-  Tue: "二",
-  Wed: "三",
-  Thu: "四",
-  Fri: "五",
-  Sat: "六"
-};
-
 /**
  * Formats an instant as `MM-DD 周X HH:mm` in Asia/Shanghai (Beijing) time,
  * echoing the `<b>07-12 周日</b> ... 生成 20:05` style used in final.html's
  * topbar mock. Beijing time has no DST, so a fixed IANA zone is exact.
+ *
+ * The implementation now lives in render/format.ts (one Intl formatter for
+ * the whole app instead of five private copies); this export is kept because
+ * routes/news.ts and layout.test.ts already reference it by this name.
  */
 export function formatBeijingGeneratedAt(date: Date): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Shanghai",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    weekday: "short"
-  }).formatToParts(date);
+  return formatBeijingWeekdayTime(date);
+}
 
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  const month = byType.get("month") ?? "??";
-  const day = byType.get("day") ?? "??";
-  const hour = byType.get("hour") ?? "??";
-  const minute = byType.get("minute") ?? "??";
-  const weekdayEn = byType.get("weekday") ?? "";
-  const weekdayCn = CN_WEEKDAY_BY_EN[weekdayEn] ?? weekdayEn;
+/**
+ * How old a paper-trading snapshot may be before its page stops calling
+ * itself 最新. Was a private constant in home.ts; hoisted here (2026-07-30)
+ * because member-card.ts and paper.ts show the SAME snapshot and used to
+ * hard-code `freshness: "最新"` regardless of its age - three pages
+ * disagreeing about whether the same row is fresh is a bug by construction.
+ */
+export const SNAPSHOT_FRESH_WINDOW_MS = 90 * 60 * 1000;
 
-  return `${month}-${day} 周${weekdayCn} ${hour}:${minute}`;
+/** 最新 when the snapshot was fetched inside the window, 延迟 otherwise. A
+ * caller with NO snapshot must pass 部分缺失 itself - there is deliberately
+ * no "no data" case here, because a missing snapshot and a stale one are
+ * different facts and the caller knows which it has. */
+export function snapshotFreshness(fetchedAtIso: string, now: Date): Freshness {
+  const fetchedMs = new Date(fetchedAtIso).getTime();
+  if (Number.isNaN(fetchedMs)) {
+    return "部分缺失";
+  }
+  return now.getTime() - fetchedMs < SNAPSHOT_FRESH_WINDOW_MS ? "最新" : "延迟";
 }
 
 /** Exported so other pages' own inline freshness pills (e.g. home.ts's
@@ -192,10 +206,16 @@ function renderDegradedBanner(reasons: string[]): Html {
  * (see security.ts); this function only renders the markup.
  */
 export function renderPage(options: RenderPageOptions): string {
-  const { title, nav, member, freshness, degraded, bodyHtml, nonce } = options;
+  const { title, nav, member, freshness, degraded, bodyHtml, nonce, dataAsOf } = options;
   const now = options.now ?? new Date();
   const generatedAt = formatBeijingGeneratedAt(now);
   const pillClass = freshnessPillClass(freshness);
+  // The data time is the PROMINENT half; the request time keeps its own,
+  // explicitly-labelled slot so it can never be mistaken for the data's.
+  const timeBar = dataAsOf
+    ? html`<span><b>${member.displayName}</b> · 数据时间 ${dataAsOf}</span
+        ><span style="color:var(--sub);margin-left:8px">页面生成于 ${generatedAt}</span>`
+    : html`<span><b>${member.displayName}</b> · 页面生成于 ${generatedAt}</span>`;
 
   const sidenavItems = joinHtml(
     NAV_ITEMS.map((item) => renderNavItem(item, item.id === nav, "nav-item"))
@@ -222,7 +242,7 @@ ${trustedHtml(STRUCTURAL_CSS)}</style>
   </aside>
   <div class="main">
     <div class="topbar">
-      <span><b>${member.displayName}</b> · 生成于 ${generatedAt}</span>
+      <span style="display:flex;flex-wrap:wrap;align-items:baseline">${timeBar}</span>
       <span style="display:flex;gap:8px;align-items:center">
         <span class="pill ${pillClass}">${freshness}</span>
         <button class="theme-btn" type="button" aria-label="切换深浅主题"><span id="themeLabel">🌓</span></button>

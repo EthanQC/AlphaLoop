@@ -260,7 +260,7 @@ describe("reports routes", () => {
       const response = await authed("/reports?type=研判");
       const body = await response.text();
       expect(body).not.toContain("还在排队的问题");
-      expect(body).toContain("暂无研判");
+      expect(body).toContain("你还没有任何研判。");
     });
 
     it("owner isolation: member B's report list never shows member A's research", async () => {
@@ -271,13 +271,13 @@ describe("reports routes", () => {
       const response = await authed("/reports?type=研判");
       const body = await response.text();
       expect(body).not.toContain("A的私有研判问题");
-      expect(body).toContain("暂无研判");
+      expect(body).toContain("你还没有任何研判。");
     });
 
-    it("shows 暂无研判 when the viewer has no completed research at all", async () => {
+    it("shows the no-research empty state when the viewer has no completed research at all", async () => {
       const response = await authed("/reports?type=研判");
       const body = await response.text();
-      expect(body).toContain("暂无研判");
+      expect(body).toContain("你还没有任何研判。");
     });
   });
 
@@ -354,13 +354,13 @@ describe("reports routes", () => {
       const response = await authed("/reports?type=复盘");
       const body = await response.text();
       expect(body).not.toContain("2026-06");
-      expect(body).toContain("暂无复盘");
+      expect(body).toContain("你还没有任何月度复盘。");
     });
 
     it("shows 暂无复盘 (with the auto-generation hint) when the viewer has no reviews at all", async () => {
       const response = await authed("/reports?type=复盘");
       const body = await response.text();
-      expect(body).toContain("暂无复盘");
+      expect(body).toContain("你还没有任何月度复盘。");
       expect(body).toContain("每月第一个周末自动生成草稿");
     });
   });
@@ -650,7 +650,7 @@ describe("reports routes", () => {
 
       const body = await (await authedAsOther("/reports?type=official-paper")).text();
       expect(body).not.toContain(`href="/official-paper/${DATE}"`);
-      expect(body).toContain("暂无报告");
+      expect(body).toContain("这个类型下还没有报告。");
       expect(body).toContain("已隐藏 1 份");
     });
 

@@ -41,6 +41,9 @@ export function renderForbiddenPage(member: ForbiddenPageMember, nav: NavId, non
     nav,
     member: { displayName: member.displayName },
     freshness: "最新",
+    // A refusal page carries no data of its own; stating a data time would
+    // invent one.
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,

@@ -178,7 +178,7 @@ describe("member card route (GET /member/<who>)", () => {
   });
 
   describe("show_performance short-circuit", () => {
-    it("shows 未公开 and issues NO snapshot query when show_performance=0 and viewer is not the subject", async () => {
+    it("shows the 未公开 empty state and issues NO snapshot query when show_performance=0 and viewer is not the subject", async () => {
       const subject = makeMember({
         id: "member_hidden",
         email: "hidden@example.com",
@@ -194,7 +194,7 @@ describe("member card route (GET /member/<who>)", () => {
       const body = await response.text();
 
       expect(response.status).toBe(200);
-      expect(body).toContain("未公开");
+      expect(body).toContain("这位成员没有公开自己的模拟盘战绩。");
       expect(body).not.toContain("50,000.00");
       // The privacy gate must run BEFORE any query, not just before
       // rendering: no query against official_paper_snapshots may run at all
@@ -215,10 +215,10 @@ describe("member card route (GET /member/<who>)", () => {
       const body = await response.text();
 
       expect(body).toContain("50,000.00");
-      expect(body).not.toContain("未公开");
+      expect(body).not.toContain("这位成员没有公开自己的模拟盘战绩。");
     });
 
-    it("shows 暂无快照数据 when show_performance=1 but no snapshot exists", async () => {
+    it("shows the no-snapshot empty state when show_performance=1 but no snapshot exists", async () => {
       const subject = makeMember({ id: "member_open_empty", email: "openempty@example.com", showPerformance: true });
       new MemberRepository(db).upsert(subject);
 
@@ -226,7 +226,7 @@ describe("member card route (GET /member/<who>)", () => {
       const response = await authed("/member/member_open_empty", token);
       const body = await response.text();
 
-      expect(body).toContain("暂无快照数据");
+      expect(body).toContain("这位成员愿意展示战绩，但还没有任何模拟盘快照。");
     });
 
     it("a member viewing their OWN card sees their KPIs even if show_performance=0", async () => {
@@ -236,7 +236,7 @@ describe("member card route (GET /member/<who>)", () => {
       const response = await authed(`/member/${member.id}`, token);
       const body = await response.text();
       expect(body).toContain("12,345.00");
-      expect(body).not.toContain("未公开");
+      expect(body).not.toContain("这位成员没有公开自己的模拟盘战绩。");
     });
   });
 
@@ -269,14 +269,14 @@ describe("member card route (GET /member/<who>)", () => {
       expect(body).toContain("系统可用");
     });
 
-    it("shows 暂无公开论点 when the subject has no public theses", async () => {
+    it("shows the no-public-theses empty state when the subject has no public theses", async () => {
       const subject = makeMember({ id: "member_subject3", email: "subject3@example.com" });
       new MemberRepository(db).upsert(subject);
 
       const { token } = seedMemberWithToken();
       const response = await authed("/member/member_subject3", token);
       const body = await response.text();
-      expect(body).toContain("暂无公开论点");
+      expect(body).toContain("这位成员没有公开任何论点。");
       expect(body).toContain("公开即接受检验");
     });
 
@@ -335,25 +335,25 @@ describe("member card route (GET /member/<who>)", () => {
       expect(body).not.toContain("系统策略卡");
     });
 
-    it("shows 暂无公开策略卡 when the subject has no public strategy cards", async () => {
+    it("shows the no-public-cards empty state when the subject has no public strategy cards", async () => {
       const subject = makeMember({ id: "member_subject_no_cards", email: "nocards@example.com" });
       new MemberRepository(db).upsert(subject);
 
       const { token } = seedMemberWithToken();
       const response = await authed("/member/member_subject_no_cards", token);
       const body = await response.text();
-      expect(body).toContain("暂无公开策略卡");
+      expect(body).toContain("这位成员没有公开任何策略卡。");
     });
   });
 
-  it("shows 暂无公开研判 (research_tasks table exists but is empty today)", async () => {
+  it("shows the no-public-research empty state (research_tasks table exists but is empty today)", async () => {
     const subject = makeMember({ id: "member_subject4", email: "subject4@example.com" });
     new MemberRepository(db).upsert(subject);
 
     const { token } = seedMemberWithToken();
     const response = await authed("/member/member_subject4", token);
     const body = await response.text();
-    expect(body).toContain("暂无公开研判");
+    expect(body).toContain("这位成员没有公开任何研判。");
   });
 
   // Phase 8 Task 4 (2026-07-16 plan): 公开研判区 real rendering (conclusion +
@@ -414,7 +414,7 @@ describe("member card route (GET /member/<who>)", () => {
       const response = await authed("/member/member_subject_private_research", token);
       const body = await response.text();
       expect(body).not.toContain("私有研判问题");
-      expect(body).toContain("暂无公开研判");
+      expect(body).toContain("这位成员没有公开任何研判。");
     });
 
     it("never shows a public but still-queued task (no conclusion to show yet)", async () => {
@@ -426,7 +426,7 @@ describe("member card route (GET /member/<who>)", () => {
       const response = await authed("/member/member_subject_queued_research", token);
       const body = await response.text();
       expect(body).not.toContain("还在排队的公开问题");
-      expect(body).toContain("暂无公开研判");
+      expect(body).toContain("这位成员没有公开任何研判。");
     });
   });
 

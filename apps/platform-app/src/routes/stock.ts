@@ -40,6 +40,28 @@
  * `null`) falls back to the pre-Task-5 first-bullet summary, with an
  * explicit "旧格式无结论框" note so a viewer never mistakes the fallback for
  * a structured result that simply happens to be terse.
+ *
+ * 2026-07-30 SPEC-DRIFT REMEDIATION (U1/U2/U3 - the operator opened this
+ * page for TSM.US and screenshotted all three):
+ *   U1 - the 提醒历史 rows rendered `alert_events.triggered_at` and
+ *        `alert_events.value` verbatim (`2026-07-29T14:40:10.879Z  日内波动
+ *        -0.03323902016262659`). Both now go through render/format.ts; the
+ *        thesis judgment timeline had the same raw-instant shape and was
+ *        fixed with it. The stored values survive in `title=` tooltips.
+ *   U2 - the topbar said 「生成于 <request time>」 on a page whose content was
+ *        3 days old, and the summary card was headed 「最新公共分析摘要」
+ *        while quoting a 398 support level against a ~375 market. The
+ *        topbar now states the DATA's time and age (`dataAsOf`), the card
+ *        is headed 公共分析摘要 with an age pill and - past
+ *        format.ts's STALE_AFTER_DAYS - an in-card warning, and
+ *        `buildStockDegradations` raises the layout banner above the fold.
+ *   U3 - the page was a bare symbol, a date, one summary and two empty
+ *        blocks. It now opens with the real quote (price/涨跌/报价数据时间/
+ *        来源 + an explicit "not realtime" line), adds a 关键数据 card built
+ *        from data/stock-facts.ts (报价/估值/技术/期权与持仓, each cell
+ *        carrying its source and data time), and every empty block says
+ *        what would fill it and how. There is deliberately NO company-name
+ *        line - nothing in this system produces one (see renderHeaderCard).
  */
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -47,6 +69,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { methodNotAllowed, type Member } from "@packages/shared-types";
 
+import { loadLatestFactSheet, type StockFactRow, type SymbolFactSheet } from "../data/stock-facts.js";
 import {
   computeThesisOutcome,
   groupThesesByOwner,
@@ -59,6 +82,23 @@ import {
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS, parseConclusionBox } from "../reports/conclusion-box.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
+import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
+import {
+  beijingDayAge,
+  beijingInstantAge,
+  describeDataDay,
+  describeDataInstant,
+  formatAlertValue,
+  formatBeijingDay,
+  formatBeijingShortTime,
+  formatInteger,
+  formatLargeAmount,
+  formatPercentUnits,
+  formatPrice,
+  formatRatioAsUnsignedPercent,
+  MISSING_NUMBER_TEXT,
+  type DataAge
+} from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
 
@@ -113,22 +153,10 @@ function currentNow(deps: StockRouteDeps): Date {
   return deps.now ? deps.now() : new Date();
 }
 
-/** `YYYY-MM-DD` for a given instant, in Asia/Shanghai (same construction as
- * routes/reports.ts's formatBeijingDate - Beijing has no DST, so a fixed
- * IANA zone is exact year-round). Not imported from reports.ts: each route
- * file owns its own small formatting helpers per this codebase's existing
- * per-page-freshness-rule convention (see routes/home.ts's own comment on
- * why it doesn't share reports.ts's freshness rule either). */
-function formatBeijingDate(date: Date): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(date);
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  return `${byType.get("year")}-${byType.get("month")}-${byType.get("day")}`;
-}
+/** `YYYY-MM-DD` for a given instant, in Asia/Shanghai. Now a thin alias over
+ * render/format.ts's shared implementation (2026-07-30): the app had five
+ * near-identical private copies of this and they were free to drift. */
+const formatBeijingDate = formatBeijingDay;
 
 /**
  * Honest freshness for this page (Global Constraints: never silently render
@@ -167,6 +195,8 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
     nav: "paper",
     member: { displayName: member.displayName },
     freshness: "最新",
+    // No data on this page at all - stating a data time would invent one.
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -282,6 +312,10 @@ export interface SymbolAlertEventRow {
   ruleType: string;
   triggeredAt: string;
   value: number;
+  /** The rule's configured threshold, also a decimal ratio - shown next to
+   * the fired value so a reader can see WHY it fired, exactly as the Feishu
+   * card does ("（阈值 ±4%）"). */
+  threshold: number;
 }
 
 const ALERT_HISTORY_LIMIT = 20;
@@ -296,7 +330,8 @@ const RULE_TYPE_LABELS: Record<string, string> = {
 function loadAlertHistoryForSymbol(db: DatabaseSync, ownerId: string, symbol: string): SymbolAlertEventRow[] {
   const rows = db
     .prepare(`
-      SELECT ae.id AS id, ar.rule_type AS rule_type, ae.triggered_at AS triggered_at, ae.value AS value
+      SELECT ae.id AS id, ar.rule_type AS rule_type, ae.triggered_at AS triggered_at,
+             ae.value AS value, ar.threshold AS threshold
       FROM alert_events ae
       JOIN alert_rules ar ON ar.id = ae.rule_id
       WHERE ae.owner_id = ? AND ar.symbol = ?
@@ -309,7 +344,8 @@ function loadAlertHistoryForSymbol(db: DatabaseSync, ownerId: string, symbol: st
     id: String(row.id),
     ruleType: String(row.rule_type),
     triggeredAt: String(row.triggered_at),
-    value: Number(row.value)
+    value: Number(row.value),
+    threshold: Number(row.threshold)
   }));
 }
 
@@ -317,11 +353,201 @@ function loadAlertHistoryForSymbol(db: DatabaseSync, ownerId: string, symbol: st
 // Rendering
 // ---------------------------------------------------------------------------
 
-function renderHeaderCard(symbol: string, latest: SymbolReportMatch | undefined): Html {
-  const dataTime = latest ? latest.entry.date : "无历史分析数据";
+// ---------------------------------------------------------------------------
+// Header + quote block (U3: the page opened with a bare symbol and a bare
+// date; spec §1.9 wants 代码/名称/数据时间 and §0.4 wants every number stamped
+// with its own data time).
+//
+// NAME: there is deliberately NO company-name line. Nothing in this system
+// produces one - `stock_facts` has no name key, `stock_analysis_targets` is
+// (symbol, owner) only, and the report markdown heads each section with the
+// bare symbol. Rendering a name would mean inventing it. What IS derivable
+// from the symbol honestly is its market (the dotted exchange suffix), so
+// that is what the header shows next to the code.
+// ---------------------------------------------------------------------------
+
+const MARKET_LABELS: Record<string, string> = {
+  US: "美股",
+  HK: "港股",
+  SH: "沪市",
+  SZ: "深市"
+};
+
+/** `TSM.US` -> `美股`; an unknown/absent suffix yields null (no guess). */
+function marketLabel(symbol: string): string | null {
+  const suffix = /\.([A-Z]{2,4})$/u.exec(symbol)?.[1];
+  return suffix ? (MARKET_LABELS[suffix] ?? suffix) : null;
+}
+
+/** Amber when the data is >= STALE_AFTER_DAYS old, plain otherwise. A null
+ * age means we could not compute one - say so rather than imply freshness. */
+function renderAgePill(age: DataAge | null): Html {
+  if (!age) {
+    return html`<span class="pill" style="background:var(--card2);color:var(--sub)">数据时间不可解析</span>`;
+  }
+  return age.stale
+    ? html`<span class="pill warn">${age.ago}</span>`
+    : html`<span class="pill ok">${age.ago}</span>`;
+}
+
+function renderHeaderCard(symbol: string, sheet: SymbolFactSheet | null, now: Date): Html {
+  const market = marketLabel(symbol);
+  const quote = sheet?.byKey.get("quote.last") ?? null;
+  const pct = sheet?.byKey.get("quote.pct") ?? null;
+
+  const quoteLine = quote
+    ? html`<div style="display:flex;align-items:baseline;gap:10px;margin-top:6px">
+          <span class="mono" style="font-size:26px;font-weight:600">${formatPrice(quote.valueNum)}</span>
+          <span class="mono ${pct && pct.valueNum !== null && pct.valueNum < 0 ? "d" : "u"}" style="font-size:15px">${
+            pct && pct.valueNum !== null ? formatPercentUnits(pct.valueNum) : MISSING_NUMBER_TEXT
+          }</span>
+          <span style="font-size:12px;color:var(--sub)">美元</span>
+        </div>
+        <p style="font-size:12px;color:var(--sub);margin:6px 0 0">
+          报价数据时间 <span class="mono">${describeDataInstant(quote.dataTime, now)}</span> · 来源 ${quote.source}
+        </p>
+        <p style="font-size:11.5px;color:var(--sub);margin:4px 0 0;line-height:1.6">
+          这不是实时行情（本平台不做实时看盘）。以上是平台最近一次抓取到的报价，交易请以券商 App 为准。
+        </p>`
+    : renderEmptyState(
+        "尚未抓取到该标的的报价。",
+        "报价随个股分析批次（每 3 天）与日报生产一并落库；该标的进入任一成员的标的池或持仓后即会开始抓取。"
+      );
+
   return html`<section class="card w2 dt-w4">
-    <h2>${symbol}</h2>
-    <p style="font-size:13px;color:var(--sub)">数据时间：<span class="mono">${dataTime}</span></p>
+    <h2>${symbol}${market ? html` <span class="pill" style="background:var(--card2);color:var(--sub)">${market}</span>` : trustedHtml("")}</h2>
+    ${quoteLine}
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
+// 关键数据: the machine-checked stock_facts row set behind the analysis.
+// ---------------------------------------------------------------------------
+
+interface FactGroupDef {
+  title: string;
+  keys: ReadonlyArray<{ key: string; label: string }>;
+}
+
+const FACT_GROUPS: readonly FactGroupDef[] = [
+  {
+    title: "报价",
+    keys: [
+      { key: "quote.prevClose", label: "前收" },
+      { key: "quote.open", label: "开盘" },
+      { key: "quote.high", label: "最高" },
+      { key: "quote.low", label: "最低" },
+      { key: "quote.volume", label: "成交量" }
+    ]
+  },
+  {
+    title: "估值",
+    keys: [
+      { key: "valuation.pe", label: "市盈率 PE" },
+      { key: "valuation.pb", label: "市净率 PB" },
+      { key: "valuation.eps", label: "每股收益 EPS" },
+      { key: "valuation.marketCap", label: "市值" },
+      { key: "valuation.targetPrice", label: "分析师目标价" }
+    ]
+  },
+  {
+    title: "技术",
+    keys: [
+      { key: "history.ma20", label: "MA20" },
+      { key: "history.ma60", label: "MA60" },
+      { key: "history.maLong", label: "长周期均线" }
+    ]
+  },
+  {
+    title: "期权与持仓",
+    keys: [
+      { key: "options.callOi", label: "看涨未平仓" },
+      { key: "options.putOi", label: "看跌未平仓" },
+      { key: "options.nextExpiry", label: "下一到期日" },
+      { key: "institutional.holdings", label: "机构持仓" },
+      { key: "news.count", label: "近期新闻条数" }
+    ]
+  }
+];
+
+/**
+ * Renders one fact's value with its unit. `value_text` wins when present -
+ * it is producer-authored prose (including honest 不可得 disclosures) and is
+ * shown verbatim. `unit` is free text (see data/stock-facts.ts): the four
+ * numeric units the live table actually uses are formatted properly, and
+ * anything else is appended after the number rather than dropped.
+ */
+function formatFactValue(fact: StockFactRow): string {
+  if (fact.valueText !== null && fact.valueText !== "") {
+    return fact.valueText;
+  }
+  if (fact.valueNum === null || !Number.isFinite(fact.valueNum)) {
+    return MISSING_NUMBER_TEXT;
+  }
+  if (fact.factKey === "valuation.marketCap") {
+    return formatLargeAmount(fact.valueNum);
+  }
+  switch (fact.unit) {
+    case "USD":
+      return `${formatPrice(fact.valueNum)} 美元`;
+    case "pct":
+      return formatPercentUnits(fact.valueNum);
+    case "shares":
+      return `${formatInteger(fact.valueNum)} 股`;
+    case "contracts":
+      return `${formatInteger(fact.valueNum)} 张`;
+    case "count":
+      return `${formatInteger(fact.valueNum)} 条`;
+    case null:
+    case "":
+      return fact.valueNum.toFixed(2);
+    default:
+      return `${fact.valueNum.toFixed(2)}（${fact.unit}）`;
+  }
+}
+
+function renderFactGroup(group: FactGroupDef, sheet: SymbolFactSheet): Html | null {
+  const rows = group.keys
+    .map(({ key, label }) => ({ label, fact: sheet.byKey.get(key) }))
+    .filter((row): row is { label: string; fact: StockFactRow } => row.fact !== undefined);
+  if (rows.length === 0) {
+    return null;
+  }
+  const cells = joinHtml(
+    rows.map(
+      (row) =>
+        html`<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0">
+          <span style="font-size:12.5px;color:var(--sub)">${row.label}</span>
+          <span class="mono" style="font-size:12.5px" title="来源 ${row.fact.source}｜数据时间 ${row.fact.dataTime}">${formatFactValue(row.fact)}</span>
+        </div>`
+    )
+  );
+  return html`<div style="margin-bottom:10px">
+    <div style="font-size:12px;color:var(--sub);font-weight:600;margin-bottom:2px">${group.title}</div>
+    ${cells}
+  </div>`;
+}
+
+function renderFactSheetCard(sheet: SymbolFactSheet | null, now: Date): Html {
+  if (!sheet) {
+    return html`<section class="card w2 dt-w4">
+      <h2>关键数据</h2>
+      ${renderEmptyState(
+        "还没有这只标的的机械核对数据（报价、估值、均线、期权持仓）。",
+        "这些数字由个股分析生产流水线写入 stock_facts；把该标的加入自己的标的池后，下一轮个股分析（每 3 天一批）就会开始填充。"
+      )}
+    </section>`;
+  }
+
+  const groups = FACT_GROUPS.map((group) => renderFactGroup(group, sheet)).filter(
+    (group): group is Html => group !== null
+  );
+  const age = beijingDayAge(sheet.tradingDay, now);
+
+  return html`<section class="card w2 dt-w4">
+    <h2>关键数据 <span class="mono" style="font-size:11px;color:var(--sub)">交易日 ${sheet.tradingDay}</span> ${renderAgePill(age)}</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 22px">${joinHtml(groups)}</div>
+    <p style="font-size:11.5px;color:var(--sub);margin:2px 0 0">每个数字的来源与数据时间在悬停提示中；同一张表内的数字都来自 ${sheet.tradingDay} 这一个交易日，不混用不同日期。</p>
   </section>`;
 }
 
@@ -339,24 +565,47 @@ const CONFIDENCE_PILL_HTML: Record<string, Html> = {
   low: html`<span class="pill" style="background:var(--card2);color:var(--sub)">${CONFIDENCE_LABELS.low}</span>`
 };
 
-function renderPublicSummaryCard(latest: SymbolReportMatch | undefined): Html {
+/**
+ * U2: this card used to be headed 「最新公共分析摘要」 with a bare date, and
+ * that word 最新 was doing real damage - on 07-30 it introduced a 07-27
+ * analysis quoting a 398 support level while the stock traded near 375, and
+ * a reader takes 最新 at face value. The card is now headed 公共分析摘要
+ * (a statement of what it is, not a freshness claim) with the report's date,
+ * an age pill, and - once the analysis is STALE_AFTER_DAYS old - an explicit
+ * in-card warning that the price levels inside it are that old. The page
+ * additionally raises the layout's degradation banner (see renderStockPage),
+ * so the warning is visible before the reader scrolls to this card.
+ */
+function renderPublicSummaryCard(latest: SymbolReportMatch | undefined, now: Date): Html {
   if (!latest) {
     return html`<section class="card w2 dt-w4">
-      <h2>最新公共分析摘要</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无公共分析</p>
+      <h2>公共分析摘要</h2>
+      ${renderEmptyState(
+        "还没有公开发布过这只标的的个股分析。",
+        "个股分析是公共资产，按「全体成员标的池并集 + 全体持仓」每 3 天批量生产一轮；把该标的加入自己的标的池，下一轮就会覆盖到它。"
+      )}
     </section>`;
   }
 
+  const age = beijingDayAge(latest.entry.date, now);
   const box = parseConclusionBox(latest.section);
+  const staleNote =
+    age?.stale === true
+      ? html`<p class="a" style="font-size:12px;margin:0 0 8px;line-height:1.65">
+          ⚠ 这份分析已是 ${age.ago}的结论。其中的价格、支撑位与估值区间来自 ${latest.entry.date} 的行情，可能与当前价格严重不符，不要当作当前判断使用。
+        </p>`
+      : trustedHtml("");
+
   const bodyHtml = box
     ? html`<p style="font-size:13.5px;line-height:1.7">${box.coreConclusion} ${CONFIDENCE_PILL_HTML[box.confidence]}</p>
-        <p style="font-size:12.5px;color:var(--sub)">合理价值区间：<span class="mono">${box.valueRange.low.toFixed(2)}–${box.valueRange.high.toFixed(2)}</span> 美元</p>
+        <p style="font-size:12.5px;color:var(--sub)">合理价值区间：<span class="mono">${box.valueRange.low.toFixed(2)}–${box.valueRange.high.toFixed(2)}</span> 美元（${latest.entry.date} 的判断）</p>
         <p style="font-size:12.5px;color:var(--sub)">复盘日期：<span class="mono">${box.reviewDate}</span></p>`
     : html`<p style="font-size:13.5px;line-height:1.7">${latest.summary}</p>
         <p style="font-size:11.5px;color:var(--sub)">旧格式无结论框</p>`;
 
   return html`<section class="card w2 dt-w4">
-    <h2>最新公共分析摘要 <span class="mono" style="font-size:11px;color:var(--sub)">${latest.entry.date}</span></h2>
+    <h2>公共分析摘要 <span class="mono" style="font-size:11px;color:var(--sub)">${latest.entry.date}</span> ${renderAgePill(age)}</h2>
+    ${staleNote}
     ${bodyHtml}
     <div style="margin-top:8px"><a href="/${latest.entry.type}/${latest.entry.date}" style="color:var(--accent);font-size:13px">阅读全文 →</a></div>
   </section>`;
@@ -367,19 +616,21 @@ const VISIBILITY_LABELS: Record<string, string> = { system: "系统可用", publ
 
 function renderEvidencePoints(points: string[]): Html {
   if (points.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin:2px 0 0">暂无依据</p>`;
+    return renderInlineEmptyState("暂无依据（可在飞书单聊补一句，会追加到这条论点上）");
   }
   return joinHtml(points.map((point) => html`<li style="font-size:12.5px">${point}</li>`));
 }
 
 function renderJudgmentTimeline(history: ThesisHistoryRow[]): Html {
   if (history.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin-top:6px">暂无判断历史</p>`;
+    return renderInlineEmptyState("暂无判断历史——每次在飞书里对这只标的补一句判断，都会 append 一行到这里，不可删改");
   }
   const rows = joinHtml(
     history.map(
+      // U1: `entry.createdAt` is a raw ISO instant in the column; a reader
+      // gets Beijing wall-clock, with the exact stored value in `title`.
       (entry) =>
-        html`<div class="alert"><time class="mono">${entry.createdAt}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
+        html`<div class="alert"><time class="mono" title="${entry.createdAt}">${formatBeijingShortTime(entry.createdAt)}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
     )
   );
   return html`<div style="margin-top:6px">${rows}</div>`;
@@ -423,6 +674,7 @@ function renderThesisRow(thesis: ThesisEvidenceRow, history: ThesisHistoryRow[],
 }
 
 function renderThesisCard(
+  symbol: string,
   theses: ThesisEvidenceRow[],
   historyByThesisId: Map<string, ThesisHistoryRow[]>,
   latestPrice: number | null
@@ -430,7 +682,10 @@ function renderThesisCard(
   if (theses.length === 0) {
     return html`<section class="card w2 dt-w4">
       <h2>我的论点卡</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无论点</p>
+      ${renderEmptyState(
+        `你还没有记过 ${symbol} 的论点，圈内也没有人公开过这只标的的论点。`,
+        `论点卡记的是「看多/看空 + 目标区间 + 失效价 + 依据」，系统会拿它做策略对照、按代码回算事后走势与命中率。在飞书单聊里说一句「记一条 ${symbol} 的看多论点，目标 x 到 y，跌破 z 失效」即可创建；默认「系统可用」档（只有你看得见），需要时再一键升为公开。`
+      )}
     </section>`;
   }
 
@@ -450,39 +705,125 @@ function renderThesisCard(
   </section>`;
 }
 
+/**
+ * U1, the row the operator screenshotted. It used to render
+ *
+ *   <time>2026-07-29T14:40:10.879Z</time> 日内波动 <b>-0.03323902016262659</b>
+ *
+ * - the raw `triggered_at` column and the raw `value` column. `value` is a
+ * decimal ratio for every rule type (contract verified against
+ * market-alerts-engine.mjs; see render/format.ts's header), so it now reads
+ * as a signed percentage, and the instant reads as Beijing wall-clock. The
+ * exact stored values stay reachable in the `title` attributes rather than
+ * being lost: this IS the audit trail for a fired alert.
+ */
 function renderAlertHistoryRow(event: SymbolAlertEventRow): Html {
   const label = RULE_TYPE_LABELS[event.ruleType] ?? event.ruleType;
-  return html`<div class="alert"><time class="mono">${event.triggeredAt}</time><span>${label} <b class="mono">${event.value}</b></span></div>`;
+  const cls = event.value < 0 ? "d" : "u";
+  return html`<div class="alert">
+    <time class="mono" title="${event.triggeredAt}">${formatBeijingShortTime(event.triggeredAt)}</time>
+    <span>${label} <b class="mono ${cls}" title="原始值 ${String(event.value)}">${formatAlertValue(event.ruleType, event.value)}</b>
+      <span style="color:var(--sub)">（阈值 ±${formatRatioAsUnsignedPercent(Math.abs(event.threshold))}）</span></span>
+  </div>`;
 }
 
-function renderAlertHistoryCard(events: SymbolAlertEventRow[]): Html {
+function renderAlertHistoryCard(symbol: string, events: SymbolAlertEventRow[]): Html {
   const body =
     events.length > 0
-      ? joinHtml(events.map(renderAlertHistoryRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无提醒</p>`;
+      ? html`${joinHtml(events.map(renderAlertHistoryRow))}
+          <p style="font-size:11.5px;color:var(--sub);margin:8px 0 0">时间为北京时间；百分比为该规则触发时的实际变动幅度，与飞书提醒卡上的同一次触发一一对应（卡片取 1 位小数，此处取 2 位）。</p>`
+      : renderEmptyState(
+          `你在 ${symbol} 上还没有触发过提醒。`,
+          `提醒来自你自己的提醒规则（日内波动 / 浮动盈亏 / 5分钟异动 / 组合敞口）。在飞书单聊里说一句「给 ${symbol} 加一条跌 4% 提醒」即可建规则；规则的标的必须在你自己的标的池或持仓里。`
+        );
   return html`<section class="card w2 dt-w4">
     <h2>我的该标的提醒历史</h2>
     ${body}
   </section>`;
 }
 
-function renderHistoryListCard(matches: SymbolReportMatch[]): Html {
+function renderHistoryListCard(matches: SymbolReportMatch[], now: Date): Html {
   if (matches.length === 0) {
     return html`<section class="card w2 dt-w4">
       <h2>历史分析列表</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无历史分析</p>
+      ${renderEmptyState(
+        "这只标的还没有任何一期个股分析。",
+        "个股分析每 3 天批量生产一轮，覆盖「全体成员标的池并集 + 全体持仓」；此外站内研究若触发新的个股分析，也会并入公共分析库的正常节奏发布。"
+      )}
     </section>`;
   }
   const rows = joinHtml(
-    matches.map(
-      (match) =>
-        html`<div class="alert"><time class="mono">${match.entry.date}</time><a href="/${match.entry.type}/${match.entry.date}" style="color:var(--accent)">${match.entry.title}</a></div>`
-    )
+    matches.map((match) => {
+      const age = beijingDayAge(match.entry.date, now);
+      return html`<div class="alert">
+        <time class="mono">${match.entry.date}</time>
+        <a href="/${match.entry.type}/${match.entry.date}" style="color:var(--accent)">${match.entry.title}</a>
+        <span style="color:var(--sub);font-size:11px">${age ? age.ago : ""}</span>
+      </div>`;
+    })
   );
   return html`<section class="card w2 dt-w4">
-    <h2>历史分析列表</h2>
+    <h2>历史分析列表 <span class="pill" style="background:var(--card2);color:var(--sub)">${matches.length} 期</span></h2>
     ${rows}
   </section>`;
+}
+
+/**
+ * The topbar's 数据时间 (U2). Prefers the quote sheet's own instant (the
+ * freshest dated thing on the page), then its trading day, then the newest
+ * analysis's date; null when the page genuinely has no dated content -
+ * saying nothing beats stamping the page with the request's clock.
+ */
+function describeStockDataAsOf(
+  sheet: SymbolFactSheet | null,
+  latest: SymbolReportMatch | undefined,
+  now: Date
+): string | null {
+  const quote = sheet?.byKey.get("quote.last");
+  if (quote?.dataTime) {
+    return describeDataInstant(quote.dataTime, now);
+  }
+  if (sheet) {
+    return describeDataDay(sheet.tradingDay, now);
+  }
+  if (latest) {
+    return describeDataDay(latest.entry.date, now);
+  }
+  return null;
+}
+
+/**
+ * The layout's degradation banner entries - "绝不静默" (req §1.1). Stale
+ * quotes and a stale analysis are reported SEPARATELY because they go stale
+ * for different reasons and a reader needs to know which one is old: on
+ * 2026-07-30 the operator saw a 07-27 analysis quoting a 398 support level
+ * against a real price near 375, and the page said nothing about it.
+ */
+function buildStockDegradations(
+  sheet: SymbolFactSheet | null,
+  latest: SymbolReportMatch | undefined,
+  now: Date
+): string[] {
+  const reasons: string[] = [];
+
+  const quote = sheet?.byKey.get("quote.last");
+  const quoteAge = quote?.dataTime ? beijingInstantAge(quote.dataTime, now) : null;
+  if (quote && quoteAge?.stale === true) {
+    reasons.push(
+      `报价数据停在 ${formatBeijingShortTime(quote.dataTime)}（${quoteAge.ago}），页面上的价格不是当前价格。行情抓取可能已中断，请以券商 App 为准。`
+    );
+  } else if (!quote) {
+    reasons.push("没有抓到这只标的的报价，本页不显示任何现价。");
+  }
+
+  const analysisAge = latest ? beijingDayAge(latest.entry.date, now) : null;
+  if (latest && analysisAge?.stale === true) {
+    reasons.push(
+      `最近一期个股分析是 ${latest.entry.date} 的（${analysisAge.ago}），其中的支撑位、估值区间与结论均基于当时行情，不代表现在。`
+    );
+  }
+
+  return reasons;
 }
 
 function renderStockPage(
@@ -502,19 +843,26 @@ function renderStockPage(
   }
   const latestPrice = loadLatestPriceForSymbol(deps.db, symbol);
   const alertEvents = loadAlertHistoryForSymbol(deps.db, member.id, symbol);
+  const factSheet = loadLatestFactSheet(deps.db, symbol);
 
-  const bodyHtml = html`<div class="bento">${renderHeaderCard(symbol, latest)}</div>
-    <div class="bento" style="margin-top:10px">${renderPublicSummaryCard(latest)}</div>
-    <div class="bento" style="margin-top:10px">${renderThesisCard(theses, historyByThesisId, latestPrice)}</div>
-    <div class="bento" style="margin-top:10px">${renderAlertHistoryCard(alertEvents)}</div>
-    <div class="bento" style="margin-top:10px">${renderHistoryListCard(matches)}</div>`;
+  const bodyHtml = html`<div class="bento">${renderHeaderCard(symbol, factSheet, now)}</div>
+    <div class="bento" style="margin-top:10px">${renderPublicSummaryCard(latest, now)}</div>
+    <div class="bento" style="margin-top:10px">${renderFactSheetCard(factSheet, now)}</div>
+    <div class="bento" style="margin-top:10px">${renderThesisCard(symbol, theses, historyByThesisId, latestPrice)}</div>
+    <div class="bento" style="margin-top:10px">${renderAlertHistoryCard(symbol, alertEvents)}</div>
+    <div class="bento" style="margin-top:10px">${renderHistoryListCard(matches, now)}</div>`;
 
   const page = renderPage({
     title: symbol,
     nav: "paper",
     member: { displayName: member.displayName },
     freshness: computeSymbolFreshness(latest, now),
-    degraded: [],
+    // U2: the topbar states the DATA's time, not the request's. The quote
+    // sheet is this page's freshest dated content, so it names the data
+    // time; with no quotes at all we fall back to the newest analysis's
+    // date, and with neither there is honestly no data time to state.
+    dataAsOf: describeStockDataAsOf(factSheet, latest, now),
+    degraded: buildStockDegradations(factSheet, latest, now),
     bodyHtml,
     nonce,
     now

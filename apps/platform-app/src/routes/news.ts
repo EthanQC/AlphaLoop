@@ -25,6 +25,8 @@ import { methodNotAllowed, type Member } from "@packages/shared-types";
 
 import { listFilterSymbols, listNewsEvents, type ImpactDirection, type NewsEventRow, type NewsEventSourceRow } from "../data/news.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { describeDataInstant } from "../render/format.js";
 import { html, joinHtml, type Html } from "../render/html.js";
 import { formatBeijingGeneratedAt, renderPage, type Freshness } from "../render/layout.js";
 
@@ -222,9 +224,19 @@ function renderEventCard(event: NewsEventRow, now: Date): Html {
   </section>`;
 }
 
-function renderEmptyStateCard(): Html {
+function renderEmptyStateCard(filtered: boolean): Html {
   return html`<section class="card w2 dt-w4">
-    <p style="font-size:13px;color:var(--sub)">近 7 天暂无聚类事件——新闻引擎随日报生成积累</p>
+    ${
+      filtered
+        ? renderEmptyState(
+            "当前筛选条件下，近 7 天没有聚类事件。",
+            "清掉上方的标的/主题筛选片即可看全部事件；筛选范围只覆盖全体成员标的池的并集，池外标的不会有新闻。"
+          )
+        : renderEmptyState(
+            "近 7 天没有聚类到任何新闻事件。",
+            "新闻由日报（每交易日 ≤30 次检索）与周报（≤60 次）的生产流水线抓取后按事件聚类；连续几天空白通常意味着日报没有跑成，可以在飞书群里查系统告警。"
+          )
+    }
   </section>`;
 }
 
@@ -235,7 +247,7 @@ function renderEmptyStateCard(): Html {
 function renderNewsBody(events: readonly NewsEventRow[], symbols: readonly string[], activeSymbol: string | null, activeTopic: string | null, now: Date): Html {
   const cards = events.length > 0
     ? joinHtml(events.map((event) => renderEventCard(event, now)))
-    : renderEmptyStateCard();
+    : renderEmptyStateCard(activeSymbol !== null || activeTopic !== null);
 
   return html`<div class="bento">${renderFilterChipsCard(symbols, activeSymbol, activeTopic)}</div>
     <div class="bento" style="margin-top:10px">${cards}</div>`;
@@ -259,12 +271,23 @@ export function renderNewsPage(
     ...(activeTopic ? { topic: activeTopic } : {})
   });
   const symbols = listFilterSymbols(deps.db);
+  // `listNewsEvents` orders newest-first (see data/news.ts), so the first
+  // event with a published source dates the whole page.
+  const newestPublishedAt =
+    events
+      .flatMap((event) => event.sources.map((source) => source.publishedAt))
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .sort()
+      .at(-1) ?? null;
 
   const page = renderPage({
     title: "新闻",
     nav: "news",
     member: { displayName: member.displayName },
     freshness: computeFreshness(events, now),
+    // U2: the newest event's own published time IS this page's data time -
+    // the news feed has no separate generation step of its own.
+    dataAsOf: newestPublishedAt ? describeDataInstant(newestPublishedAt, now) : null,
     degraded: [],
     bodyHtml: renderNewsBody(events, symbols, activeSymbol, activeTopic, now),
     nonce,

@@ -177,10 +177,10 @@ describe("strategy route (GET /strategy)", () => {
     const response = await authed("/strategy", token);
     expect(response.status).toBe(200);
     const body = await response.text();
-    expect(body).toContain("暂无纪律规则");
-    expect(body).toContain("暂无策略卡");
-    expect(body).toContain("暂无论点");
-    expect(body).toContain("圈子暂无公开策略"); // circle section, DIFFERENT wording
+    expect(body).toContain("你还没有登记任何纪律规则。");
+    expect(body).toContain("你还没有策略卡。");
+    expect(body).toContain("你还没有记过任何个股论点。");
+    expect(body).toContain("圈内还没有人公开策略或论点。"); // circle section, DIFFERENT wording
     expect(body).not.toContain("P7 上线"); // no stale placeholder text anywhere
   });
 
@@ -392,7 +392,7 @@ describe("strategy route (GET /strategy)", () => {
 
       const cardsIdx = body.indexOf("我的策略卡与论点");
       const cardNameIdx = body.indexOf("动量策略");
-      const thesesHeaderIdx = body.indexOf("暂无论点");
+      const thesesHeaderIdx = body.indexOf("你还没有记过任何个股论点。");
       expect(cardsIdx).toBeGreaterThan(-1);
       expect(cardNameIdx).toBeGreaterThan(cardsIdx);
       expect(thesesHeaderIdx).toBeGreaterThan(cardNameIdx); // cards render before theses
@@ -420,7 +420,7 @@ describe("strategy route (GET /strategy)", () => {
       const response = await authed("/strategy", tokenB);
       const body = await response.text();
 
-      expect(body).toContain("圈子暂无公开策略"); // A's system thesis must not leak into B's circle section
+      expect(body).toContain("圈内还没有人公开策略或论点。"); // A's system thesis must not leak into B's circle section
     });
 
     it("A's 'public' thesis IS visible in B's 圈子公开区, grouped under A's display name linking to /member/<A>", async () => {
@@ -444,7 +444,7 @@ describe("strategy route (GET /strategy)", () => {
       const response = await authed("/strategy", token);
       const body = await response.text();
       // Own public thesis shows once (② section) but circle section (③) is empty.
-      expect(body).toContain("圈子暂无公开策略");
+      expect(body).toContain("圈内还没有人公开策略或论点。");
     });
 
     it("does not show a revoked member's public thesis in the circle section", async () => {
@@ -455,7 +455,7 @@ describe("strategy route (GET /strategy)", () => {
       const { token: tokenB } = seedMemberWithToken({ id: "member_b", email: "b@example.com" });
       const response = await authed("/strategy", tokenB);
       const body = await response.text();
-      expect(body).toContain("圈子暂无公开策略");
+      expect(body).toContain("圈内还没有人公开策略或论点。");
     });
 
     it("A's public strategy card IS visible in B's 圈子公开区, grouped under A; A's system-only card is not", async () => {

@@ -87,6 +87,8 @@ import {
 } from "../data/monthly-review.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { beijingDayAge, describeDataDay, formatBeijingDateTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
@@ -170,25 +172,6 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
   return member;
 }
 
-const BEIJING_DATETIME_FORMAT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false
-});
-
-/** `YYYY-MM-DD HH:mm` in Asia/Shanghai (Beijing has no DST, so a fixed IANA
- * zone is exact year-round) - same convention as research.ts's own
- * formatBeijingDateTime, used here for the "已确认于 <date>" pill. */
-function formatBeijingDateTime(iso: string): string {
-  const parts = BEIJING_DATETIME_FORMAT.formatToParts(new Date(iso));
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  return `${byType.get("year")}-${byType.get("month")}-${byType.get("day")} ${byType.get("hour")}:${byType.get("minute")}`;
-}
-
 function formatPct(fraction: number): string {
   return `${Math.round(fraction * 100)}%`;
 }
@@ -207,7 +190,7 @@ function renderSampleNote(sample: ReviewSample): Html {
     return html`<p style="font-size:12px;color:var(--sub)">样本不足（&lt;10），暂不下结论。</p>`;
   }
   if (sample === "none") {
-    return html`<p style="font-size:12px;color:var(--sub)">暂无数据。</p>`;
+    return html`<p style="font-size:12px;color:var(--sub)">本月没有可统计的样本，这一段不下结论。</p>`;
   }
   return trustedHtml("");
 }
@@ -228,6 +211,7 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
     nav: "reports",
     member: { displayName: member.displayName },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -291,7 +275,7 @@ function renderConfidenceTierRow(tier: ConfidenceTierStat): Html {
       <span style="color:var(--sub)">（${tier.hits}/${tier.n}）</span>
     </div>`;
   }
-  const note = tier.sample === "none" ? "暂无数据" : `样本不足（n=${tier.n}）`;
+  const note = tier.sample === "none" ? "本月无该档预测" : `样本不足（n=${tier.n}）`;
   return html`<div class="alert"><span>「${label}」置信度</span><span style="color:var(--sub)">${note}</span></div>`;
 }
 
@@ -375,14 +359,14 @@ function renderComplianceRateRow(complianceRate: ComplianceRate): Html {
   if (complianceRate.sample === "insufficient") {
     return html`<div class="alert"><span>近期遵守率</span><span style="color:var(--sub)">样本不足（已检查 ${complianceRate.checked} 次）</span></div>`;
   }
-  return html`<div class="alert"><span>近期遵守率</span><span style="color:var(--sub)">暂无数据</span></div>`;
+  return html`<div class="alert"><span>近期遵守率</span><span style="color:var(--sub)">本月无可统计的纪律检查</span></div>`;
 }
 
 function renderReturnsSummary(label: string, summary: ReturnsSummary): Html {
   if (summary.sample === "ok") {
     return html`<span>${label}：<span class="mono ${pctClass(summary.avgReturnPct)}">${formatSignedPct(summary.avgReturnPct)}</span>（n=${summary.n}）</span>`;
   }
-  const note = summary.sample === "none" ? "暂无数据" : `样本不足（n=${summary.n}）`;
+  const note = summary.sample === "none" ? "本月无成交，无从统计" : `样本不足（n=${summary.n}）`;
   return html`<span>${label}：<span style="color:var(--sub)">${note}</span></span>`;
 }
 
@@ -435,11 +419,11 @@ function renderLessonsCard(result: MonthlyReviewResultShape): Html {
   const categories =
     result.errorCategories.length > 0
       ? joinHtml(result.errorCategories.map((category) => html`<span class="pill warn" style="margin:0 6px 6px 0">${category}</span>`))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无归类</p>`;
+      : renderEmptyState("这次复盘没有对交易做归类。", "归类由复盘引擎按你的策略与纪律分组统计；当月没有成交时这里就是空的。")
   const steps =
     result.nextSteps.length > 0
       ? joinHtml(result.nextSteps.map((step) => html`<div class="alert"><span>${step}</span></div>`))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无下一步</p>`;
+      : renderEmptyState("这次复盘没有列出下一步。", "下一步是复盘引擎在发现明确改进点时才写的；没有就是没有，不会凑数。")
   return html`<section class="card w2 dt-w4">
     <h2>错误归类 · 一句话教训 · 下一步</h2>
     <div style="margin:6px 0 10px">${categories}</div>
@@ -457,7 +441,7 @@ function renderSuggestionsCard(suggestions: ImprovementSuggestions): Html {
   const items =
     suggestions.items.length > 0
       ? joinHtml(suggestions.items.map((item) => html`<div class="alert"><span>${item}</span></div>`))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无改进建议</p>`;
+      : renderEmptyState("这次复盘没有改进建议。", "改进建议只在统计样本足够（≥10）且出现明显偏差时生成；样本不足时复盘引擎不下结论。")
   return html`<section class="card w2 dt-w4">
     <h2>改进建议</h2>
     ${items}
@@ -485,8 +469,11 @@ function renderResultBody(result: MonthlyReviewResultShape): Html {
 function renderMissingResultBody(): Html {
   return html`<div class="bento" style="margin-top:10px">
     <section class="card w2 dt-w4">
-      <h2>暂无复盘内容</h2>
-      <p style="font-size:13px;color:var(--sub)">该复盘尚未生成结果。</p>
+      <h2>复盘内容缺失</h2>
+      ${renderEmptyState(
+        "这条复盘记录存在，但里面没有结果内容。",
+        "正常流程下复盘引擎会先写好结果再让它出现在列表里；出现这个页面说明那一步没写成，可以在飞书群里查当月的复盘任务告警。"
+      )}
     </section>
   </div>`;
 }
@@ -506,11 +493,23 @@ function renderReviewPage(
   nonce: string
 ): void {
   const now = currentNow(deps);
+  // The review's own data day: the period it covers (its confirmation
+  // instant, when present, is when the OWNER signed off - not when the data
+  // is from).
+  const reviewDataDay = /^\d{4}-\d{2}$/u.test(review.period) ? `${review.period}-01` : null;
+  const reviewAge = reviewDataDay === null ? null : beijingDayAge(reviewDataDay, now);
   const page = renderPage({
     title: `${review.period} 月度复盘`,
     nav: "reports",
     member: { displayName: member.displayName },
-    freshness: "最新",
+    // U2: this used to be a hard-coded 最新 pill sitting next to a review
+    // covering a month that ended 59 days ago (observed against the live
+    // database, 2026-07-30). A monthly review is INHERENTLY historical, so
+    // it is only ever 最新 on the day it was produced.
+    freshness: reviewAge === null ? "部分缺失" : reviewAge.days === 0 ? "最新" : "延迟",
+    // A monthly review covers ONE period and never changes after it is
+    // generated; its data time is that period, not the moment it is read.
+    dataAsOf: reviewDataDay === null ? null : describeDataDay(reviewDataDay, now),
     degraded: [],
     bodyHtml: renderReviewBody(review),
     nonce,

@@ -34,13 +34,18 @@
  *                      client-side validation beyond HTML5 `required`.
  *   ② 我的模拟盘概览 - real snapshot data (net assets + today's change) via
  *                      data/overview.ts, or an honest empty state.
- *   ③ 我的待办       - real pending proposals, or "提案审批 P6 上线" (always
- *                      the latter today - P6 hasn't shipped writes yet).
- *   ④ 我的提醒流水   - real alert_events rows, or "暂无提醒".
+ *   ③ 我的待办       - real pending proposals, or an honest empty state.
+ *   ④ 我的提醒流水   - real alert_events rows, or an honest empty state.
  *   ⑤ 今日日报卡     - latest daily report from Task 4's disk scanner, or
- *                      "暂无日报".
- *   ⑥ 纪律速览       - real discipline_rules, or "策略记忆 P7 上线" (always
- *                      the latter today - P7 hasn't shipped writes yet).
+ *                      an honest empty state.
+ *   ⑥ 纪律速览       - real discipline_rules, or an honest empty state.
+ *
+ * EMPTY STATES (2026-07-30, U3): every block above used to fall back to a
+ * bare 暂无X - and two of them ("提案审批 P6 上线", "策略记忆 P7 上线") still
+ * named phases that had SHIPPED, so the page told a reader a feature was
+ * missing when it was actually just empty. They all now use
+ * render/empty-state.ts's two-line form: what the block would show, and the
+ * real mechanism that fills it.
  *
  * Phase 9 Task 4 (2026-07-16 plan) ADDITION - ⑦ 复盘速览: appended AFTER the
  * six blocks above, in its own new bento row, rather than reshuffled into
@@ -51,8 +56,8 @@
  * numbered list. Shows the viewer's own MOST RECENT monthly review (highest
  * `period`, via data/monthly-review.ts's `loadOwnerReviews` - already
  * period-DESC ordered by `MonthlyReviewRepository.listForOwner`) - period +
- * 状态（草稿/已确认）+ a `/review/<id>` link, or "暂无复盘，每月第一个周末自动
- * 生成草稿" when the owner has none yet. Monthly reviews have NO public
+ * 状态（草稿/已确认）+ a `/review/<id>` link, or an honest empty state when
+ * the owner has none yet. Monthly reviews have NO public
  * visibility (Global Constraint: 复盘 is always owner-only), so this block
  * only ever reads the VIEWER'S OWN reviews - never another member's.
  */
@@ -75,8 +80,15 @@ import {
 } from "../data/overview.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import {
+  describeDataDay,
+  describeDataInstant,
+  formatAlertValue,
+  formatBeijingShortTime
+} from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { freshnessPillClass, renderPage, type Freshness } from "../render/layout.js";
+import { freshnessPillClass, renderPage, snapshotFreshness, type Freshness } from "../render/layout.js";
 
 export interface HomeRouteDeps {
   db: DatabaseSync;
@@ -86,11 +98,13 @@ export interface HomeRouteDeps {
 }
 
 const ALERT_EVENT_LIMIT = 10;
-/** Snapshot age threshold for the home page's own freshness rule (plan Task
- * 5): "snapshot exists and < 90min old -> 最新; exists older -> 延迟; missing
- * -> 部分缺失". Distinct from (and does not reuse) reports.ts's date-based
- * freshness rule - the two pages have different notions of "fresh". */
-const SNAPSHOT_FRESH_WINDOW_MS = 90 * 60 * 1000;
+/* Snapshot age threshold moved to render/layout.ts's SNAPSHOT_FRESH_WINDOW_MS
+ * (2026-07-30) so member-card.ts and paper.ts, which render the same snapshot,
+ * cannot disagree with this page about whether it is fresh. The rule is
+ * unchanged: "snapshot exists and < 90min old -> 最新; exists older -> 延迟;
+ * missing -> 部分缺失". Still distinct from reports.ts's date-based freshness
+ * rule - those pages have a different notion of "fresh". */
+
 
 const RULE_TYPE_LABELS: Record<string, string> = {
   daily_move: "日内波动",
@@ -126,35 +140,11 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
   return member;
 }
 
-// Module-level (not per-call) - Intl.DateTimeFormat construction is
-// comparatively expensive (locale/calendar data setup), and
-// formatBeijingShortTime below is called once per alert-feed row (up to
-// ALERT_EVENT_LIMIT times per request); its options never vary, so building
-// it once at module load and reusing it is strictly cheaper than
-// reconstructing it on every call with no behavior difference.
-const BEIJING_SHORT_TIME_FORMAT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false
-});
-
-/** `MM-DD HH:mm` in Asia/Shanghai (Beijing has no DST, so a fixed IANA zone
- * is exact year-round) - compact enough for the alert feed's per-row time. */
-function formatBeijingShortTime(iso: string): string {
-  const parts = BEIJING_SHORT_TIME_FORMAT.formatToParts(new Date(iso));
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  return `${byType.get("month")}-${byType.get("day")} ${byType.get("hour")}:${byType.get("minute")}`;
-}
-
 function computeHomeFreshness(snapshot: OwnerSnapshot | null, now: Date): Freshness {
   if (!snapshot) {
     return "部分缺失";
   }
-  const ageMs = now.getTime() - new Date(snapshot.fetchedAt).getTime();
-  return ageMs < SNAPSHOT_FRESH_WINDOW_MS ? "最新" : "延迟";
+  return snapshotFreshness(snapshot.fetchedAt, now);
 }
 
 function formatNetAssets(value: number): string {
@@ -273,7 +263,10 @@ function renderPaperOverviewBlock(
   if (!snapshot) {
     return html`<section class="card w2 dt-w2">
       <h2>我的模拟盘概览</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无快照数据——模拟盘接入后显示</p>
+      ${renderEmptyState(
+        "还没有你的模拟盘快照，所以这里不显示净值和今日涨跌。",
+        "快照由 mini 上的长桥模拟盘监控每交易日抓取；开好长桥模拟盘账户并把凭据交给平台托管后，下一个交易日即有数据。"
+      )}
     </section>`;
   }
 
@@ -309,7 +302,10 @@ function renderTodoBlock(proposals: ProposalRow[]): Html {
   const body =
     proposals.length > 0
       ? joinHtml(proposals.map(renderProposalRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无待审提案</p>`;
+      : renderEmptyState(
+          "当前没有等你审批的提案。",
+          "提案在收盘后自动生成（每次 0-2 条，0 条也是合法结果），也可以在飞书里直接说「给我出一条 NVDA 的提案」；生成后审批卡会发到你的飞书单聊，24 小时无操作自动作废。"
+        );
   return html`<section class="card dt-w2">
     <h2>我的待办</h2>
     ${body}
@@ -322,9 +318,12 @@ function renderTodoBlock(proposals: ProposalRow[]): Html {
 
 function renderAlertRow(event: AlertEventRow): Html {
   const label = RULE_TYPE_LABELS[event.ruleType] ?? event.ruleType;
+  // U1 (2026-07-30): `event.value` is a decimal ratio, and used to render
+  // raw (`-0.0332390201626266`). See render/format.ts for the unit contract.
+  const cls = event.value < 0 ? "d" : "u";
   return html`<div class="alert">
-    <time class="mono">${formatBeijingShortTime(event.triggeredAt)}</time>
-    <span>${event.symbol} ${label} <b class="mono">${event.value}</b></span>
+    <time class="mono" title="${event.triggeredAt}">${formatBeijingShortTime(event.triggeredAt)}</time>
+    <span>${event.symbol} ${label} <b class="mono ${cls}" title="原始值 ${String(event.value)}">${formatAlertValue(event.ruleType, event.value)}</b></span>
   </div>`;
 }
 
@@ -332,7 +331,10 @@ function renderAlertFeedBlock(events: ReadonlyArray<AlertEventRow>): Html {
   const body =
     events.length > 0
       ? joinHtml(events.map(renderAlertRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无提醒</p>`;
+      : renderEmptyState(
+          "最近一个美股交易时段你没有触发过提醒。",
+          "提醒按你自己的规则触发（日内波动 / 浮动盈亏 / 5分钟异动 / 组合敞口），每人每日上限 30 张。在飞书单聊里说一句「给 NVDA 加一条涨跌 4% 提醒」即可建规则。"
+        );
   return html`<section class="card dt-w2">
     <h2>我的提醒流水</h2>
     ${body}
@@ -347,7 +349,10 @@ function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
   if (!entry) {
     return html`<section class="card dt-w2 report">
       <h2>今日日报卡</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无日报</p>
+      ${renderEmptyState(
+        "还没有可读的日报。",
+        "日报在每个美股交易日开盘前（北京时间约 20:00）自动生成；美股节假日无新输入则不产出，这一天本就不会有日报。"
+      )}
     </section>`;
   }
 
@@ -386,7 +391,10 @@ function renderDisciplineBlock(rules: DisciplineRuleRow[]): Html {
   const body =
     rules.length > 0
       ? joinHtml(rules.map(renderDisciplineRow))
-      : html`<p style="font-size:13px;color:var(--sub)">策略记忆 P7 上线</p>`;
+      : renderEmptyState(
+          "你还没有登记任何纪律规则。",
+          "纪律是系统能替你硬拦的东西（如「财报周不加仓」「单票不超过 20%」）。在飞书单聊里说一句「记一条纪律：…」即可登记，之后每条提案都会按它做检查。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>纪律速览</h2>
     ${body}
@@ -403,7 +411,10 @@ function renderMonthlyReviewBlock(latestReview: TypedMonthlyReview | null): Html
   if (!latestReview) {
     return html`<section class="card w2 dt-w4">
       <h2>复盘速览</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无复盘，每月第一个周末自动生成草稿</p>
+      ${renderEmptyState(
+        "还没有你的月度复盘。",
+        "复盘在每月第一个周末自动生成草稿并发到你的飞书单聊：预测命中率、决策收益对比、纪律遵守率与改进建议；你确认后结论才写进个人策略记忆。"
+      )}
     </section>`;
   }
   const statusLabel = HOME_REVIEW_STATUS_LABELS[latestReview.status] ?? latestReview.status;
@@ -488,6 +499,15 @@ export function renderHomePage(
     nav: "home",
     member: { displayName: member.displayName },
     freshness,
+    // U2: the topbar states when this page's DATA is from. The paper-trading
+    // snapshot is the home page's own live figure (净值/今日), so it names
+    // the data time; with no snapshot the newest daily report's date is the
+    // only dated content left, and with neither there is nothing to state.
+    dataAsOf: snapshot
+      ? describeDataInstant(snapshot.fetchedAt, now)
+      : latestDaily
+        ? describeDataDay(latestDaily.date, now)
+        : null,
     degraded,
     bodyHtml: renderHomeBody(
       snapshot,

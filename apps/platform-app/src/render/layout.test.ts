@@ -11,6 +11,7 @@ function renderSample(overrides: Partial<Parameters<typeof renderPage>[0]> = {})
     nav: "home",
     member: { displayName: "圈主" },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: SAMPLE_BODY,
     nonce: "test-nonce-abc",
@@ -209,5 +210,27 @@ describe("renderPage: XSS probes", () => {
   it("escapes a nonce containing markup so it cannot break out of its attribute", () => {
     const out = renderSample({ nonce: '"><script>alert(2)</script>' });
     expect(out).not.toContain("<script>alert(2)</script>");
+  });
+});
+
+describe("renderPage: the topbar's data time vs request time (2026-07-30, U2)", () => {
+  it("with a dataAsOf, states the DATA's time first and labels the request clock separately", () => {
+    const out = renderSample({ dataAsOf: "07-27（3 天前）" });
+    expect(out).toContain("数据时间 07-27（3 天前）");
+    expect(out).toContain("页面生成于 07-14 周二 20:05");
+    // The pre-fix shape, which a reader took for the data's time.
+    expect(out).not.toContain("· 生成于 07-14 周二 20:05");
+  });
+
+  it("with dataAsOf null, shows ONLY the labelled request clock - it never invents a data time", () => {
+    const out = renderSample({ dataAsOf: null });
+    expect(out).toContain("页面生成于 07-14 周二 20:05");
+    expect(out).not.toContain("数据时间");
+  });
+
+  it("escapes the dataAsOf string like any other interpolated text", () => {
+    const out = renderSample({ dataAsOf: "<script>x</script>" });
+    expect(out).toContain("&lt;script&gt;");
+    expect(out).not.toContain("数据时间 <script>");
   });
 });

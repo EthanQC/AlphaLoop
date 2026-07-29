@@ -33,6 +33,8 @@ import {
 } from "@packages/shared-types";
 
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { describeDataInstant, formatBeijingDateTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
 import { renderPage } from "../render/layout.js";
@@ -168,6 +170,7 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
     nav: "paper",
     member: { displayName: member.displayName },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -247,7 +250,8 @@ function computeHalfApprovedQuantity(originalQuantity: number): number {
 
 function renderApprovalTimelineCard(proposal: ProposalDetailRow, lifecycle: OfficialPaperOrderLifecycle | null): Html {
   const entries: Html[] = [
-    html`<div class="alert"><time class="mono">${proposal.createdAt}</time><span>提案创建</span></div>`
+    // U1: these four timeline rows all rendered the raw ISO column value.
+    html`<div class="alert"><time class="mono" title="${proposal.createdAt}">${formatBeijingDateTime(proposal.createdAt)}</time><span>提案创建</span></div>`
   ];
   if (proposal.decidedAt) {
     const decidedByNote = proposal.decidedBy ? ` · 决策人 ${proposal.decidedBy}` : "";
@@ -256,7 +260,7 @@ function renderApprovalTimelineCard(proposal: ProposalDetailRow, lifecycle: Offi
         ? ` · 数量减半至 ${computeHalfApprovedQuantity(proposal.quantity)} 股（原申请 ${proposal.quantity} 股）`
         : "";
     entries.push(
-      html`<div class="alert"><time class="mono">${proposal.decidedAt}</time><span>审批决定${decidedByNote}${halfNote}</span></div>`
+      html`<div class="alert"><time class="mono" title="${proposal.decidedAt}">${formatBeijingDateTime(proposal.decidedAt)}</time><span>审批决定${decidedByNote}${halfNote}</span></div>`
     );
   }
   // Lifecycle events (record-before-execute rows keyed by
@@ -267,16 +271,16 @@ function renderApprovalTimelineCard(proposal: ProposalDetailRow, lifecycle: Offi
   // pending) has no such row - `lifecycle` is null and neither event renders.
   if (lifecycle) {
     entries.push(
-      html`<div class="alert"><time class="mono">${lifecycle.submittedAt}</time><span>已提交至券商（${lifecycle.lifecycleStage}）</span></div>`
+      html`<div class="alert"><time class="mono" title="${lifecycle.submittedAt}">${formatBeijingDateTime(lifecycle.submittedAt)}</time><span>已提交至券商（${lifecycle.lifecycleStage}）</span></div>`
     );
     if (lifecycle.lastObservedAt !== lifecycle.submittedAt) {
       entries.push(
-        html`<div class="alert"><time class="mono">${lifecycle.lastObservedAt}</time><span>最新状态：${lifecycle.brokerStatus}（${lifecycle.lifecycleStage}）</span></div>`
+        html`<div class="alert"><time class="mono" title="${lifecycle.lastObservedAt}">${formatBeijingDateTime(lifecycle.lastObservedAt)}</time><span>最新状态：${lifecycle.brokerStatus}（${lifecycle.lifecycleStage}）</span></div>`
       );
     }
   }
   if (proposal.consumedAt) {
-    entries.push(html`<div class="alert"><time class="mono">${proposal.consumedAt}</time><span>执行完成</span></div>`);
+    entries.push(html`<div class="alert"><time class="mono" title="${proposal.consumedAt}">${formatBeijingDateTime(proposal.consumedAt)}</time><span>执行完成</span></div>`);
   }
   return html`<section class="card w2 dt-w4">
     <h2>审批与执行时间线</h2>
@@ -296,7 +300,10 @@ function deriveLifecycleTicketId(proposalId: string): string {
 function renderOutcomeCard(proposal: ProposalDetailRow): Html {
   const body = proposal.outcome
     ? html`<p style="font-size:13px">${proposal.outcome}</p>`
-    : html`<p style="font-size:13px;color:var(--sub)">待 P6/P9 完善</p>`;
+    : renderEmptyState(
+        "这条提案还没有事后表现记录。",
+        "事后表现在月度复盘里由代码回算（提案收益 vs 拿住不动），只有已成交的提案才会有；被拒绝、超时作废或尚未成交的提案这里会一直是空的。"
+      );
   return html`<section class="card w2 dt-w4">
     <h2>事后表现</h2>
     ${body}
@@ -326,6 +333,9 @@ function renderProposalPage(
     nav: "paper",
     member: { displayName: member.displayName },
     freshness: "最新",
+    // U2: a proposal detail page is a record of one past decision - its data
+    // time is the last thing that happened to it, not the moment it was read.
+    dataAsOf: describeDataInstant(proposal.consumedAt ?? proposal.decidedAt ?? proposal.createdAt, now),
     degraded: [],
     bodyHtml,
     nonce,

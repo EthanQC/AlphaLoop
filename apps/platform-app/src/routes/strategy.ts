@@ -8,7 +8,7 @@
  *                      disabled, enabled first) - each with its enforcement
  *                      badge AND a REAL 近30天遵守 statistic
  *                      (computeComplianceStats, data/strategy.ts) - no more
- *                      「统计 P7 上线」placeholder. Empty -> 「暂无纪律规则」.
+ *                      「统计 P7 上线」placeholder. Empty -> an honest empty state (render/empty-state.ts).
  *   ② 我的策略卡与论点 - the viewer's OWN strategy_cards (every visibility) with
  *                      a status badge (活跃/暂停/退役) and a visibility pill,
  *                      THEN the viewer's OWN theses (every visibility) - the
@@ -18,12 +18,13 @@
  *                      target range, invalidation, visibility pill, and its
  *                      append-only thesis_history timeline annotated with
  *                      computeThesisOutcome's deterministic post-hoc verdict.
- *                      Empty card list -> 「暂无策略卡」; empty thesis list ->
- *                      「暂无论点」(replacing the old, now-inaccurate 「策略记忆
- *                      P7 上线」placeholder - the feature has shipped).
+ *                      Empty card list / empty thesis list -> honest empty states
+ *                      naming what the block would hold and how to fill it
+ *                      (2026-07-30; these replaced bare 暂无X strings, which
+ *                      themselves had replaced a stale 「策略记忆 P7 上线」).
  *   ③ 圈子公开区     - OTHER active members' `visibility = 'public'` theses
  *                      AND strategy cards ONLY, grouped by member (display
- *                      name links to `/member/<id>`). Empty -> 「圈子暂无公开策略」
+ *                      name links to `/member/<id>`). Empty -> an honest empty state
  *                      (a DIFFERENT empty state than ①/② - "the feature
  *                      exists and works, nobody else has published anything
  *                      yet", not "this hasn't shipped").
@@ -57,6 +58,8 @@ import {
 } from "../data/strategy.js";
 import { loadAllDisciplineRulesForOwner, type DisciplineRuleRow } from "../data/overview.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
+import { formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
@@ -136,7 +139,10 @@ function renderDisciplineSection(rules: DisciplineRuleRow[], statsByRuleId: Map<
   const body =
     rules.length > 0
       ? joinHtml(rules.map((rule) => renderDisciplineRow(rule, statsByRuleId.get(rule.id) ?? { sample: "none" })))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无纪律规则</p>`;
+      : renderEmptyState(
+          "你还没有登记任何纪律规则。",
+          "纪律是系统能替你硬拦的东西（如「财报周不加仓」「单票不超过 20%」）。在飞书单聊里说一句「记一条纪律：…」即可登记；登记后每条提案都会按它做检查，执行方式会标成 代码强制 / 提案检查 / 自我约束。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>我的纪律</h2>
     ${body}
@@ -164,7 +170,10 @@ function renderStrategyCardsSubsection(cards: StrategyCardRow[]): Html {
   const body =
     cards.length > 0
       ? joinHtml(cards.map(renderStrategyCardRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无策略卡</p>`;
+      : renderEmptyState(
+          "你还没有策略卡。",
+          "策略卡记的是一套打法（场景 / 进场条件 / 风控 / 离场规则）。在飞书单聊里说一句「记一条策略：…」即可创建；默认「系统可用」档只有你看得见，升到「公开」档才会出现在你的名片上。"
+        );
   return html`<div style="margin-bottom:14px">
     <h3 style="font-size:13px;color:var(--sub);margin:0 0 6px">策略卡</h3>
     ${body}
@@ -173,7 +182,7 @@ function renderStrategyCardsSubsection(cards: StrategyCardRow[]): Html {
 
 function renderEvidencePoints(points: string[]): Html {
   if (points.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin:2px 0 0">暂无依据</p>`;
+    return renderInlineEmptyState("暂无依据");
   }
   return joinHtml(points.map((point) => html`<li style="font-size:12.5px">${point}</li>`));
 }
@@ -185,7 +194,8 @@ function renderJudgmentRow(entry: ThesisHistoryRow, outcome: ThesisOutcomeJudgme
         outcome.priceAtRender !== null ? html` (最新价 ${outcome.priceAtRender})` : trustedHtml("")
       }</span>`
     : trustedHtml("");
-  return html`<div class="alert"><time class="mono">${entry.createdAt}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span>${verdictHtml}</span></div>`;
+  // U1: raw ISO instant out of the column -> Beijing wall-clock.
+  return html`<div class="alert"><time class="mono" title="${entry.createdAt}">${formatBeijingShortTime(entry.createdAt)}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span>${verdictHtml}</span></div>`;
 }
 
 function renderHitRateLine(hitRate: ReturnType<typeof computeThesisOutcome>["hitRate"]): Html {
@@ -202,7 +212,7 @@ function renderThesisHistoryTimeline(
   outcomeByJudgmentId: Map<string, ThesisOutcomeJudgmentResult>
 ): Html {
   if (history.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin-top:6px">暂无判断历史</p>`;
+    return renderInlineEmptyState("暂无判断历史——每次在飞书里补一句判断都会 append 一行，不可删改");
   }
   const rows = joinHtml(history.map((entry) => renderJudgmentRow(entry, outcomeByJudgmentId.get(entry.id))));
   return html`<div style="margin-top:6px">${rows}</div>`;
@@ -254,7 +264,10 @@ function renderThesesSubsection(theses: ThesisEvidenceRow[], historyByThesisId: 
             renderMyThesisCard(thesis, historyByThesisId.get(thesis.id) ?? [], priceBySymbol.get(thesis.symbol) ?? null)
           )
         )
-      : html`<p style="font-size:13px;color:var(--sub)">暂无论点</p>`;
+      : renderEmptyState(
+          "你还没有记过任何个股论点。",
+          "论点卡记的是「看多/看空 + 目标区间 + 失效价 + 依据」，系统会拿它做策略对照并按代码回算事后走势与命中率（样本 <10 会标「样本不足」）。在飞书单聊里说一句「记一条 NVDA 的看多论点，目标 x 到 y，跌破 z 失效」即可创建。"
+        );
   return html`<div>
     <h3 style="font-size:13px;color:var(--sub);margin:0 0 6px">论点</h3>
     ${body}
@@ -339,7 +352,10 @@ function renderCirclePublicSection(groups: CircleGroup[]): Html {
   const body =
     groups.length > 0
       ? joinHtml(groups.map(renderCircleGroup))
-      : html`<p style="font-size:13px;color:var(--sub)">圈子暂无公开策略</p>`;
+      : renderEmptyState(
+          "圈内还没有人公开策略或论点。",
+          "只有升到「公开」档的策略卡与论点才会出现在这里并进入对方的名片；「私有」档只在本人的本地工作台，「系统可用」档只有本人能看。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>圈子公开区</h2>
     ${body}
@@ -383,6 +399,11 @@ function renderStrategyPage(res: ServerResponse, deps: StrategyRouteDeps, member
     nav: "strategy",
     member: { displayName: member.displayName },
     freshness: "最新",
+    // U2: the strategy page shows the viewer's OWN stored records - they have
+    // no production time of their own beyond the moment each was written, and
+    // each row already carries its own timestamp. A page-level 数据时间 would
+    // have to invent one, so this page honestly states none.
+    dataAsOf: null,
     degraded: [],
     bodyHtml,
     nonce,

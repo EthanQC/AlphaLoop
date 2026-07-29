@@ -90,9 +90,10 @@ export function loadRecentAlertEvents(db: DatabaseSync, ownerId: string, limit: 
 }
 
 /**
- * Pending proposals for this owner. Always empty in practice today (P6
- * hasn't shipped proposal creation yet) - the query itself is still real and
- * owner-filtered so P6 only has to start writing rows, not build this read.
+ * Pending proposals for this owner, owner-filtered in the WHERE clause.
+ * (The doc comment here used to claim "always empty in practice today - P6
+ * hasn't shipped proposal creation yet". P6 shipped; the claim was stale and
+ * is removed - 2026-07-30.)
  */
 export function loadPendingProposals(db: DatabaseSync, ownerId: string): ProposalRow[] {
   const rows = db
@@ -125,9 +126,10 @@ function mapDisciplineRuleRow(row: Record<string, unknown>): DisciplineRuleRow {
 }
 
 /**
- * Enabled discipline_rules for this owner. Always empty in practice today
- * (P7 hasn't shipped strategy-memory writes yet) - same "real, owner-filtered
- * query ahead of the data existing" shape as loadPendingProposals above.
+ * Enabled discipline_rules for this owner, owner-filtered in the WHERE
+ * clause. (This doc comment used to claim "always empty in practice today -
+ * P7 hasn't shipped strategy-memory writes yet". P7 shipped; removed
+ * 2026-07-30.)
  */
 export function loadDisciplineRules(db: DatabaseSync, ownerId: string): DisciplineRuleRow[] {
   const rows = db
@@ -153,4 +155,50 @@ export function loadAllDisciplineRulesForOwner(db: DatabaseSync, ownerId: string
     .all(ownerId) as Array<Record<string, unknown>>;
 
   return rows.map(mapDisciplineRuleRow);
+}
+
+// ---------------------------------------------------------------------------
+// 提案与成交历史 (req §1.6) - 2026-07-30. The paper page rendered a
+// "提案与成交历史 P6 上线" placeholder long after P6 shipped, so a reader with
+// real proposals in the database was told the feature did not exist.
+// ---------------------------------------------------------------------------
+
+export interface ProposalHistoryRow {
+  id: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  status: string;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+/**
+ * This owner's proposals, newest first. OWNER-SCOPED IN THE WHERE CLAUSE:
+ * a proposal is private to its owner (Global Constraints; routes/proposal.ts
+ * enforces the same rule on the detail page), so this reader takes an
+ * ownerId and never accepts a "show me everyone's" mode - the paper page
+ * only ever calls it with the VIEWER's own id, never the member being
+ * viewed.
+ */
+export function loadProposalHistory(db: DatabaseSync, ownerId: string, limit: number): ProposalHistoryRow[] {
+  const rows = db
+    .prepare(`
+      SELECT id, symbol, side, quantity, status, created_at, decided_at
+      FROM proposals
+      WHERE owner_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `)
+    .all(ownerId, limit) as Array<Record<string, unknown>>;
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    symbol: String(row.symbol),
+    side: String(row.side),
+    quantity: Number(row.quantity),
+    status: String(row.status),
+    createdAt: String(row.created_at),
+    decidedAt: row.decided_at === null || row.decided_at === undefined ? null : String(row.decided_at)
+  }));
 }

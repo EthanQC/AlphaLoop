@@ -75,6 +75,8 @@ import {
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { describeDataInstant, formatBeijingDateTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage } from "../render/layout.js";
 
@@ -127,24 +129,6 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
   return member;
 }
 
-const BEIJING_DATETIME_FORMAT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false
-});
-
-/** `YYYY-MM-DD HH:mm` in Asia/Shanghai (Beijing has no DST, so a fixed IANA
- * zone is exact year-round) - used for the verdict card's "截至 <时间>". */
-function formatBeijingDateTime(iso: string): string {
-  const parts = BEIJING_DATETIME_FORMAT.formatToParts(new Date(iso));
-  const byType = new Map(parts.map((part) => [part.type, part.value]));
-  return `${byType.get("year")}-${byType.get("month")}-${byType.get("day")} ${byType.get("hour")}:${byType.get("minute")}`;
-}
-
 // ---------------------------------------------------------------------------
 // 404 page
 // ---------------------------------------------------------------------------
@@ -161,6 +145,7 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
     nav: "home",
     member: { displayName: member.displayName },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -231,7 +216,10 @@ function renderStepRow(step: unknown, index: number): Html {
 function renderStepsList(steps: unknown): Html {
   const list = Array.isArray(steps) ? steps : [];
   if (list.length === 0) {
-    return html`<p style="font-size:13px;color:var(--sub)">暂无步骤记录</p>`;
+    return renderEmptyState(
+      "这次调研还没有记录任何步骤。",
+      "步骤流由研究引擎边跑边写（意图解析 → 拉取行情 → 检索新闻 → 读取你的论点与纪律 → 数字校验 → 生成研判）；刚提交时为空是正常的，页面会自动刷新。"
+    );
   }
   return joinHtml(list.map((step, index) => renderStepRow(step, index)));
 }
@@ -302,7 +290,9 @@ function renderKeyPointRow(point: ResearchKeyPoint): Html {
 function renderKeyPointsCard(points: ResearchKeyPoint[]): Html {
   const list = Array.isArray(points) ? points : [];
   const body =
-    list.length > 0 ? joinHtml(list.map(renderKeyPointRow)) : html`<p style="font-size:13px;color:var(--sub)">暂无关键要点</p>`;
+    list.length > 0
+      ? joinHtml(list.map(renderKeyPointRow))
+      : renderEmptyState("这次研判没有列出关键要点。", "关键要点是 3-5 条带证据角标的结论支撑；研判降级（材料收齐但结论未完成）时这里会是空的。");
   return html`<section class="card w2 dt-w4">
     <h2>关键要点</h2>
     ${body}
@@ -315,7 +305,10 @@ function renderDataTableCard(rows: ResearchDataTableRow[]): Html {
   if (list.length === 0) {
     return html`<section class="card w2 dt-w4">
       <h2>数据表</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无数据</p>
+      ${renderEmptyState(
+        "这次研判没有引用任何行情或指标数据。",
+        "数据表只收录调研过程中真正取到的数字；取不到时研究引擎会在「调研过程」里显式记一条「跳过」，不会编造。"
+      )}
     </section>`;
   }
   const body = joinHtml(
@@ -359,7 +352,10 @@ function renderComparisonCard(comparison: ResearchResult["comparison"] | undefin
   const body =
     rows.length > 0
       ? joinHtml(rows.map(renderComparisonRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无可对照的论点或纪律</p>`;
+      : renderEmptyState(
+          "你在这次研判涉及的标的上没有可对照的论点或纪律。",
+          "对照读的是你自己的「系统可用 + 公开」两档论点与纪律。在飞书单聊里记一条论点或纪律后，下次研判就会自动标出一致/冲突。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>与我的论点/纪律对照</h2>
     ${body}
@@ -370,7 +366,7 @@ function renderComparisonCard(comparison: ResearchResult["comparison"] | undefin
 function renderSuggestedActionCard(suggestedAction: string | undefined): Html {
   return html`<section class="card w2 dt-w4">
     <h2>建议动作</h2>
-    <p style="font-size:13.5px;color:var(--ink)">${suggestedAction ?? "暂无建议"}</p>
+    <p style="font-size:13.5px;color:var(--ink)">${suggestedAction ?? "这次研判没有给出可执行的建议动作——研究引擎只在证据足够支撑一个具体动作（如止损位、仓位）时才写这一段。"}</p>
     <p style="margin-top:6px;font-size:12px;color:var(--sub)">不构成投资建议，模拟盘语境。</p>
   </section>`;
 }
@@ -389,7 +385,12 @@ function renderEvidenceRow(item: ResearchEvidenceItem): Html {
 function renderEvidenceCard(evidence: ResearchEvidenceItem[]): Html {
   const list = Array.isArray(evidence) ? evidence : [];
   const body =
-    list.length > 0 ? joinHtml(list.map(renderEvidenceRow)) : html`<p style="font-size:13px;color:var(--sub)">暂无证据</p>`;
+    list.length > 0
+      ? joinHtml(list.map(renderEvidenceRow))
+      : renderEmptyState(
+          "这次研判没有引用任何外部证据。",
+          "证据链收录调研过程中真正读到的新闻与数据源；一次纯粹基于你自己持仓与论点的研判可以合法地没有外部证据。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>证据链</h2>
     ${body}
@@ -431,7 +432,10 @@ function renderVerdictBody(task: ResearchTask): Html {
       <div class="bento" style="margin-top:10px">
         <section class="card w2 dt-w4">
           <h2>核心结论</h2>
-          <p style="font-size:13px;color:var(--sub)">暂无研判结果</p>
+          ${renderEmptyState(
+            "这次任务没有产出研判结果。",
+            "任务已结束但结果为空，通常意味着研究引擎在写回结果前中断了；可以在首页重新提问一次（每人每日 10 次配额）。"
+          )}
         </section>
       </div>`;
   }
@@ -503,6 +507,9 @@ function renderResearchPage(
     nav: "home",
     member: { displayName: member.displayName },
     freshness: "最新",
+    // U2: a verdict is a snapshot of the moment it finished; an in-progress
+    // task legitimately has no data time yet.
+    dataAsOf: task.finishedAt ? describeDataInstant(task.finishedAt, now) : null,
     degraded: [],
     bodyHtml,
     nonce,

@@ -328,7 +328,7 @@ describe("monthly review reading page + confirm endpoint", () => {
       }
     });
 
-    it("样本不足/暂无数据 is shown honestly for empty-state sub-metrics, never a fabricated number", async () => {
+    it("样本不足/无样本 is shown honestly for empty-state sub-metrics, never a fabricated number", async () => {
       const id = new MonthlyReviewRepository(db).upsertDraft({
         ownerId: memberA.id,
         period: "2026-07",
@@ -368,7 +368,11 @@ describe("monthly review reading page + confirm endpoint", () => {
       const body = await response.text();
 
       expect(body).toContain("样本不足");
-      expect(body).toContain("暂无数据");
+      // Each no-sample sub-metric now says WHY it is empty instead of 暂无数据.
+      expect(body).toContain("本月没有可统计的样本，这一段不下结论。");
+      expect(body).toContain("本月无该档预测");
+      expect(body).toContain("本月无可统计的纪律检查");
+      expect(body).not.toContain(">暂无数据</span>");
       expect(body).not.toContain("NaN");
       expect(body).not.toContain("undefined");
     });

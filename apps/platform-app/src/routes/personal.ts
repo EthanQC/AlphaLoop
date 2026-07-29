@@ -45,6 +45,7 @@ import { renderMarkdown } from "../reports/markdown.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderForbiddenPage } from "../render/forbidden.js";
 import { renderPage, type Freshness } from "../render/layout.js";
+import { describeDataDay } from "../render/format.js";
 import { REPORT_BODY_STYLE, formatBeijingDate } from "./reports.js";
 
 export interface PersonalRouteDeps {
@@ -194,6 +195,9 @@ function renderMissingPage(
     nav: "reports",
     member: { displayName: member.displayName },
     freshness: "部分缺失",
+    // The page that WOULD have carried data was never generated; its
+    // requested date is the only honest time to state.
+    dataAsOf: describeDataDay(dateParam, now),
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -257,6 +261,9 @@ function renderPersonalPageHtml(
     nav: "reports",
     member: { displayName: member.displayName },
     freshness,
+    // U2: a personal page is a snapshot of ONE dated report - its data time
+    // is that report's date, never the moment the reader opened it.
+    dataAsOf: describeDataDay(date, now),
     degraded: [],
     bodyHtml: body,
     nonce,

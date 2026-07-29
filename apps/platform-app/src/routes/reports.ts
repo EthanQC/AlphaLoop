@@ -79,6 +79,8 @@ import {
   type ReportIndexEntry,
   type ReportType
 } from "../reports/scanner.js";
+import { renderEmptyState } from "../render/empty-state.js";
+import { beijingDayAge, describeDataDay } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, type Freshness } from "../render/layout.js";
 
@@ -373,14 +375,24 @@ function renderReportsListPage(
   // 复盘 has no public/done-vs-degraded filter of its own - EVERY review this
   // owner has (draft or confirmed) belongs on their own list, full stop.
   const reviews = isReviewView ? loadOwnerReviews(deps.db, member.id) : [];
+  // U2: the list's own data time = the newest thing currently listed. For the
+  // 研判/复盘 views that is the newest finished task / review period; for the
+  // report views it is the newest entry date (already DESC-sorted above).
+  const newestListedDate: string | null = isResearchView
+    ? (researchTasks.find((task) => task.finishedAt)?.finishedAt?.slice(0, 10) ?? null)
+    : isReviewView
+      ? (reviews[0]?.period ? `${reviews[0].period}-01` : null)
+      : (filtered[0]?.date ?? null);
 
   const page = renderPage({
     title: "报告库",
     nav: "reports",
     member: { displayName: member.displayName },
-    freshness: "最新",
+    // U2: 最新 was hard-coded on a list whose newest entry can be days old.
+    freshness: newestListedDate === null ? "部分缺失" : newestListedDate === formatBeijingDate(now) ? "最新" : "延迟",
+    dataAsOf: newestListedDate === null ? null : describeDataDay(newestListedDate, now),
     degraded: [],
-    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks, reviews, owned.withheld),
+    bodyHtml: renderReportsListBody(filtered, typeParam, researchTasks, reviews, owned.withheld, now),
     nonce,
     now
   });
@@ -476,14 +488,17 @@ function renderReviewChip(activeType: string | null): Html {
   return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;${extraStyle}">复盘</a>`;
 }
 
-function renderReportCard(entry: ReportIndexEntry): Html {
+function renderReportCard(entry: ReportIndexEntry, now: Date): Html {
   const legacyPill = entry.legacy
     ? html`<span class="pill warn" style="margin-left:6px">历史存档</span>`
     : trustedHtml("");
+  // U2: a bare date makes the reader do the arithmetic. Say the age.
+  const age = beijingDayAge(entry.date, now);
   return html`<a class="card" href="/${entry.type}/${entry.date}" style="display:block">
       <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--sub)">
         <span class="pill" style="background:var(--accent-soft);color:var(--accent)">${TYPE_LABELS[entry.type]}</span>
         <span class="mono">${entry.date}</span>
+        ${age ? html`<span>${age.ago}</span>` : trustedHtml("")}
         ${legacyPill}
       </div>
       <div style="margin-top:8px;font-size:14.5px;font-weight:650;color:var(--ink)">${entry.title}</div>
@@ -557,7 +572,8 @@ function renderReportsListBody(
   activeType: string | null,
   researchTasks: ResearchTask[],
   reviews: TypedMonthlyReview[],
-  withheldPaper: WithheldPaperReports
+  withheldPaper: WithheldPaperReports,
+  now: Date
 ): Html {
   const chips = joinHtml([
     ...TYPE_ORDER.map((type) => renderTypeChip(type, TYPE_LABELS[type], activeType)),
@@ -570,14 +586,23 @@ function renderReportsListBody(
   const cards = isResearchView
     ? researchTasks.length > 0
       ? joinHtml(researchTasks.map(renderResearchArchiveCard))
-      : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无研判。</p>`
+      : renderEmptyState(
+          "你还没有任何研判。",
+          "在首页顶部的提问框里问一句（如「NVDA 财报前要减仓吗」），系统会边调研边把过程展示给你，完成后研判自动归档到这里。每人每日 10 次。"
+        )
     : isReviewView
       ? reviews.length > 0
         ? joinHtml(reviews.map(renderReviewArchiveCard))
-        : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无复盘，每月第一个周末自动生成草稿。</p>`
+        : renderEmptyState(
+            "你还没有任何月度复盘。",
+            "复盘在每月第一个周末自动生成草稿并发到你的飞书单聊：预测命中率、决策收益对比、纪律遵守率与改进建议；确认后结论才写进个人策略记忆。"
+          )
       : entries.length > 0
-        ? joinHtml(entries.map(renderReportCard))
-        : html`<p style="padding:24px 4px;color:var(--sub);font-size:13px">暂无报告。</p>`;
+        ? joinHtml(entries.map((entry) => renderReportCard(entry, now)))
+        : renderEmptyState(
+            activeType === null ? "报告库里还没有任何报告。" : "这个类型下还没有报告。",
+            "日报在每个美股交易日开盘前（北京时间约 20:00）生成，周报每周一份，个股分析每 3 天一批。连续多天空白通常意味着生产流水线没有跑成，可以在飞书群里查系统告警。"
+          );
 
   return html`<div class="bento">
       <section class="card w2 dt-w4">
@@ -605,6 +630,7 @@ function renderNotFoundPage(member: Member, nonce: string, now: Date): string {
     nav: "reports",
     member: { displayName: member.displayName },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -694,13 +720,30 @@ function renderPersonalPageEntry(entry: ReportIndexEntry): Html {
   </div>`;
 }
 
-function renderReadingBody(entry: ReportIndexEntry, rawMd: string, rendered: MarkdownRenderResult): Html {
+function renderReadingBody(
+  entry: ReportIndexEntry,
+  rawMd: string,
+  rendered: MarkdownRenderResult,
+  now: Date
+): Html {
   const legacyNote = entry.legacy
     ? html`<p style="margin-top:6px;font-size:12px;color:var(--sub)">旧格式无置信度</p>`
     : trustedHtml("");
 
+  // U2: a reader who lands on a deep link has no idea how old the report is
+  // until they read the date and subtract. The summary card says it outright,
+  // and an old report says so in amber before its first sentence.
+  const age = beijingDayAge(entry.date, now);
+  const staleNote =
+    age?.stale === true
+      ? html`<p class="a" style="font-size:12px;margin:0 0 8px;line-height:1.65">⚠ 这是 ${entry.date}（${age.ago}）的报告，其中的行情、价位与结论都停在那一天。</p>`
+      : trustedHtml("");
+
   const summarySection = html`<section class="card w2 dt-w4">
-    <h2>摘要</h2>
+    <h2>摘要 <span class="mono" style="font-size:11px;color:var(--sub)">${entry.date}</span>${
+      age ? html` <span class="pill ${age.stale ? "warn" : "ok"}">${age.ago}</span>` : trustedHtml("")
+    }</h2>
+    ${staleNote}
     <p style="font-size:13.5px;line-height:1.7">${extractFirstParagraph(rawMd)}</p>
     ${legacyNote}
   </section>`;
@@ -766,6 +809,7 @@ function renderPaperForbiddenPage(member: Member, nonce: string, now: Date, deta
     nav: "reports",
     member: { displayName: member.displayName },
     freshness: "最新",
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -855,8 +899,11 @@ function renderReadingPage(
     nav: "reports",
     member: { displayName: member.displayName },
     freshness,
+    // U2: a report reading page IS its date - stamping the topbar with the
+    // request clock told a reader a 3-day-old report was "生成于" just now.
+    dataAsOf: describeDataDay(entry.date, now),
     degraded: [],
-    bodyHtml: renderReadingBody(entry, rawMd, rendered),
+    bodyHtml: renderReadingBody(entry, rawMd, rendered, now),
     nonce,
     now
   });

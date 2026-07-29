@@ -117,7 +117,7 @@ describe("news route (GET /news)", () => {
     expect(response.headers.get("content-type")).toContain("text/html");
     const body = await response.text();
 
-    expect(body).toContain("近 7 天暂无聚类事件——新闻引擎随日报生成积累");
+    expect(body).toContain("近 7 天没有聚类到任何新闻事件。");
     // Filter chips row present (全部/宏观, real links now - not disabled).
     expect(body).toContain("全部");
     expect(body).toContain("宏观");
@@ -173,7 +173,7 @@ describe("news route (GET /news)", () => {
     // Unknown-time source shows the honest label, not a fabricated time.
     expect(body).toContain("时间未知");
     expect(body).toContain("Barchart");
-    expect(body).not.toContain("近 7 天暂无聚类事件");
+    expect(body).not.toContain("近 7 天没有聚类到任何新闻事件。");
   });
 
   it("renders a javascript: source URL as plain text, never as a clickable href (2026-07 audit: defense-in-depth against a non-http(s) URL from an external RSS/LLM source)", async () => {

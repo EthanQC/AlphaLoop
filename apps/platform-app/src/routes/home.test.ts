@@ -155,17 +155,17 @@ describe("home route (GET /)", () => {
     const expectedOrder = [
       "开始研究",
       "我的模拟盘概览",
-      "暂无快照数据——模拟盘接入后显示",
+      "还没有你的模拟盘快照，所以这里不显示净值和今日涨跌。",
       "我的待办",
-      "暂无待审提案",
+      "当前没有等你审批的提案。",
       "我的提醒流水",
-      "暂无提醒",
+      "最近一个美股交易时段你没有触发过提醒。",
       "今日日报卡",
-      "暂无日报",
+      "还没有可读的日报。",
       "纪律速览",
-      "策略记忆 P7 上线",
+      "你还没有登记任何纪律规则。",
       "复盘速览",
-      "暂无复盘，每月第一个周末自动生成草稿"
+      "还没有你的月度复盘。"
     ];
 
     let cursor = -1;
@@ -198,7 +198,7 @@ describe("home route (GET /)", () => {
 
     expect(body).toContain("1,100.00 美元");
     expect(body).toContain("+10.00%");
-    expect(body).not.toContain("暂无快照数据");
+    expect(body).not.toContain("还没有你的模拟盘快照");
   });
 
   it("shows 数据不足 for today's change when there is no previous-day snapshot", async () => {
@@ -288,7 +288,7 @@ describe("home route (GET /)", () => {
     expect(body).toContain("日内波动");
     expect(body).toContain("-4.3");
     expect(body).toContain("07-14 18:10"); // Beijing time
-    expect(body).not.toContain("暂无提醒");
+    expect(body).not.toContain("最近一个美股交易时段你没有触发过提醒。");
   });
 
   it("two-member isolation: member A's alert events never appear on member B's home page", async () => {
@@ -309,7 +309,7 @@ describe("home route (GET /)", () => {
     const body = await response.text();
 
     expect(body).not.toContain("NVDA.US");
-    expect(body).toContain("暂无提醒");
+    expect(body).toContain("最近一个美股交易时段你没有触发过提醒。");
   });
 
   it("renders the latest daily report as a link, with a legacy pill (every current report is legacy)", async () => {
@@ -322,7 +322,7 @@ describe("home route (GET /)", () => {
     expect(body).toContain("今日日报标题");
     expect(body).toContain('href="/daily/2026-07-14"');
     expect(body).toContain("历史存档");
-    expect(body).not.toContain("暂无日报");
+    expect(body).not.toContain("还没有可读的日报。");
   });
 
   // Task 6 (2026-07-28): the daily card is the home page's entry point to the
@@ -344,7 +344,7 @@ describe("home route (GET /)", () => {
     const { token } = seedMemberWithToken();
     const response = await authed("/", token);
     const body = await response.text();
-    expect(body).toContain("暂无日报");
+    expect(body).toContain("还没有可读的日报。");
     expect(body).not.toContain("我的个人页");
   });
 
@@ -490,7 +490,7 @@ describe("home route (GET /)", () => {
       const response = await authed("/", tokenB);
       const body = await response.text();
       expect(body).not.toContain("2026-06");
-      expect(body).toContain("暂无复盘，每月第一个周末自动生成草稿");
+      expect(body).toContain("还没有你的月度复盘。");
     });
   });
 });

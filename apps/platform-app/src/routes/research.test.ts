@@ -163,12 +163,12 @@ describe("research route (GET /research/<id>)", () => {
       expect(body).toContain(`setTimeout(function(){location.reload();},3000);`);
     });
 
-    it("shows 暂无步骤记录 when no steps have been recorded yet", async () => {
+    it("shows the no-steps empty state when no steps have been recorded yet", async () => {
       const { member, token } = seedMemberWithToken();
       const id = createQueuedTask(member.id);
       const response = await authed(`/research/${id}`, token);
       const body = await response.text();
-      expect(body).toContain("暂无步骤记录");
+      expect(body).toContain("这次调研还没有记录任何步骤。");
     });
 
     it("running status renders 进行中 label and still polls", async () => {
@@ -259,10 +259,10 @@ describe("research route (GET /research/<id>)", () => {
       const response = await authed(`/research/${id}`, token);
       const body = await response.text();
       expect(body).toContain("低");
-      expect(body).toContain("暂无关键要点");
-      expect(body).toContain("暂无数据");
-      expect(body).toContain("暂无可对照的论点或纪律");
-      expect(body).toContain("暂无证据");
+      expect(body).toContain("这次研判没有列出关键要点。");
+      expect(body).toContain("这次研判没有引用任何行情或指标数据。");
+      expect(body).toContain("你在这次研判涉及的标的上没有可对照的论点或纪律。");
+      expect(body).toContain("这次研判没有引用任何外部证据。");
       expect(body).toContain("无跳过项");
     });
 

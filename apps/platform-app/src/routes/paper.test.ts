@@ -150,7 +150,7 @@ describe("paper route (GET /paper)", () => {
     const body = await response.text();
 
     expect(body).toContain("数据不足");
-    expect(body).toContain("暂无净值曲线数据——模拟盘接入后显示");
+    expect(body).toContain("还没有任何模拟盘快照，画不出净值曲线。");
   });
 
   it("renders an inline SVG net-worth curve when 2+ points exist", async () => {
@@ -325,4 +325,71 @@ describe("paper route (GET /paper)", () => {
     expect(body).toContain(`nonce="${nonceMatch?.[1]}"`);
     expect(body).not.toMatch(/https?:\/\//iu);
   });
+
+  // -------------------------------------------------------------------------
+  // 提案与成交历史 (req §1.6) - shipped 2026-07-30, replacing a hard-coded
+  // "提案与成交历史 P6 上线" placeholder that outlived P6 by weeks.
+  // -------------------------------------------------------------------------
+
+  function seedProposal(
+    ownerId: string,
+    opts: { symbol?: string; status?: string; createdAt?: string; decidedAt?: string | null } = {}
+  ): string {
+    const id = createId("proposal");
+    db.prepare(`
+      INSERT INTO proposals (id, owner_id, symbol, side, quantity, order_type, limit_price, reason, evidence,
+                             discipline_report, status, decided_at, decided_by, created_at, expires_at)
+      VALUES (?, ?, ?, 'buy', 2, 'limit', 390.5, '回踩 MA20', '[]', '[]', ?, ?, NULL, ?, '2026-07-28T12:30:00.000Z')
+    `).run(
+      id,
+      ownerId,
+      opts.symbol ?? "TSM.US",
+      opts.status ?? "approved",
+      opts.decidedAt === undefined ? "2026-07-27T13:00:00.000Z" : opts.decidedAt,
+      opts.createdAt ?? "2026-07-27T12:30:00.000Z"
+    );
+    return id;
+  }
+
+  it("renders the viewer's real proposals with a state badge and a link to the detail page", async () => {
+    const { member, token } = seedMemberWithToken();
+    const id = seedProposal(member.id, { status: "approved_half" });
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("提案与成交历史");
+    expect(body).toContain("减半批准");
+    expect(body).toContain(`/proposal/${id}`);
+    expect(body).toContain("TSM.US 买入 2.00 股");
+    // U1: the decision instant reads as Beijing wall-clock, not a raw ISO.
+    expect(body).toContain("07-27 21:00");
+    expect(body).not.toContain(">2026-07-27T13:00:00.000Z<");
+    // The placeholder this replaced.
+    expect(body).not.toContain("P6 上线");
+  });
+
+  it("shows an honest empty state - naming the real mechanism - when the viewer has no proposals", async () => {
+    const { token } = seedMemberWithToken();
+    const body = await (await authed("/paper", token)).text();
+    expect(body).toContain("你还没有任何提案记录。");
+    expect(body).toContain("24 小时无操作自动作废");
+    expect(body).not.toContain(">暂无提案</p>");
+  });
+
+  it("NEVER shows another member's proposals - not even when their paper view is being displayed", async () => {
+    const { token: tokenA } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
+    const memberB = makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: true });
+    new MemberRepository(db).upsert(memberB);
+    seedProposal("member_b", { symbol: "NVDA.US" });
+    const ownId = seedProposal("member_a", { symbol: "TSM.US" });
+
+    // A views B's paper page: B's proposals must not appear anywhere on it.
+    const body = await (await authed(`/paper?member=member_b`, tokenA)).text();
+
+    expect(body).toContain(`/proposal/${ownId}`); // A's own history stays put
+    expect(body).toContain("TSM.US 买入");
+    expect(body).not.toContain("NVDA.US 买入");
+    expect(body).toContain("提案是各人私有的");
+  });
+
 });

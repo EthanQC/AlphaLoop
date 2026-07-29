@@ -58,8 +58,10 @@ import {
 } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
+import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
+import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
-import { renderPage } from "../render/layout.js";
+import { renderPage, snapshotFreshness } from "../render/layout.js";
 
 export interface MemberCardRouteDeps {
   db: DatabaseSync;
@@ -129,6 +131,8 @@ function renderNotFoundPage(viewer: Member, nonce: string, now: Date): string {
     nav: "strategy",
     member: { displayName: viewer.displayName },
     freshness: "最新",
+    // A 404 carries no data of its own.
+    dataAsOf: null,
     degraded: [],
     bodyHtml: body,
     nonce,
@@ -170,6 +174,9 @@ interface PerformanceView {
   visible: boolean;
   kpis: PaperKpis | null;
   hasSeries: boolean;
+  /** When the newest snapshot behind these KPIs was fetched (U2) - null when
+   * there is no series, or when the viewer may not see it at all. */
+  fetchedAt: string | null;
 }
 
 /**
@@ -179,26 +186,40 @@ interface PerformanceView {
  */
 function loadPerformanceView(db: DatabaseSync, subject: Member, canSee: boolean): PerformanceView {
   if (!canSee) {
-    return { visible: false, kpis: null, hasSeries: false };
+    return { visible: false, kpis: null, hasSeries: false, fetchedAt: null };
   }
   const series = loadSnapshotSeriesForOwner(db, subject.id, SERIES_LIMIT);
   if (series.length === 0) {
-    return { visible: true, kpis: null, hasSeries: false };
+    return { visible: true, kpis: null, hasSeries: false, fetchedAt: null };
   }
-  return { visible: true, kpis: computePaperKpis(series), hasSeries: true };
+  // loadSnapshotSeriesForOwner returns oldest-first (see data/snapshots.ts's
+  // own ordering, which the curve rendering depends on), so the LAST element
+  // is the newest snapshot and dates this card.
+  return {
+    visible: true,
+    kpis: computePaperKpis(series),
+    hasSeries: true,
+    fetchedAt: series.at(-1)?.fetchedAt ?? null
+  };
 }
 
 function renderPerformanceSection(view: PerformanceView): Html {
   if (!view.visible) {
     return html`<section class="card w2 dt-w2">
       <h2>模拟盘战绩</h2>
-      <p style="font-size:13px;color:var(--sub)">未公开</p>
+      ${renderEmptyState(
+        "这位成员没有公开自己的模拟盘战绩。",
+        "战绩展示由本人在自己的名片上开关，默认对圈内成员展示；关闭后首页的「对比」入口也会同步置灰。这不是数据缺失。"
+      )}
     </section>`;
   }
   if (!view.hasSeries || !view.kpis) {
     return html`<section class="card w2 dt-w2">
       <h2>模拟盘战绩</h2>
-      <p style="font-size:13px;color:var(--sub)">暂无快照数据</p>
+      ${renderEmptyState(
+        "这位成员愿意展示战绩，但还没有任何模拟盘快照。",
+        "快照由 mini 上的长桥模拟盘监控每交易日抓取；成员开好模拟盘账户并把凭据交给平台托管后，下一个交易日起才会有曲线。"
+      )}
     </section>`;
   }
 
@@ -245,7 +266,10 @@ function renderStrategyCardsSection(cards: StrategyCardRow[], showVisibilityPill
   const body =
     cards.length > 0
       ? joinHtml(cards.map((card) => renderStrategyCardRow(card, showVisibilityPills)))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无公开策略卡</p>`;
+      : renderEmptyState(
+          "这位成员没有公开任何策略卡。",
+          "策略卡有三档可见性，只有升到「公开」档才会出现在名片上；「私有」档只在本人的本地工作台，「系统可用」档只有本人能看。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>公开策略清单</h2>
     ${body}
@@ -258,19 +282,20 @@ function renderStrategyCardsSection(cards: StrategyCardRow[], showVisibilityPill
 
 function renderEvidencePoints(points: string[]): Html {
   if (points.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin:2px 0 0">暂无依据</p>`;
+    return renderInlineEmptyState("暂无依据");
   }
   return joinHtml(points.map((point) => html`<li style="font-size:12.5px">${point}</li>`));
 }
 
 function renderJudgmentTimeline(history: ThesisHistoryRow[]): Html {
   if (history.length === 0) {
-    return html`<p style="font-size:12px;color:var(--sub);margin-top:6px">暂无判断历史</p>`;
+    return renderInlineEmptyState("暂无判断历史");
   }
   const rows = joinHtml(
     history.map(
       (entry) =>
-        html`<div class="alert"><time class="mono">${entry.createdAt}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
+        // U1: raw ISO instant out of the column -> Beijing wall-clock.
+        html`<div class="alert"><time class="mono" title="${entry.createdAt}">${formatBeijingShortTime(entry.createdAt)}</time><span>${entry.note} <span style="color:var(--sub)">· ${entry.source}</span></span></div>`
     )
   );
   return html`<div style="margin-top:6px">${rows}</div>`;
@@ -341,7 +366,10 @@ function renderThesesSection(
             )
           )
         )
-      : html`<p style="font-size:13px;color:var(--sub)">暂无公开论点</p>`;
+      : renderEmptyState(
+          "这位成员没有公开任何论点。",
+          "公开论点会自动带上代码回算的事后走势与命中率——公开即接受检验，所以多数论点停在「系统可用」档，只有本人看得到。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>公开论点清单</h2>
     <p style="font-size:11.5px;color:var(--sub);margin-top:-4px">公开即接受检验</p>
@@ -388,7 +416,10 @@ function renderResearchSection(tasks: ResearchTask[]): Html {
   const body =
     tasks.length > 0
       ? joinHtml(tasks.map(renderResearchRow))
-      : html`<p style="font-size:13px;color:var(--sub)">暂无公开研判</p>`;
+      : renderEmptyState(
+          "这位成员没有公开任何研判。",
+          "站内研究的研判默认仅本人可见；本人可以逐条设为公开，公开前系统会提示其中引用的「系统可用」档论点是否一并升档。"
+        );
   return html`<section class="card w2 dt-w4">
     <h2>公开研判</h2>
     ${body}
@@ -432,7 +463,11 @@ function renderMemberCardPage(
     title: subject.displayName,
     nav: "strategy",
     member: { displayName: viewer.displayName },
-    freshness: "最新",
+    // U2: 最新 was hard-coded here regardless of how old the snapshot behind
+    // the 战绩 block actually was. The card's only time-varying content is
+    // that snapshot, so it decides both the pill and the topbar's 数据时间.
+    freshness: performanceView.fetchedAt ? snapshotFreshness(performanceView.fetchedAt, now) : "部分缺失",
+    dataAsOf: performanceView.fetchedAt ? describeDataInstant(performanceView.fetchedAt, now) : null,
     degraded: [],
     bodyHtml,
     nonce,

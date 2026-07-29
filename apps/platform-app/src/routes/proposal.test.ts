@@ -197,12 +197,12 @@ describe("proposal route (GET /proposal/<id>)", () => {
     }
   });
 
-  it("renders 待 P6/P9 完善 when outcome is null", async () => {
+  it("renders an honest no-outcome empty state when outcome is null", async () => {
     const { member, token } = seedMemberWithToken();
     const id = seedProposal(db, { ownerId: member.id, outcome: null });
     const response = await authed(`/proposal/${id}`, token);
     const body = await response.text();
-    expect(body).toContain("待 P6/P9 完善");
+    expect(body).toContain("这条提案还没有事后表现记录。");
   });
 
   it("carries the CSP nonce and makes no third-party requests", async () => {
