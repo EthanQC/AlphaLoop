@@ -147,7 +147,9 @@ interface ResearchPipelineArgs {
   quoteReader?: ResearchQuoteReader;
   memoryReader?: (args: ResearchMemoryReaderArgs) => Promise<ResearchMemoryReaderResult>;
   budget?: number;
-  symbolUniverse?: string[];
+  /** `null` = the pool could not be resolved; the engine then makes NO
+   * out-of-pool claim (see research-engine.mjs's `extractSymbols`). */
+  symbolUniverse?: string[] | null;
   now?: () => Date;
   onStep?: (step: ResearchPipelineStep) => void;
 }
@@ -326,11 +328,26 @@ export interface CreateResearchWorkerDeps {
    * "预算...固定" constant lives in exactly one place (research-engine.mjs),
    * not duplicated here. */
   budget?: number;
-  /** Forwarded to the pipeline as-is; defaults to `[]` (matching the
-   * engine's own default) purely for this worker's own safety/testability -
-   * the REAL symbol universe (标的池并集 + 本人持仓) is resolved by whoever
-   * constructs the production worker (index.ts), not by this file. */
-  symbolUniverse?: string[];
+  /**
+   * §1.3's 提问标的范围 = 全体标的池并集 + 本人持仓. Either a fixed array (tests,
+   * and any caller whose pool genuinely cannot change) or - the production
+   * shape as of 2026-07-30 - a RESOLVER called once per claimed task with that
+   * task's own owner id.
+   *
+   * The resolver form exists for two reasons, both of which became user-visible
+   * once an out-of-pool symbol started getting told 「不在你的标的池」: a fixed
+   * array is read once at process start, so a symbol added later is invisible
+   * to a long-running process until it is restarted; and the 本人持仓 half is
+   * per-member, so it cannot be a single process-wide array at all. Whose
+   * positions are read is decided HERE, from the claimed row's `owner_id` -
+   * never from anything the question said (same discipline as
+   * `bindMemoryReaderToOwner` below).
+   *
+   * Omitted, or a resolver that throws, means "pool unknown" (`null` to the
+   * engine), which suppresses every out-of-pool claim rather than degrading to
+   * a claim that the pool is empty.
+   */
+  symbolUniverse?: string[] | ((ownerId: string) => string[]);
 }
 
 export interface ResearchWorker {
@@ -389,7 +406,7 @@ export function createResearchWorker(deps: CreateResearchWorkerDeps): ResearchWo
   const { db, backend, quoteReader, memoryReader } = deps;
   const now = deps.now ?? ((): Date => new Date());
   const notify = deps.notify ?? createDefaultNotifier();
-  const symbolUniverse = deps.symbolUniverse ?? [];
+  const symbolUniverse = deps.symbolUniverse;
   const repo = new ResearchTaskRepository(db);
   const members = new MemberRepository(db);
 
@@ -440,6 +457,26 @@ export function createResearchWorker(deps: CreateResearchWorkerDeps): ResearchWo
     }
   }
 
+  /** See `CreateResearchWorkerDeps.symbolUniverse`. Returns `null` for "pool
+   * unknown" - a resolver failure must not be reported to the member as an
+   * empty pool, because the engine turns an empty (but KNOWN) pool into
+   * 「不在你的标的池，先加自选」. */
+  function resolveSymbolUniverse(ownerId: string): string[] | null {
+    if (typeof symbolUniverse !== "function") {
+      return symbolUniverse ?? null;
+    }
+    try {
+      return symbolUniverse(ownerId);
+    } catch (error) {
+      console.warn(
+        `research worker: symbolUniverse resolver failed for owner ${ownerId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return null;
+    }
+  }
+
   async function tick(): Promise<boolean> {
     const claimed = repo.claimNextQueued(now().toISOString());
     if (!claimed) {
@@ -447,6 +484,7 @@ export function createResearchWorker(deps: CreateResearchWorkerDeps): ResearchWo
     }
 
     const boundMemoryReader = bindMemoryReaderToOwner(memoryReader, claimed.ownerId);
+    const claimedSymbolUniverse = resolveSymbolUniverse(claimed.ownerId);
 
     // The engine itself never throws for a throwing `backend`/`quoteReader`/
     // `memoryReader` (research-engine.mjs's own header: every collaborator
@@ -466,7 +504,7 @@ export function createResearchWorker(deps: CreateResearchWorkerDeps): ResearchWo
         quoteReader,
         memoryReader: boundMemoryReader,
         ...(deps.budget !== undefined ? { budget: deps.budget } : {}),
-        symbolUniverse,
+        symbolUniverse: claimedSymbolUniverse,
         now,
         onStep: (step) => {
           try {

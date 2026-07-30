@@ -378,6 +378,71 @@ describe("createResearchWorker (Phase 8 Task 3, 2026-07-16 plan)", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // symbolUniverse as a per-task resolver (2026-07-30): the pool used to be a
+  // plain array resolved ONCE at process start, so a long-running process never
+  // saw a newly added symbol, and the 本人持仓 half of §1.3's 「标的池并集 + 你的
+  // 持仓」 was missing entirely. Both matter now that an out-of-pool symbol gets
+  // told 「不在你的标的池」 - a stale pool would make that a false statement.
+  // -------------------------------------------------------------------------
+  describe("symbolUniverse resolver", () => {
+    it("calls the resolver per claimed task with THAT task's owner, and re-reads it on every tick", async () => {
+      const seen: string[] = [];
+      let pool = ["AAPL.US"];
+      const resolver = (ownerId: string): string[] => {
+        seen.push(ownerId);
+        return pool;
+      };
+      const first = seedQueuedTask(db, "member_a", "MSFT 还能追吗？");
+      const worker = createResearchWorker({
+        db,
+        backend: fakeBackend(),
+        quoteReader: fakeQuoteReader(),
+        memoryReader: NO_MEMORY,
+        now: FIXED_NOW,
+        symbolUniverse: resolver
+      });
+
+      await worker.tick();
+      const repo = new ResearchTaskRepository(db);
+      // MSFT is not in the pool yet -> the §1.3 prompt, not a verdict about nothing.
+      expect(repo.getById(first)?.status).toBe("failed");
+      expect(seen).toEqual(["member_a"]);
+
+      // Pool grows while the SAME process keeps running (no restart).
+      pool = ["AAPL.US", "MSFT.US"];
+      const second = seedQueuedTask(db, "member_b", "MSFT 还能追吗？");
+      await worker.tick();
+      expect(repo.getById(second)?.status).toBe("done");
+      expect(seen).toEqual(["member_a", "member_b"]);
+    });
+
+    it("treats a throwing resolver as an UNKNOWN pool - never as an empty one", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const taskId = seedQueuedTask(db, "member_a", "MSFT 还能追吗？");
+      const worker = createResearchWorker({
+        db,
+        backend: fakeBackend(),
+        quoteReader: fakeQuoteReader(),
+        memoryReader: NO_MEMORY,
+        now: FIXED_NOW,
+        symbolUniverse: () => {
+          throw new Error("SQLITE_BUSY");
+        }
+      });
+
+      await worker.tick();
+
+      const task = new ResearchTaskRepository(db).getById(taskId);
+      // Not "failed with 不在你的标的池" - the pool was never read, so no claim
+      // about it may be made.
+      expect(task?.status).toBe("done");
+      expect(JSON.stringify(task?.steps)).not.toContain("不在你的标的池");
+      expect(JSON.stringify(task?.steps)).toContain("未能读出你的标的池");
+      expect(warn).toHaveBeenCalled();
+    });
+  });
+
   describe("start/stop", () => {
     it("start() ticks on an interval and stop() halts it", async () => {
       vi.useFakeTimers();

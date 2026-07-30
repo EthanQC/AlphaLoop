@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ApiTokenRepository, MemberRepository, createId, migrate, type Member } from "@packages/shared-types";
 
 import { createPlatformServer } from "../server.js";
+import { SESSION_COOKIE_NAME, createSessionToken } from "../session.js";
 
 function memoryDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -501,5 +502,178 @@ describe("strategy route (GET /strategy)", () => {
     const body = await response.text();
     expect(body).toContain(`nonce="${nonceMatch?.[1]}"`);
     expect(body).not.toMatch(/https?:\/\//iu);
+  });
+
+  // -------------------------------------------------------------------------
+  // 档位随时可调 from a browser (req §1.7/§2.1) - POST /strategy/{theses,cards}/<id>/{promote,demote}
+  //
+  // Before 2026-07-30 the only tier control a logged-in member could reach was
+  // research.ts's 设为公开; /api/theses|cards/:id/{promote,demote} are
+  // bearer-ONLY (api-strategy.ts, and the skill manifest says so), so the
+  // `alphaloop_session` cookie a browser holds could not change a tier at all.
+  // -------------------------------------------------------------------------
+  describe("tier controls (档位随时可调)", () => {
+    function cookieFor(memberId: string): string {
+      const token = createSessionToken(memberId, Date.now() + 60 * 60 * 1000) as string;
+      return `${SESSION_COOKIE_NAME}=${token}`;
+    }
+
+    function postForm(path: string, cookie: string): Promise<Response> {
+      return fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+        body: "",
+        redirect: "manual"
+      });
+    }
+
+    function visibilityOfThesis(id: string): string {
+      return String(
+        (db.prepare(`SELECT visibility FROM theses WHERE id = ?`).get(id) as { visibility: string } | undefined)
+          ?.visibility
+      );
+    }
+
+    function visibilityOfCard(id: string): string {
+      return String(
+        (
+          db.prepare(`SELECT visibility FROM strategy_cards WHERE id = ?`).get(id) as
+            | { visibility: string }
+            | undefined
+        )?.visibility
+      );
+    }
+
+    it("renders a promote control for a system row and a demote control for a public one", async () => {
+      const { member, token } = seedMemberWithToken();
+      const systemThesis = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "system" });
+      const publicThesis = seedThesis(db, { ownerId: member.id, symbol: "TSM.US", visibility: "public" });
+      const systemCard = seedStrategyCard(db, { ownerId: member.id, name: "私有打法", visibility: "system" });
+      const publicCard = seedStrategyCard(db, { ownerId: member.id, name: "公开打法", visibility: "public" });
+
+      const body = await (await authed("/strategy", token)).text();
+
+      expect(body).toContain(`action="/strategy/theses/${systemThesis}/promote"`);
+      expect(body).toContain(`action="/strategy/theses/${publicThesis}/demote"`);
+      expect(body).toContain(`action="/strategy/cards/${systemCard}/promote"`);
+      expect(body).toContain(`action="/strategy/cards/${publicCard}/demote"`);
+      expect(body).toContain("设为公开");
+      expect(body).toContain("降回系统可用");
+    });
+
+    it("a browser SESSION COOKIE (not a bearer token) can promote and demote a thesis", async () => {
+      const { member } = seedMemberWithToken();
+      const thesisId = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "system" });
+      const cookie = cookieFor(member.id);
+
+      const promote = await postForm(`/strategy/theses/${thesisId}/promote`, cookie);
+      expect(promote.status).toBe(303);
+      expect(promote.headers.get("location")).toBe("/strategy?notice=thesis-promoted");
+      expect(visibilityOfThesis(thesisId)).toBe("public");
+
+      const demote = await postForm(`/strategy/theses/${thesisId}/demote`, cookie);
+      expect(demote.status).toBe(303);
+      expect(demote.headers.get("location")).toBe("/strategy?notice=thesis-demoted");
+      expect(visibilityOfThesis(thesisId)).toBe("system");
+    });
+
+    it("a browser SESSION COOKIE can promote and demote a strategy card", async () => {
+      const { member } = seedMemberWithToken();
+      const cardId = seedStrategyCard(db, { ownerId: member.id, name: "超跌反弹短线", visibility: "system" });
+      const cookie = cookieFor(member.id);
+
+      await postForm(`/strategy/cards/${cardId}/promote`, cookie);
+      expect(visibilityOfCard(cardId)).toBe("public");
+
+      const demote = await postForm(`/strategy/cards/${cardId}/demote`, cookie);
+      expect(demote.headers.get("location")).toBe("/strategy?notice=card-demoted");
+      expect(visibilityOfCard(cardId)).toBe("system");
+    });
+
+    it("the demote notice on the page says the already-published content is NOT recalled", async () => {
+      const { token } = seedMemberWithToken();
+      const body = await (await authed("/strategy?notice=thesis-demoted", token)).text();
+      expect(body).toContain("降档已生效");
+      expect(body).toContain("不回收");
+    });
+
+    it("a demoted thesis disappears from another member's 圈子公开区", async () => {
+      const { member } = seedMemberWithToken({ id: "member_owner", email: "owner@example.com", displayName: "甲" });
+      const thesisId = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "public" });
+      const { token: viewerToken } = seedMemberWithToken({ id: "member_viewer", email: "viewer@example.com" });
+
+      expect(await (await authed("/strategy", viewerToken)).text()).toContain("NVDA.US");
+
+      await postForm(`/strategy/theses/${thesisId}/demote`, cookieFor(member.id));
+
+      const after = await (await authed("/strategy", viewerToken)).text();
+      expect(after).toContain("圈内还没有人公开策略或论点。");
+      expect(after).not.toContain("NVDA.US");
+    });
+
+    it("403s another member's row and changes nothing; 404s an id that does not exist", async () => {
+      const { member: owner } = seedMemberWithToken({ id: "member_owner2", email: "owner2@example.com" });
+      const thesisId = seedThesis(db, { ownerId: owner.id, symbol: "NVDA.US", visibility: "public" });
+      const cardId = seedStrategyCard(db, { ownerId: owner.id, name: "别人的卡", visibility: "public" });
+      const { member: attacker } = seedMemberWithToken({ id: "member_attacker", email: "attacker@example.com" });
+      const cookie = cookieFor(attacker.id);
+
+      expect((await postForm(`/strategy/theses/${thesisId}/demote`, cookie)).status).toBe(403);
+      expect((await postForm(`/strategy/theses/${thesisId}/promote`, cookie)).status).toBe(403);
+      expect((await postForm(`/strategy/cards/${cardId}/demote`, cookie)).status).toBe(403);
+      expect(visibilityOfThesis(thesisId)).toBe("public");
+      expect(visibilityOfCard(cardId)).toBe("public");
+
+      expect((await postForm("/strategy/theses/thesis_nope/demote", cookie)).status).toBe(404);
+      expect((await postForm("/strategy/cards/strategy_card_nope/promote", cookie)).status).toBe(404);
+    });
+
+    it("401s with no identity at all, and 405s a GET on a write path", async () => {
+      const { member } = seedMemberWithToken();
+      const thesisId = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "system" });
+
+      const unauth = await fetch(`${baseUrl}/strategy/theses/${thesisId}/promote`, { method: "POST" });
+      expect(unauth.status).toBe(401);
+      expect(visibilityOfThesis(thesisId)).toBe("system");
+
+      const wrongMethod = await fetch(`${baseUrl}/strategy/theses/${thesisId}/promote`, {
+        headers: { cookie: cookieFor(member.id) }
+      });
+      expect(wrongMethod.status).toBe(405);
+    });
+
+    it("keeps the bearer-only rule on /api/theses intact - the cookie still cannot reach it", async () => {
+      const { member } = seedMemberWithToken();
+      const thesisId = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "system" });
+
+      const viaCookie = await fetch(`${baseUrl}/api/theses/${thesisId}/promote`, {
+        method: "POST",
+        headers: { cookie: cookieFor(member.id) }
+      });
+      expect(viaCookie.status).toBe(401);
+      expect(visibilityOfThesis(thesisId)).toBe("system");
+
+      // ...while the skill's bearer token still works on the same endpoint.
+      const viaBearer = await fetch(`${baseUrl}/api/theses/${thesisId}/promote`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${new ApiTokenRepository(db).issue(member.id, "skill").token}` }
+      });
+      expect(viaBearer.status).toBe(200);
+      expect(visibilityOfThesis(thesisId)).toBe("public");
+    });
+
+    it("writes an audit_log row for both directions", async () => {
+      const { member } = seedMemberWithToken();
+      const thesisId = seedThesis(db, { ownerId: member.id, symbol: "NVDA.US", visibility: "system" });
+      const cookie = cookieFor(member.id);
+
+      await postForm(`/strategy/theses/${thesisId}/promote`, cookie);
+      await postForm(`/strategy/theses/${thesisId}/demote`, cookie);
+
+      const rows = db
+        .prepare(`SELECT action FROM audit_log WHERE category = 'strategy_memory'`)
+        .all() as Array<{ action: string }>;
+      expect(rows.map((row) => row.action)).toEqual(expect.arrayContaining(["thesis promote", "thesis demote"]));
+    });
   });
 });

@@ -1,6 +1,10 @@
 /**
  * Strategy page (Task 7, upgraded Phase 7 Task 5 2026-07-15 plan):
- * `GET /strategy`. Identity-gated like every route past Task 3.
+ * `GET /strategy`, plus (2026-07-30) the four owner-only tier-change writes
+ * `POST /strategy/{theses,cards}/<id>/{promote,demote}` that make §1.7's
+ * 「档位随时可调」 reachable from a browser at all - see `renderTierControl` and
+ * `handleTierChange` below for why they live here rather than on the
+ * bearer-only /api surface. Identity-gated like every route past Task 3.
  *
  * Three sections, in this fixed order (plan Task 7 req §1.7, unchanged by
  * Task 5's rendering upgrade - not to be reshuffled):
@@ -18,6 +22,9 @@
  *                      target range, invalidation, visibility pill, and its
  *                      append-only thesis_history timeline annotated with
  *                      computeThesisOutcome's deterministic post-hoc verdict.
+ *                      Each card and thesis also carries its own one-click tier
+ *                      control (设为公开 / 降回系统可用), which is the only
+ *                      browser-reachable 档位 control for strategy memory.
  *                      Empty card list / empty thesis list -> honest empty states
  *                      naming what the block would hold and how to fill it
  *                      (2026-07-30; these replaced bare 暂无X strings, which
@@ -38,7 +45,13 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
-import { methodNotAllowed, type Member } from "@packages/shared-types";
+import {
+  AuditLogRepository,
+  STRATEGY_DEMOTION_NOTICE,
+  methodNotAllowed,
+  sendJson,
+  type Member
+} from "@packages/shared-types";
 
 import {
   computeComplianceStats,
@@ -57,6 +70,14 @@ import {
   type ThesisOutcomeJudgmentResult
 } from "../data/strategy.js";
 import { loadAllDisciplineRulesForOwner, type DisciplineRuleRow } from "../data/overview.js";
+import {
+  demoteCardVisibilityToSystem,
+  demoteThesisVisibilityToSystem,
+  getCardById,
+  getThesisById,
+  promoteCardVisibilityToPublic,
+  promoteThesisVisibilityToPublic
+} from "../data/strategy-write.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderComplianceLine } from "../render/compliance.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
@@ -147,15 +168,39 @@ function renderDisciplineSection(rules: DisciplineRuleRow[], statsByRuleId: Map<
 // ② 我的策略卡与论点
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 档位控件 (req §1.7「档位随时可调」/ §2.1「一键升档…降档时已生成的历史内容不回收」)
+//
+// The data layer and the bearer API have had both directions since Task 15, but
+// nothing a BROWSER can reach did: /api/theses|cards/:id/{promote,demote} are
+// bearer-only by design (api-strategy.ts, and the skill manifest says so out
+// loud), and a logged-in member holds a session cookie, not a token. So these
+// two-line forms - posting to this module's own /strategy/... write paths - are
+// the tier control a member actually has. Rendered ONLY inside the viewer's own
+// ② 我的策略卡与论点 section, whose readers are owner-scoped at the SQL level,
+// so a form for somebody else's row cannot be rendered in the first place; the
+// handler re-checks ownership anyway (resolve row, compare owner, 403).
+// ---------------------------------------------------------------------------
+
+function renderTierControl(kind: "theses" | "cards", id: string, visibility: string): Html {
+  const promoting = visibility !== "public";
+  const action = promoting ? "promote" : "demote";
+  const label = promoting ? "设为公开" : "降回系统可用";
+  return html`<form method="post" action="/strategy/${kind}/${id}/${action}" style="display:inline">
+    <button class="btn" type="submit" style="font-size:12px;padding:2px 8px">${label}</button>
+  </form>`;
+}
+
 function renderStrategyCardRow(card: StrategyCardRow): Html {
   const statusLabel = CARD_STATUS_LABELS[card.status] ?? card.status;
   const visibilityLabel = VISIBILITY_LABELS[card.visibility] ?? card.visibility;
   const scene = card.scene ? html` <span style="color:var(--sub)">· ${card.scene}</span>` : trustedHtml("");
   return html`<div class="disc">
     <b>${card.name}</b>${scene}
-    <div style="margin-top:4px;display:flex;gap:6px">
+    <div style="margin-top:4px;display:flex;gap:6px;align-items:center">
       <span class="pill" style="background:var(--accent-soft);color:var(--accent)">${statusLabel}</span>
       <span class="pill">${visibilityLabel}</span>
+      ${renderTierControl("cards", card.id, card.visibility)}
     </div>
   </div>`;
 }
@@ -240,6 +285,7 @@ function renderMyThesisCard(
     <b class="mono">${thesis.symbol}</b>
     <span class="${directionClass}" style="margin-left:6px;font-weight:600">${directionLabel}</span>
     <span class="pill" style="margin-left:6px;background:var(--accent-soft);color:var(--accent)">${visibilityLabel}</span>
+    <span style="margin-left:6px">${renderTierControl("theses", thesis.id, thesis.visibility)}</span>
     <div style="margin-top:4px">${range}${invalidation}</div>
     <div style="display:flex;gap:16px;margin-top:8px">
       <div style="flex:1"><div style="font-size:12px;color:var(--sub)">看多依据</div><ul style="margin:4px 0 0;padding-left:16px">${renderEvidencePoints(thesis.bullPoints)}</ul></div>
@@ -360,7 +406,35 @@ function renderCirclePublicSection(groups: CircleGroup[]): Html {
 // Assembly
 // ---------------------------------------------------------------------------
 
-function renderStrategyPage(res: ServerResponse, deps: StrategyRouteDeps, member: Member, nonce: string): void {
+/** The banner a tier change lands on. A DEMOTE carries
+ * STRATEGY_DEMOTION_NOTICE - the same sentence the bearer API returns as
+ * `notice` and the CLI prints, so the three faces cannot describe the same
+ * operation differently. A promote retracts nothing, so it discloses nothing
+ * beyond what just happened. */
+function renderTierNotice(notice: string): Html | null {
+  const text =
+    notice === "thesis-demoted" || notice === "card-demoted"
+      ? STRATEGY_DEMOTION_NOTICE
+      : notice === "thesis-promoted"
+        ? "论点已升为「公开」档：圈内成员现在能在你的名片和策略页看到它，并附代码回算的事后走势。"
+        : notice === "card-promoted"
+          ? "策略卡已升为「公开」档：圈内成员现在能在你的名片和策略页看到它。"
+          : null;
+  if (!text) {
+    return null;
+  }
+  return html`<section class="card w2 dt-w4" role="status" aria-label="档位变更">
+    <p style="font-size:13px;color:var(--ink);margin:0">${text}</p>
+  </section>`;
+}
+
+function renderStrategyPage(
+  res: ServerResponse,
+  deps: StrategyRouteDeps,
+  member: Member,
+  nonce: string,
+  notice: string | null
+): void {
   const now = currentNow(deps);
 
   const disciplineRules = loadAllDisciplineRulesForOwner(deps.db, member.id);
@@ -384,7 +458,10 @@ function renderStrategyPage(res: ServerResponse, deps: StrategyRouteDeps, member
   const circleCards = loadPublicStrategyCards(deps.db, member.id);
   const circleGroups = buildCircleGroups(circleTheses, circleCards);
 
-  const bodyHtml = html`<div class="bento">${renderDisciplineSection(disciplineRules, complianceStatsByRuleId)}</div>
+  const noticeCard = notice ? renderTierNotice(notice) : null;
+
+  const bodyHtml = html`${noticeCard ? html`<div class="bento" style="margin-bottom:10px">${noticeCard}</div>` : trustedHtml("")}
+    <div class="bento">${renderDisciplineSection(disciplineRules, complianceStatsByRuleId)}</div>
     <div class="bento" style="margin-top:10px">${renderMyStrategySection(ownCards, ownTheses, historyByThesisId, priceBySymbol)}</div>
     <div class="bento" style="margin-top:10px">${renderCirclePublicSection(circleGroups)}</div>`;
 
@@ -406,10 +483,92 @@ function renderStrategyPage(res: ServerResponse, deps: StrategyRouteDeps, member
   sendHtml(res, 200, page);
 }
 
+// ---------------------------------------------------------------------------
+// POST /strategy/theses/<id>/{promote,demote} · /strategy/cards/<id>/{promote,demote}
+// ---------------------------------------------------------------------------
+
+const FORM_URLENCODED_CONTENT_TYPE = "application/x-www-form-urlencoded";
+
 /**
- * Routes `GET /strategy`. Returns `true` if the request was handled
- * (including the 401/405 cases), `false` if the path isn't `/strategy` so
- * the caller can keep trying other routes.
+ * Flips ONE row's visibility for the resolved identity. Synchronous on purpose:
+ * these controls carry no fields (the id is in the path, the direction is the
+ * path's last segment), so there is no body to await - `req.resume()` merely
+ * drains whatever the browser sent so the connection stays reusable.
+ *
+ * Gate order is the same one proposal.ts/research.ts/api-strategy.ts use:
+ * resolve the row by id FIRST, 404 when it does not exist, 403 when it exists
+ * and belongs to somebody else. The owner is never read from the request.
+ */
+function handleTierChange(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: StrategyRouteDeps,
+  kind: "theses" | "cards",
+  id: string,
+  action: "promote" | "demote"
+): void {
+  req.resume();
+
+  const member = resolveIdentity(req, deps.db);
+  if (!member) {
+    sendJson(res, 401, { ok: false, error: "未获授权：请先登录" });
+    return;
+  }
+
+  const row = kind === "theses" ? getThesisById(deps.db, id) : getCardById(deps.db, id);
+  if (!row) {
+    sendJson(res, 404, { ok: false, error: kind === "theses" ? `未找到论点：${id}` : `未找到策略卡：${id}` });
+    return;
+  }
+  if (row.ownerId !== member.id) {
+    sendJson(res, 403, {
+      ok: false,
+      error: kind === "theses" ? "无权操作：该论点属于其他成员" : "无权操作：该策略卡属于其他成员"
+    });
+    return;
+  }
+
+  if (kind === "theses") {
+    if (action === "promote") {
+      promoteThesisVisibilityToPublic(deps.db, id);
+    } else {
+      demoteThesisVisibilityToSystem(deps.db, id);
+    }
+  } else if (action === "promote") {
+    promoteCardVisibilityToPublic(deps.db, id);
+  } else {
+    demoteCardVisibilityToSystem(deps.db, id);
+  }
+
+  const auditAction = `${kind === "theses" ? "thesis" : "card"} ${action}`;
+  new AuditLogRepository(deps.db).write("strategy_memory", auditAction, {
+    ...(kind === "theses" ? { thesisId: id } : { cardId: id }),
+    ownerId: member.id,
+    surface: "web"
+  });
+
+  const notice = `${kind === "theses" ? "thesis" : "card"}-${action === "promote" ? "promoted" : "demoted"}`;
+  const isFormPost = String(req.headers["content-type"] ?? "")
+    .toLowerCase()
+    .startsWith(FORM_URLENCODED_CONTENT_TYPE);
+  if (isFormPost) {
+    // 303 -> the browser re-GETs /strategy, where the notice card states what
+    // the change did and (for a demote) what it did NOT take back.
+    res.writeHead(303, { location: `/strategy?notice=${notice}` });
+    res.end();
+    return;
+  }
+  sendJson(res, 200, {
+    ok: true,
+    ...(action === "demote" ? { notice: STRATEGY_DEMOTION_NOTICE } : {})
+  });
+}
+
+/**
+ * Routes `GET /strategy` and the four tier-change write paths under it. Returns
+ * `true` if the request was handled (including the 401/403/404/405 cases),
+ * `false` if the path isn't this module's so the caller can keep trying other
+ * routes.
  */
 export function handleStrategyRoute(
   req: IncomingMessage,
@@ -418,6 +577,31 @@ export function handleStrategyRoute(
   deps: StrategyRouteDeps,
   nonce: string
 ): boolean {
+  const segments = url.pathname.split("/").filter((segment) => segment.length > 0);
+  if (segments[0] !== "strategy") {
+    return false;
+  }
+
+  if (
+    segments.length === 4 &&
+    (segments[1] === "theses" || segments[1] === "cards") &&
+    (segments[3] === "promote" || segments[3] === "demote")
+  ) {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    handleTierChange(
+      req,
+      res,
+      deps,
+      segments[1] as "theses" | "cards",
+      segments[2] as string,
+      segments[3] as "promote" | "demote"
+    );
+    return true;
+  }
+
   if (url.pathname !== "/strategy") {
     return false;
   }
@@ -432,6 +616,6 @@ export function handleStrategyRoute(
     return true;
   }
 
-  renderStrategyPage(res, deps, member, nonce);
+  renderStrategyPage(res, deps, member, nonce, url.searchParams.get("notice"));
   return true;
 }

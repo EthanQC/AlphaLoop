@@ -477,3 +477,108 @@ describe("runResearchPipeline - title, onStep wiring, and step ordering", () => 
     expect(typeof result.budgetSpent).toBe("number");
   });
 });
+
+// ===========================================================================
+// 池外标的提示先加自选 (spec §1.3 step 2, 2026-07-30)
+//
+// Before this: a symbol outside `symbolUniverse` was intersected away with no
+// receipt at all, so asking about a symbol you had not added produced a full
+// research verdict whose 意图解析 step said 「识别标的：无」 - the question's
+// actual subject silently discarded.
+// ===========================================================================
+
+describe("runResearchPipeline - out-of-pool symbols", () => {
+  it("prompts 先加自选 instead of researching nothing when the only named symbol is outside the pool", async () => {
+    const backend = vi.fn(async () => ({ results: [] }));
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "TSLA 财报前要减仓吗？", backend, quoteReader: quoteReaderFrom({}) })
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.reason).toBe("out_of_pool_symbol");
+    expect(result.outOfPoolSymbols).toEqual(["TSLA.US"]);
+    expect(result.message).toContain("TSLA.US");
+    expect(result.message).toContain("不在你的标的池");
+    expect(result.message).toContain("加自选");
+    expect(result.resultJson).toBeNull();
+    // The pipeline stops at 意图解析: no quote/news/budget spend at all, and the
+    // failure page derives 失败原因 from the LAST step's detail.
+    expect(backend).not.toHaveBeenCalled();
+    expect(result.budgetSpent).toBe(0);
+    expect(result.steps).toHaveLength(1);
+    expect(result.steps[0]?.name).toBe("意图解析");
+    expect(result.steps[0]?.detail).toContain("不在你的标的池");
+  });
+
+  it("still researches the in-pool symbol but leaves a receipt naming the out-of-pool one", async () => {
+    const backend = backendReturning([[rawItem()]]);
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "AAPL 和 TSLA 比谁更值得买？", backend, quoteReader: quoteReaderFrom({ "AAPL.US": 210.5 }) })
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.resultJson?.dataTable.some((row: { label: string }) => row.label.includes("AAPL.US"))).toBe(true);
+    expect(result.resultJson?.dataTable.some((row: { label: string }) => row.label.includes("TSLA.US"))).toBe(false);
+    const intent = result.steps.filter((step: { name: string }) => step.name === "意图解析");
+    expect(intent.some((step: { detail: string }) => step.detail.includes("TSLA.US"))).toBe(true);
+    expect(
+      result.skipped.some((entry: { reason: string }) => entry.reason.includes("TSLA.US") && entry.reason.includes("加自选"))
+    ).toBe(true);
+  });
+
+  it("does not call an ordinary uppercase acronym an out-of-pool ticker", async () => {
+    const backend = vi.fn(async () => ({ results: [] }));
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "现在 GDP 和 CPI 数据对 ETF 有什么影响？", backend, quoteReader: quoteReaderFrom({}) })
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.outOfPoolSymbols).toBeUndefined();
+    expect(result.steps[0]?.detail).toContain("识别标的：无");
+    expect(result.steps[0]?.detail).not.toContain("不在你的标的池");
+  });
+
+  it("makes no out-of-pool claim at all when the caller could not resolve the pool (universe unknown)", async () => {
+    const backend = vi.fn(async () => ({ results: [] }));
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "TSLA 财报前要减仓吗？", backend, quoteReader: quoteReaderFrom({}), symbolUniverse: null })
+    );
+
+    // Unknown pool must never be reported as "not in your pool" - that would be
+    // a claim about data the engine was never given.
+    expect(result.status).toBe("done");
+    expect(result.reason).toBeUndefined();
+    const details = result.steps.map((step: { detail: string }) => step.detail).join("\n");
+    expect(details).not.toContain("不在你的标的池");
+    expect(
+      result.skipped.some((entry: { reason: string }) => entry.reason.includes("标的池") && entry.reason.includes("未能读出"))
+    ).toBe(true);
+  });
+
+  it("an empty pool IS a known pool - the prompt still fires (nothing added yet is exactly the case §1.3 describes)", async () => {
+    const backend = vi.fn(async () => ({ results: [] }));
+    const result = await researchEngine.runResearchPipeline(
+      baseArgs({ question: "NVDA 还能追吗？", backend, quoteReader: quoteReaderFrom({}), symbolUniverse: [] })
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.reason).toBe("out_of_pool_symbol");
+    expect(result.outOfPoolSymbols).toEqual(["NVDA.US"]);
+  });
+
+  it("extractSymbols keeps case-insensitive in-pool matching while only ALL-CAPS shapes earn a receipt", () => {
+    const resolved = researchEngine.extractSymbols("aapl 还能拿吗", SYMBOL_UNIVERSE);
+    expect(resolved.symbols).toEqual(["AAPL.US"]);
+    expect(resolved.outOfPool).toEqual([]);
+
+    // lowercase, out of pool: no receipt (an ordinary English word is
+    // indistinguishable from a ticker in lower case), and no silent claim.
+    const lower = researchEngine.extractSymbols("tsla 还能拿吗", SYMBOL_UNIVERSE);
+    expect(lower.symbols).toEqual([]);
+    expect(lower.outOfPool).toEqual([]);
+
+    // A suffixed HK code is unambiguous even though it is numeric.
+    const hk = researchEngine.extractSymbols("0700.HK 现在什么价", SYMBOL_UNIVERSE);
+    expect(hk.outOfPool).toEqual(["0700.HK"]);
+  });
+});

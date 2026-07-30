@@ -456,4 +456,164 @@ describe("member card route (GET /member/<who>)", () => {
     expect(body).toContain(`nonce="${nonceMatch?.[1]}"`);
     expect(body).not.toMatch(/https?:\/\//iu);
   });
+
+  // -------------------------------------------------------------------------
+  // 本人自己维护 (spec §1.8) - POST /member/<id>/profile
+  // -------------------------------------------------------------------------
+
+  describe("owner-maintained card fields", () => {
+    function postForm(path: string, token: string, body: Record<string, string>): Promise<Response> {
+      return fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body).toString(),
+        redirect: "manual"
+      });
+    }
+
+    it("renders the edit form on the viewer's OWN card and never on someone else's", async () => {
+      const { member, token } = seedMemberWithToken({ riskTags: ["稳健"], stockTags: ["半导体"] });
+      const other = makeMember({ id: "member_other", email: "other@example.com" });
+      new MemberRepository(db).upsert(other);
+
+      const own = await (await authed(`/member/${member.id}`, token)).text();
+      expect(own).toContain("维护我的名片");
+      expect(own).toContain(`action="/member/${member.id}/profile"`);
+      expect(own).toContain('value="稳健"');
+      expect(own).toContain('value="半导体"');
+
+      const theirs = await (await authed(`/member/${other.id}`, token)).text();
+      expect(theirs).not.toContain("维护我的名片");
+      expect(theirs).not.toContain("/profile");
+    });
+
+    it("saves tags and the 战绩 switch, then shows them back on the card", async () => {
+      const { member, token } = seedMemberWithToken();
+
+      const response = await postForm(`/member/${member.id}/profile`, token, {
+        riskTags: "稳健, 逆向",
+        stockTags: "半导体、AI",
+        showPerformance: "off"
+      });
+
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toBe(`/member/${member.id}?profile=saved`);
+      const stored = new MemberRepository(db).getById(member.id);
+      expect(stored?.riskTags).toEqual(["稳健", "逆向"]);
+      expect(stored?.stockTags).toEqual(["半导体", "AI"]);
+      expect(stored?.showPerformance).toBe(false);
+
+      const card = await (await authed(`/member/${member.id}?profile=saved`, token)).text();
+      expect(card).toContain("名片已更新");
+      expect(card).toContain("稳健");
+      expect(card).toContain("AI");
+    });
+
+    it("an unchecked 战绩 checkbox turns the switch OFF (not 'field absent, leave it on')", async () => {
+      const { member, token } = seedMemberWithToken({ showPerformance: true });
+
+      // Exactly what a browser sends for the hidden-input + unchecked-checkbox
+      // pair the form renders: the hidden "off" only.
+      await postForm(`/member/${member.id}/profile`, token, { riskTags: "", stockTags: "", showPerformance: "off" });
+
+      expect(new MemberRepository(db).getById(member.id)?.showPerformance).toBe(false);
+    });
+
+    it("turning 战绩 off actually hides the KPI block from another member (server-enforced, not just the form)", async () => {
+      const { member, token } = seedMemberWithToken({ id: "member_subject_p", email: "p@example.com" });
+      seedSnapshot(db, { ownerId: member.id, fetchedAt: "2026-07-14T09:00:00.000Z", netAssets: 100000 });
+      const viewer = makeMember({ id: "member_viewer_p", email: "viewer-p@example.com" });
+      new MemberRepository(db).upsert(viewer);
+      const viewerToken = new ApiTokenRepository(db).issue(viewer.id, "test").token;
+
+      const before = await (await authed(`/member/${member.id}`, viewerToken)).text();
+      expect(before).toContain("累计收益");
+
+      await postForm(`/member/${member.id}/profile`, token, { riskTags: "", stockTags: "", showPerformance: "off" });
+
+      const after = await (await authed(`/member/${member.id}`, viewerToken)).text();
+      expect(after).toContain("这位成员没有公开自己的模拟盘战绩。");
+      expect(after).not.toContain("累计收益");
+    });
+
+    it("403s an attempt to edit ANOTHER member's card, and changes nothing", async () => {
+      const { token } = seedMemberWithToken();
+      const victim = makeMember({ id: "member_victim", email: "victim@example.com", riskTags: ["原样"] });
+      new MemberRepository(db).upsert(victim);
+
+      const response = await postForm(`/member/${victim.id}/profile`, token, {
+        riskTags: "被别人改了",
+        stockTags: "",
+        showPerformance: "off"
+      });
+
+      expect(response.status).toBe(403);
+      const stored = new MemberRepository(db).getById(victim.id);
+      expect(stored?.riskTags).toEqual(["原样"]);
+      expect(stored?.showPerformance).toBe(true);
+    });
+
+    it("ignores an ownerId/memberId field in the body - the write is always the resolved identity", async () => {
+      const { member, token } = seedMemberWithToken();
+      const victim = makeMember({ id: "member_victim2", email: "victim2@example.com", riskTags: ["原样"] });
+      new MemberRepository(db).upsert(victim);
+
+      const response = await postForm(`/member/${member.id}/profile`, token, {
+        ownerId: victim.id,
+        memberId: victim.id,
+        riskTags: "只改我自己",
+        stockTags: "",
+        showPerformance: "on"
+      });
+
+      expect(response.status).toBe(303);
+      expect(new MemberRepository(db).getById(member.id)?.riskTags).toEqual(["只改我自己"]);
+      expect(new MemberRepository(db).getById(victim.id)?.riskTags).toEqual(["原样"]);
+    });
+
+    it("401s without an identity and 405s a GET on the write path", async () => {
+      const { member } = seedMemberWithToken();
+      const unauth = await fetch(`${baseUrl}/member/${member.id}/profile`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: "riskTags=x"
+      });
+      expect(unauth.status).toBe(401);
+
+      const { token } = seedMemberWithToken({ id: "member_g", email: "g@example.com" });
+      const wrongMethod = await authed(`/member/${member.id}/profile`, token);
+      expect(wrongMethod.status).toBe(405);
+    });
+
+    it("refuses an over-long tag and too many tags instead of silently truncating", async () => {
+      const { member, token } = seedMemberWithToken();
+
+      const tooLong = await postForm(`/member/${member.id}/profile`, token, {
+        riskTags: "十七个字的标签实在是太长了吧",
+        stockTags: "",
+        showPerformance: "on"
+      });
+      expect(tooLong.status).toBe(400);
+      expect(await tooLong.text()).toContain("最长");
+
+      const tooMany = await postForm(`/member/${member.id}/profile`, token, {
+        riskTags: "a,b,c,d,e,f,g,h,i",
+        stockTags: "",
+        showPerformance: "on"
+      });
+      expect(tooMany.status).toBe(400);
+      expect(new MemberRepository(db).getById(member.id)?.riskTags).toEqual([]);
+    });
+
+    it("writes an audit_log row for the change", async () => {
+      const { member, token } = seedMemberWithToken();
+
+      await postForm(`/member/${member.id}/profile`, token, { riskTags: "稳健", stockTags: "", showPerformance: "on" });
+
+      const rows = db
+        .prepare(`SELECT action, payload FROM audit_log WHERE category = 'platform_members'`)
+        .all() as Array<{ action: string; payload: string }>;
+      expect(rows.some((row) => row.action === "profile update" && row.payload.includes(member.id))).toBe(true);
+    });
+  });
 });

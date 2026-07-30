@@ -291,7 +291,169 @@ describe("runTokenRevoke", () => {
   });
 });
 
+// ===========================================================================
+// runProfile - 名片自维护字段 (spec §1.8: 风险偏好与股票偏好标签「本人自己维护」,
+// 模拟盘战绩「本人可选择开/关」). Before 2026-07-30 nothing in the repo could
+// change risk_tags/stock_tags/show_performance after `add` hardcoded them, so
+// the live member measurably sat at `[]`/`[]` forever.
+// ===========================================================================
+
+describe("runProfile", () => {
+  function seedMember(options: { dbPath: string }): string {
+    return cli.runAdd({ email: "alice@example.com", name: "Alice" }, options).member.id;
+  }
+
+  it("sets both tag lists and returns the stored member", () => {
+    const { db, options } = makeDb();
+    const memberId = seedMember(options);
+
+    const result = cli.runProfile(
+      { member: memberId, "risk-tags": "稳健, 逆向", "stock-tags": "半导体、AI" },
+      options
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.member.riskTags).toEqual(["稳健", "逆向"]);
+    expect(result.member.stockTags).toEqual(["半导体", "AI"]);
+    // Persisted, not just returned.
+    const stored = new MemberRepository(db).getById(memberId);
+    expect(stored?.riskTags).toEqual(["稳健", "逆向"]);
+    expect(stored?.stockTags).toEqual(["半导体", "AI"]);
+  });
+
+  it("toggles 战绩展示 off and back on", () => {
+    const { db, options } = makeDb();
+    const memberId = seedMember(options);
+
+    cli.runProfile({ member: memberId, "show-performance": "false" }, options);
+    expect(new MemberRepository(db).getById(memberId)?.showPerformance).toBe(false);
+
+    cli.runProfile({ member: memberId, "show-performance": "true" }, options);
+    expect(new MemberRepository(db).getById(memberId)?.showPerformance).toBe(true);
+  });
+
+  it("leaves the fields it was not given alone (and never blanks email/name/status)", () => {
+    const { db, options } = makeDb();
+    const memberId = cli.runAdd({ email: "bob@example.com", name: "Bob", feishu: "ou_bob" }, options).member.id;
+    cli.runProfile({ member: memberId, "risk-tags": "稳健", "stock-tags": "AI", "show-performance": "false" }, options);
+
+    cli.runProfile({ member: memberId, "stock-tags": "港股" }, options);
+
+    const stored = new MemberRepository(db).getById(memberId);
+    expect(stored?.stockTags).toEqual(["港股"]);
+    expect(stored?.riskTags).toEqual(["稳健"]);
+    expect(stored?.showPerformance).toBe(false);
+    expect(stored?.email).toBe("bob@example.com");
+    expect(stored?.displayName).toBe("Bob");
+    expect(stored?.feishuOpenId).toBe("ou_bob");
+    expect(stored?.status).toBe("active");
+  });
+
+  it("clears a tag list when given an empty value", () => {
+    const { db, options } = makeDb();
+    const memberId = seedMember(options);
+    cli.runProfile({ member: memberId, "risk-tags": "稳健" }, options);
+
+    cli.runProfile({ member: memberId, "risk-tags": "" }, options);
+
+    expect(new MemberRepository(db).getById(memberId)?.riskTags).toEqual([]);
+  });
+
+  it("requires --member and at least one field to change", () => {
+    const { options } = makeDb();
+    const memberId = seedMember(options);
+    expect(() => cli.runProfile({ "risk-tags": "稳健" }, options)).toThrow(/--member/);
+    expect(() => cli.runProfile({ member: memberId }, options)).toThrow(/至少/);
+  });
+
+  it("rejects an unknown member, the migration sentinel, and a revoked member", () => {
+    const { options } = makeDb();
+    const memberId = seedMember(options);
+    expect(() => cli.runProfile({ member: "member_ghost", "risk-tags": "稳健" }, options)).toThrow(/不存在/);
+    expect(() => cli.runProfile({ member: "__legacy_system__", "risk-tags": "稳健" }, options)).toThrow(
+      /__legacy_system__/
+    );
+    cli.runRevoke({ member: memberId }, options);
+    expect(() => cli.runProfile({ member: memberId, "risk-tags": "稳健" }, options)).toThrow(/已被吊销/);
+  });
+
+  it("rejects a non-boolean --show-performance instead of silently reading it as false", () => {
+    const { options } = makeDb();
+    const memberId = seedMember(options);
+    expect(() => cli.runProfile({ member: memberId, "show-performance": "maybe" }, options)).toThrow(
+      /--show-performance/
+    );
+  });
+
+  it("rejects too many tags and an over-long tag instead of truncating", () => {
+    const { options } = makeDb();
+    const memberId = seedMember(options);
+    expect(() =>
+      cli.runProfile({ member: memberId, "risk-tags": "a,b,c,d,e,f,g,h,i" }, options)
+    ).toThrow(/最多/);
+    expect(() => cli.runProfile({ member: memberId, "risk-tags": "十七个字的标签实在是太长了吧" }, options)).toThrow(
+      /最长/
+    );
+  });
+
+  it("writes an audit_log row naming only the fields that changed", () => {
+    const { db, options } = makeDb();
+    const memberId = seedMember(options);
+
+    cli.runProfile({ member: memberId, "risk-tags": "稳健" }, options);
+
+    const rows = auditRows(db, "profile update");
+    expect(rows).toHaveLength(1);
+    const payload = JSON.parse(rows[0]?.payload ?? "{}") as Record<string, unknown>;
+    expect(payload.memberId).toBe(memberId);
+    expect(payload.riskTags).toEqual(["稳健"]);
+    expect(payload).not.toHaveProperty("stockTags");
+    expect(payload).not.toHaveProperty("showPerformance");
+  });
+
+  it("is reachable through buildCliResult as the `profile` subcommand", () => {
+    const { options } = makeDb();
+    const memberId = seedMember(options);
+
+    const result = cli.buildCliResult(["profile", "--member", memberId, "--risk-tags", "稳健"], options);
+
+    expect(result.ok).toBe(true);
+    expect(result.member.riskTags).toEqual(["稳健"]);
+  });
+});
+
+describe("runAdd tag/performance flags", () => {
+  it("accepts the same three fields at creation time instead of hardcoding empty defaults", () => {
+    const { db, options } = makeDb();
+
+    const result = cli.runAdd(
+      { email: "carol@example.com", name: "Carol", "risk-tags": "激进", "stock-tags": "AI,半导体", "show-performance": "false" },
+      options
+    );
+
+    expect(result.member.riskTags).toEqual(["激进"]);
+    expect(result.member.stockTags).toEqual(["AI", "半导体"]);
+    expect(result.member.showPerformance).toBe(false);
+    expect(new MemberRepository(db).getById(result.member.id)?.showPerformance).toBe(false);
+  });
+
+  it("still defaults to empty tags and 战绩展示 on when the flags are absent (§1.8 default)", () => {
+    const { options } = makeDb();
+    const result = cli.runAdd({ email: "dave@example.com", name: "Dave" }, options);
+    expect(result.member.riskTags).toEqual([]);
+    expect(result.member.stockTags).toEqual([]);
+    expect(result.member.showPerformance).toBe(true);
+  });
+});
+
 describe("per-command flag allowlist (H6 pattern: cross-command flags rejected)", () => {
+  it("rejects a token flag on profile, and a profile flag on token issue", () => {
+    expect(() => cli.parseFlags(["--member", "x", "--token-id", "t"], "profile")).toThrow(/未知参数：--token-id/);
+    expect(() => cli.parseFlags(["--member", "x", "--label", "l", "--risk-tags", "稳健"], "token issue")).toThrow(
+      /未知参数：--risk-tags/
+    );
+  });
+
   it("rejects a revoke-only flag (--member) on add", () => {
     expect(() => cli.parseFlags(["--email", "a@example.com", "--name", "A", "--member", "x"], "add")).toThrow(
       /未知参数：--member/

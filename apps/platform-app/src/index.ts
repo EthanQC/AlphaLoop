@@ -7,6 +7,7 @@ import {
 
 import { createFeishuReviewNotifier } from "./data/feishu-review-notifier.js";
 import { listFilterSymbols } from "./data/news.js";
+import { loadLatestSnapshotForOwner } from "./data/snapshots.js";
 import { getAccessJwtMode, primeAccessJwtCache } from "./identity.js";
 import {
   createDefaultMemoryReader,
@@ -45,22 +46,51 @@ const port = Number(process.env.PLATFORM_APP_PORT ?? 4314);
 // failure becomes a gracefully `degraded`/`failed` task, never a crash - see
 // research/worker.ts), a stock_facts quote reader, and a
 // data/strategy.ts-backed memory reader (owner-pre-bound per claimed task by
-// the worker itself, never a free scope param). `symbolUniverse` is the
-// circle's full tracked-symbol pool (data/news.ts's `listFilterSymbols` -
-// already used by the news page's own filter-chip row for the identical
-// "every symbol anyone in the circle is tracking" query) resolved once at
-// process startup; the plan's full "标的池并集 + 本人持仓" definition also
-// folds in each asking member's own positions, which - along with keeping
-// this pool fresh across a long-running process without a restart - is left
-// to a later task (this worker's own `symbolUniverse` is a plain injected
-// array, not a per-call resolver, by design - see its own doc comment).
-const symbolUniverse = listFilterSymbols(db);
+// the worker itself, never a free scope param).
+//
+// `symbolUniverse` is §1.3's full 提问标的范围 = 全体标的池并集 + 本人持仓, and it
+// is a RESOLVER, not an array (2026-07-30). Both halves of that change fix a
+// real wrong answer rather than a tidiness concern:
+//   · 并集 half - data/news.ts's `listFilterSymbols` (the same "every symbol
+//     anyone in the circle is tracking" query the news page's filter chips
+//     use) is re-read per task, so a symbol added to the pool today is
+//     askable today; as a startup-time constant it stayed invisible until
+//     someone restarted this process.
+//   · 持仓 half - was missing entirely. Measured against the mini's live
+//     database on 2026-07-30: the one active member's watchlist is
+//     NVDA/TSM/GOOG/QQQM/AMZN while the position they actually hold is
+//     QQQ.US, which appears in no watchlist row. Asking about their own
+//     holding would have been answered 「QQQ.US 不在你的标的池」 - false.
+// Only the asking member's OWN snapshot rows count: `loadLatestSnapshotForOwner`
+// falls back to unattributed/`__shared__` rows when a member has none of their
+// own, and an unattributed account's positions are not this member's 持仓, so
+// the ownerId is compared before the positions are used.
+function resolveResearchSymbolUniverse(ownerId: string): string[] {
+  const pool = new Set<string>();
+  for (const symbol of listFilterSymbols(db)) {
+    const normalized = symbol.trim().toUpperCase();
+    if (normalized) {
+      pool.add(normalized);
+    }
+  }
+  const snapshot = loadLatestSnapshotForOwner(db, ownerId);
+  if (snapshot && snapshot.ownerId === ownerId) {
+    for (const position of snapshot.positions) {
+      const normalized = String(position.symbol ?? "").trim().toUpperCase();
+      if (normalized) {
+        pool.add(normalized);
+      }
+    }
+  }
+  return [...pool];
+}
+
 const researchWorker = createResearchWorker({
   db,
   backend: createDefaultResearchBackend(),
   quoteReader: createDefaultQuoteReader(db),
   memoryReader: createDefaultMemoryReader(db),
-  symbolUniverse
+  symbolUniverse: resolveResearchSymbolUniverse
 });
 researchWorker.start();
 

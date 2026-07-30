@@ -148,9 +148,58 @@ function detectOperationalIntent(question) {
 // it ALSO happens to collide with a real tracked symbol.
 const SYMBOL_TOKEN_PATTERN = /\b[A-Za-z]{1,6}(?:\.[A-Za-z]{1,4})?\b/gu;
 
-function extractSymbols(question, symbolUniverse) {
+// 池外标的的 RECEIPT shapes (spec §1.3 step 2: 「提问标的范围 = 全体标的池并集 +
+// 你的持仓，池外标的提示先加自选」). The loose pattern above is safe for the
+// IN-pool half precisely because every candidate must also survive an
+// intersection with `symbolUniverse`; a receipt has no such filter behind it,
+// so its candidates must be ticker-shaped beyond reasonable doubt - otherwise
+// the prompt would tell a member that an ordinary English word "is not in your
+// pool", which is a false claim about their pool. Two shapes qualify:
+//   · an ALL-CAPS latin token of 2-6 letters, optionally market-suffixed
+//     (TSLA, TSLA.US) - the way anyone actually writes a ticker;
+//   · a numeric code that CARRIES its market suffix (0700.HK) - unambiguous
+//     even though it is digits.
+// Deliberately NOT prompted about: a lower/mixed-case out-of-pool token
+// ("tsla"), and a single capital letter (F, T - real tickers, but far more
+// often ordinary text). Both keep the pre-2026-07-30 silent-drop behaviour,
+// which states nothing rather than stating something possibly wrong. Either
+// still RESOLVES normally when it is in the pool - only the receipt is scoped.
+const OUT_OF_POOL_LATIN_PATTERN = /\b[A-Z]{2,6}(?:\.[A-Za-z]{1,4})?\b/gu;
+const OUT_OF_POOL_NUMERIC_PATTERN = /\b[0-9]{4,6}\.[A-Za-z]{2}\b/gu;
+
+// ALL-CAPS tokens that are finance/English acronyms rather than tickers. A
+// real ticker colliding with one of these (AI, C3.ai's NYSE ticker, is the
+// live example) still resolves when it IS in the member's pool - the entry
+// here only suppresses the "not in your pool" PROMPT for it, degrading to the
+// old silent behaviour instead of risking a wrong one.
+const NON_TICKER_ACRONYMS = new Set([
+  "AI", "API", "ATH", "CEO", "CFO", "CN", "CNY", "CPI", "DCF", "EBIT", "EBITDA", "EPS", "ETF", "EU",
+  "EV", "FED", "FOMC", "FYI", "GDP", "HK", "HKD", "IPO", "IRA", "IT", "JPY", "KDJ", "MA", "MACD",
+  "ML", "OK", "PB", "PE", "PEG", "PMI", "PPI", "PS", "QOQ", "RMB", "ROE", "RSI", "SEC", "TTM", "US",
+  "USD", "YOY", "YTD"
+]);
+
+/**
+ * Splits the question's ticker-shaped tokens into the ones this member may ask
+ * about (`symbols` - present in `symbolUniverse`) and the ones they may not yet
+ * (`outOfPool`), so the pipeline can PROMPT about the second group instead of
+ * discarding it silently.
+ *
+ * `universeKnown` is the third, load-bearing state: `symbolUniverse` omitted or
+ * `null` means the CALLER could not resolve the pool (e.g. the worker's
+ * resolver threw), which is NOT the same fact as an empty pool. An unknown pool
+ * produces no out-of-pool claim at all - saying 「X 不在你的标的池」 when we never
+ * read the pool would be exactly the kind of fabrication §0.4 forbids. An
+ * explicit `[]` IS a known (empty) pool: "you have not added anything yet" is a
+ * true statement and the prompt is the correct answer to it.
+ *
+ * @param {string} question
+ * @param {string[] | null | undefined} symbolUniverse
+ */
+export function extractSymbols(question, symbolUniverse) {
+  const universeKnown = Array.isArray(symbolUniverse);
   const universe = new Set(
-    (Array.isArray(symbolUniverse) ? symbolUniverse : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean)
+    (universeKnown ? symbolUniverse : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean)
   );
   const text = String(question ?? "");
   const resolved = [];
@@ -160,7 +209,26 @@ function extractSymbols(question, symbolUniverse) {
       resolved.push(normalized);
     }
   }
-  return resolved;
+
+  const outOfPool = [];
+  if (universeKnown) {
+    for (const pattern of [OUT_OF_POOL_LATIN_PATTERN, OUT_OF_POOL_NUMERIC_PATTERN]) {
+      for (const match of text.matchAll(pattern)) {
+        const raw = match[0];
+        const bare = raw.replace(/\.[A-Za-z]+$/u, "").toUpperCase();
+        if (NON_TICKER_ACRONYMS.has(bare)) {
+          continue;
+        }
+        const normalized = normalizeSymbol(raw);
+        if (!normalized || universe.has(normalized) || resolved.includes(normalized) || outOfPool.includes(normalized)) {
+          continue;
+        }
+        outOfPool.push(normalized);
+      }
+    }
+  }
+
+  return { symbols: resolved, outOfPool, universeKnown };
 }
 
 // Best-effort "what is this question actually about" string used only to
@@ -524,10 +592,17 @@ function buildSuggestedAction({ confidence, hasConflict }) {
  *   quoteReader: (symbol: string) => Promise<number|undefined> | number | undefined,
  *   memoryReader?: (args: {ownerId: string, symbols: string[]}) => Promise<{theses: object[], disciplines: object[]}>,
  *   budget?: number,
- *   symbolUniverse?: string[],
+ *   symbolUniverse?: string[] | null,
  *   now?: () => Date,
  *   onStep?: (step: {name: string, status: 'done'|'skipped', detail: string, at: string}) => void
  * }} options
+ *
+ * `symbolUniverse` has THREE states, not two (see `extractSymbols`): an array
+ * is the resolved pool (`[]` = a real, empty pool), while omitting it or
+ * passing null means "the caller could not resolve it" and suppresses every
+ * out-of-pool claim. There is deliberately no `= []` default: defaulting would
+ * silently turn "I don't know your pool" into "your pool is empty", and the
+ * difference is a user-visible claim.
  */
 export async function runResearchPipeline({
   question,
@@ -536,7 +611,7 @@ export async function runResearchPipeline({
   quoteReader,
   memoryReader,
   budget = 8,
-  symbolUniverse = [],
+  symbolUniverse,
   now = () => new Date(),
   onStep
 } = {}) {
@@ -579,13 +654,54 @@ export async function runResearchPipeline({
     };
   }
 
-  const symbols = extractSymbols(question, symbolUniverse);
+  const { symbols, outOfPool, universeKnown } = extractSymbols(question, symbolUniverse);
   const topic = extractTopic(question, symbols);
+
+  // §1.3 step 2「池外标的提示先加自选」: when the question's ONLY subject is a
+  // symbol this member has not added, a research verdict would be a verdict
+  // about nothing (that is exactly what shipped: 「识别标的：无」 followed by a
+  // full report). Stop here with the prompt instead, the same shape the
+  // operational-intent branch above uses - the /research page derives its
+  // 失败原因 from the LAST step's detail, so the prompt IS what the member reads.
+  if (symbols.length === 0 && outOfPool.length > 0) {
+    const prompt = `${outOfPool.join("、")} 不在你的标的池（提问范围＝全体标的池并集＋你的持仓），先加自选：在飞书里让机器人把它加进你的标的池，然后再提这个问题。`;
+    record({ name: STEP_NAMES.intent, status: "done", detail: prompt });
+    return {
+      status: "failed",
+      reason: "out_of_pool_symbol",
+      message: prompt,
+      outOfPoolSymbols: outOfPool,
+      resultJson: null,
+      confidence: null,
+      title,
+      steps,
+      skipped,
+      budgetSpent: 0
+    };
+  }
+
   record({
     name: STEP_NAMES.intent,
     status: "done",
     detail: `识别标的：${symbols.length > 0 ? symbols.join("、") : "无"}；主题：${topic}`
   });
+  // A partially in-pool question keeps running on what it CAN research, but the
+  // dropped half gets a receipt in both places a member looks: the steps trace
+  // and resultJson.skipped (rendered as the explicit 跳过 list on /research).
+  if (outOfPool.length > 0) {
+    record({
+      name: STEP_NAMES.intent,
+      status: "skipped",
+      detail: `跳过：${outOfPool.join("、")} 不在你的标的池，本次未纳入研究；先加自选后可单独就它提问。`
+    });
+  }
+  if (!universeKnown) {
+    record({
+      name: STEP_NAMES.intent,
+      status: "skipped",
+      detail: "跳过：未能读出你的标的池（全体标的池并集＋你的持仓），本次不判断哪些标的在池外。"
+    });
+  }
 
   // --- 2. 拉取行情 ---------------------------------------------------------
   const quotes = {};

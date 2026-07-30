@@ -1,7 +1,26 @@
 /**
- * Member card (Task 7): `GET /member/<who>`. A VIEW only - no storage of its
+ * Member card (Task 7): `GET /member/<who>`, plus (2026-07-30)
+ * `POST /member/<id>/profile` - the owner's own edit of the three fields spec
+ * §1.8 marks as theirs to maintain. The GET is a VIEW only - no storage of its
  * own (tech §2.5: "视图无存储") - every field it renders already lives on
  * `members`, `theses`, `official_paper_snapshots`, or `research_tasks`.
+ *
+ * SELF-MAINTAINED FIELDS (req §1.8: 「风险偏好与股票偏好标签（本人自己维护）」
+ * 「模拟盘战绩（本人可选择开/关，默认对圈内成员展示）」): `members.risk_tags`,
+ * `members.stock_tags` and `members.show_performance` have existed since the
+ * identity migration and this page has always READ them - but until 2026-07-30
+ * no CLI, API or Feishu path could CHANGE them after `members.mjs add`
+ * hardcoded `[]`/`[]`/`true`, so the live member's card sat permanently at
+ * 「未设置」. The form is rendered ONLY on the viewer's own card, and the write
+ * endpoint takes its owner from `resolveIdentity` alone:
+ *   · a `/member/<other>/profile` POST is 403 (the path id is COMPARED, never
+ *     trusted), and the UPDATE still binds the resolved identity's id;
+ *   · an `ownerId`/`memberId` field in the body is never read at all - the same
+ *     "silently ignored, not merely rejected" rule api-strategy.ts documents.
+ * Errors answer as JSON `{ok:false,...}` rather than a rendered page - the same
+ * accepted shape api-research.ts's own form endpoints use; none of them is
+ * reachable from the rendered UI (the form only exists on your own card, and
+ * the input lengths are what the 400 is about).
  *
  * Identity-gated like every route past Task 3 (there must be a logged-in
  * viewer before anyone's card can be shown), but the interesting access
@@ -38,9 +57,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 
 import {
+  AuditLogRepository,
   MemberRepository,
   ResearchTaskRepository,
   methodNotAllowed,
+  sendJson,
   type Member,
   type ResearchTask
 } from "@packages/shared-types";
@@ -57,6 +78,7 @@ import {
   type ThesisHistoryRow
 } from "../data/strategy.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
+import { guardAsyncWrite } from "./async-guard.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
 import { describeDataInstant, formatAccountAmount, formatBeijingShortTime } from "../render/format.js";
@@ -165,6 +187,70 @@ function renderHeaderCard(subject: Member): Html {
     <div style="margin-top:4px">${renderTagChips(subject.riskTags)}</div>
     <div style="margin-top:8px;font-size:12.5px;color:var(--sub)">标的偏好</div>
     <div style="margin-top:4px">${renderTagChips(subject.stockTags)}</div>
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
+// 维护我的名片 (owner-only edit form, req §1.8)
+// ---------------------------------------------------------------------------
+
+/** Same limits as members.mjs's `parseTagList` (re-declared, not imported -
+ * that file is a plain .mjs CLI with no type surface; this codebase's
+ * convention is to re-declare the literal and name the source of truth in a
+ * comment). Both sides REFUSE rather than truncate: a card silently dropping a
+ * tag would be showing something its owner did not write. */
+const MAX_TAGS = 8;
+const MAX_TAG_LENGTH = 12;
+
+/** `,` `，` `、` and whitespace all separate tags - the separators a
+ * Chinese-keyboard user actually types. Mirrors members.mjs's own splitter. */
+function parseTagsField(raw: string, label: string): { tags: string[] } | { error: string } {
+  const tags: string[] = [];
+  for (const candidate of raw.split(/[,，、\s]+/u)) {
+    const tag = candidate.trim();
+    if (tag.length === 0) {
+      continue;
+    }
+    if (tag.length > MAX_TAG_LENGTH) {
+      return { error: `${label}里的标签「${tag}」超长，单个标签最长 ${MAX_TAG_LENGTH} 个字。` };
+    }
+    if (!tags.includes(tag)) {
+      tags.push(tag);
+    }
+  }
+  if (tags.length > MAX_TAGS) {
+    return { error: `${label}最多 ${MAX_TAGS} 个标签，本次提交了 ${tags.length} 个。` };
+  }
+  return { tags };
+}
+
+function renderProfileForm(subject: Member): Html {
+  const checked = subject.showPerformance ? trustedHtml(" checked") : trustedHtml("");
+  return html`<section class="card w2 dt-w4" aria-label="维护我的名片">
+    <h2>维护我的名片</h2>
+    <p style="font-size:12px;color:var(--sub);margin-top:-4px">只有你能改自己的名片；标签用逗号分隔，最多 ${MAX_TAGS} 个、每个最长 ${MAX_TAG_LENGTH} 个字。</p>
+    <form method="post" action="/member/${subject.id}/profile" style="margin-top:10px">
+      <label style="display:block;font-size:12.5px;color:var(--sub)">风险偏好标签</label>
+      <input name="riskTags" value="${subject.riskTags.join("，")}" placeholder="例：稳健，逆向" style="width:100%;margin:4px 0 10px;padding:6px 8px;font-size:13px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--ink)" />
+      <label style="display:block;font-size:12.5px;color:var(--sub)">标的偏好标签</label>
+      <input name="stockTags" value="${subject.stockTags.join("，")}" placeholder="例：半导体，AI" style="width:100%;margin:4px 0 10px;padding:6px 8px;font-size:13px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--ink)" />
+      <!-- The hidden "off" is what makes an UNCHECKED box mean off: a browser
+           omits an unchecked checkbox entirely, and "absent" would otherwise be
+           indistinguishable from "not submitted". The checkbox's own value wins
+           when it IS checked (later key overwrites earlier). -->
+      <input type="hidden" name="showPerformance" value="off" />
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+        <input type="checkbox" name="showPerformance" value="on"${checked} />
+        对圈内成员展示我的模拟盘战绩
+      </label>
+      <button class="btn primary" type="submit" style="margin-top:12px">保存</button>
+    </form>
+  </section>`;
+}
+
+function renderSavedNotice(): Html {
+  return html`<section class="card w2 dt-w4" role="status" aria-label="名片已更新">
+    <p style="font-size:13px;color:var(--ink);margin:0">名片已更新。风险/标的偏好标签与战绩开关立即对圈内成员生效；关闭战绩后首页的「对比」入口也会同步置灰。</p>
   </section>`;
 }
 
@@ -438,7 +524,8 @@ function renderMemberCardPage(
   deps: MemberCardRouteDeps,
   viewer: Member,
   subject: Member,
-  nonce: string
+  nonce: string,
+  savedNotice = false
 ): void {
   const now = currentNow(deps);
   const viewingSelf = viewer.id === subject.id;
@@ -456,7 +543,9 @@ function renderMemberCardPage(
   }
   const researchTasks = loadSubjectPublicResearch(deps.db, subject.id);
 
-  const bodyHtml = html`<div class="bento">${renderHeaderCard(subject)}</div>
+  const bodyHtml = html`${savedNotice && viewingSelf ? html`<div class="bento">${renderSavedNotice()}</div>` : trustedHtml("")}
+    <div class="bento"${savedNotice && viewingSelf ? trustedHtml(' style="margin-top:10px"') : trustedHtml("")}>${renderHeaderCard(subject)}</div>
+    ${viewingSelf ? html`<div class="bento" style="margin-top:10px">${renderProfileForm(subject)}</div>` : trustedHtml("")}
     <div class="bento" style="margin-top:10px">${renderPerformanceSection(performanceView)}</div>
     <div class="bento" style="margin-top:10px">${renderStrategyCardsSection(strategyCards, viewingSelf)}</div>
     <div class="bento" style="margin-top:10px">${renderThesesSection(theses, viewingSelf, historyByThesisId, priceBySymbol)}</div>
@@ -490,10 +579,140 @@ function renderMemberCardPage(
   sendHtml(res, 200, page);
 }
 
+// ---------------------------------------------------------------------------
+// POST /member/<id>/profile
+// ---------------------------------------------------------------------------
+
+const FORM_URLENCODED_CONTENT_TYPE = "application/x-www-form-urlencoded";
+
+/** True for a browser `<form method="post">` submission (the card's own edit
+ * form). Prefix-matched because a real browser appends `;charset=UTF-8` -
+ * same test api-research.ts's `isFormUrlEncoded` applies. */
+function isFormUrlEncoded(req: IncomingMessage): boolean {
+  return String(req.headers["content-type"] ?? "")
+    .toLowerCase()
+    .startsWith(FORM_URLENCODED_CONTENT_TYPE);
+}
+
+async function readFormBody(req: IncomingMessage): Promise<Record<string, string>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+  if (contentType.startsWith("application/json")) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return Object.fromEntries(
+        Object.entries(parsed as Record<string, unknown>).map(([key, value]) => [
+          key,
+          Array.isArray(value) ? value.join(",") : typeof value === "boolean" ? (value ? "on" : "off") : String(value ?? "")
+        ])
+      );
+    } catch {
+      return {};
+    }
+  }
+  // Last key wins - which is exactly what makes the hidden-input + checkbox
+  // pair in renderProfileForm work.
+  return Object.fromEntries(new URLSearchParams(raw).entries());
+}
+
 /**
- * Routes `GET /member/<who>`. Returns `true` if the request was handled
- * (including 401/404/405 responses), `false` if the path doesn't belong to
- * this module so the caller can keep trying other routes.
+ * Applies the §1.8 self-maintained fields to the RESOLVED identity's own row.
+ * `pathMemberId` is only ever COMPARED (403 on mismatch) - the UPDATE binds
+ * `viewer.id`, so even a future routing change could not make this write
+ * somebody else's card.
+ */
+async function handleProfileUpdate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: MemberCardRouteDeps,
+  pathMemberId: string
+): Promise<void> {
+  const viewer = resolveIdentity(req, deps.db);
+  if (!viewer) {
+    sendJson(res, 401, { ok: false, error: "未获授权：请先登录" });
+    return;
+  }
+  if (pathMemberId !== viewer.id) {
+    sendJson(res, 403, { ok: false, error: "无权操作：只能维护自己的名片" });
+    return;
+  }
+
+  const body = await readFormBody(req);
+
+  // Only the three §1.8 fields are read. `ownerId`/`memberId`/`displayName`/
+  // `email`/`status` in the body are ignored outright, never rejected - a
+  // caller trying to write "as" someone else simply updates their own row.
+  const fields: Partial<Pick<Member, "riskTags" | "stockTags" | "showPerformance">> = {};
+  if (body.riskTags !== undefined) {
+    const parsed = parseTagsField(body.riskTags, "风险偏好标签");
+    if ("error" in parsed) {
+      sendJson(res, 400, { ok: false, error: parsed.error, field: "riskTags" });
+      return;
+    }
+    fields.riskTags = parsed.tags;
+  }
+  if (body.stockTags !== undefined) {
+    const parsed = parseTagsField(body.stockTags, "标的偏好标签");
+    if ("error" in parsed) {
+      sendJson(res, 400, { ok: false, error: parsed.error, field: "stockTags" });
+      return;
+    }
+    fields.stockTags = parsed.tags;
+  }
+  if (body.showPerformance !== undefined) {
+    const raw = String(body.showPerformance).trim().toLowerCase();
+    if (["on", "true", "1", "yes", "开"].includes(raw)) {
+      fields.showPerformance = true;
+    } else if (["off", "false", "0", "no", "关"].includes(raw)) {
+      fields.showPerformance = false;
+    } else {
+      sendJson(res, 400, { ok: false, error: "战绩开关只接受 on/off", field: "showPerformance" });
+      return;
+    }
+  }
+  if (Object.keys(fields).length === 0) {
+    sendJson(res, 400, { ok: false, error: "没有要修改的字段（风险偏好标签 / 标的偏好标签 / 战绩开关）" });
+    return;
+  }
+
+  const members = new MemberRepository(deps.db);
+  // Re-read inside the write path: `viewer` came from identity resolution and
+  // `upsert` overwrites every column, so the row is fetched and spread rather
+  // than reconstructed (members.mjs's runProfile does the same for the same
+  // reason).
+  const current = members.getById(viewer.id);
+  if (!current || current.status !== "active") {
+    sendJson(res, 403, { ok: false, error: "无权操作：账号状态不允许修改名片" });
+    return;
+  }
+  const updated: Member = { ...current, ...fields };
+  members.upsert(updated);
+  new AuditLogRepository(deps.db).write("platform_members", "profile update", {
+    memberId: viewer.id,
+    ...fields
+  });
+
+  if (isFormUrlEncoded(req)) {
+    // 303 so the browser's follow-up is a GET (POST-then-redirect), landing
+    // back on the card with the honest "what this changed" notice.
+    res.writeHead(303, { location: `/member/${viewer.id}?profile=saved` });
+    res.end();
+    return;
+  }
+  sendJson(res, 200, { ok: true, member: updated });
+}
+
+/**
+ * Routes `GET /member/<who>` and `POST /member/<id>/profile`. Returns `true` if
+ * the request was handled (including 401/403/404/405 responses), `false` if the
+ * path doesn't belong to this module so the caller can keep trying other routes.
  */
 export function handleMemberCardRoute(
   req: IncomingMessage,
@@ -503,6 +722,15 @@ export function handleMemberCardRoute(
   nonce: string
 ): boolean {
   const segments = url.pathname.split("/").filter((segment) => segment.length > 0);
+  if (segments.length === 3 && segments[0] === "member" && segments[2] === "profile") {
+    if (req.method !== "POST") {
+      methodNotAllowed(res);
+      return true;
+    }
+    guardAsyncWrite(handleProfileUpdate(req, res, deps, segments[1] as string), req, res, "member-card");
+    return true;
+  }
+
   if (segments.length !== 2 || segments[0] !== "member") {
     return false;
   }
@@ -534,6 +762,6 @@ export function handleMemberCardRoute(
     return true;
   }
 
-  renderMemberCardPage(res, deps, viewer, subject, nonce);
+  renderMemberCardPage(res, deps, viewer, subject, nonce, url.searchParams.get("profile") === "saved");
   return true;
 }

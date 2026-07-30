@@ -76,8 +76,12 @@ describe("G3: every repository write in apps/openclaw-config carries the fields 
     // `composeDecisionUpdate({ ...updated, decidedByDisplayName })` call is
     // now a boundary call whose spread this file cannot resolve. More of the
     // file is checked than before, not less.
+    // members.mjs's entry moved 198 -> 329 on 2026-07-30: §1.8's profile-edit
+    // commands were added ABOVE it, so `runRevoke`'s fetch-then-spread upsert
+    // just shifted down. Same construct, same single blind spot - the list is
+    // still three entries long, which is what makes this a ratchet.
     expect(real.unverifiable.map((entry: string) => entry.split(":").slice(0, 2).join(":"))).toEqual([
-      "apps/openclaw-config/scripts/members.mjs:198",
+      "apps/openclaw-config/scripts/members.mjs:329",
       "apps/openclaw-config/scripts/proposals.mjs:326",
       "apps/openclaw-config/scripts/proposals.mjs:531"
     ]);

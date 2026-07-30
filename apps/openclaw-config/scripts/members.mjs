@@ -37,8 +37,11 @@ const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
 
 // This CLI has no genuine boolean/no-value flags (unlike market-alerts.mjs's
-// --all/--purge) - every flag here (email/name/feishu/member/label/token-id)
-// always expects a value. Kept as an explicit (empty) set, rather than
+// --all/--purge) - every flag here expects a value, including
+// `--show-performance`, which takes an explicit true/false rather than being
+// present-means-on (see parseBooleanFlag: this flag decides whether the circle
+// can see someone's account, so an ambiguous value is refused, not coerced).
+// Kept as an explicit (empty) set, rather than
 // omitted, so the intent - "there are none, not that we forgot to list them" -
 // is visible at the call site, matching market-alerts.mjs's structure.
 const BOOLEAN_FLAGS = new Set();
@@ -48,12 +51,87 @@ const BOOLEAN_FLAGS = new Set();
 // --label under `revoke`) fails loud with "未知参数" instead of parsing fine
 // and then silently never being read.
 const COMMAND_FLAGS = {
-  add: new Set(["email", "name", "feishu"]),
+  add: new Set(["email", "name", "feishu", "risk-tags", "stock-tags", "show-performance"]),
   list: new Set([]),
+  profile: new Set(["member", "risk-tags", "stock-tags", "show-performance"]),
   revoke: new Set(["member"]),
   "token issue": new Set(["member", "label"]),
   "token revoke": new Set(["token-id"])
 };
+
+// 名片自维护字段 (spec §1.8). Limits are refusals, never silent truncation: a
+// card that quietly dropped the 9th tag would be showing something the member
+// did not write.
+const MAX_TAGS = 8;
+const MAX_TAG_LENGTH = 12;
+
+/**
+ * Parses a tag flag into a normalized list. Accepts the three separators a
+ * Chinese-keyboard user actually types (`,` `，` `、`) plus whitespace; an empty
+ * value is a legitimate "clear this list", NOT a missing argument.
+ *
+ * @param {string} value
+ * @param {string} flagName
+ */
+export function parseTagList(value, flagName) {
+  const raw = String(value ?? "")
+    .split(/[,，、\s]+/u)
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
+  const tags = [];
+  for (const tag of raw) {
+    if (tag.length > MAX_TAG_LENGTH) {
+      throw new Error(`--${flagName} 里的标签「${tag}」超长，单个标签最长 ${MAX_TAG_LENGTH} 个字。`);
+    }
+    if (!tags.includes(tag)) {
+      tags.push(tag);
+    }
+  }
+  if (tags.length > MAX_TAGS) {
+    throw new Error(`--${flagName} 最多 ${MAX_TAGS} 个标签，本次提交了 ${tags.length} 个。`);
+  }
+  return tags;
+}
+
+/**
+ * Parses `--show-performance`. Refuses anything it does not recognize rather
+ * than coercing it: JS truthiness would read `--show-performance maybe` as
+ * "on" and `--show-performance 0` as "on" too, and this flag decides whether
+ * the circle can see someone's account.
+ *
+ * @param {string} value
+ */
+export function parseBooleanFlag(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["true", "1", "on", "yes", "开"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "off", "no", "关"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`--show-performance 只接受 true/false（也可写 on/off、1/0、开/关），收到的是「${value}」。`);
+}
+
+/**
+ * Reads the three §1.8 self-maintained fields out of a flag bag. Returns only
+ * the keys that were actually PRESENT, so a caller can distinguish "set this to
+ * empty" from "leave it as it is".
+ *
+ * @param {Record<string, string>} flags
+ */
+function readProfileFields(flags) {
+  const fields = {};
+  if (flags["risk-tags"] !== undefined) {
+    fields.riskTags = parseTagList(flags["risk-tags"], "risk-tags");
+  }
+  if (flags["stock-tags"] !== undefined) {
+    fields.stockTags = parseTagList(flags["stock-tags"], "stock-tags");
+  }
+  if (flags["show-performance"] !== undefined) {
+    fields.showPerformance = parseBooleanFlag(flags["show-performance"]);
+  }
+  return fields;
+}
 
 /**
  * Parses `--flag value` pairs from an argv slice (after the subcommand).
@@ -131,6 +209,10 @@ export function runAdd(flags, options = {}) {
   if (flags.feishu !== undefined && !feishuOpenId) {
     throw new Error("缺少 --feishu 参数值。");
   }
+  // §1.8's self-maintained fields, optional at creation time. Absent keeps the
+  // spec's own defaults (no tags, 战绩默认对圈内成员展示); the member changes them
+  // afterwards on their own card (routes/member-card.ts) or via `profile` below.
+  const profileFields = readProfileFields(flags);
 
   return withDb(options, (db) => {
     const members = new MemberRepository(db);
@@ -151,9 +233,9 @@ export function runAdd(flags, options = {}) {
       email,
       ...(feishuOpenId ? { feishuOpenId } : {}),
       displayName: name,
-      riskTags: [],
-      stockTags: [],
-      showPerformance: true,
+      riskTags: profileFields.riskTags ?? [],
+      stockTags: profileFields.stockTags ?? [],
+      showPerformance: profileFields.showPerformance ?? true,
       status: "active",
       createdAt: nowIso()
     };
@@ -176,6 +258,55 @@ export function runAdd(flags, options = {}) {
 // require reaching for raw SQL. Read-only: writes no audit_log row.
 export function runList(_flags, options = {}) {
   return withDb(options, (db) => ({ ok: true, members: new MemberRepository(db).listAll() }));
+}
+
+/**
+ * `profile --member <id> [--risk-tags ...] [--stock-tags ...] [--show-performance true|false]`
+ * - the OPERATOR's path to the three fields spec §1.8 marks 「本人自己维护」.
+ *
+ * WHO THIS IS FOR: this is a local admin CLI (same trust level as `add` and
+ * `revoke` right above/below - both of which already create and retire people),
+ * so the member id is a plain argument here. The MEMBER-facing path is the form
+ * on their own card (apps/platform-app/src/routes/member-card.ts), which never
+ * takes an owner from the request: it writes the resolved session identity and
+ * 403s a mismatching id. Nothing about this command widens what a member can do
+ * to somebody else's card.
+ *
+ * Only the flags actually PRESENT are written, and the row is fetched first and
+ * spread (same reason runRevoke does it - `upsert` overwrites every column, so a
+ * partial object would blank out email/name/status).
+ */
+export function runProfile(flags, options = {}) {
+  const memberId = requireFlag(flags, "member");
+  if (memberId === LEGACY_SYSTEM_MEMBER_ID) {
+    throw new Error(`不能修改 __legacy_system__ 的名片（迁移占位成员，并非真实成员）。`);
+  }
+
+  const fields = readProfileFields(flags);
+  if (Object.keys(fields).length === 0) {
+    throw new Error("请至少提供 --risk-tags / --stock-tags / --show-performance 之一。");
+  }
+
+  return withDb(options, (db) => {
+    const members = new MemberRepository(db);
+    const member = members.getById(memberId);
+    if (!member) {
+      throw new Error(`成员不存在：${memberId}。`);
+    }
+    if (member.status !== "active") {
+      throw new Error(`成员已被吊销，无法修改名片：${memberId}。`);
+    }
+
+    const updated = { ...member, ...fields };
+    members.upsert(updated);
+
+    new AuditLogRepository(db).write("platform_members", "profile update", {
+      memberId,
+      ...fields
+    });
+
+    return { ok: true, member: updated };
+  });
 }
 
 export function runRevoke(flags, options = {}) {
@@ -257,6 +388,7 @@ export function runTokenRevoke(flags, options = {}) {
 const COMMANDS = {
   add: runAdd,
   list: runList,
+  profile: runProfile,
   revoke: runRevoke,
   "token issue": runTokenIssue,
   "token revoke": runTokenRevoke

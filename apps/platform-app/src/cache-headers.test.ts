@@ -203,8 +203,16 @@ const RECOGNISED_PATHNAME_USES: RegExp[] = [
 const RECOGNISED_SEGMENT_USES: RegExp[] = [
   /^segments\[\d+\]\s*(?:===|!==)\s*(?:"|[A-Za-z_$])/u,
   /^segments\[\d+\]\s*(?:as\s+string\s*)?[),;\]]/u,
-  /^segments\[\d+\]\s*(?:as\s+string\s*)?\s+in\s+[A-Za-z_$]/u
+  /^segments\[\d+\]\s*(?:as\s+string\s*)?\s+in\s+[A-Za-z_$]/u,
+  // `segments[i] as "theses" | "cards"` - a union assertion IS the enumeration
+  // of what that segment may be, so it is both a recognised form and a source of
+  // literals (see SEGMENT_UNION_ASSERTION in tokensFromSource). strategy.ts's
+  // tier promote/demote routes decide two segments this way.
+  /^segments\[\d+\]\s*as\s+"[^"]*"(?:\s*\|\s*"[^"]*")*/u
 ];
+
+/** Matches the union-assertion form above and captures its literal list. */
+const SEGMENT_UNION_ASSERTION = /segments\[\d+\]\s*as\s+("[^"]*"(?:\s*\|\s*"[^"]*")*)/gu;
 
 /**
  * Fails with file:line for any `pathname` / `segments[i]` usage the extractor
@@ -286,6 +294,12 @@ function tokensFromSource(relative: string, source: string): string[] {
       if (value !== undefined) {
         tokens.add(value);
       }
+    }
+  }
+
+  for (const match of source.matchAll(SEGMENT_UNION_ASSERTION)) {
+    for (const literal of (match[1] as string).matchAll(/"([^"]*)"/gu)) {
+      tokens.add(literal[1] as string);
     }
   }
 
@@ -389,6 +403,17 @@ const PROBES: Probe[] = [
   // up. Found by the strengthened enumeration (G4-a): the module special-cases
   // this path and nothing here had ever asked it for one.
   { module: "routes/member-card.ts", method: "GET", path: "/member/__legacy_system__", expectStatus: 404 },
+  // POST /member/<id>/profile - §1.8's "本人自己维护" edit of risk_tags /
+  // stock_tags / show_performance. Aimed at ANOTHER member's id on purpose: the
+  // 403 refusal is a per-viewer answer about a private resource, so it needs the
+  // same no-store headers as the 200, and this is the probe the strengthened
+  // enumeration demanded when the route was added.
+  {
+    module: "routes/member-card.ts",
+    method: "POST",
+    path: `/member/${OTHER_MEMBER_ID}/profile`,
+    expectStatus: 403
+  },
   // routes/feishu-callback.ts - Feishu's own server calls this, so it is the
   // one route besides /login that must answer WITHOUT an identity. With no
   // signing key configured (this suite sets none) it fails closed at 503,
