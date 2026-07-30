@@ -5,7 +5,12 @@ import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveRuntimePaths } from "../../../packages/shared-types/dist/index.js";
+import {
+  openTradingDatabase,
+  resolveRuntimePaths,
+  sendInteractiveCard
+} from "../../../packages/shared-types/dist/index.js";
+import { SCHEDULED_JOB_DAILY_BACKUP, runScheduledJobWithHeartbeat } from "./scheduled-job-heartbeat.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 
@@ -257,6 +262,40 @@ export function parseRetentionDaysArg(rawValue, defaultValue = 30) {
   return parsed;
 }
 
+/**
+ * Task 24 (2026-07-28 spec-drift remediation): runs `runBackup` inside the
+ * shared scheduled-job heartbeat so com.alphaloop.daily-backup finally leaves
+ * a run_log trace and escalates after three consecutive failures.
+ *
+ * The heartbeat needs its own connection to the trading database, and
+ * `openTradingDatabase` CREATES the file when it is missing. runBackup's very
+ * first act is to refuse a missing database ("Trading database not found"), so
+ * opening one unconditionally would turn that honest refusal into a silent
+ * "backed up a freshly created, empty database". Hence the existsSync guard:
+ * with no database there is also nowhere to write a heartbeat, and the run
+ * falls through to the un-instrumented path with its original error.
+ */
+async function runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot }) {
+  const body = () => runBackup({ dbPath, dest, retentionDays, memorydRoot });
+  if (!existsSync(dbPath)) {
+    return body();
+  }
+  const db = openTradingDatabase(dbPath);
+  try {
+    return await runScheduledJobWithHeartbeat(
+      db,
+      {
+        job: SCHEDULED_JOB_DAILY_BACKUP,
+        inputs: [{ dest, retentionDays }],
+        sendCard: (card) => sendInteractiveCard(card, { operator: true })
+      },
+      body
+    );
+  } finally {
+    db.close();
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const dest = resolve(readFlagValue(args, "--dest") ?? join(repoRoot, "runtime", "backups"));
@@ -265,7 +304,7 @@ async function main() {
 
   try {
     const retentionDays = parseRetentionDaysArg(readFlagValue(args, "--retention-days"));
-    const result = runBackup({ dbPath, dest, retentionDays, memorydRoot });
+    const result = await runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot });
     console.log(JSON.stringify(result));
   } catch (error) {
     console.log(JSON.stringify({

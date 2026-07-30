@@ -1241,6 +1241,91 @@ describe("alerts-poller-health check (task H2)", () => {
   });
 });
 
+// Task 24 (2026-07-28 spec-drift remediation). The run_log half for the three
+// scheduled daemons that had no heartbeat at all until this task - see
+// checkScheduledJobHeartbeats' own header for the mini measurement that
+// motivated it.
+describe("scheduled-job-heartbeat check (Task 24)", () => {
+  const SATURDAY_NOON = Date.parse("2026-07-11T12:00:00.000Z"); // outside market hours
+
+  function snapshotWith(dbPath: string, nowMs = SATURDAY_NOON) {
+    return {
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs,
+      dbPath
+    };
+  }
+
+  it("warns for every scheduled job that has no run_log row while its launchd label is loaded", async () => {
+    const dir = makeTempDir("alphaloop-doctor-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(dbPath));
+
+    for (const job of ["daily-backup", "official-paper-poll", "official-paper-pnl"]) {
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: `scheduled-job-heartbeat.${job}.never_ran`, severity: "warn" })
+      ]));
+    }
+  });
+
+  it("says nothing about a job whose launchd label is not loaded on this machine", async () => {
+    const dir = makeTempDir("alphaloop-doctor-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...snapshotWith(dbPath),
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.filter((job) => job.label !== "com.alphaloop.daily-backup")
+    });
+
+    expect(report.findings.some((entry) => entry.code === "scheduled-job-heartbeat.daily-backup.never_ran")).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "scheduled-job-heartbeat.official-paper-poll.never_ran" })
+    ]));
+  });
+
+  it("warns when a job's heartbeat has gone stale, and stays quiet while it is fresh", async () => {
+    const dir = makeTempDir("alphaloop-doctor-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    // official-paper-poll is hourly; 3h is its stale threshold.
+    recordJobRun(db, { job: "official-paper-poll", startedAt: "2026-07-11T11:30:00.000Z", ok: true });
+    recordJobRun(db, { job: "official-paper-pnl", startedAt: "2026-07-11T04:00:00.000Z", ok: true });
+    db.close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(dbPath));
+
+    expect(report.findings.some((entry) => entry.code === "scheduled-job-heartbeat.official-paper-poll.stale")).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "scheduled-job-heartbeat.official-paper-pnl.stale", severity: "warn" })
+    ]));
+  });
+
+  it("fails the report when a scheduled job has 3+ consecutive failed runs", async () => {
+    const dir = makeTempDir("alphaloop-doctor-db-");
+    const dbPath = join(dir, "trading.sqlite");
+    const db = openTradingDatabase(dbPath);
+    for (let i = 0; i < 3; i += 1) {
+      recordJobRun(db, { job: "daily-backup", startedAt: `2026-07-11T1${i}:00:00.000Z`, ok: false, failedStep: "run" });
+    }
+    db.close();
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(dbPath));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "scheduled-job-heartbeat.daily-backup.consecutive_failures", severity: "error" })
+    ]));
+  });
+});
+
 // Phase 3 Task 8: platform-app is a KeepAlive HTTP service (unlike the two
 // periodic jobs above) - launchd-jobs above only proves it's *loaded*, this
 // check proves its /health route actually answers. Covers all three

@@ -38,6 +38,7 @@
 | 提醒误报反馈 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/market-alerts.mjs feedback --actor <member-id> --event <event-id> [--note <备注>]` |
 | 标的池：设置自己的（整组替换） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/stock-analysis.mjs targets --owner <member-id> AAPL MSFT NVDA`（pnpm 别名：`pnpm stock-analysis:targets`） |
 | 标的池：查看 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/stock-analysis.mjs list-targets`（pnpm 别名：`pnpm stock-analysis:list-targets`） |
+| 按需分析某只标的（「帮我看看 NVDA」） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/stock-analysis.mjs analyze <SYMBOL>`（一次只能一只，例如 `analyze NVDA.US`）。输出是单行 JSON，`markdown` 字段是完整分析正文，照实转述给成员。**这是只读的按需分析**：不写入公共分析库、不记预测，正文由确定性事实直接生成、没有叠加模型叙述——转述时把 `note` 里这层限定一并说明，并告诉成员公开版在平台 `/stock/<SYMBOL>` 页面。取不到行情时命令会以中文报错退出，如实转述，不要改用记忆里的旧价格作答。 |
 | 交易提案：发起（自己的盘） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/proposals.mjs create --owner <member-id> --symbol <SYMBOL> --side <buy\|sell> --quantity <数量> --reason <理由> [--limit-price N] [--stop-loss N] [--invalidation 文本] [--confidence N]` |
 | 交易提案：查询 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/proposals.mjs list --owner <member-id> [--status <状态>]` |
 | 策略记忆：论点（thesis） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs thesis <create\|judge\|promote\|withdraw\|from-conclusion> --owner <member-id> ...`（`create` 支持 `--visibility` 指定三档可见性，默认圈内可见；用户说"公开记一条策略"就传对应档位） |

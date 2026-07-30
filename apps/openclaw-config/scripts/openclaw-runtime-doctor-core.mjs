@@ -30,6 +30,10 @@ import {
 } from "./stock-analysis-freshness.mjs";
 import { buildManagedOpenClawCronJobs } from "./openclaw-cron-jobs.mjs";
 import { CRON_JOB_MARKET_ALERTS } from "./openclaw-cron-runner-state.mjs";
+import {
+  SCHEDULED_JOB_ESCALATION_THRESHOLD,
+  SCHEDULED_LAUNCHD_JOBS
+} from "./scheduled-job-heartbeat.mjs";
 import { getZonedParts, isUsRegularMarketHours } from "./trading-schedule.mjs";
 
 // Round 6 moved the residency contract and the judgement built on it into
@@ -357,6 +361,7 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "runner-recent-failures", run: () => checkRecentRunnerFailures(recentRunnerResults) },
     { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot, nowMs) },
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
+    { name: "scheduled-job-heartbeat", run: () => checkScheduledJobHeartbeats(snapshot, nowMs) },
     { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
     { name: "broker-executor-health", run: () => checkBrokerExecutorHealth(snapshot) },
     { name: "daily-backup-health", run: () => checkDailyBackupHealth(snapshot, nowMs) },
@@ -1918,6 +1923,71 @@ function checkAlertsPollerHealth(snapshot, nowMs) {
   }));
 
   return findings;
+}
+
+// Task 24 (2026-07-28 spec-drift remediation) - "scheduled-job-heartbeat".
+//
+// checkAlertsPollerHealth above did this for exactly one job, `market-alerts`,
+// because until this task that was the only SCHEDULED launchd job that wrote
+// run_log rows at all. Measured read-only on the live mini on 2026-07-29:
+// run_log held rows for market-alerts / proposal-sweep / daily / stock-analysis
+// / weekly and NOTHING for com.alphaloop.daily-backup or the two official-paper
+// daemons, so "launchd never fired it" and "it threw on every tick for a week"
+// were the same observation - no rows.
+//
+// This is the run_log half for the other three. It is deliberately NOT a
+// replacement for daily-backup-health / official-paper-health, which read the
+// ARTIFACTS those jobs are supposed to produce: a job can tick happily and
+// still produce nothing (checkStockAnalysisHealth's own header documents that
+// exact failure), and conversely a job can be un-fired by launchd while
+// yesterday's artifact still looks fresh. The two halves answer different
+// questions and both are needed.
+//
+// Gated on the label actually being loaded in launchd, like every other job
+// check here - on a machine that never installed the daemons, "no heartbeat"
+// is the correct state, not a symptom.
+function checkScheduledJobHeartbeats(snapshot, nowMs) {
+  if (!snapshot.dbPath) {
+    return [];
+  }
+  const loaded = SCHEDULED_LAUNCHD_JOBS.filter((entry) => isLaunchdJobLoaded(snapshot, entry.label));
+  if (loaded.length === 0) {
+    return [];
+  }
+
+  return withReadOnlyTradingDb(snapshot.dbPath, "scheduled-job-heartbeat", "定时任务 run_log", (db) => {
+    const findings = [];
+    for (const entry of loaded) {
+      const lastRun = lastRunAt(db, entry.job);
+      if (lastRun === null) {
+        findings.push(warn(
+          `scheduled-job-heartbeat.${entry.job}.never_ran`,
+          `${entry.label} 已加载，但 run_log 里没有任何 job=${entry.job} 的记录——launchd 可能从未真正触发过它，`
+            + `也可能它每次都在写心跳之前就崩了。请看该任务的 launchd 错误日志。`
+        ));
+        continue;
+      }
+
+      const lastRunMs = Date.parse(lastRun);
+      if (!Number.isFinite(lastRunMs) || nowMs - lastRunMs > entry.staleAfterMs) {
+        findings.push(warn(
+          `scheduled-job-heartbeat.${entry.job}.stale`,
+          `${entry.displayName}（${entry.label}）最近一次 run_log 心跳是 ${lastRun}，`
+            + `已超过 ${Math.round(entry.staleAfterMs / 3_600_000)} 小时没有新记录——该任务可能已停止运行。`
+        ));
+      }
+
+      const consecutiveFailures = consecutiveFailureCount(db, entry.job);
+      if (consecutiveFailures >= SCHEDULED_JOB_ESCALATION_THRESHOLD) {
+        findings.push(error(
+          `scheduled-job-heartbeat.${entry.job}.consecutive_failures`,
+          `${entry.displayName}（${entry.label}）已连续失败 ${consecutiveFailures} 次`
+            + `（阈值 ${SCHEDULED_JOB_ESCALATION_THRESHOLD}）。该任务自己也应该已经发出过升级卡片。`
+        ));
+      }
+    }
+    return findings;
+  });
 }
 
 // task H2 fix round (this task, CRITICAL finding): isUsRegularMarketHours

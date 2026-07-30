@@ -1,16 +1,18 @@
 # Skill 接入流程（§5.3）
 
-> Phase 7 Task 4 交付物。这份文档描述**操作员**（圈主/管理员）怎么给一个新成员
-> 开通 skill 写权限，以及**成员**本人怎么把 skill 配置填好并自证可用。真实分发
-> 到成员本机、真实计时是 P10（本文档先把流程钉死，分发机制留给 P10）。
+> 这份文档描述**操作员**（圈主/管理员）怎么给一个新成员开通 skill 写权限，
+> 以及**成员**本人怎么把 skill 配置填好并自证可用。
 
 ## 前提
 
 - 操作员能访问运行 AlphaLoop 的机器（trading db 所在主机），并且能执行仓库根目录
   下的 `node` 脚本。
-- 成员已经知道 AlphaLoop platform-app 对外的地址
-  （本地/圈内阶段是 `http://127.0.0.1:4314`；P10 接入 Cloudflare Access 隧道后
-  会换成团队域名下的 HTTPS 地址 —— 两种情况下 `api.baseUrl` 都指向这同一个地址）。
+- 成员已经知道 AlphaLoop platform-app 的公网地址：`https://reports.qingverse.com`
+  （经 Cloudflare Tunnel 暴露，机器上跑的是 `com.cloudflare.cloudflared` 系统
+  daemon）。在机器本机上调试时也可以用 `http://127.0.0.1:4314`——两者是同一个
+  服务，`api.baseUrl` 填公网地址即可。
+  登录**没有**接 Cloudflare Access：浏览器走的是自建的邮箱验证码登录
+  （`GET /login`，登录码经飞书单聊发给本人），skill 走 bearer token。
 
 ## 第一步（操作员）：`members.mjs add` 新增成员
 
