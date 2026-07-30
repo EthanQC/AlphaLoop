@@ -58,7 +58,33 @@ export function resolveSnapshotOwnerId(db) {
   return activeMembers.length === 1 ? activeMembers[0].id : SHARED_OWNER_SENTINEL;
 }
 
-async function pollOfficialPaper(db, forceRun = false) {
+// 2026-07-30, found by following the FIRST live order end to end: nothing
+// scheduled reconcile-official-paper-orders.mjs. It had a package.json entry
+// (`longbridge:reconcile-official-paper`) and two doc comments describing when
+// it runs, but no launchd job, no openclaw cron entry and no other caller -
+// proposal-sweep only expires pending proposals. So a submitted order that
+// FILLED would sit as `submitted|New` in official_paper_order_lifecycle
+// forever: no execution report, nothing on the owner's personal page, and the
+// operator's approved trade silently never confirmed. The hourly poll is the
+// right host: it already runs exactly during US regular hours (the only time
+// fills happen), already holds the Longbridge session, and a reconcile needs
+// the same freshness the snapshot does. Reconcile failure must not cost the
+// snapshot - the two results are reported separately, never merged.
+async function reconcileAfterPoll(db) {
+  try {
+    const { reconcileOfficialPaperOrders } = await import("./reconcile-official-paper-orders.mjs");
+    const result = await reconcileOfficialPaperOrders(db);
+    return { ok: true, ...result };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Exported (2026-07-30) so the reconcile wiring is testable at the seam that
+// broke: `deps.perMember` / `deps.reconcile` are injection points ONLY - the
+// CLI dispatch below passes neither, so production always runs the real pair.
+export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
+  const { reconcile = reconcileAfterPoll, perMember = pollOfficialPaperPerMember } = deps;
   if (!forceRun && !shouldRunOfficialPaperHourlyPoll(new Date())) {
     console.log(JSON.stringify({ skipped: true, reason: "outside_us_hourly_poll_window" }, null, 2));
     return;
@@ -73,9 +99,10 @@ async function pollOfficialPaper(db, forceRun = false) {
   // reflection this per-member branch deliberately does NOT generate yet -
   // per-member reflections are a P7/control-agent concern, out of this
   // task's scope).
-  const perMemberResults = await pollOfficialPaperPerMember(db);
+  const perMemberResults = await perMember(db);
   if (perMemberResults) {
-    console.log(JSON.stringify({ polled: true, perMember: true, snapshots: perMemberResults }, null, 2));
+    const reconcileResult = await reconcile(db);
+    console.log(JSON.stringify({ polled: true, perMember: true, snapshots: perMemberResults, reconcile: reconcileResult }, null, 2));
     return;
   }
 
@@ -89,7 +116,8 @@ async function pollOfficialPaper(db, forceRun = false) {
     VALUES (?, ?, ?, ?, ?)
   `).run(reflectionId, snapshotId, snapshot.fetchedAt, reflection.summary, JSON.stringify(reflection));
 
-  console.log(JSON.stringify({ polled: true, snapshotId, reflectionId, summary: reflection.summary }, null, 2));
+  const reconcileResult = await reconcile(db);
+  console.log(JSON.stringify({ polled: true, snapshotId, reflectionId, summary: reflection.summary, reconcile: reconcileResult }, null, 2));
 }
 
 // Task 6 (2026-07-15 phase6 plan): per-member polling loop. For every

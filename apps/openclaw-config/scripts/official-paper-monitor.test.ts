@@ -1192,3 +1192,51 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
     expect(text).toContain("1200.00 USD");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Reconcile wiring (2026-07-30). Found by following the FIRST live order end
+// to end: reconcile-official-paper-orders.mjs had a package.json entry and doc
+// comments describing its schedule, but NO caller anywhere - so a filled order
+// would sit `submitted|New` forever and the owner's approved trade would never
+// be confirmed on any surface. The hourly poll now runs it; these tests hold
+// the wiring at the injection seam so it cannot silently detach again.
+// ---------------------------------------------------------------------------
+describe("pollOfficialPaper runs reconciliation after every successful poll", () => {
+  it("calls reconcile once after the per-member branch and reports its result separately", async () => {
+    const { db } = makeDb();
+    const calls: string[] = [];
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (line: unknown) => { logs.push(String(line)); };
+    try {
+      await officialPaperMonitor.pollOfficialPaper(db, true, {
+        perMember: async () => { calls.push("perMember"); return [{ memberId: "member_1", snapshotId: "snap_1" }]; },
+        reconcile: async () => { calls.push("reconcile"); return { ok: true, confirmed: 1 }; }
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    expect(calls).toEqual(["perMember", "reconcile"]);
+    const payload = JSON.parse(logs.join("\n"));
+    expect(payload.reconcile).toEqual({ ok: true, confirmed: 1 });
+    expect(payload.polled).toBe(true);
+  });
+
+  it("a failing reconcile is reported, never thrown - the snapshot must not be lost to it", async () => {
+    const { db } = makeDb();
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (line: unknown) => { logs.push(String(line)); };
+    try {
+      await officialPaperMonitor.pollOfficialPaper(db, true, {
+        perMember: async () => [{ memberId: "member_1", snapshotId: "snap_1" }],
+        reconcile: async () => ({ ok: false, error: "长桥不可达" })
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    const payload = JSON.parse(logs.join("\n"));
+    expect(payload.polled).toBe(true);
+    expect(payload.reconcile).toEqual({ ok: false, error: "长桥不可达" });
+  });
+});
