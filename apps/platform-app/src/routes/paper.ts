@@ -65,9 +65,10 @@ import {
   type SnapshotPosition,
   type SnapshotSeriesPoint
 } from "../data/snapshots.js";
+import { loadPositionDailyMoves, type PositionDailyMove } from "../data/stock-facts.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderEmptyState } from "../render/empty-state.js";
-import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
+import { describeDataDay, describeDataInstant, formatBeijingShortTime, formatPercentUnits } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { freshnessPillClass, renderPage, unknownDataTime, type Freshness } from "../render/layout.js";
 
@@ -132,6 +133,14 @@ const PAPER_PAGE_STYLE = trustedHtml(`<style>
 .positions-table td{border-bottom:1px dashed var(--line)}
 .positions-table td.num,.positions-table th.num{text-align:right}
 tr.degraded td{background:var(--amber-bg)}
+.move-list{display:flex;flex-direction:column;gap:6px}
+.move-row{display:flex;align-items:center;gap:8px;font-size:12.5px}
+.move-sym{flex:none;width:82px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.move-track{position:relative;flex:1 1 auto;min-width:0;height:14px;background:var(--card2);border-radius:3px}
+.move-axis{position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--line)}
+.move-bar{position:absolute;top:2px;bottom:2px;border-radius:2px;min-width:1px}
+.move-val{flex:none;width:66px;text-align:right}
+.move-note{flex:1 1 auto;color:var(--sub)}
 </style>`);
 
 function sendHtml(res: ServerResponse, status: number, body: string): void {
@@ -184,6 +193,31 @@ interface PaperViewData {
   series: SnapshotSeriesPoint[];
   kpis: PaperKpis;
   drawdown: DrawdownSegment | null;
+  /** 持仓当日涨跌 for the bar chart, one entry per held symbol, ordered
+   * largest-position-first (the same ordering the donut uses). Empty whenever
+   * `snapshot` is null or `canSeePerformance` is false - the bar chart is part
+   * of the SAME 战绩 surface the holdings table is, so it must never be
+   * reachable when that surface is withheld. */
+  dailyMoves: PositionDailyMove[];
+}
+
+/** Held symbols, largest market value first - the same price/quantity fallback
+ * ladder computePositionShares uses (live price, else cost price, else 0), so
+ * the bar chart and the donut can never disagree about what is held. */
+function positionSymbolsByValue(positions: readonly SnapshotPosition[]): string[] {
+  return positions
+    .map((p) => {
+      const price =
+        typeof p.price === "number" && Number.isFinite(p.price)
+          ? p.price
+          : typeof p.costPrice === "number" && Number.isFinite(p.costPrice)
+            ? p.costPrice
+            : 0;
+      const qty = typeof p.quantity === "number" && Number.isFinite(p.quantity) ? p.quantity : 0;
+      return { symbol: p.symbol, value: Math.max(0, price * qty) };
+    })
+    .sort((a, b) => b.value - a.value)
+    .map((p) => p.symbol);
 }
 
 /**
@@ -198,7 +232,7 @@ interface PaperViewData {
  */
 function loadPaperViewData(db: DatabaseSync, target: Member, canSeePerformance: boolean): PaperViewData {
   if (!canSeePerformance) {
-    return { visible: false, snapshot: null, series: [], kpis: computePaperKpis([]), drawdown: null };
+    return { visible: false, snapshot: null, series: [], kpis: computePaperKpis([]), drawdown: null, dailyMoves: [] };
   }
   const snapshot = loadLatestSnapshotForOwner(db, target.id);
   const series = loadSnapshotSeriesForOwner(db, target.id, SERIES_LIMIT);
@@ -207,7 +241,8 @@ function loadPaperViewData(db: DatabaseSync, target: Member, canSeePerformance: 
     snapshot,
     series,
     kpis: computePaperKpis(series),
-    drawdown: computeMaxDrawdownSegment(series)
+    drawdown: computeMaxDrawdownSegment(series),
+    dailyMoves: snapshot ? loadPositionDailyMoves(db, positionSymbolsByValue(snapshot.positions)) : []
   };
 }
 
@@ -509,13 +544,81 @@ function renderPositionsTableCard(snapshot: OwnerSnapshot | null): Html {
 }
 
 // ---------------------------------------------------------------------------
-// 持仓当日涨跌条形图 - honest placeholder (snapshots don't store prevClose)
+// 持仓当日涨跌条形图 (req §1.6)
+//
+// Until 2026-07-30 this card printed a fixed "数据不足——当日涨跌需行情接入
+// （P6）". Both halves of that sentence were wrong: P6 shipped weeks earlier,
+// and the quote data was never missing - report-facts.mjs has been writing a
+// signed `quote.pct` fact per (trading_day, symbol) all along (verified on the
+// deployed mini: `SELECT DISTINCT fact_key FROM stock_facts` lists
+// quote.pct/quote.last/quote.prevClose). The card simply never joined to it.
+//
+// Bars are divergent around a centre line, 绿涨红跌 per §1.3's colour rule,
+// scaled to the largest ABSOLUTE move in the set so the widest bar is always
+// full-width and the rest are read against it. A symbol with no usable
+// `quote.pct` gets its producer-supplied reason in words instead of a
+// zero-width bar (§0.4: a computed 0 is a fabrication).
 // ---------------------------------------------------------------------------
 
-function renderDailyMoveBarsCard(): Html {
+/** Half-width of the plot, in percent of the row - a +x% and a -x% move must
+ * draw the same length in opposite directions, so each side gets half. */
+const MOVE_BAR_HALF_WIDTH_PCT = 50;
+
+function renderDailyMoveRow(move: PositionDailyMove, scale: number): Html {
+  if (move.pct === null) {
+    return html`<div class="move-row">
+      <span class="move-sym">${move.symbol}</span>
+      <span class="move-note">${move.reason ?? "当日涨跌不可得"}</span>
+    </div>`;
+  }
+  const up = move.pct >= 0;
+  // `scale` is the largest absolute move in the set and is only ever used as a
+  // divisor here, where the caller has already guaranteed it is > 0.
+  const width = (Math.abs(move.pct) / scale) * MOVE_BAR_HALF_WIDTH_PCT;
+  const bar = up
+    ? html`<span class="move-bar" style="left:50%;width:${width.toFixed(2)}%;background:var(--up)"></span>`
+    : html`<span class="move-bar" style="right:50%;width:${width.toFixed(2)}%;background:var(--down)"></span>`;
+  return html`<div class="move-row">
+    <span class="move-sym">${move.symbol}</span>
+    <span class="move-track"><span class="move-axis"></span>${bar}</span>
+    <span class="move-val mono ${up ? "u" : "d"}">${formatPercentUnits(move.pct)}</span>
+  </div>`;
+}
+
+function renderDailyMoveBarsCard(moves: readonly PositionDailyMove[], now: Date): Html {
+  if (moves.length === 0) {
+    return html`<section class="card w2 dt-w2">
+      <h2>持仓当日涨跌</h2>
+      ${renderEmptyState("没有持仓，画不出当日涨跌。", "这张图按最近一次快照里的持仓逐只取当日涨跌幅；空仓时没有可画的条目。")}
+    </section>`;
+  }
+  const scale = Math.max(...moves.map((move) => (move.pct === null ? 0 : Math.abs(move.pct))));
+  const plottable = moves.filter((move) => move.pct !== null);
+  if (plottable.length === 0 || scale <= 0) {
+    // Either nothing has a quote, or every quote says exactly 0.00% - in both
+    // cases there is no bar length to scale against. Say which, don't draw.
+    return html`<section class="card w2 dt-w2">
+      <h2>持仓当日涨跌</h2>
+      ${renderEmptyState(
+        plottable.length === 0 ? "持仓都取不到当日涨跌。" : "持仓当日涨跌全为 0.00%，没有可画的长度。",
+        plottable.length === 0
+          ? "逐只原因见下方；这里不会用 0% 代替取不到。"
+          : "条形按最大绝对涨跌幅缩放；全为 0 时任何一根都没有长度。"
+      )}
+      <div class="move-list" style="margin-top:8px">${joinHtml(moves.map((move) => renderDailyMoveRow(move, 1)))}</div>
+    </section>`;
+  }
+  // Every plottable row shares one trading day in practice (one snapshot, one
+  // day's facts), but do not assume it: label the newest and let the rest be
+  // read from their own rows if they ever diverge.
+  const days = [...new Set(plottable.map((move) => move.tradingDay).filter((day): day is string => day !== null))].sort();
+  const newest = days.at(-1);
   return html`<section class="card w2 dt-w2">
     <h2>持仓当日涨跌</h2>
-    <p style="font-size:13px;color:var(--sub)">数据不足——当日涨跌需行情接入（P6）</p>
+    <p style="font-size:11.5px;color:var(--sub);margin:-2px 0 8px">
+      ${newest ? `数据日：${describeDataDay(newest, now)}` : "数据日未知"}${days.length > 1 ? `（另含 ${days.length - 1} 个更早的数据日）` : ""}
+    </p>
+    <div class="move-list">${joinHtml(moves.map((move) => renderDailyMoveRow(move, scale)))}</div>
   </section>`;
 }
 
@@ -666,7 +769,7 @@ function renderProposalsHistoryCard(proposals: ProposalHistoryRow[]): Html {
       ? joinHtml(proposals.map(renderProposalHistoryRow))
       : renderEmptyState(
           "你还没有任何提案记录。",
-          "提案在收盘后自动生成（每次 0-2 条，0 条也是合法结果），也可以在飞书里直接说「给我出一条 NVDA 的提案」；审批卡发到你的飞书单聊，24 小时无操作自动作废。无已批准提案的下单请求会被服务端拒绝。"
+          "现在提案只有一条产生路径：在飞书里说一句「给我出一条 NVDA 的提案」。收盘后自动出提案（每次 0-2 条）还没接上，所以不开盘也不会自己冒出提案来。提出后审批卡发到你的飞书单聊，24 小时无操作自动作废；没有已批准提案的下单请求会被服务端拒绝。"
         );
   return html`<section class="card w2 dt-w4">
     <h2>提案与成交历史</h2>
@@ -738,7 +841,7 @@ function renderPaperPage(
 
     bodyHtml = html`<div class="bento">${renderMemberSwitcherCard(members, viewer.id, viewer.id)}</div>
       <div class="bento" style="margin-top:10px">${renderKpiRowCard(self.kpis)}</div>
-      <div class="bento" style="margin-top:10px">${curveCard}${renderDailyMoveBarsCard()}</div>
+      <div class="bento" style="margin-top:10px">${curveCard}${renderDailyMoveBarsCard(self.dailyMoves, now)}</div>
       <div class="bento" style="margin-top:10px">${renderPositionsTableCard(self.snapshot)}</div>
       <div class="bento" style="margin-top:10px">${renderPositionDonutCard(self.snapshot)}${proposalsCard}</div>
       ${PAPER_PAGE_STYLE}`;
@@ -751,7 +854,7 @@ function renderPaperPage(
 
     const contentHtml = canSeePerformance
       ? html`<div class="bento" style="margin-top:10px">${renderKpiRowCard(data.kpis)}</div>
-        <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown)}${renderDailyMoveBarsCard()}</div>
+        <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown)}${renderDailyMoveBarsCard(data.dailyMoves, now)}</div>
         <div class="bento" style="margin-top:10px">${renderPositionsTableCard(data.snapshot)}</div>
         <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${proposalsCard}</div>`
       : html`<div class="bento" style="margin-top:10px">${renderHiddenPerformanceCard(viewed)}</div>`;

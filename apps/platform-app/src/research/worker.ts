@@ -196,11 +196,15 @@ function loadResearchEngine(): Promise<ResearchEngineModule> {
 // factories).
 // ---------------------------------------------------------------------------
 
-/** Mirrors data/memoryd-mirror.ts's `createMemorydBackend()` exactly: a
- * documented, P10-gated placeholder callers can already wire in the SHAPE of
- * today, which simply re-throws research-engine.mjs's own "P10 ignition"
- * error the first time it's actually invoked (i.e. the first news query a
- * real run attempts) - never at construction time. */
+/** The production research backend: a thin lazy wrapper around
+ * research-engine.mjs's own `createResearchBackend()`, which is LIVE wiring
+ * over the shared OpenClaw gateway client (`_openclaw-gateway.mjs`) and issues
+ * a real `complete()` call per planned query. Nothing here is a placeholder,
+ * and nothing throws at construction time: the engine module is imported (and
+ * the per-task backend built) on the FIRST query, so a missing gateway
+ * token/unreachable gateway surfaces as a gateway error inside the pipeline -
+ * which research-engine.mjs turns into a `degraded` run with whatever evidence
+ * it already had, never a crashed worker. */
 export function createDefaultResearchBackend(): ResearchBackend {
   return async (planned) => {
     const engine = await loadResearchEngine();

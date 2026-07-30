@@ -40,10 +40,10 @@ const db = openTradingDatabase(dbPath);
 const port = Number(process.env.PLATFORM_APP_PORT ?? 4314);
 
 // Phase 8 Task 3 (2026-07-16 plan): the real in-process research worker,
-// wired to real collaborators - a P10-gated research backend (throws until
-// P10 stands up the real restricted OpenClaw gateway; the worker itself
-// already turns that throw into a gracefully `degraded`/`failed` task, never
-// a crash - see research/worker.ts), a stock_facts quote reader, and a
+// wired to real collaborators - a LIVE research backend (research-engine.mjs's
+// createResearchBackend over the shared OpenClaw gateway client; a gateway
+// failure becomes a gracefully `degraded`/`failed` task, never a crash - see
+// research/worker.ts), a stock_facts quote reader, and a
 // data/strategy.ts-backed memory reader (owner-pre-bound per claimed task by
 // the worker itself, never a free scope param). `symbolUniverse` is the
 // circle's full tracked-symbol pool (data/news.ts's `listFilterSymbols` -

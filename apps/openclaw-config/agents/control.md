@@ -41,9 +41,9 @@
 | 按需分析某只标的（「帮我看看 NVDA」） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/stock-analysis.mjs analyze <SYMBOL>`（一次只能一只，例如 `analyze NVDA.US`）。输出是单行 JSON，`markdown` 字段是完整分析正文，照实转述给成员。**这是只读的按需分析**：不写入公共分析库、不记预测，正文由确定性事实直接生成、没有叠加模型叙述——转述时把 `note` 里这层限定一并说明，并告诉成员公开版在平台 `/stock/<SYMBOL>` 页面。取不到行情时命令会以中文报错退出，如实转述，不要改用记忆里的旧价格作答。 |
 | 交易提案：发起（自己的盘） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/proposals.mjs create --owner <member-id> --symbol <SYMBOL> --side <buy\|sell> --quantity <数量> --reason <理由> [--limit-price N] [--stop-loss N] [--invalidation 文本] [--confidence N]` |
 | 交易提案：查询 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/proposals.mjs list --owner <member-id> [--status <状态>]` |
-| 策略记忆：论点（thesis） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs thesis <create\|judge\|promote\|withdraw\|from-conclusion> --owner <member-id> ...`（`create` 支持 `--visibility` 指定三档可见性，默认圈内可见；用户说"公开记一条策略"就传对应档位） |
+| 策略记忆：论点（thesis） | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs thesis <create\|judge\|promote\|demote\|withdraw\|from-conclusion> --owner <member-id> ...`（`create` 支持 `--visibility` 指定三档可见性，默认圈内可见；用户说"公开记一条策略"就传对应档位。`demote` 是把公开档降回「系统可用」——已经发出去的报告/名片内容不会回收，命令自己会返回这句话，照实转述） |
 | 策略记忆：纪律规则 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs rule <create\|enable\|disable\|list> --owner <member-id> ...` |
-| 策略记忆：策略卡 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs card <create\|status\|promote\|list> --owner <member-id> ...` |
+| 策略记忆：策略卡 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/strategy.mjs card <create\|status\|promote\|demote\|list> --owner <member-id> ...`（`demote` 同样只降档不回收历史） |
 | 月度复盘：生成 / 查询 / 查看 | `node {{REPO_ROOT}}/apps/openclaw-config/scripts/reviews.mjs <generate\|list\|show> --owner <member-id> ...`（`confirm` 只在成员本人明确要求确认自己的复盘时执行） |
 | 行情 / 持仓 / 资产查询（只读） | `~/.local/bin/longbridge <quote\|assets\|positions\|watchlist\|news\|finance-calendar\|order-list\|order-executions\|order-detail\|check> ...`（例如 `~/.local/bin/longbridge quote NVDA.US`；**禁止**使用 `longbridge order submit`，下单必须走提案审批流） |
 | 站内研究（深度研判） | 平台研究接口 `POST http://127.0.0.1:4314/api/research`，body `{"question":"..."}`，携带该成员的 `Authorization: Bearer <token>`（归属由 token 决定）；没有可用 token 时，引导成员去平台站内研究入口自己提交 |

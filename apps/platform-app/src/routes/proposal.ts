@@ -17,10 +17,13 @@
  *      codes are meant to disagree, not to be indistinguishable.).
  *   4. Row exists AND `owner_id === viewer.id` -> render the full page.
  *
- * The empty `proposals` table today (P6 hasn't shipped proposal creation
- * yet) means every real id 404s in production right now - but the 403 code
- * path must exist and be exercised with seeded rows in tests (plan: "空表
- * ...仍必须真实存在并测试").
+ * `proposals` is still empty on the deployed mini (measured 2026-07-30:
+ * `SELECT COUNT(*) FROM proposals` = 0), so every real id 404s there today.
+ * That is NOT because the write path is unshipped - proposals.mjs's `create`
+ * has shipped and the Feishu control agent can call it - it is because nothing
+ * generates proposals on a schedule yet, so no one has created one. The 403
+ * code path must exist and be exercised with seeded rows in tests regardless
+ * (plan: "空表 ...仍必须真实存在并测试").
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";

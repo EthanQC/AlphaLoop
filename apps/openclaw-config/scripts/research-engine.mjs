@@ -13,8 +13,12 @@
 // (news-agent-search.mjs) as closely as the (simpler) research-question
 // shape allows:
 //   - `createResearchBackend()` (bottom of this file) mirrors
-//     `createOpenclawSearchBackend` exactly: a documented, P10-gated throw.
-//     Every test in research-engine.test.ts instead injects a fake backend.
+//     `createOpenclawSearchBackend` exactly: a REAL backend over the shared
+//     `_openclaw-gateway.mjs` client (one `complete()` call per planned
+//     query). It does NOT throw - it is live production wiring, and the only
+//     way it degrades is the way any gateway failure degrades (see
+//     `executeResearchQueries`). Every test in research-engine.test.ts
+//     injects a fake backend instead, so no test touches the network.
 //   - the backend's raw text is defused (defuseMarkdownInText, report-
 //     news.mjs #29) before it is ever adopted for rendering, AND the raw
 //     pre-defuse text is separately quarantined behind the SAME

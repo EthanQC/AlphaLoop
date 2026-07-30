@@ -449,4 +449,97 @@ describe("paper route (GET /paper)", () => {
     expect(body).toContain('aria-disabled="true"');
     expect(body).toContain("对方未公开战绩");
   });
+
+  // -------------------------------------------------------------------------
+  // 持仓当日涨跌条形图 (req §1.6) - 2026-07-30. This card used to print a fixed
+  // 「数据不足——当日涨跌需行情接入（P6）」 no matter what was in the database.
+  // Facts are written by the PRODUCER (report-facts.mjs's buildStockFacts +
+  // persistStockFacts, the pair stock-analysis.mjs calls) from a real
+  // Longbridge quote payload - see data/position-daily-move.test.ts's header
+  // for why a hand-written INSERT would not prove anything here.
+  // -------------------------------------------------------------------------
+
+  async function produceQuoteFacts(symbol: string, quote: Record<string, unknown>, tradingDay: string): Promise<void> {
+    // eslint-disable-next-line import/no-unresolved -- plain .mjs, no dist
+    const reportFacts = await import("../../../openclaw-config/scripts/report-facts.mjs");
+    const facts = reportFacts.buildStockFacts({
+      symbol,
+      quote,
+      history: {},
+      fundamentals: {},
+      optionChain: {},
+      news: [],
+      tradingDay
+    });
+    reportFacts.persistStockFacts(db, tradingDay, symbol, facts);
+  }
+
+  it("draws a bar per holding, 绿涨红跌, with the number the producer computed", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1100,
+      positions: [
+        { symbol: "TSM.US", quantity: 10, price: 394.525, priceSource: "live" },
+        { symbol: "NVDA.US", quantity: 5, price: 180, priceSource: "live" }
+      ]
+    });
+    await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
+    await produceQuoteFacts("NVDA.US", { last: 180, prev_close: 175, volume: 1000 }, "2026-07-14");
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("持仓当日涨跌");
+    // The falling holding is red and signed negative; the rising one is green.
+    expect(body).toContain("-2.20%");
+    expect(body).toContain("+2.86%");
+    expect(body).toContain("background:var(--down)");
+    expect(body).toContain("background:var(--up)");
+    // TSM is the larger position, so it comes first (same ordering as the donut).
+    expect(body.indexOf("TSM.US")).toBeLessThan(body.indexOf("NVDA.US"));
+    // The stale phase-name placeholder is gone for good.
+    expect(body).not.toContain("当日涨跌需行情接入");
+  });
+
+  it("says WHY a holding has no 当日涨跌 instead of drawing it at 0%", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1100,
+      positions: [
+        { symbol: "TSM.US", quantity: 10, price: 394.525, priceSource: "live" },
+        { symbol: "GOOG.US", quantity: 1, price: 200, priceSource: "live" }
+      ]
+    });
+    await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
+    // GOOG has no facts at all - a symbol the analysis batch never reached.
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("没有任何行情事实行");
+    // A missing quote must not be rendered as a flat 0.00% bar.
+    expect(body).not.toContain("+0.00%");
+  });
+
+  it("never queries another member's quote facts when they hide their performance", async () => {
+    const { token } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
+    new MemberRepository(db).upsert(
+      makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: false })
+    );
+    seedSnapshot(db, {
+      ownerId: "member_b",
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 5000,
+      positions: [{ symbol: "TSM.US", quantity: 99, price: 394.525, priceSource: "live" }]
+    });
+    await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
+
+    const body = await (await authed("/paper?member=member_b", token)).text();
+
+    expect(body).toContain("对方未公开战绩");
+    expect(body).not.toContain("持仓当日涨跌");
+    expect(body).not.toContain("-2.20%");
+  });
 });

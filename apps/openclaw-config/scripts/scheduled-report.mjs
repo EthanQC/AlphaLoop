@@ -2470,12 +2470,12 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
   const marketNews = marketNewsResult.articles;
   const macroEvents = macroCalendarResult.entries;
 
-  // Phase 4 Task 7: L2 topic search, budget by report kind (Global
-  // Constraints: daily <=30, weekly <=60). The real OpenClaw backend is a
-  // P10 placeholder (createOpenclawSearchBackend always throws today), so
-  // this degrades on every run until P10 ignition - that degradation is a
-  // first-class, disclosed state (header marker + warnings bullet), not a
-  // crash.
+  // Phase 4 Task 7: L2 topic search, budget by report kind (§0.4: daily <=30,
+  // weekly <=60). `runNewsAgentSearch` resolves its own default backend -
+  // news-agent-search.mjs's createOpenclawSearchBackend, LIVE gateway wiring,
+  // not a throwing placeholder. When the gateway is unreachable or answers
+  // unparseably, the run degrades instead of crashing, and the degradation is
+  // a first-class disclosed state (header marker + warnings bullet).
   const newsSearch = await runNewsAgentSearch({
     symbols: trackedSymbols,
     l1Titles: marketNews.map((article) => article.title),

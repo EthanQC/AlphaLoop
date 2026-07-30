@@ -86,3 +86,64 @@ export function loadLatestFactSheet(db: DatabaseSync, symbol: string): SymbolFac
   }
   return { tradingDay, byKey };
 }
+
+/**
+ * One position's 当日涨跌 for §1.6's 持仓当日涨跌条形图.
+ *
+ * `pct` is the PRODUCER's own `quote.pct` fact - report-facts.mjs's
+ * `buildStockQuoteFacts` computes it as `(last - prevClose) / prevClose * 100`
+ * and stores it with `unit = 'pct'` (a SIGNED percentage, per that function's
+ * own comment). This module never recomputes it: recomputing from `quote.last`
+ * and `quote.prevClose` here would be a second implementation of the same
+ * arithmetic, free to drift from the one the reports print.
+ *
+ * `pct === null` is the honest "this symbol has no usable 当日涨跌 today" and
+ * carries the `reason` the caller must render instead of a bar. It is NEVER a
+ * zero: a flat bar and a missing quote must not look the same (§0.4).
+ */
+export interface PositionDailyMove {
+  symbol: string;
+  pct: number | null;
+  /** The fact's own trading day, so the caller can label/age it (§0.4). Null
+   * only when the symbol has no `stock_facts` rows at all. */
+  tradingDay: string | null;
+  /** The producer's own `data_time` for the quote row behind `pct`. */
+  dataTime: string | null;
+  source: string | null;
+  /** Present exactly when `pct === null`. */
+  reason?: string;
+}
+
+/**
+ * Reads each symbol's newest `quote.pct` fact. Order of the input is
+ * preserved so the caller decides the bar order (the paper page sorts by
+ * market value, matching its own holdings table).
+ */
+export function loadPositionDailyMoves(db: DatabaseSync, symbols: readonly string[]): PositionDailyMove[] {
+  return symbols.map((symbol) => {
+    const sheet = loadLatestFactSheet(db, symbol);
+    if (!sheet) {
+      return { symbol, pct: null, tradingDay: null, dataTime: null, source: null, reason: "没有任何行情事实行" };
+    }
+    const fact = sheet.byKey.get("quote.pct");
+    if (!fact || fact.valueNum === null || !Number.isFinite(fact.valueNum)) {
+      return {
+        symbol,
+        pct: null,
+        tradingDay: sheet.tradingDay,
+        dataTime: fact?.dataTime ?? null,
+        source: fact?.source ?? null,
+        // The producer writes an explicit 数据不可得 source when the upstream
+        // quote lacked the inputs; surface that rather than inventing a reason.
+        reason: fact?.source && fact.source !== "" ? `当日涨跌不可得（${fact.source}）` : "当日涨跌不可得"
+      };
+    }
+    return {
+      symbol,
+      pct: fact.valueNum,
+      tradingDay: sheet.tradingDay,
+      dataTime: fact.dataTime,
+      source: fact.source
+    };
+  });
+}

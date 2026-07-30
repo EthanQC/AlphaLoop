@@ -42,6 +42,56 @@ describe("control agent 能力路由表", () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Subcommand COMPLETENESS, checked against the CLI's own dispatch table.
+  //
+  // The header above names "a subcommand the script never implements" as the
+  // hazard, but the reverse was the one that actually shipped: strategy.mjs
+  // grew `thesis demote` / `card demote` (§2.1 三档可见性 降档) and the route
+  // table was never updated, so the bot - which types only what this table
+  // tells it to - had no way to demote anything. A member asking "把这条降回
+  // 圈内" would have been told the capability does not exist.
+  //
+  // `COMMANDS` in strategy.mjs is the producer: its keys ARE the accepted
+  // subcommands. This reads them from the source rather than restating them,
+  // so adding a subcommand without routing it fails here.
+  // -------------------------------------------------------------------------
+  function declaredSubcommands(scriptRelative: string, group: string): string[] {
+    const source = readFileSync(join(repoRoot, scriptRelative), "utf8");
+    const table = source.slice(source.indexOf("const COMMANDS = {"));
+    const end = table.indexOf("};");
+    return [...table.slice(0, end).matchAll(/"([\w-]+) ([\w-]+)":/gu)]
+      .filter((match) => match[1] === group)
+      .map((match) => match[2] as string);
+  }
+
+  /** The `<a|b|c>` alternation the route table offers for one command prefix. */
+  function routedSubcommands(prefix: string): string[] {
+    const row = persona.split("\n").find((line) => line.includes(prefix)) ?? "";
+    const alternation = new RegExp(`${prefix} <([^>]+)>`, "u").exec(row);
+    return alternation ? (alternation[1] as string).split(/\\?\|/u).map((part) => part.trim()) : [];
+  }
+
+  for (const group of ["thesis", "card"]) {
+    it(`routes every strategy.mjs \`${group} …\` subcommand the CLI accepts`, () => {
+      const declared = declaredSubcommands("apps/openclaw-config/scripts/strategy.mjs", group);
+      expect(declared.length).toBeGreaterThan(1);
+      const routed = routedSubcommands(`strategy.mjs ${group}`);
+      for (const subcommand of declared) {
+        expect(routed, `strategy.mjs ${group} ${subcommand} is implemented but not routed`).toContain(subcommand);
+      }
+    });
+  }
+
+  it("tells the agent a demote does not claw back what was already published", () => {
+    // §2.1: 降档时已生成的历史内容不回收（如实告知）. The CLI returns that notice;
+    // the agent has to relay it rather than implying a public thesis can be
+    // un-published retroactively.
+    const rows = persona.split("\n").filter((line) => line.includes("demote"));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.some((row) => row.includes("不会回收") || row.includes("不回收"))).toBe(true);
+  });
+
   it("routes on-demand single-symbol analysis, so a member can ask for one in Feishu", () => {
     // req §3.4: 个股分析 is produced 每 3 天批量 + 按需 + 站内研究触发, and §4
     // lists 分析请求 among the conversation capabilities. Without this row the

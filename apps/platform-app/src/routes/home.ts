@@ -450,7 +450,7 @@ function renderTodoBlock(proposals: ProposalRow[]): Html {
       ? joinHtml(proposals.map(renderProposalRow))
       : renderEmptyState(
           "当前没有等你审批的提案。",
-          "提案在收盘后自动生成（每次 0-2 条，0 条也是合法结果），也可以在飞书里直接说「给我出一条 NVDA 的提案」；生成后审批卡会发到你的飞书单聊，24 小时无操作自动作废。"
+          "现在提案只有一条产生路径：在飞书里说一句「给我出一条 NVDA 的提案」。收盘后自动出提案还没接上，所以这里空着不代表系统判断「今天不该动」。提出后审批卡会发到你的飞书单聊，24 小时无操作自动作废。"
         );
   return html`<section class="card dt-w2">
     <h2>我的待办</h2>

@@ -3,9 +3,10 @@
 // deterministic per-section text (stock-analysis.mjs), following the SAME
 // injectable-backend/budget-free/degrade-honestly shape Phase 4 Task 5
 // established for restricted-agent search (news-agent-search.mjs):
-//   - the real backend is a documented, P10-gated throw
-//     (createNarrativeLlmBackend, bottom of this file) - every test in
-//     narrative-engine.test.ts injects a fake backend instead.
+//   - the real backend (createNarrativeLlmBackend, bottom of this file) is
+//     LIVE production wiring over the shared `_openclaw-gateway.mjs` client,
+//     not a throwing placeholder - every test in narrative-engine.test.ts
+//     injects a fake backend instead, so no test touches the network.
 //   - external/LLM-produced text is defused (defuseMarkdownInText,
 //     report-news.mjs #29) before it is ever adopted for rendering.
 //   - the backend's output NEVER drives what gets asked next - each of the

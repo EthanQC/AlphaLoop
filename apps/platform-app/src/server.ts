@@ -38,8 +38,8 @@ export interface PlatformServerDeps {
   /** In-process research worker (Task 3, research/worker.ts) that
    * `POST /api/research` kicks, fire-and-forget, after a successful
    * submission. The real process (index.ts) constructs one wired to real
-   * collaborators (a P10-gated research backend, a stock_facts quote reader,
-   * a data/strategy.ts-backed memory reader) and calls its own `.start()`
+   * collaborators (a live gateway-backed research backend, a stock_facts quote
+   * reader, a data/strategy.ts-backed memory reader) and calls its own `.start()`
    * separately - this dep only needs `.tick()` (see
    * routes/api-research.ts's `ResearchWorkerLike`). Tests either omit this
    * entirely (a submission stays `queued`, unprocessed - fine for tests that
@@ -57,9 +57,10 @@ export interface PlatformServerDeps {
   onLoginSendSettled?: LoginRouteDeps["onSendSettled"];
   /** Injectable Feishu single-chat confirm notifier (Task 4, routes/
    * review.ts), fired fire-and-forget after `POST /api/reviews/:id/confirm`.
-   * Defaults to createFeishuReviewNotifier()'s P10-gated placeholder (always
-   * degrades to `{delivered:false}` today) when the real entrypoint
-   * (index.ts) doesn't supply one. */
+   * When omitted, routes/review.ts falls back to the REAL
+   * createFeishuReviewNotifier({db}) (data/feishu-review-notifier.ts:
+   * members.feishu_open_id lookup + sendInteractiveCard) - not a placeholder.
+   * Tests inject a fake to stay hermetic. */
   feishuNotifier?: FeishuReviewNotifier;
   /** Card transport used by the Feishu approval callback (routes/
    * feishu-callback.ts) to re-render a decided card in place. Unset in

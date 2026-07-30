@@ -18,10 +18,11 @@
 //   async ({ query, kind }) => ({ results: [{ title, publisher, url,
 //     publishedAt, summary_zh, impact, evidence_quote }, ...] })
 // so every test in news-agent-search.test.ts drives a fake backend with zero
-// real network/agent calls, and the one REAL backend
-// (createOpenclawSearchBackend, bottom of this file) is left as a documented
-// P10 wiring point until the real OpenClaw restricted-agent gateway and its
-// search-quota measurement exist.
+// real network/agent calls. The one REAL backend
+// (createOpenclawSearchBackend, bottom of this file) is LIVE production
+// wiring over the shared `_openclaw-gateway.mjs` client - scheduled-report.mjs
+// injects it, and it issues real gateway calls. It is not a throwing
+// placeholder; the budget accounting below is what bounds it.
 //
 // ---------------------------------------------------------------------------
 // Anti-injection rationale (why raw external text is quarantined, not just
