@@ -213,13 +213,55 @@ function renderSourceLine(source: NewsEventSourceRow, now: Date): Html {
   </div>`;
 }
 
+/**
+ * Collapses the headline this card already shows as its `<h2>` out of the two
+ * prose blocks underneath it.
+ *
+ * Measured 2026-07-30 against the mini's live news_events (1836 rows):
+ * `impact_reason` is character-for-character equal to `title_zh` on 1474 of
+ * them (80.3%), and `summary_zh` STARTS WITH `title_zh` on 1836 of them
+ * (100%) - the wire services this pipeline reads (格隆汇/华尔街见闻 快讯) put
+ * the headline on the summary's first line, and the clusterer copies the
+ * headline into impact_reason whenever it has no distinct reason to give. So
+ * every card printed its headline three times in a row, ~1300 cards deep.
+ *
+ * Deduplicated HERE rather than at write time on purpose: this heals all 1836
+ * rows already in the database, whereas a producer-side change would only fix
+ * rows written after it ships. Nothing is hidden - a reason that genuinely
+ * differs from the headline, and a summary body beyond the repeated first
+ * line, both still render in full.
+ */
+function dedupeHeadline(titleZh: string, text: string | null): string | null {
+  if (text === null) {
+    return null;
+  }
+  const title = titleZh.trim();
+  const trimmed = text.trim();
+  if (title.length === 0 || trimmed.length === 0) {
+    return trimmed.length === 0 ? null : text;
+  }
+  if (trimmed === title) {
+    return null;
+  }
+  // Only ever strips the headline when it is the summary's own FIRST LINE -
+  // never a substring match mid-paragraph, which would mangle a sentence.
+  const newline = trimmed.indexOf("\n");
+  if (newline !== -1 && trimmed.slice(0, newline).trim() === title) {
+    const rest = trimmed.slice(newline + 1).trim();
+    return rest.length > 0 ? rest : null;
+  }
+  return text;
+}
+
 function renderEventCard(event: NewsEventRow, now: Date): Html {
   const sources = joinHtml(event.sources.map((source) => renderSourceLine(source, now)));
+  const reason = dedupeHeadline(event.titleZh, event.impactReason);
+  const summary = dedupeHeadline(event.titleZh, event.summaryZh);
   return html`<section class="card w2 dt-w2">
     <h2>${event.titleZh}${renderImpactBadge(event)}</h2>
     <div style="margin-bottom:8px">${renderAffectedChips(event.impactAffected)}</div>
-    ${event.impactReason ? html`<p style="font-size:12.5px;color:var(--sub);margin-bottom:8px">${event.impactReason}</p>` : ""}
-    ${event.summaryZh ? html`<p style="font-size:13px;color:var(--ink);white-space:pre-line;margin-bottom:10px">${event.summaryZh}</p>` : ""}
+    ${reason ? html`<p style="font-size:12.5px;color:var(--sub);margin-bottom:8px">${reason}</p>` : ""}
+    ${summary ? html`<p style="font-size:13px;color:var(--ink);white-space:pre-line;margin-bottom:10px">${summary}</p>` : ""}
     <div>${sources}</div>
   </section>`;
 }

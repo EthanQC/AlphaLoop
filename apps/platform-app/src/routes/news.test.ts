@@ -269,6 +269,87 @@ describe("news route (GET /news)", () => {
     expect(response.status).toBe(405);
   });
 
+  // 2026-07-30: measured against the mini's live news_events, impact_reason
+  // equals title_zh on 80.3% of 1836 rows and summary_zh begins with title_zh
+  // on 100% of them, so every card printed its headline three times running.
+  describe("headline de-duplication", () => {
+    const wireTitle = "费城半导体指数跌5% 美光科技跌超7%";
+    // The real 格隆汇 shape: reason == title, and the summary's first line IS
+    // the title, followed by the actual wire body.
+    const wireBody = "格隆汇7月30日｜费城半导体指数跌5%，报10483.39点。台积电股价下跌4.61%。";
+
+    async function fetchBody(): Promise<string> {
+      const response = await fetch(`${baseUrl}/news`, { headers: { authorization: `Bearer ${token}` } });
+      expect(response.status).toBe(200);
+      return response.text();
+    }
+
+    it("prints a wire headline once, not three times, and keeps the body", async () => {
+      const eventId = insertEvent(db, {
+        clusterKey: "wire",
+        titleZh: wireTitle,
+        summaryZh: `${wireTitle}\n${wireBody}`,
+        impactReason: wireTitle,
+        lastPublishedAt: "2026-07-14T09:00:00.000Z"
+      });
+      insertSource(db, {
+        eventId,
+        origin: "rsshub/gelonghui",
+        publisher: "格隆汇",
+        titleRaw: wireTitle,
+        publishedAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const body = await fetchBody();
+      // Once in the <h2>. (The filter-chip row above carries no headlines.)
+      expect(body.split(wireTitle)).toHaveLength(2);
+      // The wire body itself is never dropped.
+      expect(body).toContain(wireBody);
+    });
+
+    it("still shows an impact reason that genuinely differs from the headline", async () => {
+      const eventId = insertEvent(db, {
+        clusterKey: "distinct",
+        titleZh: "英伟达发布新一代加速卡",
+        summaryZh: "英伟达今日发布新一代加速卡，单卡算力提升约 30%。",
+        impactReason: "直接影响 AI 算力供给与相关标的估值",
+        lastPublishedAt: "2026-07-14T09:00:00.000Z"
+      });
+      insertSource(db, {
+        eventId,
+        origin: "rsshub/wallstreetcn",
+        publisher: "华尔街见闻",
+        titleRaw: "英伟达发布新一代加速卡",
+        publishedAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const body = await fetchBody();
+      expect(body).toContain("直接影响 AI 算力供给与相关标的估值");
+      expect(body).toContain("英伟达今日发布新一代加速卡，单卡算力提升约 30%。");
+    });
+
+    it("drops a summary that is nothing but the headline", async () => {
+      const title = "美股三大股指均跌超1%";
+      const eventId = insertEvent(db, {
+        clusterKey: "titleonly",
+        titleZh: title,
+        summaryZh: title,
+        impactReason: title,
+        lastPublishedAt: "2026-07-14T09:00:00.000Z"
+      });
+      insertSource(db, {
+        eventId,
+        origin: "rsshub/gelonghui",
+        publisher: "格隆汇",
+        titleRaw: title,
+        publishedAt: "2026-07-14T09:00:00.000Z"
+      });
+
+      const body = await fetchBody();
+      expect(body.split(title)).toHaveLength(2);
+    });
+  });
+
   // Task 19 (2026-07-30): a page full of headlines whose sources carry no
   // publication time used to render a topbar with the REQUEST clock as its
   // only timestamp - indistinguishable from a page with no data at all.
