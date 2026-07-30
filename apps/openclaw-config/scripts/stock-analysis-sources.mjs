@@ -156,3 +156,14 @@ export function buildFinnhubMetricUrl(symbol) {
   url.searchParams.set("metric", "all");
   return url;
 }
+
+// /stock/profile2 is the only free-tier endpoint that states which CURRENCY
+// /stock/metric answered in - `metric=all` has no currency field at all
+// (measured 2026-07-30 on the mini's key: `currency` is absent from the
+// metric object for both TSM and NVDA, while profile2 returns "TWD" for TSM
+// and "USD" for NVDA). See normalizeFinnhubMetrics for what depends on it.
+export function buildFinnhubProfileUrl(symbol) {
+  const url = new URL("https://finnhub.io/api/v1/stock/profile2");
+  url.searchParams.set("symbol", toBareSymbol(symbol));
+  return url;
+}

@@ -35,6 +35,7 @@ import {
 import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD, getStockFacts } from "./stock-facts-store.mjs";
 import {
   buildFinnhubMetricUrl,
+  buildFinnhubProfileUrl,
   buildNasdaqHeaders,
   buildNasdaqHistoricalUrl,
   buildNasdaqOptionChainUrl,
@@ -1548,12 +1549,21 @@ export async function fetchFinnhubMetrics(symbol, { fetchJson = fetchJsonWithTim
   if (!key) {
     return { source: "finnhub-metric", error: "未配置 FINNHUB_API_KEY，Finnhub 估值指标未读取" };
   }
-  try {
-    const payload = await fetchJson(buildFinnhubMetricUrl(symbol), { "X-Finnhub-Token": key });
-    return normalizeFinnhubMetrics(payload);
-  } catch (error) {
-    return { source: "finnhub-metric", error: formatFetchError(error, "Finnhub 指标接口") };
+  // profile2 rides along in the same Promise.all so the currency costs no
+  // extra wall-clock, and its failure is NOT fatal: normalizeFinnhubMetrics
+  // treats an unknown currency the same way it treats a known foreign one -
+  // keep the dimensionless ratios, drop the amounts, say why. See that
+  // function for the TSM/TWD measurement this exists for.
+  const [metricResult, profileResult] = await Promise.allSettled([
+    fetchJson(buildFinnhubMetricUrl(symbol), { "X-Finnhub-Token": key }),
+    fetchJson(buildFinnhubProfileUrl(symbol), { "X-Finnhub-Token": key })
+  ]);
+  if (metricResult.status === "rejected") {
+    return { source: "finnhub-metric", error: formatFetchError(metricResult.reason, "Finnhub 指标接口") };
   }
+  const reportingCurrency =
+    profileResult.status === "fulfilled" ? profileResult.value?.currency : undefined;
+  return normalizeFinnhubMetrics(metricResult.value, { reportingCurrency });
 }
 
 export async function fetchFundamentalSnapshots(symbol, {

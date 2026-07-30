@@ -42,16 +42,82 @@ export function extractStockAnalysisStatistics(html) {
 // Finnhub free tier, /stock/metric?metric=all (verified 2026-07-27 with the
 // production key on the mini: AMZN -> 128 metrics; QQQM -> 19 metrics with no
 // pe/pb at all, because a fund structurally has none). marketCapitalization
-// is denominated in MILLIONS of USD - multiplying it here keeps every
-// consumer on one unit (raw USD), the same unit Nasdaq's MarketCap string
+// is denominated in MILLIONS - multiplying it here keeps every consumer on
+// one unit (raw currency units), the same unit Nasdaq's MarketCap string
 // parses to.
-export function normalizeFinnhubMetrics(payload) {
+//
+// THE CURRENCY IS NOT ALWAYS USD, and until 2026-07-30 this file assumed it
+// was. Measured that day against the mini's own FINNHUB_API_KEY:
+//
+//   /stock/profile2?symbol=TSM  -> currency "TWD", exchange
+//       "TAIWAN STOCK EXCHANGE", marketCapitalization 59125801.64
+//   /stock/metric?symbol=TSM    -> marketCapitalization 59125800,
+//       epsTTM 87.3818, 52WeekHigh 2535   (all TWD)
+//   /stock/profile2?symbol=NVDA -> currency "USD", exchange "NASDAQ NMS"
+//
+// Finnhub resolves a bare ADR ticker to the company's HOME listing, so for
+// TSM it answers in New Taiwan dollars. Those numbers were written to
+// stock_facts with unit "USD" and shipped: the 2026-07-27 batch told the
+// operator "TSM.US ... EPS 为 87.38 美元，市值为 60,941,068,000,000 美元" and
+// /stock/TSM.US rendered 市值 60.94 万亿美元 - a number labelled in dollars
+// that was never dollars, and one the card's own PE (26.89) against its own
+// price (394.52 USD, from Longbridge) contradicts outright: 394.52/26.89
+// implies an EPS near 14.7, not 87.4.
+//
+// So the currency-denominated fields are now gated on a MEASURED currency,
+// and the ratios are not. PE and PB are dimensionless (price and earnings
+// are in the same currency, and the ratio survives), so they stay whatever
+// the listing is. marketCap, EPS and the 52-week range are amounts; without
+// proof they are dollars they do not ship, and the reason - naming the
+// currency - travels out on `failures` so summarizeValuation renders
+// 不可得（来源未提供该字段：…）instead of a wrong number. There is
+// deliberately no FX conversion: inventing a rate to relabel a foreign
+// amount as dollars would be fabricating the very number this is protecting.
+//
+// The reasons are FIELD-SCOPED (`fieldFailures`), not dumped on the snapshot's
+// general `failures` list: `renderMissingValuationDisclosure` joins every
+// general failure into every missing field's parenthetical, so a shared list
+// would have TSM's 一年目标价 - a field Finnhub never returns for anybody -
+// blaming New Taiwan dollars for its absence.
+//
+// Keys are the disclosure field names summarizeValuation asks for ("eps",
+// "marketCap"), not the snapshot's own property names, so a reason can reach
+// the reader at all. `fiftyTwoWeekHighLow` has no rendered slot anywhere
+// (merged and then never read - grep it), hence no entry.
+const FINNHUB_MONEY_FIELDS = [
+  { key: "marketCap", disclosure: "marketCap" },
+  { key: "epsTrailingTwelveMonths", disclosure: "eps" },
+  { key: "fiftyTwoWeekHighLow", disclosure: null }
+];
+
+/**
+ * One declared shape for both branches, so callers (and this directory's
+ * `pnpm typecheck`, which type-checks the .mjs) get named optional fields
+ * instead of a two-member union nothing can read a property off.
+ *
+ * @typedef {{
+ *   source: string,
+ *   error?: string,
+ *   trailingPE?: number,
+ *   priceToBook?: number,
+ *   epsTrailingTwelveMonths?: number,
+ *   marketCap?: number,
+ *   fiftyTwoWeekHighLow?: string,
+ *   fieldFailures?: Record<string, string[]>
+ * }} FinnhubMetricSnapshot
+ *
+ * @param {unknown} payload Raw /stock/metric response.
+ * @param {{reportingCurrency?: unknown}} [options] `reportingCurrency` comes
+ *   from /stock/profile2 - see the block comment above.
+ * @returns {FinnhubMetricSnapshot}
+ */
+export function normalizeFinnhubMetrics(payload, { reportingCurrency } = {}) {
   const metric = payload?.metric;
   if (!metric || typeof metric !== "object") {
     return { source: "finnhub-metric", error: "Finnhub 指标接口未返回 metric 字段" };
   }
   const marketCapMillions = toNumber(metric.marketCapitalization);
-  return {
+  const snapshot = {
     source: "finnhub-metric",
     trailingPE: toNumber(metric.peTTM ?? metric.peBasicExclExtraTTM ?? metric.peAnnual),
     priceToBook: toNumber(metric.pbQuarterly ?? metric.pbAnnual),
@@ -59,6 +125,37 @@ export function normalizeFinnhubMetrics(payload) {
     marketCap: marketCapMillions === undefined ? undefined : marketCapMillions * 1_000_000,
     fiftyTwoWeekHighLow: formatFiftyTwoWeekRange(metric["52WeekHigh"], metric["52WeekLow"])
   };
+
+  const currency = String(reportingCurrency ?? "").trim().toUpperCase();
+  if (currency === "USD") {
+    return snapshot;
+  }
+
+  // Deliberately free of full-width parentheses, for the same reason
+  // INSUFFICIENT_SAMPLE_PREFIX is: report-quality.mjs's disclosure detectors
+  // wrap a reason in 「（…）」 and match the inside with `[^）]{4,}`, so a
+  // nested full-width pair is a hazard not worth carrying for a comma's worth
+  // of prose.
+  const reason = currency
+    ? `finnhub-metric：该标的在 Finnhub 以 ${currency} 计价，Finnhub 把 ADR 代码解析到了公司本土上市地，金额类指标不是美元，已丢弃不用`
+    : "finnhub-metric：未能确认该标的在 Finnhub 的计价货币，金额类指标可能不是美元，已丢弃不用";
+
+  // Only report a dropped field if there was actually a value to drop -
+  // otherwise every ETF (Finnhub returns no EPS for a fund) would collect a
+  // currency complaint on top of its correct 不适用 reason.
+  const fieldFailures = {};
+  for (const { key, disclosure } of FINNHUB_MONEY_FIELDS) {
+    if (snapshot[key] === undefined) {
+      continue;
+    }
+    snapshot[key] = undefined;
+    const slot = disclosure ?? key;
+    fieldFailures[slot] = [reason];
+  }
+  if (Object.keys(fieldFailures).length > 0) {
+    snapshot.fieldFailures = fieldFailures;
+  }
+  return snapshot;
 }
 
 function formatFiftyTwoWeekRange(high, low) {
@@ -214,7 +311,7 @@ function hasUsableFundamentalValues(normalized) {
 }
 
 export function mergeFundamentalSnapshots(snapshots) {
-  const merged = { sources: [], failures: [] };
+  const merged = { sources: [], failures: [], fieldFailures: {} };
   for (const snapshot of snapshots.filter(Boolean)) {
     if (snapshot.error) {
       merged.failures.push(`${snapshot.source ?? "未知来源"}：${snapshot.error}`);
@@ -224,8 +321,20 @@ export function mergeFundamentalSnapshots(snapshots) {
     if (!normalized) {
       continue;
     }
+    // A source's own per-field reasons carry regardless of whether it went on
+    // to contribute anything, so "why is 市值 missing" is answerable even when
+    // the only source that had one withheld it.
+    const withheld = Object.entries(normalized.fieldFailures);
+    for (const [field, reasons] of withheld) {
+      merged.fieldFailures[field] = [...(merged.fieldFailures[field] ?? []), ...reasons];
+    }
     if (!hasUsableFundamentalValues(normalized)) {
-      merged.failures.push(`${normalized.source ?? "未知来源"}：返回结构完整但没有任何估值字段`);
+      // ...but do not ALSO claim it returned nothing when it already said why
+      // it withheld what it had - "没有任何估值字段" would contradict the
+      // currency reason sitting next to it.
+      if (withheld.length === 0) {
+        merged.failures.push(`${normalized.source ?? "未知来源"}：返回结构完整但没有任何估值字段`);
+      }
       continue;
     }
     for (const key of MERGED_FUNDAMENTAL_KEYS) {
@@ -242,8 +351,26 @@ export function mergeFundamentalSnapshots(snapshots) {
   }
   merged.sources = Array.from(new Set(merged.sources));
   merged.failures = Array.from(new Set(merged.failures));
+  // A field that some LATER source did supply is not missing, so its withheld
+  // reason must not be rendered - the reader would be told 市值 is unavailable
+  // next to a 市值. Only reasons for still-absent fields survive.
+  merged.fieldFailures = Object.fromEntries(
+    Object.entries(merged.fieldFailures)
+      .filter(([field]) => merged[DISCLOSURE_FIELD_TO_MERGED_KEY[field] ?? field] === undefined)
+      .map(([field, reasons]) => [field, Array.from(new Set(reasons))])
+  );
   return merged;
 }
+
+// summarizeValuation asks for disclosure field names ("eps"); the merged
+// object stores snapshot property names ("epsTrailingTwelveMonths"). Fields
+// whose two names already agree need no entry.
+const DISCLOSURE_FIELD_TO_MERGED_KEY = {
+  eps: "epsTrailingTwelveMonths",
+  pe: "trailingPE",
+  pb: "priceToBook",
+  targetPrice: "oneYearTarget"
+};
 
 // Equity-only metrics: an ETF has no earnings, no book value and no
 // sell-side one-year target, so these are not "missing data" for a fund -
@@ -378,18 +505,28 @@ export const TARGET_UPSIDE_UNAVAILABLE_REASONS = {
 // the source did not return the field - and points at the 估值补充 bullet that
 // names which source failed and how. The structural (ETF) reason is short and
 // self-contained, so it is rendered in full either way.
-export function renderMissingValuationDisclosure(field, { instrumentKind = "stock", failures = [], error, brief = false } = {}) {
+// `fieldFailures` are reasons scoped to THIS field (a source that answered but
+// withheld this one value - see normalizeFinnhubMetrics' currency gate). They
+// win over the general per-source list, which is what makes 一年目标价 stop
+// blaming a currency it has nothing to do with.
+export function renderMissingValuationDisclosure(
+  field,
+  { instrumentKind = "stock", failures = [], fieldFailures = {}, error, brief = false } = {}
+) {
   if (instrumentKind === "etf" && ETF_INAPPLICABLE_REASONS[field]) {
     return `${VALUATION_DISCLOSURE.inapplicable}（${ETF_INAPPLICABLE_REASONS[field]}）`;
   }
   if (brief) {
     return `${VALUATION_DISCLOSURE.unavailable}（估值来源未返回该字段，原因见估值补充）`;
   }
-  const reason = error
-    ? `估值来源读取失败：${error}`
-    : failures.length > 0
-      ? `来源未提供该字段：${failures.join("；")}`
-      : "已接入的估值来源均未返回该字段";
+  const scoped = Array.isArray(fieldFailures[field]) ? fieldFailures[field] : [];
+  const reason = scoped.length > 0
+    ? `来源未提供该字段：${scoped.join("；")}`
+    : error
+      ? `估值来源读取失败：${error}`
+      : failures.length > 0
+        ? `来源未提供该字段：${failures.join("；")}`
+        : "已接入的估值来源均未返回该字段";
   return `${VALUATION_DISCLOSURE.unavailable}（${reason}）`;
 }
 
@@ -418,7 +555,10 @@ export function summarizeValuation(valuation, { instrumentKind = "stock" } = {})
     pe !== undefined && pe > 0 && pe < 30 ? "PE 低于 30" : ""
   ].filter(Boolean);
   const sourceText = valuation.sources?.length ? `；来源 ${valuation.sources.join("、")}` : "";
-  const reasonFor = (field) => renderMissingValuationDisclosure(field, { instrumentKind, failures });
+  const fieldFailures =
+    valuation.fieldFailures && typeof valuation.fieldFailures === "object" ? valuation.fieldFailures : {};
+  const reasonFor = (field) =>
+    renderMissingValuationDisclosure(field, { instrumentKind, failures, fieldFailures });
 
   const summary = [
     `PE ${valuationValueOrReason(formatNumber(pe), pe, reasonFor("pe"))}`,
@@ -742,7 +882,14 @@ function normalizeFundamentalSnapshot(snapshot) {
     marketCap: toNumber(snapshot.marketCap),
     oneYearTarget: toNumber(snapshot.oneYearTarget ?? snapshot.targetMeanPrice),
     previousClose: toNumber(snapshot.previousClose),
-    fiftyTwoWeekHighLow: snapshot.fiftyTwoWeekHighLow
+    fiftyTwoWeekHighLow: snapshot.fiftyTwoWeekHighLow,
+    // PER-FIELD reasons from a source that answered but withheld some fields
+    // on purpose (currently only normalizeFinnhubMetrics' non-USD gate). Kept
+    // separate from `snapshot.error`, which means the whole source failed:
+    // finnhub still supplies PE/PB for TSM, so it must keep counting as a
+    // contributing source while still explaining the two amounts it dropped.
+    fieldFailures:
+      snapshot.fieldFailures && typeof snapshot.fieldFailures === "object" ? snapshot.fieldFailures : {}
   };
 }
 

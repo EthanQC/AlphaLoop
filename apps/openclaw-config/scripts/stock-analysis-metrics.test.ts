@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 const metrics = await import("./stock-analysis-metrics.mjs");
@@ -371,18 +373,21 @@ describe("normalizeNasdaqOptionChain", () => {
 
 describe("normalizeFinnhubMetrics", () => {
   it("maps the free-tier TTM ratios and converts marketCapitalization out of millions", () => {
-    const result = metrics.normalizeFinnhubMetrics({
-      metric: {
-        peTTM: 27.4988,
-        peAnnual: 32.1467,
-        pbQuarterly: 5.0684,
-        pbAnnual: 6.0027,
-        epsTTM: 8.3676,
-        marketCapitalization: 2_496_832.8,
-        "52WeekHigh": 278.56,
-        "52WeekLow": 196
-      }
-    });
+    const result = metrics.normalizeFinnhubMetrics(
+      {
+        metric: {
+          peTTM: 27.4988,
+          peAnnual: 32.1467,
+          pbQuarterly: 5.0684,
+          pbAnnual: 6.0027,
+          epsTTM: 8.3676,
+          marketCapitalization: 2_496_832.8,
+          "52WeekHigh": 278.56,
+          "52WeekLow": 196
+        }
+      },
+      { reportingCurrency: "USD" }
+    );
 
     expect(result).toMatchObject({
       source: "finnhub-metric",
@@ -395,11 +400,98 @@ describe("normalizeFinnhubMetrics", () => {
   });
 
   it("leaves PE/PB undefined for a fund (Finnhub's free tier returns neither), without inventing a value", () => {
-    const result = metrics.normalizeFinnhubMetrics({ metric: { "52WeekHigh": 308.21, "52WeekLow": 227 } });
+    const result = metrics.normalizeFinnhubMetrics(
+      { metric: { "52WeekHigh": 308.21, "52WeekLow": 227 } },
+      { reportingCurrency: "USD" }
+    );
 
     expect(result.trailingPE).toBeUndefined();
     expect(result.priceToBook).toBeUndefined();
     expect(result.fiftyTwoWeekHighLow).toBe("$308.21/$227");
+  });
+});
+
+// -------------------------------------------------------------------------
+// The TSM/TWD defect (2026-07-30). Inputs here are the REAL Finnhub responses
+// captured from the deployed mini with its own API key - see the fixture's
+// own `_howCaptured`. Authoring these payloads by hand is exactly how the
+// original bug survived: the fabricated shape carried a currency the real API
+// never promises.
+// -------------------------------------------------------------------------
+const finnhubLive = JSON.parse(
+  readFileSync(new URL("./__fixtures__/finnhub-live-payloads.json", import.meta.url), "utf8")
+) as {
+  symbols: Record<string, { metric: { metric: Record<string, unknown> }; profile2: Record<string, unknown> }>;
+};
+
+describe("normalizeFinnhubMetrics: a non-USD listing must not ship amounts labelled USD", () => {
+  it("keeps TSM's dimensionless ratios but drops the TWD amounts, naming the currency", () => {
+    const live = finnhubLive.symbols.TSM!;
+    // The live values this guards, so a fixture refresh that changes them is
+    // visible rather than silent.
+    expect(live.profile2.currency).toBe("TWD");
+    expect(live.metric.metric.marketCapitalization).toBe(59_125_800);
+    expect(live.metric.metric.epsTTM).toBe(87.3818);
+
+    const result = metrics.normalizeFinnhubMetrics(live.metric, {
+      reportingCurrency: live.profile2.currency
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.trailingPE).toBe(26.0932);
+    expect(result.priceToBook).toBe(9.7158);
+    // The three amounts that used to ship as 美元.
+    expect(result.marketCap).toBeUndefined();
+    expect(result.epsTrailingTwelveMonths).toBeUndefined();
+    expect(result.fiftyTwoWeekHighLow).toBeUndefined();
+    expect(result.fieldFailures).toEqual({
+      marketCap: [expect.stringContaining("TWD")],
+      eps: [expect.stringContaining("TWD")],
+      fiftyTwoWeekHighLow: [expect.stringContaining("TWD")]
+    });
+  });
+
+  it("keeps everything for NVDA, whose live profile really is USD", () => {
+    const live = finnhubLive.symbols.NVDA!;
+    expect(live.profile2.currency).toBe("USD");
+
+    const result = metrics.normalizeFinnhubMetrics(live.metric, {
+      reportingCurrency: live.profile2.currency
+    });
+
+    expect(result.marketCap).toBe(4_752_638 * 1_000_000);
+    expect(result.epsTrailingTwelveMonths).toBe(6.529999999999999);
+    expect(result.fieldFailures).toBeUndefined();
+  });
+
+  it("fails closed when the currency cannot be established at all (Finnhub has no profile for a fund)", () => {
+    const live = finnhubLive.symbols.QQQM!;
+    // Measured: profile2 answers `{}` for an ETF, so there is no currency to
+    // read - and an amount we cannot denominate must not be printed as 美元.
+    expect(live.profile2.currency).toBeUndefined();
+
+    const result = metrics.normalizeFinnhubMetrics(live.metric, {
+      reportingCurrency: live.profile2.currency
+    });
+
+    expect(result.fiftyTwoWeekHighLow).toBeUndefined();
+    expect(result.fieldFailures).toEqual({ fiftyTwoWeekHighLow: [expect.stringContaining("未能确认")] });
+  });
+
+  it("carries the currency reason all the way to the rendered 估值补充 line instead of a number", () => {
+    const live = finnhubLive.symbols.TSM!;
+    const merged = metrics.mergeFundamentalSnapshots([
+      metrics.normalizeFinnhubMetrics(live.metric, { reportingCurrency: live.profile2.currency })
+    ]);
+
+    expect(merged.marketCap).toBeUndefined();
+    expect(merged.sources).toEqual(["finnhub-metric"]);
+
+    const { summary } = metrics.summarizeValuation(merged);
+    expect(summary).toContain("PE 26.09");
+    expect(summary).not.toContain("60.94");
+    expect(summary).not.toContain("87.38");
+    expect(summary).toMatch(/市值 不可得（[^）]*TWD/u);
   });
 });
 

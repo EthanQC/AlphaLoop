@@ -1182,6 +1182,48 @@ describe("fetchFinnhubMetrics / fetchFundamentalSnapshots", () => {
     expect(result.error).toContain("FINNHUB_API_KEY");
   });
 
+  // 2026-07-30, the TSM/TWD defect: /stock/metric has no currency field, so
+  // the amounts it returns were being written to stock_facts as USD whatever
+  // exchange Finnhub resolved the ticker to. The fetcher must actually ASK
+  // profile2 and act on the answer.
+  it("probes /stock/profile2 for the reporting currency and drops the amounts when it is not USD", async () => {
+    const requested: string[] = [];
+    const result = await stockAnalysis.fetchFinnhubMetrics("TSM.US", {
+      apiKey: "test-key",
+      fetchJson: async (url: unknown) => {
+        const href = String(url);
+        requested.push(href);
+        if (href.includes("/stock/profile2")) {
+          return { currency: "TWD", exchange: "TAIWAN STOCK EXCHANGE" };
+        }
+        return { metric: { peTTM: 26.0932, pbQuarterly: 9.7158, epsTTM: 87.3818, marketCapitalization: 59_125_800 } };
+      }
+    });
+
+    expect(requested.some((href) => href.includes("/stock/profile2") && href.includes("symbol=TSM"))).toBe(true);
+    expect(result.trailingPE).toBe(26.0932);
+    expect(result.marketCap).toBeUndefined();
+    expect(result.epsTrailingTwelveMonths).toBeUndefined();
+    expect(JSON.stringify(result.fieldFailures)).toContain("TWD");
+  });
+
+  it("still returns the metrics when only the currency probe fails, and says the currency is unconfirmed", async () => {
+    const result = await stockAnalysis.fetchFinnhubMetrics("AMZN.US", {
+      apiKey: "test-key",
+      fetchJson: async (url: unknown) => {
+        if (String(url).includes("/stock/profile2")) {
+          throw new Error("503 Service Unavailable");
+        }
+        return { metric: { peTTM: 27.4988, marketCapitalization: 2_496_832.8 } };
+      }
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.trailingPE).toBe(27.4988);
+    expect(result.marketCap).toBeUndefined();
+    expect(JSON.stringify(result.fieldFailures)).toContain("未能确认");
+  });
+
   it("merges Finnhub valuation with Nasdaq's one-year target and carries each failed source's reason", async () => {
     const merged = await stockAnalysis.fetchFundamentalSnapshots("AMZN.US", {
       instrumentKind: "stock",
