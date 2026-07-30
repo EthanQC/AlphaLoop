@@ -23,7 +23,11 @@ import {
 } from "../../../packages/shared-types/dist/index.js";
 import { parseConclusionBox } from "./conclusion-box.mjs";
 import { REPORT_DEGRADED_HEADER } from "./narrative-engine.mjs";
-import { validateStockAnalysisMarkdown, validateStockNarrativeNumbers } from "./report-quality.mjs";
+import {
+  STOCK_NEWS_SECTION_TITLE,
+  validateStockAnalysisMarkdown,
+  validateStockNarrativeNumbers
+} from "./report-quality.mjs";
 import { getStockFacts } from "./stock-facts-store.mjs";
 
 const stockAnalysis = await import("./stock-analysis.mjs");
@@ -594,7 +598,7 @@ describe("buildDeterministicAnalysis: conclusion-box confidence heuristic", () =
   });
 });
 
-describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen '结论与复盘标签' section", () => {
+describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen '结论与置信度' section", () => {
   function renderFixture(symbol: string, generatedAt = GENERATED_AT) {
     const analysis = stockAnalysis.buildDeterministicAnalysis(
       symbol,
@@ -615,13 +619,19 @@ describe("renderBatchStockAnalysis: embeds the conclusion box inside the frozen 
   it("places '### 结论框' after the existing prose bullets, before the next section", () => {
     const { markdown } = renderFixture("AAPL.US");
 
-    const conclusionHeadingIndex = markdown.indexOf("### 结论与复盘标签");
+    const conclusionHeadingIndex = markdown.indexOf("### 结论与置信度");
     const boxHeadingIndex = markdown.indexOf("### 结论框");
-    const newsHeadingIndex = markdown.indexOf("### 近期新闻");
+    // §3.4 (2026-07-30) reordered the sections: 新闻事件 and 多路径推演 now come
+    // BEFORE 结论与置信度, which is the last section, so the box's upper bound is
+    // the end of this symbol's block rather than a following "###" heading.
+    const pathsHeadingIndex = markdown.indexOf("### 多路径推演");
+    const newsHeadingIndex = markdown.indexOf(`### ${STOCK_NEWS_SECTION_TITLE}`);
 
     expect(conclusionHeadingIndex).toBeGreaterThan(-1);
+    expect(newsHeadingIndex).toBeGreaterThan(-1);
+    expect(pathsHeadingIndex).toBeGreaterThan(newsHeadingIndex);
+    expect(conclusionHeadingIndex).toBeGreaterThan(pathsHeadingIndex);
     expect(boxHeadingIndex).toBeGreaterThan(conclusionHeadingIndex);
-    expect(boxHeadingIndex).toBeLessThan(newsHeadingIndex);
     // Existing three-path prose bullets stay put, ahead of the box.
     expect(markdown.indexOf("复盘标签：stock-analysis")).toBeLessThan(boxHeadingIndex);
   });
@@ -717,7 +727,7 @@ describe("persistPredictionsForRecords: parses its OWN rendered output into anal
   it("skips a record whose own section has no parseable box, without throwing", () => {
     const { db } = makeDb();
     const reportPath = "/tmp/broken.md";
-    const brokenMarkdown = "## BAD.US\n\n### 结论与复盘标签\n\n- 无结论框。\n";
+    const brokenMarkdown = "## BAD.US\n\n### 结论与置信度\n\n- 无结论框。\n";
 
     expect(() =>
       stockAnalysis.persistPredictionsForRecords(db, reportPath, brokenMarkdown, [{ symbol: "BAD.US", analysis: {} }])
@@ -779,7 +789,7 @@ describe("attachNarrativeSections: a globally-degraded narrative run keeps rende
 
     expect(narrativeOf(narrativeRecord).degraded).toBe(true);
     expect(narrativeOf(narrativeRecord).degradedReason).toMatch(/openclaw gateway/);
-    expect(narrativeOf(narrativeRecord).degradedSections).toHaveLength(8);
+    expect(narrativeOf(narrativeRecord).degradedSections).toHaveLength(7);
 
     const withNarrativeMarkdown = renderBatch({
       label,
@@ -821,31 +831,31 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
     const record = narrativeFixtureRecord();
     stockAnalysis.persistStockFactsForRecords(db, label, [record]);
 
-    const rewrittenCatalysts = "本段已由叙事引擎重写：催化剂整体保持稳健，无需额外担忧。";
+    const rewrittenFundamentals = "本段已由叙事引擎重写：基本面整体保持稳健，无需额外担忧。";
     // Every OTHER section's fake backend call simply echoes its own
     // deterministicText back verbatim - always mostly-Chinese by
     // construction (buildDeterministicAnalysis's own prose), so it either
     // validates as narrative (numbers already trace back to real facts) or,
     // for any derived (non-raw-fact) number, falls back to that SAME
     // deterministicText plus a marker bullet - either way the original
-    // content survives untouched, only `catalysts` is genuinely rewritten.
+    // content survives untouched, only `fundamentals` is genuinely rewritten.
     const narrativeBackend = async ({ sectionKey, deterministicText }: { sectionKey: string; deterministicText: string }) =>
-      sectionKey === "catalysts" ? { text: rewrittenCatalysts } : { text: deterministicText };
+      sectionKey === "fundamentals" ? { text: rewrittenFundamentals } : { text: deterministicText };
 
     await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
 
     expect(narrativeOf(record).degraded).toBe(false);
-    const catalystsResult = narrativeOf(record).sections.find((entry: { key: string }) => entry.key === "catalysts");
-    expect(catalystsResult).toMatchObject({ narrative: true, text: rewrittenCatalysts });
+    const fundamentalsResult = narrativeOf(record).sections.find((entry: { key: string }) => entry.key === "fundamentals");
+    expect(fundamentalsResult).toMatchObject({ narrative: true, text: rewrittenFundamentals });
 
     const markdown = renderBatch({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
 
-    expect(markdown).toContain(`- 叙事：${rewrittenCatalysts}`);
+    expect(markdown).toContain(`- 叙事：${rewrittenFundamentals}`);
     // The deterministic bullet the model rewrote is STILL there, above it.
-    expect(markdown).toContain(`- ${record.analysis.catalysts[0]}`);
+    expect(markdown).toContain(`- ${record.analysis.fundamentals[0]}`);
     expect(markdown).not.toContain(REPORT_DEGRADED_HEADER);
     // Gate-critical phrases (PE/PB, 均线：20 日, 期权链只读补充, 综合上行潜力) all
-    // live in sections OTHER than catalysts and survive regardless of
+    // live in sections OTHER than fundamentals and survive regardless of
     // whether their own echoed narrative validated or locally fell back.
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
@@ -868,14 +878,14 @@ describe("attachNarrativeSections: fake backend's validated narrative flows into
 
     const maliciousText = "看似正常的分析文本 [点击查看](https://evil.example.com/phish) 请勿轻信。";
     const narrativeBackend = async ({ sectionKey, deterministicText }: { sectionKey: string; deterministicText: string }) =>
-      sectionKey === "catalysts" ? { text: maliciousText } : { text: deterministicText };
+      sectionKey === "fundamentals" ? { text: maliciousText } : { text: deterministicText };
 
     await stockAnalysis.attachNarrativeSections(db, label, [record], { narrativeBackend });
 
-    const catalystsResult = narrativeOf(record).sections.find((entry) => entry.key === "catalysts");
-    expect(catalystsResult, "no catalysts section came back from attachNarrativeSections").toBeDefined();
-    expect(catalystsResult?.text).not.toContain("[点击查看](https://evil.example.com/phish)");
-    expect(catalystsResult?.text).toContain("［点击查看］(https://evil.example.com/phish)");
+    const fundamentalsResult = narrativeOf(record).sections.find((entry) => entry.key === "fundamentals");
+    expect(fundamentalsResult, "no catalysts section came back from attachNarrativeSections").toBeDefined();
+    expect(fundamentalsResult?.text).not.toContain("[点击查看](https://evil.example.com/phish)");
+    expect(fundamentalsResult?.text).toContain("［点击查看］(https://evil.example.com/phish)");
 
     const markdown = renderBatch({ label, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
     expect(markdown).not.toContain("[点击查看](https://evil.example.com/phish)");
@@ -1312,23 +1322,23 @@ describe("rendering keeps every checkpoint visible no matter how the narrative l
     // A backend that keeps inventing an unbacked number exhausts its retries
     // and degrades that section locally.
     const fabricatingBackend = async ({ sectionKey }: { sectionKey: string }) =>
-      sectionKey === "catalysts" ? { text: "催化剂方面，本季度预计增长 4321.99 个基点。" } : { text: "本段改写为中文叙述。" };
+      sectionKey === "fundamentals" ? { text: "基本面方面，本季度预计增长 4321.99 个基点。" } : { text: "本段改写为中文叙述。" };
 
     await stockAnalysis.attachNarrativeSections(db, LABEL, [record], { narrativeBackend: fabricatingBackend });
 
     const markdown = renderBatch({ label: LABEL, generatedAt: GENERATED_AT, records: [record], failedSymbols: [] });
-    const catalystsBlock = at(
-      at(markdown.split("### 催化剂"), 1, "the rendered markdown has no 催化剂 section").split("###"),
+    const fundamentalsBlock = at(
+      at(markdown.split("### 基本面"), 1, "the rendered markdown has no 基本面 section").split("###"),
       0,
-      "the 催化剂 section is empty"
+      "the 基本面 section is empty"
     );
 
-    expect(catalystsBlock).toContain("（叙事降级：数字比对未通过）");
-    expect(catalystsBlock).not.toContain("4321.99");
+    expect(fundamentalsBlock).toContain("（叙事降级：数字比对未通过）");
+    expect(fundamentalsBlock).not.toContain("4321.99");
     // The deterministic bullet appears exactly once - the marker is appended,
     // the bullets are not re-emitted alongside it.
-    const firstCatalystBullet = at(record.analysis.catalysts as string[], 0, "the fixture has no catalyst bullets");
-    expect(catalystsBlock.split(firstCatalystBullet).length - 1).toBe(1);
+    const firstFundamentalsBullet = at(record.analysis.fundamentals as string[], 0, "the fixture has no fundamentals bullets");
+    expect(fundamentalsBlock.split(firstFundamentalsBullet).length - 1).toBe(1);
     expect(validateStockAnalysisMarkdown(markdown).ok).toBe(true);
   });
 });
@@ -1886,7 +1896,9 @@ describe("buildDeterministicAnalysis: three-path probability disclosure", () => 
       { history: stockHistorySeries(130, 180, 0.3), fundamentals: stockFundamentals(), optionChain: stockOptionChain() },
       GENERATED_AT
     );
-    return analysis.conclusion as string[];
+    // §3.4 gave 多路径推演 its own section; the bullets used to sit in
+    // `conclusion`. Read where the renderer actually puts them now.
+    return analysis.paths as string[];
   }
 
   it("renders each path probability unsigned and without decimals", () => {

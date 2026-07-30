@@ -10,6 +10,43 @@ import { toNumber } from "./report-data.mjs";
 // "PE 暂无" with no reason at all. That is precisely the silent gap the
 // facts-coverage gate exists to catch, so an empty payload is now an explicit,
 // reason-carrying error snapshot.
+// The `$`-marked fields in a Nasdaq summary payload. Measured 2026-07-30
+// against the live endpoint:
+//
+//   /quote/TSM/summary?assetclass=stocks -> Exchange "NYSE",
+//       OneYrTarget "$500.00", PreviousClose "$392.31",
+//       FiftTwoWeekHighLow "$479/$223.7", MarketCap "1,943,227,792,382"
+//   /quote/QQQM/summary?assetclass=etf   -> PreviousClose "$278.14",
+//       FiftTwoWeekHighLow "$308.21/$227", AnnualizedDividend "$1.4086",
+//       MarketCap "92,770,579,573"
+//
+// So Nasdaq marks its per-share amounts with a literal "$" but ships MarketCap
+// as a bare digit string. `parseMoney` strips the "$" without ever looking at
+// it, which means until 2026-07-30 the market cap's currency was nothing but
+// this file's assumption - the same assumption that shipped TSM's TWD market
+// cap as 60.94 万亿美元 through the Finnhub path (see normalizeFinnhubMetrics).
+//
+// The "$" IS the source's own currency statement, so it is now read: an amount
+// ships only when this payload marked at least one of its money fields with
+// one, and the unmarked MarketCap inherits that same response's currency
+// (one response, one listing, one currency - Nasdaq's quote API only covers
+// US-listed securities). No marker anywhere means no verified currency, so the
+// amounts are withheld with a field-scoped reason instead of being labelled
+// 美元 on faith. Both live shapes above carry markers, so neither the equity
+// nor the fund path loses a number to this gate today - it is the ADR/foreign
+// listing case that it exists for.
+const NASDAQ_USD_MARKER_FIELDS = [
+  "PreviousClose",
+  "OneYrTarget",
+  "FiftTwoWeekHighLow",
+  "TodayHighLow",
+  "AnnualizedDividend"
+];
+
+function hasUsdMarker(raw) {
+  return /^\s*\$/u.test(String(raw ?? ""));
+}
+
 export function normalizeNasdaqSummary(payload) {
   const summaryData = payload?.data?.summaryData;
   if (!summaryData || typeof summaryData !== "object") {
@@ -19,24 +56,134 @@ export function normalizeNasdaqSummary(payload) {
       error: `Nasdaq 摘要未返回该标的数据（${String(apiMessage ?? "响应缺少 summaryData").slice(0, 80)}）`
     };
   }
-  return {
+  const usdMarked = NASDAQ_USD_MARKER_FIELDS.some((field) => hasUsdMarker(summaryData[field]?.value));
+  const snapshot = {
     source: "nasdaq-summary",
     oneYearTarget: parseMoney(summaryData.OneYrTarget?.value),
     marketCap: parseMoney(summaryData.MarketCap?.value),
     fiftyTwoWeekHighLow: String(summaryData.FiftTwoWeekHighLow?.value ?? "").trim() || undefined,
     previousClose: parseMoney(summaryData.PreviousClose?.value)
   };
+  if (usdMarked) {
+    snapshot.amountCurrency = "USD";
+    return snapshot;
+  }
+  return withheldAmounts(snapshot, "nasdaq-summary：响应中没有任何 $ 计价标记，无法确认金额类字段的计价货币，已丢弃不用");
+}
+
+// The amount fields every snapshot shape shares, paired with the disclosure
+// field name summarizeValuation asks for (`renderMissingValuationDisclosure`
+// keys on those, not on the snapshot's own property names, so a withheld
+// amount's reason can actually reach the reader). Ratios are deliberately
+// absent: PE and PB are dimensionless - price and earnings are in the same
+// currency and the ratio survives the currency being foreign - so they are
+// never withheld by a currency gate.
+const AMOUNT_FIELDS = [
+  { key: "marketCap", disclosure: "marketCap" },
+  { key: "epsTrailingTwelveMonths", disclosure: "eps" },
+  { key: "oneYearTarget", disclosure: "targetPrice" },
+  { key: "previousClose", disclosure: null },
+  { key: "fiftyTwoWeekHighLow", disclosure: null }
+];
+
+/**
+ * Drops every amount this snapshot holds and records WHY, per field, so the
+ * report says 不可得（来源未提供该字段：…原因…） instead of printing a number
+ * under a currency nobody verified. Only fields that actually held a value
+ * collect a reason - otherwise every ETF (no EPS for a fund) would pick up a
+ * currency complaint on top of its correct 不适用 reason.
+ *
+ * `amountCurrency` is deliberately left unset: a snapshot that withheld its
+ * amounts has no verified currency to advertise.
+ */
+function withheldAmounts(snapshot, reason, fields = AMOUNT_FIELDS) {
+  const fieldFailures = { ...(snapshot.fieldFailures ?? {}) };
+  for (const { key, disclosure } of fields) {
+    if (snapshot[key] === undefined) {
+      continue;
+    }
+    snapshot[key] = undefined;
+    const slot = disclosure ?? key;
+    fieldFailures[slot] = [...(fieldFailures[slot] ?? []), reason];
+  }
+  if (Object.keys(fieldFailures).length > 0) {
+    snapshot.fieldFailures = fieldFailures;
+  }
+  return snapshot;
+}
+
+// stockanalysis.com states its own currencies, in the payload the page ships
+// its data in. Measured 2026-07-30 against the live pages this fetcher hits:
+//
+//   /stocks/tsm/statistics/  -> curr:{main:"USD",price:"USD",dividend:"USD",
+//                                     financial:"TWD"}   Market Cap 1,760,622,599,911
+//   /stocks/nvda/statistics/ -> curr:{main:"USD",price:"USD",dividend:"USD",
+//                                     financial:"USD"}
+//   /stocks/aapl/statistics/ -> same all-USD shape as NVDA
+//   /etf/qqqm/               -> no curr block, and no PE/PB/Market Cap this
+//                               extractor can match at all
+//
+// TSM is the case that matters: market cap is USD (the ADR's, 1.76T - the same
+// order as Nasdaq's 1.94T for the same listing, and ~1/30th of Finnhub's TWD
+// 59.13T, which is the TWD/USD rate), while the FINANCIAL statements - hence
+// EPS, revenue, net income - are in TWD. One page, two currencies, and this
+// extractor used to read both under one assumed 美元.
+//
+// So `main` gates the market cap and `financial` gates EPS. The ratios are
+// dimensionless and are never gated (see AMOUNT_FIELDS).
+//
+// Note on "EPS (ttm)": that exact label does not appear on any of the three
+// statistics pages measured above (grep count 0 on all three), so this
+// extractor contributes no EPS today - the report's only EPS source is
+// Finnhub, itself currency-gated. The gate below is therefore latent rather
+// than load-bearing right now, which is exactly why it is worth having: the
+// day the page reintroduces that label for an ADR, a TWD EPS must not ship as
+// dollars the way TSM's Finnhub EPS did on 2026-07-27.
+const STOCKANALYSIS_CURRENCY_BLOCK_PATTERN = /curr\s*:\s*\{([^}]*)\}/u;
+const STOCKANALYSIS_CURRENCY_ENTRY_PATTERN = /(main|price|dividend|financial)\s*:\s*"([A-Za-z]{3})"/gu;
+
+/** The page's own `curr` declaration, uppercased; `{}` when the page has none. */
+export function readStockAnalysisCurrencies(html) {
+  const block = STOCKANALYSIS_CURRENCY_BLOCK_PATTERN.exec(String(html ?? ""))?.[1];
+  if (!block) {
+    return {};
+  }
+  const currencies = {};
+  for (const match of block.matchAll(STOCKANALYSIS_CURRENCY_ENTRY_PATTERN)) {
+    currencies[match[1]] = match[2].toUpperCase();
+  }
+  return currencies;
+}
+
+function stockAnalysisCurrencyReason(scope, code) {
+  return code
+    ? `stockanalysis-statistics：页面声明${scope}以 ${code} 计价，不是美元，已丢弃不用`
+    : `stockanalysis-statistics：页面未声明${scope}的计价货币，无法确认是否为美元，已丢弃不用`;
 }
 
 export function extractStockAnalysisStatistics(html) {
   const text = String(html ?? "");
-  return {
+  const currencies = readStockAnalysisCurrencies(text);
+  const snapshot = {
     source: "stockanalysis-statistics",
     trailingPE: extractMetric(text, "PE Ratio"),
     priceToBook: extractMetric(text, "PB Ratio"),
     epsTrailingTwelveMonths: extractMetric(text, "EPS \\(ttm\\)"),
     marketCap: extractMetric(text, "Market Cap")
   };
+  if (currencies.main === "USD") {
+    snapshot.amountCurrency = "USD";
+  } else {
+    withheldAmounts(snapshot, stockAnalysisCurrencyReason("市值口径", currencies.main), [
+      { key: "marketCap", disclosure: "marketCap" }
+    ]);
+  }
+  if (currencies.financial !== "USD") {
+    withheldAmounts(snapshot, stockAnalysisCurrencyReason("财务报表口径", currencies.financial), [
+      { key: "epsTrailingTwelveMonths", disclosure: "eps" }
+    ]);
+  }
+  return snapshot;
 }
 
 // Finnhub free tier, /stock/metric?metric=all (verified 2026-07-27 with the
@@ -103,6 +250,7 @@ const FINNHUB_MONEY_FIELDS = [
  *   epsTrailingTwelveMonths?: number,
  *   marketCap?: number,
  *   fiftyTwoWeekHighLow?: string,
+ *   amountCurrency?: string,
  *   fieldFailures?: Record<string, string[]>
  * }} FinnhubMetricSnapshot
  *
@@ -128,6 +276,7 @@ export function normalizeFinnhubMetrics(payload, { reportingCurrency } = {}) {
 
   const currency = String(reportingCurrency ?? "").trim().toUpperCase();
   if (currency === "USD") {
+    snapshot.amountCurrency = "USD";
     return snapshot;
   }
 
@@ -142,20 +291,10 @@ export function normalizeFinnhubMetrics(payload, { reportingCurrency } = {}) {
 
   // Only report a dropped field if there was actually a value to drop -
   // otherwise every ETF (Finnhub returns no EPS for a fund) would collect a
-  // currency complaint on top of its correct 不适用 reason.
-  const fieldFailures = {};
-  for (const { key, disclosure } of FINNHUB_MONEY_FIELDS) {
-    if (snapshot[key] === undefined) {
-      continue;
-    }
-    snapshot[key] = undefined;
-    const slot = disclosure ?? key;
-    fieldFailures[slot] = [reason];
-  }
-  if (Object.keys(fieldFailures).length > 0) {
-    snapshot.fieldFailures = fieldFailures;
-  }
-  return snapshot;
+  // currency complaint on top of its correct 不适用 reason. Shared with the
+  // Nasdaq/StockAnalysis gates below (`withheldAmounts`) so all three sources
+  // drop-and-disclose the same way rather than three hand-written loops.
+  return withheldAmounts(snapshot, reason, FINNHUB_MONEY_FIELDS);
 }
 
 function formatFiftyTwoWeekRange(high, low) {
@@ -301,6 +440,14 @@ const MERGED_FUNDAMENTAL_KEYS = [
   "previousClose"
 ];
 
+// Which of the merged keys are AMOUNTS (a quantity of money) rather than
+// dimensionless ratios - derived from AMOUNT_FIELDS, the same list the three
+// currency gates withhold through, so "which fields need a currency" is stated
+// once. `fiftyTwoWeekHighLow` is in AMOUNT_FIELDS but not in
+// MERGED_FUNDAMENTAL_KEYS (it merges on its own line below), and set
+// membership simply never asks about it.
+const AMOUNT_KEY_SET = new Set(AMOUNT_FIELDS.map((field) => field.key));
+
 // A snapshot that carries NO usable field is not a source - counting it as
 // one is what let `fundamentals` end up "not an error, but also not a single
 // value" and rendered as an unexplained "暂无" (see normalizeNasdaqSummary's
@@ -311,7 +458,7 @@ function hasUsableFundamentalValues(normalized) {
 }
 
 export function mergeFundamentalSnapshots(snapshots) {
-  const merged = { sources: [], failures: [], fieldFailures: {} };
+  const merged = { sources: [], failures: [], fieldFailures: {}, amountCurrencies: {} };
   for (const snapshot of snapshots.filter(Boolean)) {
     if (snapshot.error) {
       merged.failures.push(`${snapshot.source ?? "未知来源"}：${snapshot.error}`);
@@ -340,6 +487,15 @@ export function mergeFundamentalSnapshots(snapshots) {
     for (const key of MERGED_FUNDAMENTAL_KEYS) {
       if (merged[key] === undefined && normalized[key] !== undefined) {
         merged[key] = normalized[key];
+        // An amount and the currency it is denominated in travel together, from
+        // the SAME snapshot - a per-field pairing, not one flag for the merged
+        // object. Sources disagree on which fields they answer (Finnhub has the
+        // TTM ratios and no target price, Nasdaq has the target price and no
+        // EPS), so a single merged currency would be attributing one source's
+        // verification to another source's number.
+        if (AMOUNT_KEY_SET.has(key)) {
+          merged.amountCurrencies[key] = normalized.amountCurrency;
+        }
       }
     }
     if (normalized.fiftyTwoWeekHighLow && !merged.fiftyTwoWeekHighLow) {
@@ -410,6 +566,16 @@ export const VALUATION_DISCLOSURE = {
   inapplicable: "不适用",
   unavailable: "不可得"
 };
+
+// The 估值 section's own 口径 line. States the rule the amount gates enforce, so
+// a reader can tell WHY a market cap is sometimes a number and sometimes a
+// 不可得 - and so nobody mistakes the absence of an FX conversion for an
+// oversight. Lives here next to VALUATION_DISCLOSURE because it uses the same
+// vocabulary the gates and detectors are built from.
+export const AMOUNT_CURRENCY_POLICY_DISCLOSURE =
+  "金额计价口径：市值、EPS、目标价等金额只在来源自报计价货币且为美元时给出数字，"
+  + "否则按不可得处理并写明原因；本系统不做汇率换算——给一个外币金额编一个汇率再标成美元，"
+  + "正是要防的编造。PE/PB 是比率、没有货币量纲，不受此限。";
 
 // 2026-07-27 (second adversarial pass, defect 5): the honest wording for "this
 // metric needs an N-session window and the sample is shorter than that". Same
@@ -534,6 +700,56 @@ function valuationValueOrReason(formatted, value, disclosure) {
   return value === undefined ? disclosure : formatted;
 }
 
+// ---------------------------------------------------------------------------
+// 金额必须带已核实的计价货币 (2026-07-30)
+// ---------------------------------------------------------------------------
+//
+// The rule, stated once: a RATIO renders bare (PE/PB are dimensionless), an
+// AMOUNT renders only with the currency its own source stated. Nothing in this
+// file may attach 美元 to a number because the report happens to be about US
+// equities - that inference is what put 市值 60.94 万亿美元 (TWD) and
+// EPS 87.38 美元 (TWD) into the 2026-07-27 batch and onto /stock/TSM.US.
+//
+// The three normalizers above withhold their amounts when they could not read a
+// currency, so in practice `amountCurrencies[key]` is set whenever the amount
+// is. This branch is the structural backstop for the case where it is not: the
+// amount is reported as 不可得 WITH the reason, never printed unlabelled and
+// never printed under a guessed label.
+//
+// report-facts.mjs's buildStockFacts writes valuation.eps/marketCap/targetPrice
+// rows with a hardcoded unit "USD". That hardcode is correct only because of
+// the invariant this section enforces - a non-USD amount never reaches the
+// merged object at all, so a stored row can only ever hold a USD amount or a
+// NULL. Weaken the gates here and that unit becomes a lie again.
+const AMOUNT_CURRENCY_LABELS = { USD: "美元" };
+const AMOUNT_CURRENCY_UNVERIFIED_REASON = "金额已取到但来源未声明计价货币，无法确认是否为美元，按不可得处理";
+
+function normalizeCurrencyCode(value) {
+  const code = String(value ?? "").trim().toUpperCase();
+  return /^[A-Z]{3}$/u.test(code) ? code : undefined;
+}
+
+/** 美元 for USD, otherwise the bare ISO code - never an invented translation. */
+export function amountCurrencyLabel(code) {
+  return AMOUNT_CURRENCY_LABELS[code] ?? code;
+}
+
+/**
+ * One amount, rendered with its verified currency or replaced by a disclosure.
+ * `format` receives (value, currencyLabel) so the compact-money and
+ * plain-number shapes share this single gate instead of each re-checking.
+ */
+function renderAmount({ value, currency, format, missingDisclosure }) {
+  if (value === undefined) {
+    return missingDisclosure;
+  }
+  const code = normalizeCurrencyCode(currency);
+  if (!code) {
+    return `${VALUATION_DISCLOSURE.unavailable}（${AMOUNT_CURRENCY_UNVERIFIED_REASON}）`;
+  }
+  return format(value, amountCurrencyLabel(code));
+}
+
 export function summarizeValuation(valuation, { instrumentKind = "stock" } = {}) {
   if (!valuation || valuation.error) {
     return {
@@ -560,12 +776,17 @@ export function summarizeValuation(valuation, { instrumentKind = "stock" } = {})
   const reasonFor = (field) =>
     renderMissingValuationDisclosure(field, { instrumentKind, failures, fieldFailures });
 
+  const currencies =
+    valuation.amountCurrencies && typeof valuation.amountCurrencies === "object" ? valuation.amountCurrencies : {};
+  const amount = (mergedKey, value, field, format) =>
+    renderAmount({ value, currency: currencies[mergedKey], format, missingDisclosure: reasonFor(field) });
+
   const summary = [
     `PE ${valuationValueOrReason(formatNumber(pe), pe, reasonFor("pe"))}`,
     `PB ${valuationValueOrReason(formatNumber(pb), pb, reasonFor("pb"))}`,
-    `EPS ${valuationValueOrReason(formatNumber(eps), eps, reasonFor("eps"))}`,
-    `市值 ${valuationValueOrReason(formatCompactMoney(marketCap), marketCap, reasonFor("marketCap"))}`,
-    `一年目标价 ${valuationValueOrReason(formatNumber(oneYearTarget), oneYearTarget, reasonFor("targetPrice"))}`
+    `EPS ${amount("epsTrailingTwelveMonths", eps, "eps", (value, label) => `${formatNumber(value)} ${label}`)}`,
+    `市值 ${amount("marketCap", marketCap, "marketCap", formatCompactMoney)}`,
+    `一年目标价 ${amount("oneYearTarget", oneYearTarget, "targetPrice", (value, label) => `${formatNumber(value)} ${label}`)}`
   ].join("；");
 
   return {
@@ -576,6 +797,192 @@ export function summarizeValuation(valuation, { instrumentKind = "stock" } = {})
         ? "ETF 无市盈率/市净率口径，便宜程度改看均线折价与溢价"
         : "PE/PB 未触发明显便宜信号，或数据缺失"
   };
+}
+
+// ---------------------------------------------------------------------------
+// 分析师与情绪 (spec r2 §3.4 第 4 段, 2026-07-30)
+// ---------------------------------------------------------------------------
+//
+// Finnhub's /stock/recommendation IS on the free tier. Measured 2026-07-30 with
+// the mini's own FINNHUB_API_KEY:
+//
+//   ?symbol=TSM  -> [{"symbol":"2330.TW","period":"2026-07-01","strongBuy":13,
+//                     "buy":28,"hold":2,"sell":0,"strongSell":0}, …]
+//   ?symbol=NVDA -> [{"symbol":"NVDA","period":"2026-07-01","strongBuy":24,
+//                     "buy":40,"hold":4,"sell":1,"strongSell":0}, …]
+//   ?symbol=QQQM -> []
+//
+// Two things that response tells us, and both get reported:
+//   1. The counts are DIMENSIONLESS. Unlike marketCap/EPS they carry no
+//      currency, so there is no unit to verify and nothing to withhold - this
+//      is the one analyst datum this deployment can state outright.
+//   2. The echoed `symbol` is Finnhub's OWN resolution of the ticker, and for
+//      TSM it is 2330.TW - the Taiwan listing, the same ADR-to-home-listing
+//      resolution that made its /stock/metric answer TWD. The ratings are the
+//      covering analysts' ratings of the company either way, but the reader is
+//      told which listing they were filed against rather than being left to
+//      assume they came from US sell-side desks.
+//
+// /stock/price-target (the target DISTRIBUTION and the up/downgrade history)
+// is 403 on this tier, and no retail/social sentiment feed is connected at all.
+// Both gaps are disclosed by name in the rendered section instead of being
+// papered over with a computed-looking number.
+export function normalizeFinnhubRecommendation(payload, { requestedSymbol } = {}) {
+  if (!Array.isArray(payload)) {
+    return { source: "finnhub-recommendation", error: "Finnhub 分析师评级接口未返回数组" };
+  }
+  if (payload.length === 0) {
+    return { source: "finnhub-recommendation", empty: true };
+  }
+  // Newest period first in the live response; sort rather than trust it.
+  const latest = [...payload]
+    .filter((row) => row && typeof row === "object")
+    .sort((left, right) => String(right.period ?? "").localeCompare(String(left.period ?? "")))[0];
+  if (!latest) {
+    return { source: "finnhub-recommendation", error: "Finnhub 分析师评级数组中没有可用记录" };
+  }
+  const counts = {
+    strongBuy: toNumber(latest.strongBuy) ?? 0,
+    buy: toNumber(latest.buy) ?? 0,
+    hold: toNumber(latest.hold) ?? 0,
+    sell: toNumber(latest.sell) ?? 0,
+    strongSell: toNumber(latest.strongSell) ?? 0
+  };
+  const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  if (total === 0) {
+    return { source: "finnhub-recommendation", empty: true };
+  }
+  return {
+    source: "finnhub-recommendation",
+    period: String(latest.period ?? "").slice(0, 10) || undefined,
+    resolvedSymbol: String(latest.symbol ?? "").trim() || undefined,
+    requestedSymbol: String(requestedSymbol ?? "").trim() || undefined,
+    ...counts,
+    total
+  };
+}
+
+export const ANALYST_GAP_DISCLOSURE =
+  "未接入：卖方目标价分布与分析师上下调流水（Finnhub 免费版 /stock/price-target 返回 403）、"
+  + "社媒与散户情绪指标（本部署无数据源）；两项按不可得处理，不做推断、不给替代数字。";
+
+export const ETF_ANALYST_INAPPLICABLE_REASON = "ETF 无卖方评级覆盖，Finnhub 对基金返回空评级数组";
+
+/**
+ * The 分析师与情绪 section's bullets. Every number here is either a
+ * dimensionless count/ratio or an amount routed through `renderAmount`, so no
+ * figure can reach the reader with an unverified currency.
+ *
+ * `optionStats` supplies the ONLY sentiment proxy this deployment measures
+ * (put/call open interest, read-only). It is labelled a proxy, in the sentence,
+ * because a put/call ratio is not a sentiment index and must not read as one.
+ */
+export function summarizeAnalystSentiment({
+  recommendation,
+  valuation,
+  lastPrice,
+  optionStats,
+  newsCount,
+  instrumentKind = "stock"
+} = {}) {
+  const bullets = [];
+  bullets.push(`卖方评级：${renderAnalystRatings(recommendation, instrumentKind)}`);
+
+  const target = toNumber(valuation?.oneYearTarget);
+  const price = toNumber(lastPrice);
+  const failures = Array.isArray(valuation?.failures) ? valuation.failures : [];
+  const fieldFailures =
+    valuation?.fieldFailures && typeof valuation.fieldFailures === "object" ? valuation.fieldFailures : {};
+  const currencies =
+    valuation?.amountCurrencies && typeof valuation.amountCurrencies === "object" ? valuation.amountCurrencies : {};
+  const targetText = renderAmount({
+    value: target,
+    currency: currencies.oneYearTarget,
+    format: (value, label) => `${formatNumber(value)} ${label}`,
+    missingDisclosure: renderMissingValuationDisclosure("targetPrice", {
+      instrumentKind,
+      failures,
+      fieldFailures,
+      error: valuation?.error
+    })
+  });
+  const upside = target !== undefined && price !== undefined && price > 0
+    ? formatPercent(((target - price) / price) * 100)
+    : undefined;
+  bullets.push(
+    `一年目标价：${targetText}；目标价隐含空间：${upside ?? renderTargetUpsideGap(target, price, instrumentKind, failures, fieldFailures, valuation)}。`
+  );
+
+  bullets.push(`情绪代理：${renderSentimentProxy(optionStats, newsCount)}`);
+  bullets.push(ANALYST_GAP_DISCLOSURE);
+  return bullets;
+}
+
+function renderTargetUpsideGap(target, price, instrumentKind, failures, fieldFailures, valuation) {
+  if (target === undefined) {
+    return renderMissingValuationDisclosure("targetPrice", {
+      instrumentKind,
+      failures,
+      fieldFailures,
+      error: valuation?.error,
+      brief: true
+    });
+  }
+  const reason = price === undefined
+    ? TARGET_UPSIDE_UNAVAILABLE_REASONS.missingPrice
+    : TARGET_UPSIDE_UNAVAILABLE_REASONS.invalidPrice;
+  return `${VALUATION_DISCLOSURE.unavailable}（${reason}）`;
+}
+
+function renderAnalystRatings(recommendation, instrumentKind) {
+  if (instrumentKind === "etf") {
+    return `${VALUATION_DISCLOSURE.inapplicable}（${ETF_ANALYST_INAPPLICABLE_REASON}）`;
+  }
+  if (!recommendation || recommendation.error) {
+    const reason = recommendation?.error ?? "本次未读取到分析师评级来源";
+    return `${VALUATION_DISCLOSURE.unavailable}（${reason}）`;
+  }
+  if (recommendation.empty) {
+    return `${VALUATION_DISCLOSURE.unavailable}（Finnhub 对该标的返回空评级数组，覆盖机构数为 0）`;
+  }
+  const period = recommendation.period ? `统计期 ${recommendation.period}` : "统计期未标注";
+  const listing = analystListingNote(recommendation);
+  return `${recommendation.total} 家覆盖 — 强烈买入 ${recommendation.strongBuy}、买入 ${recommendation.buy}、`
+    + `持有 ${recommendation.hold}、卖出 ${recommendation.sell}、强烈卖出 ${recommendation.strongSell}`
+    + `（Finnhub，${period}）${listing}。`;
+}
+
+// Finnhub echoes the symbol it actually resolved. When that differs from the
+// ticker this pipeline asked about (TSM -> 2330.TW), the reader is told, for the
+// same reason the metrics gate exists: an ADR code silently resolving to the
+// home listing is exactly how a foreign-denominated number got shipped as 美元.
+function analystListingNote(recommendation) {
+  const resolved = String(recommendation.resolvedSymbol ?? "").toUpperCase();
+  const requested = String(recommendation.requestedSymbol ?? "").toUpperCase();
+  if (!resolved || !requested || resolved === requested) {
+    return "";
+  }
+  return `；口径提示：Finnhub 把 ${requested} 解析为 ${resolved}，该评级来自公司本土上市地的覆盖机构，不是美股 ADR 单独的卖方口径`;
+}
+
+function renderSentimentProxy(optionStats, newsCount) {
+  const callOi = toNumber(optionStats?.callOpenInterest);
+  const putOi = toNumber(optionStats?.putOpenInterest);
+  const parts = [];
+  if (callOi !== undefined && putOi !== undefined && callOi > 0) {
+    parts.push(
+      `Put/Call 未平仓比 ${formatNumber(putOi / callOi)}`
+      + `（到期日 ${optionStats?.expiration ?? "未标注"}，Call ${formatNumber(callOi)} 张 / Put ${formatNumber(putOi)} 张）`
+    );
+  } else {
+    const reason = optionStats?.summary
+      ? String(optionStats.summary).replace(/。$/u, "")
+      : "期权链未返回可用未平仓数据";
+    parts.push(`Put/Call 未平仓比 ${VALUATION_DISCLOSURE.unavailable}（${reason}）`);
+  }
+  const count = toNumber(newsCount);
+  parts.push(count === undefined ? "本批次新闻条数未统计" : `本批次新闻 ${count} 条，来源分布见新闻事件段`);
+  return `${parts.join("；")}。该比值只是持仓结构的情绪代理，不是情绪指数，不能单独作为方向依据。`;
 }
 
 // Accepts EITHER shape:
@@ -883,6 +1290,14 @@ function normalizeFundamentalSnapshot(snapshot) {
     oneYearTarget: toNumber(snapshot.oneYearTarget ?? snapshot.targetMeanPrice),
     previousClose: toNumber(snapshot.previousClose),
     fiftyTwoWeekHighLow: snapshot.fiftyTwoWeekHighLow,
+    // The currency this source STATED for its own amounts (never one this
+    // file inferred): "USD" only when the source's payload said so - Finnhub's
+    // /stock/profile2 currency, Nasdaq's own "$" markers, StockAnalysis'
+    // `curr.main`. Undefined means unverified, in which case the amounts were
+    // already withheld by the normalizer that read the payload, so this is the
+    // ONLY way a number can reach the renderer at all: with its source's
+    // currency attached.
+    amountCurrency: typeof snapshot.amountCurrency === "string" ? snapshot.amountCurrency : undefined,
     // PER-FIELD reasons from a source that answered but withheld some fields
     // on purpose (currently only normalizeFinnhubMetrics' non-USD gate). Kept
     // separate from `snapshot.error`, which means the whole source failed:
@@ -923,21 +1338,25 @@ function formatPercent(value) {
   return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${number.toFixed(2)}%` : "暂无";
 }
 
-function formatCompactMoney(value) {
+// `currencyLabel` is REQUIRED, and there is deliberately no default: the old
+// single-argument version hardcoded 美元 into every scale suffix, which is how
+// a TWD market cap rendered as "60.94 万亿美元". Callers reach this only through
+// `renderAmount`, which has already verified the currency came from the source.
+function formatCompactMoney(value, currencyLabel) {
   const number = Number(value);
   if (!Number.isFinite(number)) {
     return "暂无";
   }
   if (Math.abs(number) >= 1_000_000_000_000) {
-    return `${(number / 1_000_000_000_000).toFixed(2)} 万亿美元`;
+    return `${(number / 1_000_000_000_000).toFixed(2)} 万亿${currencyLabel}`;
   }
   if (Math.abs(number) >= 1_000_000_000) {
-    return `${(number / 1_000_000_000).toFixed(2)} 十亿美元`;
+    return `${(number / 1_000_000_000).toFixed(2)} 十亿${currencyLabel}`;
   }
   if (Math.abs(number) >= 1_000_000) {
-    return `${(number / 1_000_000).toFixed(2)} 百万美元`;
+    return `${(number / 1_000_000).toFixed(2)} 百万${currencyLabel}`;
   }
-  return `${number.toFixed(2)} 美元`;
+  return `${number.toFixed(2)} ${currencyLabel}`;
 }
 
 function clamp(value, min, max) {

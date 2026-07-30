@@ -147,9 +147,10 @@ export function buildStockAnalysisHistoryUrl(symbol, instrumentKind, { range = "
 
 // Finnhub free tier: /stock/metric IS available (verified 2026-07-27 with the
 // production key: AMZN returns 128 metrics including peTTM/pbQuarterly/
-// epsTTM/marketCapitalization). /stock/candle, /stock/option-chain and
-// /stock/price-target are all 403 on the free tier - they are deliberately
-// NOT wired anywhere; their absence is disclosed in prose instead.
+// epsTTM/marketCapitalization), and so is /stock/recommendation (verified
+// 2026-07-30, see buildFinnhubRecommendationUrl). /stock/candle,
+// /stock/option-chain and /stock/price-target are all 403 on the free tier -
+// they are deliberately NOT wired anywhere; their absence is disclosed in prose.
 export function buildFinnhubMetricUrl(symbol) {
   const url = new URL("https://finnhub.io/api/v1/stock/metric");
   url.searchParams.set("symbol", toBareSymbol(symbol));
@@ -164,6 +165,18 @@ export function buildFinnhubMetricUrl(symbol) {
 // and "USD" for NVDA). See normalizeFinnhubMetrics for what depends on it.
 export function buildFinnhubProfileUrl(symbol) {
   const url = new URL("https://finnhub.io/api/v1/stock/profile2");
+  url.searchParams.set("symbol", toBareSymbol(symbol));
+  return url;
+}
+
+// /stock/recommendation IS on the free tier - measured 2026-07-30 with the
+// mini's FINNHUB_API_KEY: TSM returns four monthly periods (the newest
+// strongBuy 13 / buy 28 / hold 2 / sell 0 / strongSell 0) and every row echoes
+// symbol "2330.TW", NVDA returns four periods echoing "NVDA", QQQM returns [].
+// The counts carry no currency, which is why this is the one analyst figure
+// this deployment can state outright - see normalizeFinnhubRecommendation.
+export function buildFinnhubRecommendationUrl(symbol) {
+  const url = new URL("https://finnhub.io/api/v1/stock/recommendation");
   url.searchParams.set("symbol", toBareSymbol(symbol));
   return url;
 }

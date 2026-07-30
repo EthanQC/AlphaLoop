@@ -21,7 +21,7 @@ import {
   selectDiverseNewsArticles,
   summarizeNewsSourceBreakdown
 } from "./report-news.mjs";
-import { assertStockAnalysisQuality, STOCK_NEWS_SECTION_TITLE, validateStockNarrativeNumbers } from "./report-quality.mjs";
+import { assertStockAnalysisQuality, validateStockNarrativeNumbers } from "./report-quality.mjs";
 import { buildStockFacts, persistStockFacts } from "./report-facts.mjs";
 import { parseConclusionBox, renderConclusionBox } from "./conclusion-box.mjs";
 import {
@@ -36,6 +36,7 @@ import { CONFIDENCE_COVERAGE_CHECKPOINTS, CONFIDENCE_COVERAGE_THRESHOLD, getStoc
 import {
   buildFinnhubMetricUrl,
   buildFinnhubProfileUrl,
+  buildFinnhubRecommendationUrl,
   buildNasdaqHeaders,
   buildNasdaqHistoricalUrl,
   buildNasdaqOptionChainUrl,
@@ -45,9 +46,11 @@ import {
   buildYahooOptionChainUrls,
   INSTRUMENT_KIND_STOCK,
   nasdaqAssetClassOrder,
-  resolveInstrumentKind
+  resolveInstrumentKind,
+  toBareSymbol as toBareFinnhubSymbol
 } from "./stock-analysis-sources.mjs";
 import {
+  AMOUNT_CURRENCY_POLICY_DISCLOSURE,
   PATH_PROBABILITY_BOUNDS,
   PATH_PROBABILITY_DISCLOSURE,
   extractStockAnalysisStatistics,
@@ -55,6 +58,8 @@ import {
   formatPathProbability,
   mergeFundamentalSnapshots,
   normalizeFinnhubMetrics,
+  normalizeFinnhubRecommendation,
+  summarizeAnalystSentiment,
   normalizeNasdaqHistorical,
   normalizeNasdaqOptionChain,
   normalizeNasdaqSummary,
@@ -597,7 +602,22 @@ export function persistStockFactsForRecords(db, tradingDay, records) {
 // own returned object shape. `conclusionBox`/`conclusionBoxMarkdown` are
 // deliberately excluded - those are the Task 2 structured block, rendered
 // verbatim, never run through narrative rewriting.
-const NARRATIVE_SECTION_KEYS = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"];
+// The seven buildDeterministicAnalysis arrays the narrative layer may add prose
+// to, and the same seven `deterministicTextForRecord` flattens for the
+// numeric-match gate. 2026-07-30: renamed with the sections (spec r2 §3.4) -
+// basic+trading merged into quoteTechnicals, thesis' valuation half became
+// valuation, catalysts folded into fundamentals, risks folded into paths, and
+// analysts is new. The news section is NOT here: it never was one of these keys
+// (raw external content, no narrative contract).
+const NARRATIVE_SECTION_KEYS = [
+  "quoteTechnicals",
+  "valuation",
+  "fundamentals",
+  "analysts",
+  "options",
+  "paths",
+  "conclusion"
+];
 
 // Mutates each record with a `narrative` field ({sections, degraded,
 // degradedReason, degradedSections, retriesUsed} - generateNarrativeSections'
@@ -640,10 +660,11 @@ async function fetchStockAnalysisRecord(symbol, generatedAt) {
   // everywhere, and self-healing when the static table is wrong (each Nasdaq
   // fetch retries the other asset class).
   const instrumentKind = resolveInstrumentKind(symbol);
-  const [history, fundamentals, optionChain] = await Promise.all([
+  const [history, fundamentals, optionChain, recommendation] = await Promise.all([
     fetchStockHistory(symbol, { instrumentKind }),
     fetchFundamentalSnapshots(symbol, { instrumentKind }),
-    fetchStockOptionChain(symbol, { instrumentKind })
+    fetchStockOptionChain(symbol, { instrumentKind }),
+    fetchFinnhubRecommendation(symbol)
   ]);
   const news = await fetchStockNews(symbol);
 
@@ -654,8 +675,15 @@ async function fetchStockAnalysisRecord(symbol, generatedAt) {
     history,
     fundamentals,
     optionChain,
+    recommendation,
     news,
-    analysis: buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain, instrumentKind }, generatedAt)
+    analysis: buildDeterministicAnalysis(
+      symbol,
+      quote,
+      news,
+      { history, fundamentals, optionChain, recommendation, instrumentKind },
+      generatedAt
+    )
   };
 }
 
@@ -835,35 +863,13 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
   const conclusionBoxMarkdown = renderConclusionBox(conclusionBoxParams);
 
   return {
-    basic: [
+    // 报价技术面 - the quote and the technical read of it, in one place. Before
+    // 2026-07-30 these were two sections (标的基本信息 / 市场表现与交易层面) with the
+    // price in one and the levels derived from it in the other.
+    quoteTechnicals: [
       `最新价格：${formatNumber(last)}；涨跌幅：${formatPercent(pct)}；成交量：${formatNumber(volume)}。`,
       `日内区间：${formatNumber(low)} - ${formatNumber(high)}；开盘：${formatNumber(open)}；前收：${formatNumber(prevClose)}。`,
       `6 个月走势：${historyStats.summary}`,
-      `数据来源：Longbridge 行情；Longbridge/Yahoo Finance/Google News 多源新闻；历史走势 ${historyStats.source ?? "本次未取到（原因见上一条）"}；期权链 ${optionStats.source ?? "本次未取到（原因见期权段）"}；估值 ${extraData.fundamentals?.sources?.length ? extraData.fundamentals.sources.join("、") : "本次未取到（原因见基本面段）"}。`
-    ],
-    thesis: [
-      "短线判断以价格相对前收、日内区间和新闻催化为主；中期判断仍需结合财报、指引和行业景气。",
-      `当前新闻主线：${newsTitles || "暂未读取到有效新闻标题"}。`,
-      `便宜程度：${historyStats.cheapness}；${valuation.cheapness}。`,
-      upsidePotential
-    ],
-    fundamentals: [
-      "已验证：Longbridge 实时行情、日内高低点、成交量、多源新闻标题、媒体、链接与发布时间。",
-      `估值补充：${valuation.summary}`,
-      upsidePotential,
-      "待验证：最新财报原文、管理层指引、同行估值分位和盈利释放节奏；缺失项不会进入自动交易。",
-      "报告中所有预测均视为待验证路径，不作为实盘自动执行依据。"
-    ],
-    catalysts: [
-      "近期催化剂来自公司新闻、财报窗口、宏观利率预期、行业景气和同类股票联动。",
-      "若新闻标题集中在指引上修、订单增长、监管缓和或行业需求改善，偏正向；反之偏负向。"
-    ],
-    risks: [
-      "若价格跌破支撑且成交量放大，需要重新评估短线方向。",
-      "若新闻只影响情绪而不改变基本面，应降低结论权重。",
-      "任何实盘动作都必须停在建议卡和人工复核。"
-    ],
-    trading: [
       `短线支撑位参考：${formatNumber(historyStats.support ?? support)}；短线阻力位参考：${formatNumber(historyStats.resistance ?? resistance)}。`,
       // 2026-07-27 (defect 5): "20 日"/"60 日" are FIXED labels, so a sample
       // shorter than the window renders the disclosed reason instead of a
@@ -871,18 +877,68 @@ export function buildDeterministicAnalysis(symbol, quote, news, extraData = {}, 
       // The third figure keeps naming the window it really used.
       `均线：20 日 ${formatMovingAverage(historyStats, "ma20")}；60 日 ${formatMovingAverage(historyStats, "ma60")}；${historyStats.longWindowDays ?? "180"} 日 ${formatNumber(historyStats.ma180)}。`,
       `日内强弱：${pct === undefined ? "缺少前收数据" : pct >= 0 ? "相对前收偏强" : "相对前收偏弱"}。`,
-      "大单、卖压和做空比例必须分开验证，不能用盘口现象直接推断做空。"
+      "大单、卖压和做空比例必须分开验证，不能用盘口现象直接推断做空。",
+      `数据来源：Longbridge 行情；Longbridge/Yahoo Finance/Google News 多源新闻；历史走势 ${historyStats.source ?? "本次未取到（原因见上一条）"}；期权链 ${optionStats.source ?? "本次未取到（原因见期权段）"}；估值 ${extraData.fundamentals?.sources?.length ? extraData.fundamentals.sources.join("、") : "本次未取到（原因见估值段）"}。`
     ],
+    // 估值 - its own section as of 2026-07-30 (spec r2 §3.4). "估值补充：" and
+    // "综合上行潜力：" keep their exact prefixes: report-quality.mjs's
+    // VALUATION_EVIDENCE_LINE_PATTERN / UPSIDE_EVIDENCE_LINE_PATTERN and the
+    // valuation.pe / valuation.targetPrice facts-coverage checkpoints all anchor
+    // on them, and they are what makes this section's numbers auditable rather
+    // than prose. Every amount inside `valuation.summary` has already been
+    // through summarizeValuation's currency gate - a figure whose currency no
+    // source stated is rendered 不可得 with the reason, never labelled 美元.
+    valuation: [
+      `估值补充：${valuation.summary}`,
+      AMOUNT_CURRENCY_POLICY_DISCLOSURE,
+      `便宜程度：${historyStats.cheapness}；${valuation.cheapness}。`,
+      upsidePotential
+    ],
+    fundamentals: [
+      "已验证：Longbridge 实时行情、日内高低点、成交量、多源新闻标题、媒体、链接与发布时间。",
+      "待验证：最新财报原文、管理层指引、同行估值分位和盈利释放节奏；缺失项不会进入自动交易。",
+      `当前新闻主线：${newsTitles || "暂未读取到有效新闻标题"}。`,
+      "短线判断以价格相对前收、日内区间和新闻催化为主；中期判断仍需结合财报、指引和行业景气。",
+      // The old 催化剂 section's bullets. They live here rather than in 新闻事件
+      // because that section is gate-exempt (raw external content), and
+      // first-party prose belongs where the numeric/narrative gates can see it.
+      "近期催化剂来自公司新闻、财报窗口、宏观利率预期、行业景气和同类股票联动。",
+      "若新闻标题集中在指引上修、订单增长、监管缓和或行业需求改善，偏正向；反之偏负向。",
+      "报告中所有预测均视为待验证路径，不作为实盘自动执行依据。"
+    ],
+    // 分析师与情绪 - new section (spec r2 §3.4). Ratings are dimensionless counts
+    // from Finnhub; the target price goes through the same currency gate as
+    // every other amount; sentiment is a NAMED proxy plus an explicit list of
+    // what is not connected. See summarizeAnalystSentiment.
+    analysts: summarizeAnalystSentiment({
+      recommendation: extraData.recommendation,
+      valuation: extraData.fundamentals,
+      lastPrice: last,
+      optionStats,
+      newsCount: Array.isArray(news) ? news.length : undefined,
+      instrumentKind
+    }),
     options: [
       `下一次美股月度期权到期日参考：${nextMonthlyExpiry}；到期日前后重点看价格钉仓、Gamma 暴露和流动性变化。`,
       `期权链只读补充：${optionStats.summary}`,
       "当前系统不执行、不模拟、不建议任何期权自动化，仅把期权交割作为现货波动影响因素。"
     ],
-    conclusion: [
+    // 多路径推演 - its own section as of 2026-07-30. These three bullets and
+    // their 口径 disclosure used to sit inside the conclusion section, where a
+    // reader looking for "what are the scenarios" had to find them among the
+    // review tags. The old 风险点 section's invalidation conditions join them:
+    // a downside path and the condition that invalidates the thesis are the
+    // same subject.
+    paths: [
       `上行路径（约 ${formatPathProbability(bullishProbability)}）：若守住 ${formatNumber(historyStats.support ?? support)} 并放量突破 ${formatNumber(historyStats.resistance ?? resistance)}，短线偏上行。`,
       `震荡路径（约 ${formatPathProbability(neutralProbability)}）：若价格继续围绕日内区间运行且新闻没有改变基本面，维持观察。`,
       `回撤路径（约 ${formatPathProbability(bearishProbability)}）：若跌破 ${formatNumber(historyStats.support ?? support)} 且新闻/宏观共振转弱，短线偏回撤。`,
       PATH_PROBABILITY_DISCLOSURE,
+      "失效条件：若价格跌破支撑且成交量放大，需要重新评估短线方向。",
+      "若新闻只影响情绪而不改变基本面，应降低结论权重。",
+      "任何实盘动作都必须停在建议卡和人工复核。"
+    ],
+    conclusion: [
       upsidePotential,
       "复盘标签：stock-analysis、support-resistance、options-expiry-watch、prediction-review。"
     ],
@@ -1186,7 +1242,7 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
     "",
     "## 本批次结论",
     "",
-    ...records.map((record) => bullet(`${record.symbol}：支撑位 ${extractTradingLevel(record.analysis.trading[0], "support")}；阻力位 ${extractTradingLevel(record.analysis.trading[0], "resistance")}；需要按新闻与成交量继续验证。`)),
+    ...records.map((record) => bullet(`${record.symbol}：支撑位 ${extractTradingLevel(record.analysis, "support")}；阻力位 ${extractTradingLevel(record.analysis, "resistance")}；需要按新闻与成交量继续验证。`)),
     // Task H7: per-symbol isolation (see fetchStockAnalysisRecords) means a
     // batch can partially fail - disclose exactly which symbols were
     // skipped and why, instead of the previous all-or-nothing behavior
@@ -1215,6 +1271,15 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
       : null;
     for (const section of template.sections) {
       lines.push(`### ${section.title}`, "");
+      // The news section's ORDER comes from the template (spec r2 §3.4 puts it
+      // sixth, between 期权链只读 and 多路径推演) instead of being appended after the
+      // loop the way it was until 2026-07-30 - which could only ever render it
+      // last. Its body is the news feed, not a buildDeterministicAnalysis array.
+      if (section.kind === "news") {
+        lines.push(...renderSymbolNewsBullets(record));
+        lines.push("");
+        continue;
+      }
       const values = sectionValues(record.analysis, section.title, narrativeSectionsByKey);
       for (const value of values) {
         lines.push(bullet(value));
@@ -1230,22 +1295,27 @@ export function renderBatchStockAnalysis({ label, generatedAt, records, failedSy
       }
       lines.push("");
     }
-    // Heading text imported from report-quality.mjs (defect 2/3): the gates
-    // that must find EVERY symbol's news block - and must refuse to read
-    // valuation evidence out of one - key on this exact literal.
-    lines.push(`### ${STOCK_NEWS_SECTION_TITLE}`, "");
-    const visibleNews = selectDiverseNewsArticles(record.news, 6);
-    lines.push(bullet(`来源分布：${summarizeNewsSourceBreakdown(record.news)}。`));
-    if (!visibleNews.some(hasNonLongbridgeNewsSource)) {
-      lines.push("- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。");
-    }
-    for (const entry of visibleNews) {
-      lines.push(renderDetailedNewsLine(entry, formatShanghaiTime));
-    }
-    lines.push("");
   }
 
   return lines.join("\n").trimEnd();
+}
+
+// One symbol's news bullets. Extracted when the news section moved inside the
+// template loop (2026-07-30) so the body is built in one place regardless of
+// where the template orders the section. The heading itself is the template's
+// (STOCK_NEWS_SECTION_TITLE, imported from report-quality.mjs - defect 2/3: the
+// gates that must find EVERY symbol's news block, and must refuse to read
+// valuation evidence out of one, key on that exact literal).
+function renderSymbolNewsBullets(record) {
+  const visibleNews = selectDiverseNewsArticles(record.news, 6);
+  const bullets = [bullet(`来源分布：${summarizeNewsSourceBreakdown(record.news)}。`)];
+  if (!visibleNews.some(hasNonLongbridgeNewsSource)) {
+    bullets.push("- 来源提示：本批次未读取到可展示的非 Longbridge 新闻，已保留来源降级状态。");
+  }
+  for (const entry of visibleNews) {
+    bullets.push(renderDetailedNewsLine(entry, formatShanghaiTime));
+  }
+  return bullets;
 }
 
 function hasNonLongbridgeNewsSource(article) {
@@ -1260,7 +1330,7 @@ function hasNonLongbridgeNewsSource(article) {
 // sectionValues three-way match - kept as one named constant so
 // renderBatchStockAnalysis's conclusion-box embedding above and this map's
 // key can never independently typo-diverge from each other.
-const CONCLUSION_SECTION_TITLE = "结论与复盘标签";
+const CONCLUSION_SECTION_TITLE = "结论与置信度";
 
 // Phase 5 Task 3 (2026-07-15 plan): reverse of the map inside sectionValues
 // below - the frozen Chinese section title -> the internal English key
@@ -1269,13 +1339,12 @@ const CONCLUSION_SECTION_TITLE = "结论与复盘标签";
 // sectionValues' map can never independently drift apart on which title
 // corresponds to which section.
 const TITLE_TO_SECTION_KEY = {
-  "标的基本信息": "basic",
-  "投资逻辑": "thesis",
-  "基本面分析": "fundamentals",
-  "催化剂": "catalysts",
-  "风险点": "risks",
-  "市场表现与交易层面": "trading",
-  "期权交割与阻力支撑": "options",
+  "报价技术面": "quoteTechnicals",
+  "估值": "valuation",
+  "基本面": "fundamentals",
+  "分析师与情绪": "analysts",
+  "期权链只读": "options",
+  "多路径推演": "paths",
   [CONCLUSION_SECTION_TITLE]: "conclusion"
 };
 
@@ -1357,11 +1426,22 @@ export function deterministicTextForRecord(record) {
   return NARRATIVE_SECTION_KEYS.map((key) => (record?.analysis?.[key] ?? []).join("\n")).join("\n");
 }
 
-function extractTradingLevel(line, side) {
+// 2026-07-30: this used to be handed `analysis.trading[0]` - a fixed section
+// array at a fixed index. It now SEARCHES the 报价技术面 bullets for the sentence
+// that actually carries the levels, so reordering or inserting a bullet cannot
+// silently turn every 本批次结论 line into "支撑位 暂无". A missing sentence still
+// yields formatNumber(undefined) = 暂无, exactly as before.
+function extractTradingLevel(analysis, side) {
   const pattern = side === "support"
     ? /支撑位参考：([^；]+)/u
     : /阻力位参考：(.+)。/u;
-  return formatNumber(String(line ?? "").match(pattern)?.[1]);
+  for (const line of analysis?.quoteTechnicals ?? []) {
+    const match = String(line ?? "").match(pattern);
+    if (match) {
+      return formatNumber(match[1]);
+    }
+  }
+  return formatNumber(undefined);
 }
 
 // Task H4: schema v7 (task H3) rebuilt stock_analysis_targets with a
@@ -1564,6 +1644,32 @@ export async function fetchFinnhubMetrics(symbol, { fetchJson = fetchJsonWithTim
   const reportingCurrency =
     profileResult.status === "fulfilled" ? profileResult.value?.currency : undefined;
   return normalizeFinnhubMetrics(metricResult.value, { reportingCurrency });
+}
+
+// Finnhub's analyst recommendation trends - the 分析师与情绪 section's only
+// first-party analyst data (spec r2 §3.4). Free tier, verified 2026-07-30 with
+// the mini's own key: TSM -> 4 monthly periods echoing symbol "2330.TW",
+// NVDA -> 4 periods echoing "NVDA", QQQM -> []. `requestedSymbol` is threaded
+// through so the renderer can tell the reader when Finnhub resolved the ticker
+// to a different listing than the one asked about - the same ADR resolution that
+// made its /stock/metric answer in New Taiwan dollars.
+//
+// A failure here is never fatal to the batch: the section discloses the reason
+// and the rest of the analysis renders unchanged.
+export async function fetchFinnhubRecommendation(symbol, {
+  fetchJson = fetchJsonWithTimeout,
+  apiKey = process.env.FINNHUB_API_KEY
+} = {}) {
+  const key = String(apiKey ?? "").trim();
+  if (!key) {
+    return { source: "finnhub-recommendation", error: "未配置 FINNHUB_API_KEY，分析师评级未读取" };
+  }
+  try {
+    const payload = await fetchJson(buildFinnhubRecommendationUrl(symbol), { "X-Finnhub-Token": key });
+    return normalizeFinnhubRecommendation(payload, { requestedSymbol: toBareFinnhubSymbol(symbol) });
+  } catch (error) {
+    return { source: "finnhub-recommendation", error: formatFetchError(error, "Finnhub 分析师评级接口") };
+  }
 }
 
 export async function fetchFundamentalSnapshots(symbol, {

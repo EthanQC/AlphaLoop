@@ -516,12 +516,41 @@ describe("normalizeNasdaqSummary: an empty payload is an ERROR, not a value-less
   });
 });
 
+// Fixture policy for this describe block (2026-07-30): an AMOUNT now renders only
+// with the currency its own source stated, so a hand-typed `{marketCap: 97e9}`
+// with no currency beside it is not a shape any producer emits - it is a shape
+// that would let this suite assert on a rendering the pipeline cannot actually
+// reach. Every valuation object below is therefore built by running
+// mergeFundamentalSnapshots over the SAME normalizers production runs, on payload
+// shapes measured against the live endpoints (see the source comments in
+// stock-analysis-metrics.mjs for the raw responses these mirror).
+function nasdaqSummaryPayload(summaryData: Record<string, unknown>) {
+  return { data: { summaryData } };
+}
+
+/** The QQQM `?assetclass=etf` shape, measured 2026-07-30. */
+const ETF_NASDAQ_PAYLOAD = nasdaqSummaryPayload({
+  PreviousClose: { label: "Previous Close", value: "$278.14" },
+  FiftTwoWeekHighLow: { label: "52 Week High/Low", value: "$308.21/$227" },
+  MarketCap: { label: "Market Cap", value: "97,291,489,986" }
+});
+
+/** The NVDA `?assetclass=stocks` shape, measured 2026-07-30. */
+const EQUITY_NASDAQ_PAYLOAD = nasdaqSummaryPayload({
+  Exchange: { label: "Exchange", value: "NASDAQ-GS" },
+  OneYrTarget: { label: "1 Year Target", value: "$320.00" },
+  PreviousClose: { label: "Previous Close", value: "$199.00" },
+  FiftTwoWeekHighLow: { label: "52 Week High/Low", value: "$212.19/$86.62" },
+  MarketCap: { label: "Market Cap", value: "2,496,832,800,000" }
+});
+
 describe("summarizeValuation: every missing metric states WHY", () => {
   it("discloses an ETF's structurally-inapplicable PE/PB/EPS/target instead of rendering '暂无'", () => {
-    const result = metrics.summarizeValuation(
-      { sources: ["nasdaq-summary", "finnhub-metric"], failures: [], marketCap: 97_291_489_986 },
-      { instrumentKind: "etf" }
-    );
+    const valuation = metrics.mergeFundamentalSnapshots([
+      metrics.normalizeNasdaqSummary(ETF_NASDAQ_PAYLOAD),
+      { source: "finnhub-metric", error: "Finnhub 指标接口未返回 metric 字段" }
+    ]);
+    const result = metrics.summarizeValuation(valuation, { instrumentKind: "etf" });
 
     expect(result.summary).toContain("PE 不适用（ETF 无市盈率口径");
     expect(result.summary).toContain("PB 不适用（ETF 无市净率口径");
@@ -531,22 +560,26 @@ describe("summarizeValuation: every missing metric states WHY", () => {
   });
 
   it("names the failing sources when an equity's metric is missing for a non-structural reason", () => {
-    const result = metrics.summarizeValuation(
-      { sources: ["nasdaq-summary"], failures: ["finnhub-metric：Finnhub 指标接口触发限流，当前维度待验证"], oneYearTarget: 320 },
-      { instrumentKind: "stock" }
-    );
+    const valuation = metrics.mergeFundamentalSnapshots([
+      { source: "finnhub-metric", error: "Finnhub 指标接口触发限流，当前维度待验证" },
+      metrics.normalizeNasdaqSummary(EQUITY_NASDAQ_PAYLOAD)
+    ]);
+    const result = metrics.summarizeValuation(valuation, { instrumentKind: "stock" });
 
     expect(result.summary).toContain("PE 不可得（来源未提供该字段：finnhub-metric");
-    expect(result.summary).toContain("一年目标价 320.00");
+    expect(result.summary).toContain("一年目标价 320.00 美元");
   });
 
   it("marks an ETF's metrics 不适用 (structural) and a source outage 不可得 (data), so a reader can tell them apart", () => {
     const etf = metrics.summarizeValuation(
-      { sources: ["nasdaq-summary"], failures: [], marketCap: 97_291_489_986 },
+      metrics.mergeFundamentalSnapshots([metrics.normalizeNasdaqSummary(ETF_NASDAQ_PAYLOAD)]),
       { instrumentKind: "etf" }
     );
     const outage = metrics.summarizeValuation(
-      { sources: ["nasdaq-summary"], failures: ["finnhub-metric：Finnhub 指标接口返回 429"], marketCap: 3_000_000_000_000 },
+      metrics.mergeFundamentalSnapshots([
+        { source: "finnhub-metric", error: "Finnhub 指标接口返回 429" },
+        metrics.normalizeNasdaqSummary(EQUITY_NASDAQ_PAYLOAD)
+      ]),
       { instrumentKind: "stock" }
     );
 
@@ -557,13 +590,162 @@ describe("summarizeValuation: every missing metric states WHY", () => {
   });
 
   it("still renders real numbers untouched when every metric is present", () => {
+    const valuation = metrics.mergeFundamentalSnapshots([
+      metrics.normalizeFinnhubMetrics(
+        { metric: { peTTM: 27.76, pbQuarterly: 5.648, epsTTM: 8.37, marketCapitalization: 2_496_832.8 } },
+        { reportingCurrency: "USD" }
+      ),
+      metrics.normalizeNasdaqSummary(EQUITY_NASDAQ_PAYLOAD)
+    ]);
+    const result = metrics.summarizeValuation(valuation, { instrumentKind: "stock" });
+
+    expect(result.summary).toContain("PE 27.76；PB 5.65；EPS 8.37 美元");
+    expect(result.summary).toContain("市值 2.50 万亿美元");
+    expect(result.summary).toContain("一年目标价 320.00 美元");
+    expect(result.summary).not.toContain("不可得");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 金额的计价货币必须来自来源本身 (2026-07-30)
+// ---------------------------------------------------------------------------
+describe("amount currencies are read from each source, never assumed", () => {
+  it("reads Nasdaq's own $ markers and lets the unmarked MarketCap inherit them", () => {
+    const snapshot = metrics.normalizeNasdaqSummary(EQUITY_NASDAQ_PAYLOAD);
+
+    expect(snapshot.amountCurrency).toBe("USD");
+    expect(snapshot.marketCap).toBe(2_496_832_800_000);
+    expect(snapshot.oneYearTarget).toBe(320);
+  });
+
+  it("withholds Nasdaq's amounts when the payload carries no $ marker at all", () => {
+    // Same field set, every money value unmarked - the shape a non-USD listing
+    // would have to produce for its numbers to be silently read as dollars.
+    const snapshot = metrics.normalizeNasdaqSummary(
+      nasdaqSummaryPayload({
+        OneYrTarget: { label: "1 Year Target", value: "500.00" },
+        PreviousClose: { label: "Previous Close", value: "392.31" },
+        MarketCap: { label: "Market Cap", value: "1,943,227,792,382" }
+      })
+    );
+
+    expect(snapshot.amountCurrency).toBeUndefined();
+    expect(snapshot.marketCap).toBeUndefined();
+    expect(snapshot.oneYearTarget).toBeUndefined();
+    expect(snapshot.fieldFailures?.marketCap?.[0]).toContain("没有任何 $ 计价标记");
+    expect(snapshot.fieldFailures?.targetPrice?.[0]).toContain("没有任何 $ 计价标记");
+  });
+
+  it("keeps StockAnalysis' USD market cap but drops the EPS its own page says is TWD", () => {
+    // The TSM statistics page's shape, measured 2026-07-30: one page, two
+    // currencies - market cap in the listing's USD, financial statements in TWD.
+    const html = [
+      'curr:{main:"USD",price:"USD",dividend:"USD",financial:"TWD"},stream:true',
+      '<td>PE Ratio</td><td title="25.268">25.27</td>',
+      '<td>EPS (ttm)</td><td title="87.3818">87.38</td>',
+      '<td>Market Cap</td><td title="1,760,622,599,911">1.76T</td>'
+    ].join("\n");
+
+    const snapshot = metrics.extractStockAnalysisStatistics(html);
+
+    expect(metrics.readStockAnalysisCurrencies(html)).toEqual({
+      main: "USD",
+      price: "USD",
+      dividend: "USD",
+      financial: "TWD"
+    });
+    expect(snapshot.amountCurrency).toBe("USD");
+    expect(snapshot.marketCap).toBe(1_760_622_599_911);
+    expect(snapshot.trailingPE).toBe(25.268);
+    expect(snapshot.epsTrailingTwelveMonths).toBeUndefined();
+    expect(snapshot.fieldFailures?.eps?.[0]).toContain("财务报表口径以 TWD 计价");
+  });
+
+  it("drops StockAnalysis' amounts when the page declares no currency at all", () => {
+    const snapshot = metrics.extractStockAnalysisStatistics('<td>Market Cap</td><td title="92,770,579,573">92.77B</td>');
+
+    expect(snapshot.amountCurrency).toBeUndefined();
+    expect(snapshot.marketCap).toBeUndefined();
+    expect(snapshot.fieldFailures?.marketCap?.[0]).toContain("页面未声明市值口径的计价货币");
+  });
+
+  it("refuses to print an amount whose currency nobody verified, even if the number is there", () => {
+    // The structural backstop: a valuation object carrying an amount with no
+    // entry in amountCurrencies (a legacy caller, or a future source that forgets
+    // to state one) renders the disclosure - not a number under a guessed 美元.
     const result = metrics.summarizeValuation(
-      { sources: ["finnhub-metric"], trailingPE: 27.76, priceToBook: 5.648, epsTrailingTwelveMonths: 8.37, marketCap: 2_496_832_800_000, oneYearTarget: 320 },
+      { sources: ["mystery-source"], failures: [], marketCap: 60_941_068_000_000, amountCurrencies: {} },
       { instrumentKind: "stock" }
     );
 
-    expect(result.summary).toContain("PE 27.76；PB 5.65；EPS 8.37");
-    expect(result.summary).not.toContain("不可得");
+    expect(result.summary).not.toContain("万亿美元");
+    expect(result.summary).toContain("市值 不可得（金额已取到但来源未声明计价货币");
+  });
+});
+
+describe("normalizeFinnhubRecommendation / summarizeAnalystSentiment", () => {
+  // The live TSM response, measured 2026-07-30 with the mini's own key. Note the
+  // echoed symbol: Finnhub resolved the ADR ticker to the Taiwan listing, the
+  // same resolution that made its /stock/metric answer in TWD.
+  const TSM_RECOMMENDATION = [
+    { symbol: "2330.TW", period: "2026-07-01", strongBuy: 13, buy: 28, hold: 2, sell: 0, strongSell: 0 },
+    { symbol: "2330.TW", period: "2026-06-01", strongBuy: 11, buy: 29, hold: 2, sell: 0, strongSell: 0 }
+  ];
+
+  it("takes the newest period and keeps the symbol Finnhub actually resolved", () => {
+    const normalized = metrics.normalizeFinnhubRecommendation(TSM_RECOMMENDATION, { requestedSymbol: "TSM" });
+
+    expect(normalized.period).toBe("2026-07-01");
+    expect(normalized.resolvedSymbol).toBe("2330.TW");
+    expect(normalized.total).toBe(43);
+  });
+
+  it("tells the reader when the ratings were filed against a different listing", () => {
+    const bullets = metrics.summarizeAnalystSentiment({
+      recommendation: metrics.normalizeFinnhubRecommendation(TSM_RECOMMENDATION, { requestedSymbol: "TSM" }),
+      valuation: metrics.mergeFundamentalSnapshots([metrics.normalizeNasdaqSummary(EQUITY_NASDAQ_PAYLOAD)]),
+      lastPrice: 394.525,
+      optionStats: { expiration: "2026-07-31", callOpenInterest: 68_513, putOpenInterest: 103_700 },
+      newsCount: 12,
+      instrumentKind: "stock"
+    });
+
+    expect(bullets[0]).toContain("43 家覆盖 — 强烈买入 13、买入 28、持有 2、卖出 0、强烈卖出 0");
+    expect(bullets[0]).toContain("Finnhub 把 TSM 解析为 2330.TW");
+    // The target price is an amount, so it obeys the same currency rule.
+    expect(bullets[1]).toContain("一年目标价：320.00 美元");
+    expect(bullets[2]).toContain("Put/Call 未平仓比 1.51");
+    expect(bullets[2]).toContain("不是情绪指数");
+    expect(bullets[3]).toBe(metrics.ANALYST_GAP_DISCLOSURE);
+  });
+
+  it("calls an ETF's ratings structurally inapplicable rather than missing", () => {
+    const bullets = metrics.summarizeAnalystSentiment({
+      recommendation: metrics.normalizeFinnhubRecommendation([], { requestedSymbol: "QQQM" }),
+      valuation: metrics.mergeFundamentalSnapshots([metrics.normalizeNasdaqSummary(ETF_NASDAQ_PAYLOAD)]),
+      lastPrice: 278.14,
+      // Through the real summarizer, so the disclosed reason is the one a reader
+      // would actually see rather than a hand-written approximation of it.
+      optionStats: metrics.summarizeOptionChainStats({ error: "Nasdaq 期权链未返回最近到期日的未平仓数据" }),
+      newsCount: 0,
+      instrumentKind: "etf"
+    });
+
+    expect(bullets[0]).toContain(`不适用（${metrics.ETF_ANALYST_INAPPLICABLE_REASON}）`);
+    expect(bullets[2]).toContain("Put/Call 未平仓比 不可得（期权链读取失败：Nasdaq 期权链未返回最近到期日的未平仓数据）");
+  });
+
+  it("discloses a rating outage with the reason instead of an empty distribution", () => {
+    const bullets = metrics.summarizeAnalystSentiment({
+      recommendation: { source: "finnhub-recommendation", error: "Finnhub 分析师评级接口返回 429" },
+      valuation: { sources: [], failures: [], amountCurrencies: {} },
+      lastPrice: 100,
+      optionStats: { error: "期权链来源均未返回可用数据" },
+      newsCount: 3,
+      instrumentKind: "stock"
+    });
+
+    expect(bullets[0]).toContain("不可得（Finnhub 分析师评级接口返回 429）");
   });
 });
 
