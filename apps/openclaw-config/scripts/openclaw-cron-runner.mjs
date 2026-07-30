@@ -114,13 +114,21 @@ loadLocalEnv(repoRoot);
 // (task H1 fix: this object and KNOWN_CRON_JOB_NAMES used to hardcode the
 // same strings independently, free to drift).
 const allowedJobs = {
-  "/run/daily": { name: CRON_JOB_DAILY, command: [pnpmBin, "report:daily:run"], timeoutMs: 15 * 60 * 1000 },
+  // 2026-07-30: 45min, not 15 - the same lesson the weekly line below learned
+  // on 07-26, replayed on the daily. When news coverage widened from the first
+  // 8 symbols to the full watchlist union (§0.4), a daily run stopped fitting
+  // in 15 minutes (Yahoo answers 429 with backoff, and the URL gate now
+  // confirms citations with ranged GETs). Measured on the mini: three runner
+  // attempts on 07-30 died as `signal=SIGTERM, exitCode=null` at exactly the
+  // cap while the identical command completed by hand - which re-halted the
+  // job hours after its quality-gate failure had been fixed. The "daily
+  // measured ~3.5min" claim below described the 8-symbol pipeline.
+  "/run/daily": { name: CRON_JOB_DAILY, command: [pnpmBin, "report:daily:run"], timeoutMs: 45 * 60 * 1000 },
   // 2026-07-26: 45min, not 15. The weekly report aggregates a full week of
   // news clustering plus per-symbol analysis; measured on the mini it takes
   // ~20 minutes, so the old 15-minute cap SIGTERM'd every single run (three
   // consecutive kills in run_log, each exactly 15:00 after start) and the
-  // weekly pipeline had never once produced output. Daily measured ~3.5min
-  // and stays at 15.
+  // weekly pipeline had never once produced output.
   "/run/weekly": { name: CRON_JOB_WEEKLY, command: [pnpmBin, "report:weekly:run"], timeoutMs: 45 * 60 * 1000 },
   "/run/stock-analysis": { name: CRON_JOB_STOCK_ANALYSIS, command: [pnpmBin, "stock-analysis:scheduled"], timeoutMs: 20 * 60 * 1000 },
   // 2026-07 audit fix: these two were registered in openclaw-cron-jobs.mjs (proposal-expiry sweep,
