@@ -23,7 +23,14 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { methodNotAllowed, type Member } from "@packages/shared-types";
 
-import { listFilterSymbols, listNewsEvents, type ImpactDirection, type NewsEventRow, type NewsEventSourceRow } from "../data/news.js";
+import {
+  listFilterSymbols,
+  listNewsEvents,
+  summarizeNewsEventWindow,
+  type ImpactDirection,
+  type NewsEventRow,
+  type NewsEventSourceRow
+} from "../data/news.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderEmptyState } from "../render/empty-state.js";
 import { describeDataInstant } from "../render/format.js";
@@ -47,6 +54,22 @@ export interface NewsRouteDeps {
 // listNewsEvents take a computed sinceIso cutoff for.
 const WINDOW_DAYS = 7;
 const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+// 2026-07-30. §1.5 asks for 「可翻近 7 天」 and this page took that literally in
+// the worst way: it rendered the ENTIRE window in one response. Measured against
+// a byte-copy of the mini's live trading.sqlite (1307 events in window):
+// 1303 event cards, 2,122,507 bytes. The filters do not rescue it either -
+// ?topic=宏观 still matches 1208 events / 1,895,519 bytes, because most wire
+// items implicate no specific ticker. On a phone that is a multi-second load and
+// a DOM the browser has to lay out all at once.
+//
+// So the window stays 7 days and the reader pages through it. Ordering is
+// newest-first, page size 50: at the live corpus's ~1.6 KB per card that is a
+// ~100 KB page, and the whole window is still reachable (27 pages), which is
+// what 「可翻近 7 天」 asks for. Nothing is truncated away - the page states the
+// true total, and the pager preserves whatever symbol/topic filter is active, so
+// the filter narrows the set first and the page size only slices what is left.
+const PAGE_SIZE = 50;
 
 // Freshness thresholds (plan Task 7, req): <6h since the most recent
 // clustered event's last_published_at -> "最新"; <48h -> "延迟"; older, or no
@@ -83,17 +106,11 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
 // Freshness
 // ---------------------------------------------------------------------------
 
-function computeFreshness(events: readonly NewsEventRow[], now: Date): Freshness {
-  const latestIso = events.reduce<string | null>((latest, event) => {
-    if (!event.lastPublishedAt) {
-      return latest;
-    }
-    if (!latest || event.lastPublishedAt > latest) {
-      return event.lastPublishedAt;
-    }
-    return latest;
-  }, null);
-
+// Takes the window's newest `last_published_at` (an aggregate over every event
+// matching the current filters) rather than a page of rows: what a reader needs
+// to know is how fresh the FEED is, and that must not change because they walked
+// back a page.
+function computeFreshness(latestIso: string | null, now: Date): Freshness {
   if (!latestIso) {
     return "部分缺失";
   }
@@ -283,16 +300,90 @@ function renderEmptyStateCard(filtered: boolean): Html {
 }
 
 // ---------------------------------------------------------------------------
+// Pager
+// ---------------------------------------------------------------------------
+
+interface PageState {
+  page: number;
+  pageCount: number;
+  total: number;
+  offset: number;
+}
+
+/**
+ * Resolves `?page=` against the filtered total. An out-of-range, zero, negative
+ * or non-numeric page CLAMPS into range rather than rendering a blank grid that
+ * looks identical to "no news at all" - the reader would have no way to tell a
+ * bad URL from an empty feed.
+ */
+function resolvePageState(total: number, raw: string | null): PageState {
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const parsed = Number.parseInt(String(raw ?? "1"), 10);
+  const page = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), pageCount) : 1;
+  return { page, pageCount, total, offset: (page - 1) * PAGE_SIZE };
+}
+
+/** Keeps the active symbol/topic filter across a page step - a pager that drops
+ * the filter would silently widen what the reader is looking at. */
+function pageHref(page: number, activeSymbol: string | null, activeTopic: string | null): string {
+  const params = new URLSearchParams();
+  if (activeSymbol) {
+    params.set("symbol", activeSymbol);
+  }
+  if (activeTopic) {
+    params.set("topic", activeTopic);
+  }
+  if (page > 1) {
+    params.set("page", String(page));
+  }
+  const query = params.toString();
+  return query.length > 0 ? `/news?${query}` : "/news";
+}
+
+function renderPagerLink(label: string, href: string | null): Html {
+  if (!href) {
+    return html`<span style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;color:var(--sub);opacity:.5">${label}</span>`;
+  }
+  return html`<a href="${href}" style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;margin:0 8px 8px 0;background:var(--card);color:var(--ink)">${label}</a>`;
+}
+
+function renderPagerCard(state: PageState, shown: number, activeSymbol: string | null, activeTopic: string | null): Html {
+  const first = state.total === 0 ? 0 : state.offset + 1;
+  const last = state.offset + shown;
+  const prev = state.page > 1 ? pageHref(state.page - 1, activeSymbol, activeTopic) : null;
+  const next = state.page < state.pageCount ? pageHref(state.page + 1, activeSymbol, activeTopic) : null;
+  return html`<section class="card w2 dt-w4">
+    <h2>翻页</h2>
+    <p style="font-size:12.5px;color:var(--sub);margin-bottom:8px">近 ${WINDOW_DAYS} 天共 ${String(state.total)} 件事件，当前第 ${String(state.page)}/${String(state.pageCount)} 页（第 ${String(first)}-${String(last)} 件，按最近发布时间倒序）。筛选先生效，再分页。</p>
+    <div>${joinHtml([renderPagerLink("← 更新", prev), renderPagerLink("更早 →", next)])}</div>
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
 
-function renderNewsBody(events: readonly NewsEventRow[], symbols: readonly string[], activeSymbol: string | null, activeTopic: string | null, now: Date): Html {
+function renderNewsBody(
+  events: readonly NewsEventRow[],
+  symbols: readonly string[],
+  activeSymbol: string | null,
+  activeTopic: string | null,
+  now: Date,
+  state: PageState
+): Html {
   const cards = events.length > 0
     ? joinHtml(events.map((event) => renderEventCard(event, now)))
     : renderEmptyStateCard(activeSymbol !== null || activeTopic !== null);
+  // The pager is omitted when the whole filtered window fits on one page -
+  // "第 1/1 页" next to two dead arrows is noise, not navigation.
+  const pager = state.pageCount > 1
+    ? html`<div class="bento" style="margin-top:10px">${renderPagerCard(state, events.length, activeSymbol, activeTopic)}</div>`
+    : html``;
 
   return html`<div class="bento">${renderFilterChipsCard(symbols, activeSymbol, activeTopic)}</div>
-    <div class="bento" style="margin-top:10px">${cards}</div>`;
+    ${pager}
+    <div class="bento" style="margin-top:10px">${cards}</div>
+    ${pager}`;
 }
 
 export function renderNewsPage(
@@ -307,34 +398,38 @@ export function renderNewsPage(
   const activeTopic = url.searchParams.get("topic");
 
   const sinceIso = new Date(now.getTime() - WINDOW_MS).toISOString();
-  const events = listNewsEvents(deps.db, {
+  const filters = {
     sinceIso,
     ...(activeSymbol ? { symbol: activeSymbol } : {}),
     ...(activeTopic ? { topic: activeTopic } : {})
-  });
+  };
+  // Total + newest timestamp over the whole FILTERED window, then one page of
+  // rows out of it. Both halves share buildWindowQuery (data/news.ts), so the
+  // count the pager prints and the rows it pages through are the same set.
+  const summary = summarizeNewsEventWindow(deps.db, filters);
+  const state = resolvePageState(summary.total, url.searchParams.get("page"));
+  const events = listNewsEvents(deps.db, { ...filters, limit: PAGE_SIZE, offset: state.offset });
   const symbols = listFilterSymbols(deps.db);
-  // `listNewsEvents` orders newest-first (see data/news.ts), so the first
-  // event with a published source dates the whole page.
-  const newestPublishedAt =
-    events
-      .flatMap((event) => event.sources.map((source) => source.publishedAt))
-      .filter((value): value is string => typeof value === "string" && value.length > 0)
-      .sort()
-      .at(-1) ?? null;
 
   const page = renderPage({
     title: "新闻",
     nav: "news",
     member: { displayName: member.displayName },
-    freshness: computeFreshness(events, now),
+    // Freshness and 数据时间 both come from the WINDOW's newest event, not from
+    // this page's newest row: paging back to page 20 does not make the news feed
+    // three days stale, and printing that it did would be a false claim about
+    // the data behind the page. `last_published_at` is exactly the newest
+    // source's published_at (verified on all 1836 of the mini's live rows), so
+    // this is the same instant the pre-paging code derived by scanning sources.
+    freshness: computeFreshness(summary.latestPublishedAt, now),
     // U2: the newest event's own published time IS this page's data time -
     // the news feed has no separate generation step of its own. There is no
     // "listed but undated" case to disclose here: data/news.ts's
     // `listNewsEvents` filters on `last_published_at IS NOT NULL`, so an
     // event with no known time is never on this page in the first place.
-    dataAsOf: newestPublishedAt ? describeDataInstant(newestPublishedAt, now) : null,
+    dataAsOf: summary.latestPublishedAt ? describeDataInstant(summary.latestPublishedAt, now) : null,
     degraded: [],
-    bodyHtml: renderNewsBody(events, symbols, activeSymbol, activeTopic, now),
+    bodyHtml: renderNewsBody(events, symbols, activeSymbol, activeTopic, now, state),
     nonce,
     now
   });

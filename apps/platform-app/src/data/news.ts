@@ -67,6 +67,31 @@ export interface ListNewsEventsFilters {
   sinceIso: string;
   symbol?: string | undefined;
   topic?: string | undefined;
+  /**
+   * Page size. Omitted = every matching row, which is what this function did
+   * before 2026-07-30 and what news-store.mjs's `listEventsInWindow` still
+   * does. The route always passes one: measured against the mini's live db, the
+   * unpaged 7-day window is 1303 events / 2,122,507 bytes of HTML in a single
+   * response, and 1208 of those events survive the 宏观 filter, so filtering
+   * alone never made the page small.
+   */
+  limit?: number | undefined;
+  offset?: number | undefined;
+}
+
+export interface NewsEventWindowSummary {
+  /** Rows matching the SAME filters, ignoring limit/offset. */
+  total: number;
+  /**
+   * Newest `last_published_at` in the filtered window. Read from an aggregate
+   * rather than from the returned page on purpose: the page's own newest row
+   * dates page 1 correctly and every later page WRONGLY, which would make the
+   * header's 数据时间/新鲜度 drift older as a reader pages back through history.
+   * Verified against the mini's 1836 live events: `last_published_at` equals
+   * `MAX(source.published_at)` on every single row (0 mismatches), which is why
+   * this one column can date the page without joining the sources table.
+   */
+  latestPublishedAt: string | null;
 }
 
 function fromJsonArray(raw: unknown): string[] {
@@ -131,22 +156,24 @@ function mapSourceRow(row: Record<string, unknown>): NewsEventSourceRow {
  *     returns plain rows, not client-aggregated arrays).
  */
 export function listNewsEvents(db: DatabaseSync, filters: ListNewsEventsFilters): NewsEventRow[] {
-  const { sinceIso, symbol, topic } = filters;
-  const conditions = ["last_published_at IS NOT NULL", "last_published_at >= ?"];
-  const params: Array<string> = [sinceIso];
+  const { limit, offset } = filters;
+  const { where, params } = buildWindowQuery(filters);
 
-  if (symbol) {
-    conditions.push("impact_affected LIKE ?");
-    params.push(`%"${symbol}"%`);
-  }
-  if (topic === "宏观") {
-    conditions.push("(impact_affected = '[]' OR impact_affected LIKE ?)");
-    params.push(`%"宏观"%`);
-  }
+  // LIMIT/OFFSET is appended only when a page size was asked for, so a caller
+  // that wants the whole window still gets the whole window. `ORDER BY
+  // last_published_at DESC` alone is not a total order (wire services publish
+  // many items on the same second - the mini's live db has 1836 events across
+  // 1775 distinct timestamps), and a non-deterministic tie break would let the
+  // same event appear on two pages while another appeared on none. `id` is the
+  // primary key, so adding it makes the order total.
+  const pageClause = typeof limit === "number" ? ` LIMIT ? OFFSET ?` : "";
+  const pageParams: Array<string | number> = typeof limit === "number"
+    ? [Math.max(0, Math.trunc(limit)), Math.max(0, Math.trunc(offset ?? 0))]
+    : [];
 
   const rows = db
-    .prepare(`SELECT * FROM news_events WHERE ${conditions.join(" AND ")} ORDER BY last_published_at DESC`)
-    .all(...params) as Array<Record<string, unknown>>;
+    .prepare(`SELECT * FROM news_events WHERE ${where} ORDER BY last_published_at DESC, id DESC${pageClause}`)
+    .all(...params, ...pageParams) as Array<Record<string, unknown>>;
 
   const events = rows.map(mapEventRow);
   if (events.length === 0) {
@@ -171,6 +198,42 @@ export function listNewsEvents(db: DatabaseSync, filters: ListNewsEventsFilters)
   }
 
   return events;
+}
+
+/** The shared WHERE clause of every query in this module - one definition, so a
+ * page, its total and its timestamp can never be computed over different sets. */
+function buildWindowQuery(filters: ListNewsEventsFilters): { where: string; params: string[] } {
+  const { sinceIso, symbol, topic } = filters;
+  const conditions = ["last_published_at IS NOT NULL", "last_published_at >= ?"];
+  const params: string[] = [sinceIso];
+
+  if (symbol) {
+    conditions.push("impact_affected LIKE ?");
+    params.push(`%"${symbol}"%`);
+  }
+  if (topic === "宏观") {
+    conditions.push("(impact_affected = '[]' OR impact_affected LIKE ?)");
+    params.push(`%"宏观"%`);
+  }
+
+  return { where: conditions.join(" AND "), params };
+}
+
+/**
+ * How many events the CURRENT filters match, and when the newest of them was
+ * published - both over the whole filtered window, so a paged page can state a
+ * true total ("共 1303 条") and carry a data timestamp that does not sag as the
+ * reader pages backwards. Ignores `limit`/`offset` by construction.
+ */
+export function summarizeNewsEventWindow(db: DatabaseSync, filters: ListNewsEventsFilters): NewsEventWindowSummary {
+  const { where, params } = buildWindowQuery(filters);
+  const row = db
+    .prepare(`SELECT COUNT(*) AS total, MAX(last_published_at) AS latest FROM news_events WHERE ${where}`)
+    .get(...params) as { total?: unknown; latest?: unknown } | undefined;
+  return {
+    total: Number(row?.total ?? 0),
+    latestPublishedAt: row?.latest === null || row?.latest === undefined ? null : String(row.latest)
+  };
 }
 
 /**

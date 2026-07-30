@@ -13,7 +13,7 @@ import {
 import { CONFIDENCE_LABELS, parseReportConclusionBox, renderReportConclusionBox } from "./conclusion-box.mjs";
 import { renderDailyRoutineChecklist } from "./daily-routine.mjs";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
-import { collectL1News } from "./news-sources.mjs";
+import { collectL1News, RSSHUB_ROUTES } from "./news-sources.mjs";
 import { buildEventFromCluster, clusterArticles } from "./news-engine.mjs";
 import { getDailyFacts, upsertEventWithSources } from "./news-store.mjs";
 import { createOpenclawSearchBackend, runL2TopicSearch, runL3DeepDive } from "./news-agent-search.mjs";
@@ -36,7 +36,14 @@ import {
 } from "./report-macro.mjs";
 import { fetchEarningsCalendar, renderEarningsCalendarLines } from "./report-earnings.mjs";
 import { isUsRegularTradingDate } from "./trading-schedule.mjs";
-import { assertReportQuality, findPersonalContentLeaks, validateNarrativeNumbers, validateReportUrls } from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts, summarizeWeeklyMarketPerformance } from "./report-facts.mjs";
+import {
+  assertReportQuality,
+  CHINESE_RATIO_DISCLOSURE_PREFIX,
+  CHINESE_SOURCE_FLOOR_PERCENT,
+  findPersonalContentLeaks,
+  validateNarrativeNumbers,
+  validateReportUrls
+} from "./report-quality.mjs";import { buildDailyFacts, persistDailyFacts, summarizeWeeklyMarketPerformance } from "./report-facts.mjs";
 
 // Phase 4 Task 7: news-search budgets/limits (Global Constraints - spec
 // values, not to be changed here). L2 topic search runs for both daily and
@@ -59,6 +66,43 @@ export const L3_BUDGETS = {
 };
 
 const NEWS_CARD_LIMIT = 8;
+
+// How many symbols of the §0.4 pool (全体成员标的池的并集 + 全体持仓) ONE run may
+// fetch news for. Overridable with REPORT_NEWS_SYMBOL_LIMIT; anything the cap
+// leaves out is named in the report's 证据与来源 block, never silently dropped.
+//
+// Raised 8 -> 40 on 2026-07-30. 8 was 2/5 of the spec's own pool: §0.4 caps each
+// member's watchlist at 20, so two members alone reach 40 symbols and a run
+// searched the first eight of them. 40 is the two-member pool, and it is bounded
+// by the first hard limit in the collection path rather than by taste: Finnhub
+// gets exactly one call per symbol through a limiter that permits 60 per minute
+// and THROWS past that (news-sources.mjs's createFinnhubRateLimiter - the
+// surplus symbols would lose their Finnhub leg to a warning each), so 60 is the
+// ceiling and 40 keeps headroom under it.
+//
+// What this trades, all measured 2026-07-30 rather than estimated:
+//   - REQUESTS: 5 upstream calls per symbol (Finnhub, Yahoo search, Yahoo RSS,
+//     Google News RSS, Longbridge news), so a run goes from 43 to 203 L1 calls.
+//     The three Chinese RSSHub feeds are per-RUN, not per-symbol, so they do not
+//     move. The L2 agent search is budget-capped (§0.4: daily ≤30 / weekly ≤60
+//     queries, planL2Queries trims the plan to fit), so it does not scale here.
+//   - WALL CLOCK: the fan-out is one Promise.allSettled, so the network legs
+//     overlap; the parts that do not are the Longbridge leg (one CLI subprocess
+//     per symbol, serialized behind the shared `quote` limiter - ≥100 ms apart,
+//     ≤10/s) and clustering, which is O(n²) over the collected articles. Timed
+//     against the mini's 1909 real article titles: 156 ms at 226 articles
+//     (today's one-symbol volume), 2.7 s at 1000, 9.1 s at 1900 - so ~2800
+//     articles (40 symbols) lands near 20 s. The mini's daily report currently
+//     takes 184-234 s end to end against §0.4's 15-minute ceiling, so the added
+//     cost fits, and clustering is the term to watch if the pool keeps growing.
+//   - CHINESE-SOURCE MIX: this is the real cost, and it is why the
+//     news.chinese_ratio gate had to stop being fatal in the same commit. The
+//     Chinese feeds are per-run and the English ones per-symbol, so the ratio is
+//     160/(160 + ~66N): the mini measured 70.80% at N=1, this cap puts it near
+//     6%, and even N=6 (its pool today) is already 28.8%, under the §0.4 floor.
+//     Every such report now SAYS so, in a line that also reports how many of the
+//     printed cards carry a Chinese source.
+const DEFAULT_NEWS_SYMBOL_LIMIT = 40;
 
 // Task 20: how far ahead the earnings calendar looks. Longer than the macro
 // lookahead (REPORT_MACRO_LOOKAHEAD_DAYS, 14 days) on purpose - macro releases
@@ -2137,6 +2181,69 @@ function computeChineseSourceRatio(sources) {
   return (zh / sources.length) * 100;
 }
 
+// 2026-07-30. The 中文源占比 statistic used to be a pure delivery blocker
+// (report-quality.mjs's news.chinese_ratio - see its own comment for the two
+// measurements that made that indefensible). It is now blocking only when the
+// number is BELOW THE FLOOR AND UNEXPLAINED, so the renderer owes the reader an
+// explanation whenever it prints a sub-floor number. This builds it.
+//
+// Everything in the sentence is measured from this run, never assumed:
+//   - the ratio and the floor;
+//   - each of the three Chinese feeds, by name, with either the number of
+//     sources it actually contributed or the verbatim failure warning
+//     collectL1News recorded for it (they all live behind ONE self-hosted
+//     RSSHub, so they fail together and a reader must be told that);
+//   - how many symbols this run searched, because the English sources are
+//     fetched PER SYMBOL while the Chinese feeds are fetched once per run - the
+//     structural reason the ratio falls as the §0.4 pool grows.
+// A caller that never ran collectL1News (a direct renderDailyReport unit test)
+// has no source health to report, and says so rather than implying success.
+function describeChineseSourceHealth(data, allSources) {
+  const warnings = Array.isArray(data.newsWarnings) ? data.newsWarnings : [];
+  const health = data.newsSourceHealth ?? null;
+  return Object.values(RSSHUB_ROUTES)
+    .map((route) => {
+      const label = route.sourceName ?? route.name;
+      const state = health ? health[`rsshub-${route.name}`] : undefined;
+      if (state === "failed") {
+        const warning = warnings.find((entry) => String(entry).includes(label));
+        return warning ? singleLine(warning, 120) : `RSSHub ${label} 读取失败（原因未记录）`;
+      }
+      const collected = allSources.filter((source) => String(source.origin ?? "") === `rsshub-${route.name}`).length;
+      if (state === "ok") {
+        return `${label} 已读取 ${collected} 条`;
+      }
+      return `${label} 本次采集状态未记录（已入库 ${collected} 条）`;
+    })
+    .join("；");
+}
+
+// `cardEvents` is the ≤NEWS_CARD_LIMIT events this section actually PRINTS, and
+// it is in the sentence on purpose: 中文源占比 is measured over the whole
+// collected pool (kept that way so the number stays comparable with every
+// archived report), and at a large symbol pool that number says very little
+// about the document in front of the reader - 2800 collected sources, 8 cards
+// shown. So the disclosure also states how many of the shown cards carry a
+// Chinese source, which is the thing a reader can actually check.
+function renderChineseRatioDisclosure(data, allSources, chineseRatio, cardEvents) {
+  if (chineseRatio >= CHINESE_SOURCE_FLOOR_PERCENT) {
+    return [];
+  }
+  const searched = Array.isArray(data.trackedSymbols) ? data.trackedSymbols.length : 0;
+  const searchedLabel = searched > 0 ? `${searched} 只标的` : "标的数未记录";
+  const cards = Array.isArray(cardEvents) ? cardEvents : [];
+  const cardsWithChinese = cards.filter((event) =>
+    (Array.isArray(event.sources) ? event.sources : []).some((source) => source.lang === "zh")
+  ).length;
+  return [
+    `${CHINESE_RATIO_DISCLOSURE_PREFIX}：本次中文源占比 ${chineseRatio.toFixed(2)}%，低于 ${CHINESE_SOURCE_FLOOR_PERCENT}% 目标；`
+      + `本节展示的 ${cards.length} 张事件卡中有 ${cardsWithChinese} 张带中文来源。`
+      + `三个中文源全部来自本机自建 RSSHub，本次状态：${describeChineseSourceHealth(data, allSources)}。`
+      + `英文源按标的逐只检索（本次 ${searchedLabel}），中文源每轮只有三个固定 feed，标的越多占比越低；`
+      + `这是采集结构与可达性的结果，不代表当日没有中文新闻。`
+  ];
+}
+
 function translateUncertaintyLabel(value) {
   const labels = { high: "高", medium: "中", low: "低" };
   return labels[value] ?? "未知";
@@ -2220,6 +2327,7 @@ function renderClusteredNewsSection(data, periodLabel = "本窗口") {
     `- 新闻来源分布：${sourceBreakdown}。`,
     `- 非券商源占比：${nonBrokerRatio.toFixed(2)}%。`,
     `- 中文源占比：${chineseRatio.toFixed(2)}%。`,
+    ...renderChineseRatioDisclosure(data, allSources, chineseRatio, cardEvents),
     ...(l3Section ? ["", l3Section] : [])
   ].join("\n");
 }
@@ -2447,7 +2555,7 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
     positions: officialPaperSnapshot.positions,
     extraSymbols: splitCsv(process.env.REPORT_NEWS_SYMBOLS ?? "")
   });
-  const newsSymbolLimit = Math.max(1, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? 8));
+  const newsSymbolLimit = Math.max(1, Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? DEFAULT_NEWS_SYMBOL_LIMIT));
   const trackedSymbols = pooledSymbols.slice(0, newsSymbolLimit);
   const symbolsBeyondNewsLimit = pooledSymbols.slice(newsSymbolLimit);
   // Task 20: the earnings half of §3.1's 「宏观与财报日历」, over the FULL pool
@@ -2519,6 +2627,9 @@ async function fetchRequiredReportMarketData(info, reportKind, db) {
     newsSearchReason: newsSearch.reason,
     l3DeepDive,
     newsWarnings: marketNewsResult.warnings,
+    // Per-source ok/failed/skipped map from collectL1News, read by
+    // renderChineseRatioDisclosure to name WHICH Chinese feed was unreachable.
+    newsSourceHealth: marketNewsResult.sourceHealth,
     longbridgeWarnings,
     macroEvents,
     macroWarnings: macroCalendarResult.warnings,
@@ -2612,9 +2723,14 @@ function settledFailureLabel(result, label) {
 // empty" invariant) - RSSHub and Finnhub simply join the same pool as two
 // more entries in collectL1News's source list, so they can only ADD
 // articles/warnings, never change how the four original sources behave.
+// 2026-07-30: `sourceHealth` is no longer dropped on the floor. It is the ONLY
+// place that knows whether a Chinese feed answered at all (a feed that answered
+// with an empty document produces no warning and no articles, so warnings alone
+// cannot tell "RSSHub is down" from "RSSHub had nothing"), and the sub-floor
+// 中文源覆盖不足 disclosure has to name which of the three it was.
 async function fetchMarketNews(symbols) {
-  const { articles, warnings } = await collectL1News({ symbols, env: process.env });
-  return { articles, warnings };
+  const { articles, warnings, sourceHealth } = await collectL1News({ symbols, env: process.env });
+  return { articles, warnings, sourceHealth };
 }
 
 // Task H7 (2026-07-14 legacy audit): every OTHER required data source

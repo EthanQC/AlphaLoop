@@ -40,10 +40,19 @@ const LONG_ENGLISH_WORD_PATTERN = /(?:\b[A-Za-z][A-Za-z'-]{2,}\b[\s,.:;!?()/-]*)
 // drift apart. It lives here, not there, because stock-analysis.mjs already
 // imports this file - the reverse edge would be circular (same reasoning as
 // stock-facts-store.mjs's CONFIDENCE_COVERAGE_CHECKPOINTS).
-export const STOCK_NEWS_SECTION_TITLE = "近期新闻";
+//
+// 2026-07-30: renamed 近期新闻 -> 新闻事件 to match spec r2 §3.4's sixth section.
+// LEGACY_STOCK_NEWS_SECTION_TITLE keeps the old heading recognized by every
+// pattern below, because the reports already on disk (and already delivered)
+// carry it: a news block the gates stop recognizing is not a harmless miss, it
+// is a block whose raw external headlines start being scanned as first-party
+// numeric evidence (see extractDeterministicEvidenceLines and
+// EXEMPT_STOCK_SUBSECTION_HEADINGS).
+export const STOCK_NEWS_SECTION_TITLE = "新闻事件";
+export const LEGACY_STOCK_NEWS_SECTION_TITLE = "近期新闻";
 const MULTI_SOURCE_NEWS_SECTION_TITLE = "多源新闻";
 const NEWS_SECTION_HEADING_PATTERN = new RegExp(
-  `^(?:${STOCK_NEWS_SECTION_TITLE}|${MULTI_SOURCE_NEWS_SECTION_TITLE})`,
+  `^(?:${STOCK_NEWS_SECTION_TITLE}|${LEGACY_STOCK_NEWS_SECTION_TITLE}|${MULTI_SOURCE_NEWS_SECTION_TITLE})`,
   "u"
 );
 // Level 1-3 headings delimit a section; deeper ones (####) are content INSIDE
@@ -247,15 +256,61 @@ export function validateReportMarkdown(markdown, { kind = "daily" } = {}) {
     }
 
     // news.chinese_ratio: parses the "- 中文源占比：X%。" summary bullet this
-    // task defines (T7 is the renderer that will actually emit it, scoped
-    // the same section-aware way as the source-distribution line above -
-    // see extractChineseRatioPercent). Fails when news is present in the
-    // report but either the line is missing entirely, or its parsed
-    // percentage is below the Global Constraints' 30% floor.
+    // task defines (T7 is the renderer that emits it, scoped the same
+    // section-aware way as the source-distribution line above - see
+    // extractChineseRatioPercent).
+    //
+    // 2026-07-30 OUTAGE FIX. This gate used to fail on ANY sub-30% ratio, and
+    // that made it a second copy of the news.url_reachability bug: a delivery
+    // blocker armed by things that are not fabrications. Two measurements:
+    //
+    //   1. ALL THREE Chinese sources (华尔街见闻/财联社/格隆汇) come from ONE
+    //      locally-hosted RSSHub (news-sources.mjs's RSSHUB_ROUTES +
+    //      DEFAULT_RSSHUB_BASE_URL = http://127.0.0.1:1200), so one container
+    //      hiccup takes the ratio to 0 and destroyed the whole report. Measured
+    //      2026-07-30: rsshub answers 200 on the mini and 000 from a dev box,
+    //      which is exactly how a local `daily prepare` died on
+    //      「报告质量校验失败：news.chinese_ratio」.
+    //   2. THE FLOOR IS ALSO UNREACHABLE AT THE SPEC'S OWN SYMBOL POOL. The
+    //      three Chinese feeds are fetched ONCE per run (they take no symbol),
+    //      while the four English sources are fetched PER SYMBOL, so the ratio
+    //      is 160/(160 + ~66N) for N searched symbols. Measured on the mini's
+    //      2026-07-30 daily (N=1): 华尔街见闻 100 + 财联社 45 + 格隆汇 15 = 160 of
+    //      226 sources = 70.80%, exactly the rendered number. At the mini's
+    //      CURRENT pool (§0.4 union: QQQ.US + 5 active targets, N=6) the same
+    //      arithmetic gives 28.8% - i.e. the next scheduled daily would have
+    //      failed this gate with every source perfectly healthy.
+    //
+    // So a sub-floor ratio is no longer evidence of anything dishonest; it is a
+    // collection-mix fact that the reader is entitled to be TOLD. What still
+    // blocks is the absence of honesty, which is the same line every other gate
+    // in this file draws:
+    //
+    //   blocks   the statistic line is GONE from a report that carries news
+    //            (`:统计行缺失`) - the renderer lost a required number, and a
+    //            reader would have no idea coverage was ever measured. Always
+    //            recoverable: deliverReport re-renders a prepared file that
+    //            fails a gate rather than hard-failing the run.
+    //   blocks   the ratio is below the floor and the report does NOT carry the
+    //            renderer's coverage disclosure (`:未披露`) - a thin number
+    //            printed with no explanation of why.
+    //   ships    the ratio is below the floor WITH that disclosure, which names
+    //            the measured percentage, the health of each of the three
+    //            Chinese feeds, and how many symbols diluted the pool.
+    //
+    // The disclosure marker is CHINESE_RATIO_DISCLOSURE_PREFIX, and
+    // renderClusteredNewsSection emits it on exactly this condition - unlike
+    // news.source_diversity_v2's 来源降级状态 escape above, which no
+    // daily/weekly renderer has ever emitted (only stock-analysis.mjs does), so
+    // that escape is dead code for this report family. The parity is proven by a
+    // test that renders a REAL sub-floor report through renderDailyReport and
+    // runs this function over it, not by a hand-typed fixture.
     if (newsLines.length > 0) {
       const chineseRatioPercent = extractChineseRatioPercent(text);
-      if (chineseRatioPercent === null || chineseRatioPercent < 30) {
-        failures.push("news.chinese_ratio");
+      if (chineseRatioPercent === null) {
+        failures.push("news.chinese_ratio:统计行缺失");
+      } else if (chineseRatioPercent < CHINESE_SOURCE_FLOOR_PERCENT && !hasChineseRatioDisclosure(text)) {
+        failures.push(`news.chinese_ratio:未披露(${chineseRatioPercent}%)`);
       }
     }
 
@@ -805,7 +860,10 @@ function extractNewsLines(markdown) {
 // contain the same Chinese phrase deep inside a detailed news bullet
 // satisfies neither condition, so it can no longer forge source diversity
 // or evade the news.detail_depth line count.
-const SOURCE_SUMMARY_SECTION_HEADING_PATTERN = /^(?:证据与来源|近期新闻|多源新闻)/u;
+const SOURCE_SUMMARY_SECTION_HEADING_PATTERN = new RegExp(
+  `^(?:证据与来源|${STOCK_NEWS_SECTION_TITLE}|${LEGACY_STOCK_NEWS_SECTION_TITLE}|${MULTI_SOURCE_NEWS_SECTION_TITLE})`,
+  "u"
+);
 
 function extractSourceLabels(markdown, newsLines) {
   const labels = [];
@@ -854,7 +912,35 @@ function extractSourceLabels(markdown, newsLines) {
 // forge source diversity.
 const CHINESE_RATIO_LINE_PATTERN = /^-\s*中文源占比：\s*([0-9]+(?:\.[0-9]+)?)\s*%/u;
 
+// §0.4's 中文源占比 target. Exported so the RENDERER decides whether to emit the
+// coverage disclosure using the same number this gate judges with, rather than a
+// second hand-typed 30 that could drift out from under it.
+export const CHINESE_SOURCE_FLOOR_PERCENT = 30;
+
+// The disclosure a sub-floor report must carry, in the same "- <label>：<facts>。"
+// bullet style as 来源分布/中文源占比/事件稀少提示/链接核验. Exported and IMPORTED
+// BY THE RENDERER (scheduled-report.mjs's renderClusteredNewsSection) for the
+// same reason STOCK_NEWS_SECTION_TITLE is: the literal the renderer writes and
+// the literal this gate looks for must be one string, not two.
+export const CHINESE_RATIO_DISCLOSURE_PREFIX = "- 中文源覆盖不足";
+
 function extractChineseRatioPercent(markdown) {
+  return scanSourceSummaryLines(markdown, (line) => {
+    const match = line.match(CHINESE_RATIO_LINE_PATTERN);
+    return match ? Number(match[1]) : undefined;
+  });
+}
+
+// Scoped exactly like extractChineseRatioPercent's own parse: only a bullet
+// inside a section the report generator uses for source statistics counts, so a
+// news headline quoting the disclosure wording cannot satisfy the gate.
+function hasChineseRatioDisclosure(markdown) {
+  return scanSourceSummaryLines(markdown, (line) => (line.startsWith(CHINESE_RATIO_DISCLOSURE_PREFIX) ? true : undefined)) === true;
+}
+
+// Walks the source-summary sections (### 证据与来源 / ### 多源新闻… / ###
+// 近期新闻) and returns the first non-undefined value `pick` yields, else null.
+function scanSourceSummaryLines(markdown, pick) {
   let inSourceSummarySection = false;
   for (const rawLine of markdown.split("\n")) {
     const line = rawLine.trim();
@@ -866,9 +952,9 @@ function extractChineseRatioPercent(markdown) {
     if (!inSourceSummarySection) {
       continue;
     }
-    const match = line.match(CHINESE_RATIO_LINE_PATTERN);
-    if (match) {
-      return Number(match[1]);
+    const picked = pick(line);
+    if (picked !== undefined) {
+      return picked;
     }
   }
   return null;
@@ -1373,7 +1459,11 @@ const STOCK_DEGRADE_MARKER_PATTERN = new RegExp(
   `${escapeRegExp(NUMERIC_DEGRADE_MARKER)}|${escapeRegExp(NON_CHINESE_DEGRADE_MARKER)}`,
   "u"
 );
-const EXEMPT_STOCK_SUBSECTION_HEADINGS = new Set(["结论框", "近期新闻"]);
+const EXEMPT_STOCK_SUBSECTION_HEADINGS = new Set([
+  "结论框",
+  STOCK_NEWS_SECTION_TITLE,
+  LEGACY_STOCK_NEWS_SECTION_TITLE
+]);
 
 function extractStockNumberTokens(text) {
   const withoutDates = String(text ?? "").replace(STOCK_ISO_DATE_PATTERN, "");

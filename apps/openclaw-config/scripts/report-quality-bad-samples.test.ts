@@ -243,14 +243,19 @@ describe("bad sample: <3 独立来源 (news.source_diversity_v2)", () => {
   });
 });
 
-describe("bad sample: 中文占比 20% (news.chinese_ratio)", () => {
-  it("fails news.chinese_ratio when the 中文源占比 line is below the 30% floor", () => {
+// 2026-07-30: an UNDISCLOSED shortfall is still a bad sample, but the shortfall
+// alone is not. All three Chinese feeds come from one locally hosted RSSHub, so
+// making the ratio fatal on its own meant a single container hiccup destroyed the
+// day's report - the failure mode that actually took daily reporting down. The
+// failure code now carries the measured ratio, and the disclosed variant ships.
+describe("bad sample: 中文占比 20% 且未披露 (news.chinese_ratio)", () => {
+  it("fails, naming the measured ratio, when the shortfall is not disclosed", () => {
     const markdown = goodNewFormatReport().replace("中文源占比：85.00%。", "中文源占比：20.00%。");
 
     const result = validateReportMarkdown(markdown, { kind: "daily" });
 
     expect(result.ok).toBe(false);
-    expect(result.failures).toContain("news.chinese_ratio");
+    expect(result.failures).toContain("news.chinese_ratio:未披露(20%)");
   });
 });
 

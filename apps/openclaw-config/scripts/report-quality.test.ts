@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CHINESE_RATIO_DISCLOSURE_PREFIX,
+  CHINESE_SOURCE_FLOOR_PERCENT,
   countFactsCoverage,
   validateNarrativeNumbers,
   validateReportMarkdown,
@@ -532,16 +534,40 @@ describe("Phase 4 Task 6 - news.source_diversity_v2", () => {
   });
 });
 
+// 2026-07-30: this gate used to be a pure delivery blocker, and that is how it
+// took the daily report down. All three Chinese feeds come from ONE locally
+// hosted RSSHub (DEFAULT_RSSHUB_BASE_URL = http://127.0.0.1:1200), so a single
+// container hiccup collapsed the ratio and destroyed the whole report - the same
+// shape as news.url_reachability, which read a publisher's HEAD 404 as proof its
+// live article was invented. The rule now: a thin Chinese mix SHIPS as long as
+// the report says so, and only an undisclosed shortfall (or a missing statistic
+// altogether, i.e. we cannot even tell) blocks. Each case below pins one arm of
+// that, including the arm that must PASS - without it the gate could quietly go
+// back to fatal and every test here would still be green.
 describe("Phase 4 Task 6 - news.chinese_ratio", () => {
-  it("fails when the 中文源占比 line is below the 30% floor", () => {
+  it("blocks an undisclosed shortfall, naming the measured ratio", () => {
     const markdown = GOOD_NEW_FORMAT_REPORT.replace("中文源占比：85.00%。", "中文源占比：20.00%。");
 
     const result = validateReportMarkdown(markdown, { kind: "daily" });
 
-    expect(result.failures).toContain("news.chinese_ratio");
+    expect(result.failures).toContain("news.chinese_ratio:未披露(20%)");
   });
 
-  it("fails when news is present but the 中文源占比 line is missing entirely", () => {
+  it("SHIPS the same shortfall once the report discloses it", () => {
+    const markdown = GOOD_NEW_FORMAT_REPORT.replace(
+      "中文源占比：85.00%。",
+      [
+        "中文源占比：20.00%。",
+        `${CHINESE_RATIO_DISCLOSURE_PREFIX}：本次中文源占比 20.00%，低于 ${CHINESE_SOURCE_FLOOR_PERCENT}% 目标；财联社电报未返回条目（RSSHub 不可达）。`
+      ].join("\n")
+    );
+
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+
+    expect(result.failures.filter((code) => code.startsWith("news.chinese_ratio"))).toEqual([]);
+  });
+
+  it("blocks when the statistic is missing entirely, because then the mix is unknowable", () => {
     const markdown = GOOD_NEW_FORMAT_REPORT
       .split("\n")
       .filter((line) => !line.includes("中文源占比"))
@@ -549,7 +575,7 @@ describe("Phase 4 Task 6 - news.chinese_ratio", () => {
 
     const result = validateReportMarkdown(markdown, { kind: "daily" });
 
-    expect(result.failures).toContain("news.chinese_ratio");
+    expect(result.failures).toContain("news.chinese_ratio:统计行缺失");
   });
 });
 
@@ -1494,7 +1520,7 @@ describe("stock.numeric_match: deterministic derivations are backed, fabrication
   it("accepts numbers the renderer itself derived (probabilities, trend score, window labels) via deterministicTextBySymbol", () => {
     const { record, factsByKey, analysis } = buildStockRecord("AAPL.US");
     const markdown = renderStockReport([{ record }]);
-    const deterministicText = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"]
+    const deterministicText = ["quoteTechnicals", "valuation", "fundamentals", "analysts", "options", "paths", "conclusion"]
       .map((key) => (analysis as Record<string, string[]>)[key].join("\n"))
       .join("\n");
 
@@ -1504,7 +1530,7 @@ describe("stock.numeric_match: deterministic derivations are backed, fabrication
 
   it("still fails a number that is in neither the facts table nor the deterministic text", () => {
     const { record, factsByKey, analysis } = buildStockRecord("AAPL.US");
-    const deterministicText = ["basic", "thesis", "fundamentals", "catalysts", "risks", "trading", "options", "conclusion"]
+    const deterministicText = ["quoteTechnicals", "valuation", "fundamentals", "analysts", "options", "paths", "conclusion"]
       .map((key) => (analysis as Record<string, string[]>)[key].join("\n"))
       .join("\n");
     const markdown = renderStockReport([{ record }]).replace("日内强弱：", "日内强弱（叙事补充 777.77）：");
@@ -1694,7 +1720,7 @@ describe("stock.upside_depth: judged on the renderer's own bullet, never on mode
   it("PASSES when the deterministic 综合上行潜力 bullet is present and only the narrative says 只看期权链", () => {
     const aapl = buildStockRecord("AAPL.US");
     const markdown = renderStockReport([
-      { record: withNarrative(aapl.record, { thesis: "本段只看期权链的持仓分布并不足以定方向，仍需结合估值与趋势。" }) }
+      { record: withNarrative(aapl.record, { valuation: "本段只看期权链的持仓分布并不足以定方向，仍需结合估值与趋势。" }) }
     ]);
 
     expect(markdown).toContain("- 叙事：本段只看期权链");
@@ -1704,7 +1730,7 @@ describe("stock.upside_depth: judged on the renderer's own bullet, never on mode
   it("FAILS when the deterministic bullet is gone even though the narrative says 综合上行潜力", () => {
     const aapl = buildStockRecord("AAPL.US");
     const rendered = renderStockReport([
-      { record: withNarrative(aapl.record, { thesis: "综合上行潜力：偏强，估值与趋势共振。" }) }
+      { record: withNarrative(aapl.record, { valuation: "综合上行潜力：偏强，估值与趋势共振。" }) }
     ]);
     const withoutDeterministicUpside = rendered
       .split("\n")

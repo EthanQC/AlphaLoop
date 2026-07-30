@@ -1371,3 +1371,203 @@ describe("Task 21: a full US market holiday produces an honest skip, not an empt
     expect(scheduledReport.resolveUsMarketHolidaySkip("daily", info)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-07-30: news.chinese_ratio stops being a delivery blocker
+// ---------------------------------------------------------------------------
+
+/**
+ * REAL headlines, copied verbatim out of the mini's live `news_event_sources`
+ * table (2026-07-29/30 rows, read over ssh from a byte-copy of
+ * runtime/trading.sqlite). Provenance matters here: this test's whole point is
+ * that a sub-30% Chinese ratio SHIPS with a disclosure instead of destroying the
+ * report, and the ratio is decided by `isNativeCjkArticle` (news-engine.mjs)
+ * running over the article titles - so the titles have to be the ones the real
+ * feeds actually publish, not seven strings shaped by whoever wrote the test.
+ * The 7:2 English-to-Chinese mix is the shape of a real run too: the four
+ * English sources are fetched PER SYMBOL while the three Chinese RSSHub feeds
+ * are fetched once per run.
+ *
+ * Everything downstream of these titles is the production code path:
+ * renderDailyReport -> renderClusteredNewsSection -> clusterArticles /
+ * buildEventFromCluster -> computeChineseSourceRatio ->
+ * renderChineseRatioDisclosure, then report-quality.mjs's real gate.
+ */
+const LIVE_ENGLISH_HEADLINES = [
+  {
+    title: "Oil jumps after Iran attempts ‘surprise attack’; chip stocks slump further as AI sell-off continues – as it happened",
+    url: "https://www.theguardian.com/business/live/2026/jul/29/oil-jumps-iran-surprise-attack-chip-stocks-slump-ai-sell-off-economy-latest-news",
+    publishedAt: "2026-07-13T21:41:00.000Z",
+    source: "openclaw-l2-search",
+    publisher: "The Guardian"
+  },
+  {
+    title: "Daily Breadth Improves, but the Broader Trend Stays Fragile",
+    url: "https://finnhub.io/api/news?id=8fd934ea9e1da2faf4a4d1a3a071f29756788b8e712aff8fcf6618b355e2e6c3",
+    publishedAt: "2026-07-13T21:18:21.000Z",
+    source: "finnhub",
+    publisher: "ChartMill"
+  },
+  {
+    title: "Markets Hold Back As Crude Oil Prices Climb",
+    url: "https://finnhub.io/api/news?id=100d233e5e5121aa0f2ff3b2d63ec525c26c3c754c3c7939ca40033c9e1c4d13",
+    publishedAt: "2026-07-13T21:19:00.000Z",
+    source: "finnhub",
+    publisher: "SeekingAlpha"
+  },
+  {
+    title: "The AI Bubble Is Bursting - Don't Get Mauled",
+    url: "https://finnhub.io/api/news?id=80a61f6172cff48ce5cb175aed2a2dec8476b640ce200faa20406565fc773cdc",
+    publishedAt: "2026-07-13T20:11:53.000Z",
+    source: "finnhub",
+    publisher: "SeekingAlpha"
+  },
+  {
+    title: "The most important stretch of earnings season is here — and Wall Street wants receipts from AI giants",
+    url: "https://www.businessinsider.com/meta-microsoft-amazon-q2-earnings-preview-what-hyperscaler-investors-expect-2026-7",
+    publishedAt: "2026-07-13T19:50:01.217Z",
+    source: "openclaw-l2-search",
+    publisher: "Business Insider"
+  },
+  {
+    title: "Chips Sell First, Ask Questions Later - And SK Hynix Just Handed Them the Answer",
+    url: "https://finnhub.io/api/news?id=2dd0609fece9b7df7d96e884291a99b4db8c8f2618b80ae5cd0c2bffda101783",
+    publishedAt: "2026-07-13T19:12:44.000Z",
+    source: "finnhub",
+    publisher: "ChartMill"
+  },
+  {
+    title: "The Worst Of 1999 And 2008: Bubbles, Moral Hazard, And Bailouts",
+    url: "https://finnhub.io/api/news?id=69f4e09a926087b601fe96a2f598e2aad912b8bb59d5f388db8c14cd15f6241d",
+    publishedAt: "2026-07-13T19:09:48.000Z",
+    source: "finnhub",
+    publisher: "SeekingAlpha"
+  }
+];
+
+const LIVE_CHINESE_HEADLINES = [
+  {
+    title: "意大利和沙特重申支持落实“两国方案”",
+    url: "https://wallstreetcn.com/livenews/3141798",
+    publishedAt: "2026-07-13T22:04:36.000Z",
+    source: "rsshub-wallstreetcn",
+    publisher: "华尔街见闻"
+  },
+  {
+    title: "美国三大股指均跌超1%，道指目前跌860点、跌幅1.6%，纳指跌1.4%，半导体指数跌4.1%，银行指数跌1.9%，罗素2000指数跌1.4%。",
+    url: "https://wallstreetcn.com/livenews/3141797",
+    publishedAt: "2026-07-13T22:00:09.000Z",
+    source: "rsshub-wallstreetcn",
+    publisher: "华尔街见闻"
+  }
+];
+
+function buildEnglishHeavyNewsData(overrides: Record<string, unknown> = {}) {
+  const marketNews = [...LIVE_CHINESE_HEADLINES, ...LIVE_ENGLISH_HEADLINES].map((entry, index) => ({
+    id: entry.url,
+    symbol: "QQQ.US",
+    title: entry.title,
+    url: entry.url,
+    publishedAt: entry.publishedAt,
+    publishedAtMs: Date.parse(entry.publishedAt),
+    source: entry.source,
+    sourceName: entry.publisher,
+    publisher: entry.publisher,
+    order: index
+  }));
+  return { ...buildFixtureData(), marketNews, newsEvents: undefined, ...overrides };
+}
+
+describe("news.chinese_ratio: a sub-floor ratio discloses, an unexplained one blocks", () => {
+  const info = scheduledReport.resolveReportWindow("daily", "2026-07-14");
+
+  it("ships a 22% report with a disclosure that names the ratio, the feeds and the symbol count", () => {
+    const markdown = scheduledReport.renderDailyReport(info, buildEnglishHeavyNewsData());
+
+    // 2 of 9 sources are Chinese - measured by the renderer, not asserted into
+    // existence: this is the number the real computeChineseSourceRatio prints.
+    expect(markdown).toContain("- 中文源占比：22.22%。");
+    expect(markdown).toContain("- 中文源覆盖不足：本次中文源占比 22.22%，低于 30% 目标；");
+    expect(markdown).toMatch(/本节展示的 \d+ 张事件卡中有 \d+ 张带中文来源/u);
+    expect(markdown).toContain("英文源按标的逐只检索");
+    // With no sourceHealth on the data (this fixture never ran collectL1News),
+    // the line says the status is unrecorded rather than implying success.
+    expect(markdown).toContain("本次采集状态未记录");
+
+    // The whole point: the gate lets it through.
+    const result = validateReportMarkdown(markdown, { kind: "daily" });
+    expect(result.failures).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("names the unreachable RSSHub feed verbatim when collectL1News recorded one", () => {
+    const markdown = scheduledReport.renderDailyReport(
+      info,
+      buildEnglishHeavyNewsData({
+        newsSourceHealth: {
+          "rsshub-cls": "failed",
+          "rsshub-wallstreetcn": "ok",
+          "rsshub-gelonghui": "failed"
+        },
+        newsWarnings: ["RSSHub 财联社读取失败：fetch failed", "RSSHub 格隆汇读取失败：HTTP 502"]
+      })
+    );
+
+    expect(markdown).toContain("RSSHub 财联社读取失败：fetch failed");
+    expect(markdown).toContain("RSSHub 格隆汇读取失败：HTTP 502");
+    expect(markdown).toContain("华尔街见闻 已读取 2 条");
+    expect(validateReportMarkdown(markdown, { kind: "daily" }).ok).toBe(true);
+  });
+
+  it("blocks the same report once the disclosure line is stripped out", () => {
+    const markdown = scheduledReport.renderDailyReport(info, buildEnglishHeavyNewsData());
+    const stripped = markdown
+      .split("\n")
+      .filter((line) => !line.startsWith("- 中文源覆盖不足"))
+      .join("\n");
+
+    const result = validateReportMarkdown(stripped, { kind: "daily" });
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("news.chinese_ratio:未披露(22.22%)");
+  });
+
+  it("blocks a report whose 中文源占比 statistic went missing altogether", () => {
+    const markdown = scheduledReport.renderDailyReport(info, buildEnglishHeavyNewsData());
+    const stripped = markdown
+      .split("\n")
+      .filter((line) => !line.startsWith("- 中文源占比："))
+      .join("\n");
+
+    const result = validateReportMarkdown(stripped, { kind: "daily" });
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain("news.chinese_ratio:统计行缺失");
+  });
+
+  it("does not print the disclosure when the ratio clears the floor", () => {
+    const markdown = scheduledReport.renderDailyReport(info, buildFixtureData());
+
+    expect(markdown).toContain("- 中文源占比：");
+    expect(markdown).not.toContain("- 中文源覆盖不足");
+    expect(validateReportMarkdown(markdown, { kind: "daily" }).ok).toBe(true);
+  });
+});
+
+describe("REPORT_NEWS_SYMBOL_LIMIT: the default cap covers the §0.4 pool", () => {
+  it("defaults to 40 - two members' 20-symbol watchlists, not 8", async () => {
+    // Read from the module's own resolution path rather than re-declaring the
+    // number: `fetchRequiredReportMarketData` is not exported, so this asserts
+    // on the literal the source actually carries, which is what a drift here
+    // would change.
+    const source = readFileSync(new URL("./scheduled-report.mjs", import.meta.url), "utf8");
+    expect(source).toContain("const DEFAULT_NEWS_SYMBOL_LIMIT = 40;");
+    expect(source).toContain("Number(process.env.REPORT_NEWS_SYMBOL_LIMIT ?? DEFAULT_NEWS_SYMBOL_LIMIT)");
+    // The cap must stay under the Finnhub limiter's own ceiling, or the surplus
+    // symbols silently lose their Finnhub leg to a rate-limit warning each.
+    const { createFinnhubRateLimiter } = await import("./news-sources.mjs");
+    const limiter = createFinnhubRateLimiter();
+    for (let i = 0; i < 40; i += 1) {
+      limiter.acquire(`symbol-${i}`);
+    }
+    expect(limiter.size()).toBe(40);
+  });
+});
