@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -327,6 +328,33 @@ const RSSHUB_P10_CONTAINER_COMMAND = "docker run -d --name rsshub -p 127.0.0.1:1
 // collected anything yet (eventCount === 0, handled as "nothing to report").
 const NEWS_ENGINE_STALE_THRESHOLD_MS = 48 * 60 * 60_000;
 
+// "login-delivery-health" (2026-07-30, J4 follow-up) --------------------------
+//
+// How far back the check compares login_send_log reservations against
+// login_delivery_log outcomes. 24h mirrors routes/login.ts's PRUNE_AGE_MS -
+// both tables are pruned on that horizon at the send sites, so a wider window
+// would only compare against rows that may already be gone.
+const LOGIN_DELIVERY_WINDOW_MS = 24 * 60 * 60_000;
+// A reservation younger than this may simply still be in flight (the send is
+// out of band and a slow Feishu call takes seconds, not minutes) - it is not
+// yet "a reservation that never got an outcome".
+const LOGIN_DELIVERY_SETTLE_GRACE_MS = 5 * 60_000;
+// Mirrors routes/login.ts's LEGACY_SYSTEM_MEMBER_ID (itself mirroring
+// identity.ts's, per that codebase's re-declare convention): the v7 migration
+// placeholder is never a person and never logs in.
+const LOGIN_LEGACY_SYSTEM_MEMBER_ID = "__legacy_system__";
+
+// Mirrors shared-types database.ts's hashThrottleKey("email", ...) - a sha256
+// of `email:<trimmed, lowercased address>` - rather than importing dist (this
+// module deliberately imports only siblings and node builtins; same reasoning
+// as PLATFORM_APP_HEALTH_DEFAULT_PORT above). The equivalence is not taken on
+// faith: openclaw-runtime-doctor-login-delivery.test.ts seeds login_send_log
+// through the REAL handleRequestCode and this check only finds those rows if
+// this replica produces the same hash.
+function loginEmailKeyHash(email) {
+  return createHash("sha256").update(`email:${String(email).trim().toLowerCase()}`).digest("hex");
+}
+
 export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
   const gatewayPids = distinctPids(snapshot.gatewayListeners);
   const runnerPids = distinctPids(snapshot.cronRunnerListeners);
@@ -379,7 +407,11 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "deploy-checkout", run: () => checkDeployCheckout(snapshot) },
     { name: "launchd-plists", run: () => checkStrayUserPlists(snapshot) },
     { name: "openclaw-cron", run: () => checkOpenClawCronJobs(snapshot) },
-    { name: "notification-routing", run: () => checkNotificationRouting(snapshot) }
+    { name: "notification-routing", run: () => checkNotificationRouting(snapshot) },
+    // 2026-07-30 (J4 follow-up): a broken login-code delivery is invisible to
+    // members BY DESIGN (anti-enumeration), and its Feishu alert can ride the
+    // very channel that failed - this is the observer that needs neither.
+    { name: "login-delivery-health", run: () => checkLoginDeliveryHealth(snapshot, nowMs) }
   ];
 
   const findings = await runChecksFailureIsolated(checks);
@@ -1861,6 +1893,168 @@ function checkNewsEngineHealth(snapshot, nowMs) {
     }
 
     return [];
+  });
+}
+
+// "login-delivery-health" (2026-07-30, J4 follow-up): are login codes that
+// members request actually ARRIVING?
+//
+// By design (routes/login.ts's anti-enumeration rule) the member always sees
+// the same 「已发送」 page, the throttle slot is reserved BEFORE the send is
+// attempted, and a failed delivery is only a stderr line plus a throttled
+// Feishu alert - and the dominant failure mode IS Feishu being down, in which
+// case that alert rides the broken channel. This check is the layer that needs
+// no Feishu: it reads the trading db read-only and compares the two ledgers
+// the login route writes:
+//
+//   login_send_log      one row per RESERVED send (written before the attempt;
+//                       includes addresses that match no member).
+//   login_delivery_log  one row per delivery ATTEMPT at a real active member
+//                       (v19 migration), success or failure.
+//
+// Reservations are tied back to members by recomputing each ACTIVE member's
+// email hash (loginEmailKeyHash above - the same sha256 login_send_log
+// stores); reservations that match no member are stranger-controlled traffic
+// and are deliberately ignored, so probing the form cannot make this check
+// (or bury this check in) noise.
+//
+// Failure conditions, exactly:
+//   .delivery_failing (error)  some member's LATEST outcome in the last 24h is
+//                              a failure - their codes are not arriving right
+//                              now (a later success clears it per member).
+//   .missing_outcomes (error)  a member-linked reservation older than 5
+//                              minutes has FEWER outcome rows than
+//                              reservations for that member - the delivery job
+//                              died (or the process was killed) between
+//                              reserving the slot and recording any outcome.
+//   .recent_failures (warn)    failures happened in the window but every
+//                              member's latest attempt succeeded - recovered,
+//                              still worth an operator's glance.
+//   .table_missing (warn)      members ARE requesting codes but the db has no
+//                              login_delivery_log table yet (schema older than
+//                              v19) - the machine cannot vouch for delivery at
+//                              all until the migration lands.
+function checkLoginDeliveryHealth(snapshot, nowMs) {
+  if (!snapshot.dbPath) {
+    return [];
+  }
+
+  return withReadOnlyTradingDb(snapshot.dbPath, "login-delivery-health", "登录验证码投递", (db) => {
+    const tables = new Set(
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('members', 'login_send_log', 'login_delivery_log')`)
+        .all()
+        .map((row) => String(row.name))
+    );
+    if (!tables.has("members") || !tables.has("login_send_log")) {
+      // Pre-v15 schema: the email-code login does not exist here at all.
+      return [];
+    }
+
+    const windowStartIso = new Date(nowMs - LOGIN_DELIVERY_WINDOW_MS).toISOString();
+    const activeMembers = db
+      .prepare(`SELECT id, email FROM members WHERE status = 'active' AND id <> ? AND email IS NOT NULL AND email <> ''`)
+      .all(LOGIN_LEGACY_SYSTEM_MEMBER_ID);
+    if (activeMembers.length === 0) {
+      return [];
+    }
+    const memberIdByEmailHash = new Map(
+      activeMembers.map((member) => [loginEmailKeyHash(member.email), String(member.id)])
+    );
+
+    const memberReservations = db
+      .prepare(`SELECT key_hash, created_at FROM login_send_log WHERE scope = 'email' AND created_at >= ?`)
+      .all(windowStartIso)
+      .filter((row) => memberIdByEmailHash.has(String(row.key_hash)));
+
+    if (!tables.has("login_delivery_log")) {
+      if (memberReservations.length === 0) {
+        return [];
+      }
+      return [warn(
+        "login-delivery-health.table_missing",
+        `最近 24 小时内成员请求过 ${memberReservations.length} 次登录验证码，但数据库还没有 login_delivery_log 表`
+          + `（schema 早于 v19），无法判断验证码是否真的送达。请部署包含 v19 迁移的最新代码并重启 platform-app。`
+      )];
+    }
+
+    const outcomes = db
+      .prepare(`SELECT member_id, email_hash, ok, reason, created_at FROM login_delivery_log WHERE created_at >= ? ORDER BY created_at ASC`)
+      .all(windowStartIso);
+
+    const findings = [];
+
+    // Latest outcome per email hash: a member whose most recent attempt failed
+    // is failing NOW; an earlier failure a later success papered over is only
+    // history. Rows are grouped by email_hash (always present - the crash path
+    // has no member_id) and displayed by member id where one is known.
+    const latestByHash = new Map();
+    let failureCount = 0;
+    for (const row of outcomes) {
+      latestByHash.set(String(row.email_hash), row);
+      if (Number(row.ok) !== 1) {
+        failureCount += 1;
+      }
+    }
+    const failingNow = [...latestByHash.entries()].filter(([, row]) => Number(row.ok) !== 1);
+    if (failingNow.length > 0) {
+      const described = failingNow.map(([hash, row]) => {
+        const memberId = row.member_id ? String(row.member_id) : memberIdByEmailHash.get(hash) ?? "成员未知";
+        return `${memberId}（最近一次 ${row.created_at}，原因 ${row.reason ?? "未知"}）`;
+      });
+      findings.push(error(
+        "login-delivery-health.delivery_failing",
+        `登录验证码正在投递失败：最近 24 小时共 ${failureCount} 次失败，其中 ${failingNow.length} 个账号`
+          + `最后一次尝试仍是失败——${described.join("；")}。成员侧只会看到「已发送」，不会有任何报错。`
+          + `请检查飞书应用凭据与通道，并 grep platform-app err.log 中的 LOGIN-DELIVERY-FAILED。`
+      ));
+    } else if (failureCount > 0) {
+      findings.push(warn(
+        "login-delivery-health.recent_failures",
+        `最近 24 小时内有 ${failureCount} 次登录验证码投递失败，但相关账号最后一次投递均已成功（已自行恢复）。`
+          + `失败明细见 platform-app err.log 的 LOGIN-DELIVERY-FAILED 行。`
+      ));
+    }
+
+    // Reservation-vs-outcome comparison, per member-linked email hash: a
+    // reservation is a promise that a delivery was attempted, so (allowing the
+    // settle grace for in-flight sends) each hash must have at least as many
+    // outcome rows as settled reservations. Fewer means the background job
+    // died before recording ANYTHING - the one failure shape the outcome
+    // ledger itself cannot report.
+    const settleCutoffIso = new Date(nowMs - LOGIN_DELIVERY_SETTLE_GRACE_MS).toISOString();
+    const settledReservationsByHash = new Map();
+    for (const row of memberReservations) {
+      if (String(row.created_at) > settleCutoffIso) {
+        continue;
+      }
+      const hash = String(row.key_hash);
+      settledReservationsByHash.set(hash, (settledReservationsByHash.get(hash) ?? 0) + 1);
+    }
+    const outcomeCountByHash = new Map();
+    for (const row of outcomes) {
+      const hash = String(row.email_hash);
+      outcomeCountByHash.set(hash, (outcomeCountByHash.get(hash) ?? 0) + 1);
+    }
+    let missingCount = 0;
+    const missingMembers = new Set();
+    for (const [hash, reserved] of settledReservationsByHash) {
+      const recorded = outcomeCountByHash.get(hash) ?? 0;
+      if (recorded < reserved) {
+        missingCount += reserved - recorded;
+        missingMembers.add(memberIdByEmailHash.get(hash) ?? "成员未知");
+      }
+    }
+    if (missingCount > 0) {
+      findings.push(error(
+        "login-delivery-health.missing_outcomes",
+        `最近 24 小时内有 ${missingCount} 次成员验证码请求只留下了 login_send_log 预约、没有任何投递结果记录`
+          + `（涉及：${[...missingMembers].join("、")}）。这说明后台投递任务在记录结果前就中断了`
+          + `（进程崩溃/重启、数据库不可写，或成员在请求后才被激活）。请查看 platform-app err.log 并让该成员重试。`
+      ));
+    }
+
+    return findings;
   });
 }
 

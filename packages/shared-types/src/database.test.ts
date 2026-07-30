@@ -16,6 +16,7 @@ import {
   ResearchTaskRepository,
   MonthlyReviewRepository,
   LoginCodeRepository,
+  LoginDeliveryLogRepository,
   LoginThrottleRepository,
   LOGIN_CODE_MAX_ATTEMPTS,
   buildLoginCodeHash,
@@ -4126,10 +4127,6 @@ describe("v17 execution_reports.owner_id migration (C1: per-member fills were pu
 // to invent a value for a file that no longer exists.
 // ---------------------------------------------------------------------------
 describe("v18 stock_analysis_runs.pdf_path drop (Task 14: PDF retired)", () => {
-  it("SCHEMA_VERSION is 18", () => {
-    expect(SCHEMA_VERSION).toBe(18);
-  });
-
   it("a fresh db has no pdf_path column on stock_analysis_runs", () => {
     const db = memoryDb();
     migrate(db);
@@ -4185,5 +4182,150 @@ describe("v18 stock_analysis_runs.pdf_path drop (Task 14: PDF retired)", () => {
 
     expect(() => migrate(db)).not.toThrow();
     expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v19 (2026-07-30, J4 follow-up): login_delivery_log - the delivery-outcome
+// ledger the doctor's login-delivery-health check joins against login_send_log.
+// Reserve-before-send (routes/login.ts) means the throttle ledger cannot say
+// whether a code ever arrived; this table is the durable half of that answer.
+// ---------------------------------------------------------------------------
+describe("v19 login_delivery_log (delivery outcomes for the email-code login)", () => {
+  const OUTCOME_MEMBER: Member = {
+    id: "member_1",
+    email: "member@example.com",
+    displayName: "圈内成员",
+    riskTags: [],
+    stockTags: [],
+    showPerformance: true,
+    status: "active",
+    createdAt: "2026-07-01T00:00:00.000Z"
+  };
+
+  it("SCHEMA_VERSION is 19", () => {
+    expect(SCHEMA_VERSION).toBe(19);
+  });
+
+  it("a fresh db lands at v19 with the table, its indexes, and a nullable member_id FK", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    const columns = (db.prepare("PRAGMA table_info(login_delivery_log)").all() as Array<{ name: string; notnull: number }>);
+    expect(columns.map((column) => column.name)).toEqual([
+      "id",
+      "member_id",
+      "email_hash",
+      "ok",
+      "reason",
+      "created_at"
+    ]);
+    // member_id nullable (the crash path records with the member unknown).
+    expect(columns.find((column) => column.name === "member_id")?.notnull).toBe(0);
+    const fk = db.prepare("PRAGMA foreign_key_list(login_delivery_log)").all() as Array<{ table: string }>;
+    expect(fk.map((row) => row.table)).toEqual(["members"]);
+    const indexes = (db.prepare("PRAGMA index_list(login_delivery_log)").all() as Array<{ name: string }>)
+      .map((row) => row.name)
+      // The PRIMARY KEY's own sqlite_autoindex_* is not ours to assert on.
+      .filter((name) => !name.startsWith("sqlite_autoindex_"))
+      .sort();
+    expect(indexes).toEqual(["login_delivery_log_created_idx", "login_delivery_log_email_idx"]);
+  });
+
+  it("upgrades a deployed v18 db in place (the shape the live mini runs today)", () => {
+    const db = memoryDb();
+    migrate(db);
+    // Reproduce the deployed v18 shape: everything current except this table.
+    db.exec(`
+      DROP TABLE login_delivery_log;
+      PRAGMA user_version = 18;
+    `);
+    expect(getSchemaVersion(db)).toBe(18);
+
+    migrate(db);
+
+    expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'login_delivery_log'").all()
+    ).toHaveLength(1);
+  });
+
+  it("records outcomes with the SAME email hash login_send_log uses, so the doctor can join the two", () => {
+    const db = memoryDb();
+    migrate(db);
+    new MemberRepository(db).upsert(OUTCOME_MEMBER);
+
+    // Both writers, same address (case/whitespace differ deliberately).
+    new LoginThrottleRepository(db).record("email", "Member@Example.com ", "2026-07-30T10:00:00.000Z");
+    new LoginDeliveryLogRepository(db).record({
+      memberId: "member_1",
+      email: "member@example.com",
+      ok: false,
+      reason: "飞书卡片发送失败。",
+      now: "2026-07-30T10:00:02.000Z"
+    });
+
+    const sendKey = db.prepare("SELECT key_hash FROM login_send_log").get() as { key_hash: string };
+    const outcome = db.prepare("SELECT email_hash, member_id, ok, reason FROM login_delivery_log").get() as {
+      email_hash: string;
+      member_id: string;
+      ok: number;
+      reason: string;
+    };
+    expect(outcome.email_hash).toBe(sendKey.key_hash);
+    expect(outcome.email_hash).toBe(LoginDeliveryLogRepository.emailHashFor("member@example.com"));
+    // The hash, never the address.
+    expect(outcome.email_hash).not.toContain("member@example.com");
+    expect(outcome).toMatchObject({ member_id: "member_1", ok: 0, reason: "飞书卡片发送失败。" });
+  });
+
+  it("maps rows back out via listSince, oldest first, and prunes by created_at", () => {
+    const db = memoryDb();
+    migrate(db);
+    new MemberRepository(db).upsert(OUTCOME_MEMBER);
+    const log = new LoginDeliveryLogRepository(db);
+    log.record({ memberId: "member_1", email: "member@example.com", ok: false, reason: "job_threw", now: "2026-07-29T09:00:00.000Z" });
+    log.record({ memberId: "member_1", email: "member@example.com", ok: true, now: "2026-07-30T09:00:00.000Z" });
+    log.record({ memberId: null, email: "member@example.com", ok: false, reason: "job_threw", now: "2026-07-30T10:00:00.000Z" });
+
+    const since = log.listSince("2026-07-30T00:00:00.000Z");
+    expect(since.map((row) => [row.memberId, row.ok, row.reason])).toEqual([
+      ["member_1", true, null],
+      [null, false, "job_threw"]
+    ]);
+    expect(since[0]?.emailHash).toBe(LoginDeliveryLogRepository.emailHashFor("member@example.com"));
+
+    log.prune("2026-07-30T00:00:00.000Z");
+    expect(db.prepare("SELECT COUNT(*) AS c FROM login_delivery_log").get()).toEqual({ c: 2 });
+  });
+
+  it("caps a runaway failure reason instead of storing a log dump", () => {
+    const db = memoryDb();
+    migrate(db);
+    new MemberRepository(db).upsert(OUTCOME_MEMBER);
+    new LoginDeliveryLogRepository(db).record({
+      memberId: "member_1",
+      email: "member@example.com",
+      ok: false,
+      reason: "长".repeat(1000)
+    });
+
+    const row = db.prepare("SELECT reason FROM login_delivery_log").get() as { reason: string };
+    expect(row.reason).toHaveLength(300);
+  });
+
+  it("refuses an outcome naming a member that does not exist (FK) and a truthiness outside 0/1 (CHECK)", () => {
+    const db = memoryDb();
+    migrate(db);
+
+    expect(() =>
+      new LoginDeliveryLogRepository(db).record({ memberId: "ghost", email: "ghost@example.com", ok: true })
+    ).toThrow(/FOREIGN KEY/u);
+    expect(() =>
+      db
+        .prepare("INSERT INTO login_delivery_log (id, member_id, email_hash, ok, created_at) VALUES ('x', NULL, 'h', 2, 't')")
+        .run()
+    ).toThrow(/CHECK/u);
   });
 });

@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -1109,6 +1109,60 @@ const MIGRATIONS: MigrationStep[] = [
     if (columns.some((column) => String(column.name) === "pdf_path")) {
       db.exec(`ALTER TABLE stock_analysis_runs DROP COLUMN pdf_path;`);
     }
+  },
+  (db) => {
+    // v19 (2026-07-30, J4 follow-up): login_delivery_log - what became of each
+    // login-code delivery ATTEMPT for a real, active member.
+    //
+    // WHY IT EXISTS: routes/login.ts records the throttle slot in
+    // login_send_log BEFORE the send is attempted (deliberate - see
+    // reserveSendSlot's comment there), so a burnt slot and a delivered code
+    // are the same login_send_log row, and the anti-enumeration rule means the
+    // member sees the same 「已发送」 page either way. Until this table, the
+    // only trace of a failed delivery was a stderr line - nothing durable that
+    // a health check could read after the fact. The doctor's
+    // login-delivery-health check (apps/openclaw-config/scripts/
+    // openclaw-runtime-doctor-core.mjs) compares recent login_send_log
+    // reservations against these rows, with no Feishu involved.
+    //
+    // - member_id NULLABLE: the normal writer (routes/login.ts's deliverCode)
+    //   always knows the member, but the crash path (the delivery job threw
+    //   before or during the member lookup) records a best-effort row with the
+    //   member unknown. No default backfill question arises - the table starts
+    //   empty.
+    // - email_hash: the SAME sha256(`email:<lowercased>`) as
+    //   login_send_log.key_hash (hashThrottleKey below), never the plaintext
+    //   address - so the two tables join on it and neither is a list of
+    //   guessed emails.
+    // - ok + reason: reason is the SANITIZED explanation the notifier returned
+    //   (or a fixed token like 'no_feishu_open_id' / 'job_threw'); the code
+    //   itself must never appear here, same rule as every log line in
+    //   routes/login.ts.
+    // - Rows are written only for attempts at ACTIVE members (plus the
+    //   crash path above). Addresses that match no member and revoked members
+    //   write nothing: that is traffic a stranger controls, and rows for it
+    //   would let anyone bury the real signal (same reasoning as
+    //   routes/login.ts's DELIVERY_ALARM).
+    // - Pruned by LoginDeliveryLogRepository.prune on the same 24h horizon as
+    //   login_send_log, at the same write sites.
+    //
+    // IF NOT EXISTS, same precedent as the v11/v12/v13/v17/v18 steps above:
+    // several of THIS file's own migration tests wind `user_version` back to an
+    // earlier number while leaving table shapes at their latest, so this step
+    // can legitimately meet a login_delivery_log that already exists. A real
+    // v18 database never has one.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS login_delivery_log (
+        id TEXT PRIMARY KEY,
+        member_id TEXT REFERENCES members(id),
+        email_hash TEXT NOT NULL,
+        ok INTEGER NOT NULL CHECK(ok IN (0, 1)),
+        reason TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS login_delivery_log_email_idx ON login_delivery_log(email_hash, created_at);
+      CREATE INDEX IF NOT EXISTS login_delivery_log_created_idx ON login_delivery_log(created_at);
+    `);
   }
 ];
 
@@ -1968,6 +2022,74 @@ export class LoginThrottleRepository {
 
 function hashThrottleKey(scope: LoginThrottleScope, key: string): string {
   return hashToken(`${scope}:${key.trim().toLowerCase()}`);
+}
+
+/** One login_delivery_log row, mapped. See the v19 migration comment for what
+ * each field means and why member_id can be null. */
+export interface LoginDeliveryOutcome {
+  id: string;
+  memberId: string | null;
+  emailHash: string;
+  ok: boolean;
+  reason: string | null;
+  createdAt: string;
+}
+
+/** Defensive cap on the stored failure reason: the writer only ever passes
+ * sanitized text, but a runaway upstream error message must not turn a health
+ * ledger into a log dump. */
+const LOGIN_DELIVERY_REASON_MAX_CHARS = 300;
+
+/**
+ * The delivery-outcome ledger for the email-code login (v19 migration above):
+ * one row per delivery ATTEMPT at an active member, success or failure.
+ * Written by routes/login.ts's background send; read (read-only, by raw SQL)
+ * by the doctor's login-delivery-health check, which joins it against
+ * login_send_log via the shared email hash - `emailHashFor` IS
+ * hashThrottleKey('email', ...), exposed so the writer cannot drift from the
+ * ledger it must join against.
+ */
+export class LoginDeliveryLogRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  static emailHashFor(email: string): string {
+    return hashThrottleKey("email", email);
+  }
+
+  record(input: { memberId: string | null; email: string; ok: boolean; reason?: string; now?: string }): void {
+    const reason = input.reason?.slice(0, LOGIN_DELIVERY_REASON_MAX_CHARS) ?? null;
+    this.db
+      .prepare(`
+        INSERT INTO login_delivery_log (id, member_id, email_hash, ok, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        createId("login_delivery"),
+        input.memberId,
+        LoginDeliveryLogRepository.emailHashFor(input.email),
+        input.ok ? 1 : 0,
+        reason,
+        input.now ?? nowIso()
+      );
+  }
+
+  listSince(since: string): LoginDeliveryOutcome[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM login_delivery_log WHERE created_at >= ? ORDER BY created_at ASC`)
+      .all(since) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      memberId: row.member_id === null || row.member_id === undefined ? null : String(row.member_id),
+      emailHash: String(row.email_hash),
+      ok: Number(row.ok) === 1,
+      reason: row.reason === null || row.reason === undefined ? null : String(row.reason),
+      createdAt: String(row.created_at)
+    }));
+  }
+
+  prune(before: string): void {
+    this.db.prepare(`DELETE FROM login_delivery_log WHERE created_at < ?`).run(before);
+  }
 }
 
 // Input to ProposalRepository.create(): every Proposal field EXCEPT the ones

@@ -66,12 +66,16 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   AuditLogRepository,
   LoginCodeRepository,
+  LoginDeliveryLogRepository,
   LoginThrottleRepository,
   MemberRepository,
+  deliverOperationalAlertToFeishu,
   generateLoginCode,
   methodNotAllowed,
   sendJson,
-  type Member
+  type Member,
+  type OperationalAlertPayload,
+  type OperationalAlertResult
 } from "@packages/shared-types";
 
 import { createFeishuLoginCodeSender, type LoginCodeSender } from "../data/login-code-notifier.js";
@@ -91,6 +95,10 @@ export interface LoginRouteDeps {
    * background job's promise is handed here so a test can await it instead of
    * sleeping. Never set in production. */
   onSendSettled?: (settled: Promise<void>) => void;
+  /** Operator escalation for delivery failures (see raiseOperatorAlert).
+   * Production omits it and gets shared-types' deliverOperationalAlertToFeishu
+   * - the same channel market-alerts' escalations ride; tests inject a fake. */
+  operationalAlert?: (payload: OperationalAlertPayload) => Promise<OperationalAlertResult>;
 }
 
 /** How long a code stays usable. */
@@ -270,9 +278,11 @@ async function handleRequestCode(
  * burns all three of their 15-minute slots on codes that do not exist and is
  * then throttled out of the recovery too. Deliberate - the alternative (record
  * only what was delivered) makes the endpoint unlimited during exactly the
- * outage an attacker would pick - and it is the reason DELIVERY_ALARM below has
- * to be findable: the ledger cannot tell an operator that this happened, since
- * a burnt slot and a delivered one are the same row.
+ * outage an attacker would pick. This ledger alone therefore cannot tell an
+ * operator that it happened - a burnt slot and a delivered one are the same
+ * row - which is why deliverCode records what became of each slot in
+ * `login_delivery_log` (v19 migration), the durable other half the doctor's
+ * login-delivery-health check compares this ledger against.
  */
 function reserveSendSlot(deps: LoginRouteDeps, email: string, clientIp: string, now: Date): boolean {
   const throttle = new LoginThrottleRepository(deps.db);
@@ -305,29 +315,129 @@ function reserveSendSlot(deps: LoginRouteDeps, email: string, clientIp: string, 
  *
  * A member whose code never arrives sees a perfectly normal 「已发送」 page and
  * tries again; the anti-enumeration rule above means they MUST, so the login
- * flow can be entirely broken while looking entirely healthy from outside. The
- * only trace is stderr, and until now the three ways it can break wrote three
- * unrelated sentences, none of which a log watch could key on.
+ * flow can be entirely broken while looking entirely healthy from outside.
+ * Every failure line carries this token. It is deliberately ugly and unique:
+ * `grep -c LOGIN-DELIVERY-FAILED platform-app.err.log` is the check, and a
+ * non-zero count on a deployment with real members means people cannot log in
+ * right now.
  *
- * Every one of them now carries this token. It is deliberately ugly and
- * unique: `grep -c LOGIN-DELIVERY-FAILED platform-app.err.log` is the check,
- * and a non-zero count on a deployment with real members means people cannot
- * log in right now.
- *
- * Why not escalate to Feishu instead: the dominant failure this reports IS
- * Feishu being unreachable, so an alert card would ride the channel that just
- * failed. market-alerts-poll.mjs hit the same wall (its "Fix 3" note) and
- * answered it with an out-of-band artifact rather than a message. This stops
- * at making the evidence findable, because the artifact-plus-doctor-check half
- * belongs with the deploy path rather than in a request handler.
+ * The token is one of THREE layers, because no single one survives every
+ * failure (2026-07-30, this task):
+ *   1. This stderr token - survives everything the process itself survives,
+ *      but somebody has to go read the log.
+ *   2. A THROTTLED operator alert through the operational-alert channel
+ *      (raiseOperatorAlert below). It reaches the operator's own Feishu
+ *      unprompted - but the dominant failure this reports IS Feishu being
+ *      unreachable, in which case the alert rides the channel that just
+ *      failed. market-alerts-poll.mjs hit the same wall (its "Fix 3" note),
+ *      which is why this layer is explicitly best-effort and never the only
+ *      one.
+ *   3. A durable outcome row in `login_delivery_log` (recordDeliveryOutcome
+ *      below), which needs no Feishu at all: the doctor's
+ *      login-delivery-health check (openclaw-runtime-doctor-core.mjs) compares
+ *      recent login_send_log reservations against these rows and fails the
+ *      machine when members are requesting codes that never arrive.
  *
  * NOT emitted for an address that matches no member, an inactive member, or a
- * throttled attempt. Those are all normal traffic - anyone can type any
- * address into the form - and counting them would bury the real signal under
- * noise a stranger controls. This fires only when a REAL, ACTIVE member with a
- * Feishu id on file could not be reached, which is never normal.
+ * throttled attempt - and neither is the alert, nor an outcome row. Those are
+ * all normal traffic - anyone can type any address into the form - and
+ * counting them would bury the real signal under noise a stranger controls.
+ * All three layers fire only when a REAL, ACTIVE member with a Feishu id on
+ * file could not be reached (or, for 2 and 3, when such a member can never be
+ * reached for want of a feishu_open_id), which is never normal.
  */
 const DELIVERY_ALARM = "LOGIN-DELIVERY-FAILED";
+
+/**
+ * One operator alert per failure BURST, not one per failed attempt: after an
+ * alert attempt, further delivery failures inside this window only log and
+ * record. In-process state on purpose - a restart forgetting the burst costs
+ * at most one extra card, while persisting it would add a write to a path
+ * whose whole premise is that infrastructure is failing.
+ *
+ * The clock counts alert ATTEMPTS, successful or not: during a full Feishu
+ * outage every attempt fails, and re-attempting more often than this would
+ * hammer a dead API without informing anyone (layer 3 above is the net for
+ * that case).
+ */
+const OPERATOR_ALERT_BURST_WINDOW_MS = 15 * 60 * 1000;
+let lastOperatorAlertAttemptAtMs: number | null = null;
+
+/** Tests share this module instance; mirrors identity.ts's
+ * __resetAccessJwtStateForTests convention. Never called in production. */
+export function __resetLoginOperatorAlertThrottleForTests(): void {
+  lastOperatorAlertAttemptAtMs = null;
+}
+
+/**
+ * Layer 2: tell the operator, through the same operational-alert channel
+ * market-alerts' escalations use. The body names the member ID and a
+ * SANITIZED reason only - never the code (which must exist nowhere but the
+ * card and the scrypt hash) and never the member's email address (the member
+ * id is what an operator needs to look the account up; the address would only
+ * widen what a leaked alert exposes).
+ *
+ * Failures here are logged WITHOUT the DELIVERY_ALARM token: the token counts
+ * member-impacting delivery failures, and the primary line for this failure
+ * has already been written by the caller.
+ */
+async function raiseOperatorAlert(deps: LoginRouteDeps, now: Date, detail: string): Promise<void> {
+  const nowMs = now.getTime();
+  if (
+    lastOperatorAlertAttemptAtMs !== null &&
+    nowMs - lastOperatorAlertAttemptAtMs < OPERATOR_ALERT_BURST_WINDOW_MS
+  ) {
+    return;
+  }
+  lastOperatorAlertAttemptAtMs = nowMs;
+  try {
+    const send = deps.operationalAlert ?? deliverOperationalAlertToFeishu;
+    const result = await send({
+      title: "登录验证码投递失败",
+      markdown: [
+        detail,
+        `发生时间：${now.toISOString()}。成员在页面上只会看到「已发送」，不会看到任何错误提示。`,
+        "同一故障批次 15 分钟内只发送本告警一次；期间的其余失败请查看 platform-app 的 err.log" +
+          `（grep ${DELIVERY_ALARM}）。若本告警因飞书整体故障未能送达，runtime doctor 的 ` +
+          "login-delivery-health 检查会在不依赖飞书的情况下报出同一问题。"
+      ].join("\n")
+    });
+    if (!result.sent) {
+      console.error(
+        `login: operator alert about a code delivery failure could not be sent: ${result.reason ?? "unknown"}`
+      );
+    }
+  } catch (error) {
+    console.error(
+      `login: operator alert about a code delivery failure threw: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+/**
+ * Layer 3: the durable outcome row (login_delivery_log, v19 migration) the
+ * doctor compares login_send_log reservations against. Best-effort by
+ * necessity - if this write fails the doctor sees a reservation with NO
+ * outcome at all, which its login-delivery-health check treats as a failure in
+ * its own right (that is what makes a crash between reserve and record
+ * visible), so a throw here is logged and deliberately not retried.
+ */
+function recordDeliveryOutcome(
+  deps: LoginRouteDeps,
+  input: { memberId: string | null; email: string; ok: boolean; reason?: string },
+  now: Date
+): void {
+  try {
+    const outcomes = new LoginDeliveryLogRepository(deps.db);
+    outcomes.prune(new Date(now.getTime() - PRUNE_AGE_MS).toISOString());
+    outcomes.record({ ...input, now: now.toISOString() });
+  } catch (error) {
+    console.error(
+      `login: failed to record a delivery outcome (the doctor's login-delivery-health check will see ` +
+        `a reservation with no outcome instead): ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
 
 /**
  * Mints + stores + delivers the code without the HTTP response waiting on any
@@ -336,10 +446,20 @@ const DELIVERY_ALARM = "LOGIN-DELIVERY-FAILED";
  * caller already answered; every failure is logged, sanitized, and dropped.
  */
 function runSendInBackground(deps: LoginRouteDeps, email: string, now: Date): void {
-  const settled = deliverCode(deps, email, now).catch((error: unknown) => {
+  const settled = deliverCode(deps, email, now).catch(async (error: unknown) => {
     console.error(
       `login: ${DELIVERY_ALARM} code delivery job threw: ${error instanceof Error ? error.message : String(error)}`
     );
+    // The job died before deliverCode could say what happened - whether a
+    // member was even involved is unknown here, so the outcome row carries a
+    // null member and a FIXED reason (the raw error text stays in stderr
+    // only, where a future error message embedding something sensitive can
+    // do the least harm). Both layers are best-effort: if the throw came
+    // from the db, the record fails too and the doctor sees a reservation
+    // with no outcome, which is the signal for exactly this case.
+    const settledAt = currentNow(deps);
+    recordDeliveryOutcome(deps, { memberId: null, email, ok: false, reason: "job_threw" }, settledAt);
+    await raiseOperatorAlert(deps, settledAt, "一次登录验证码后台投递任务异常退出（成员未知，原因见 err.log）。");
   });
   deps.onSendSettled?.(settled);
 }
@@ -347,6 +467,8 @@ function runSendInBackground(deps: LoginRouteDeps, email: string, now: Date): vo
 async function deliverCode(deps: LoginRouteDeps, email: string, now: Date): Promise<void> {
   const member = new MemberRepository(deps.db).getByEmail(email);
   if (!member || member.status !== "active" || member.id === LEGACY_SYSTEM_MEMBER_ID) {
+    // Stranger-controlled traffic: no log line, no alert, no outcome row -
+    // see DELIVERY_ALARM's note on noise.
     return;
   }
   if (!member.feishuOpenId) {
@@ -355,6 +477,17 @@ async function deliverCode(deps: LoginRouteDeps, email: string, now: Date): Prom
     console.error(
       `login: ${DELIVERY_ALARM} member ${member.id} is active but has no feishu_open_id on file, ` +
         `so no code can ever be delivered to them.`
+    );
+    const settledAt = currentNow(deps);
+    recordDeliveryOutcome(
+      deps,
+      { memberId: member.id, email, ok: false, reason: "no_feishu_open_id" },
+      settledAt
+    );
+    await raiseOperatorAlert(
+      deps,
+      settledAt,
+      `成员 ${member.id} 处于激活状态但没有 feishu_open_id，验证码永远无法送达，该成员将一直无法登录。`
     );
     return;
   }
@@ -372,13 +505,27 @@ async function deliverCode(deps: LoginRouteDeps, email: string, now: Date): Prom
 
   const send = deps.loginCodeSender ?? createFeishuLoginCodeSender();
   const result = await send({ openId: member.feishuOpenId, code, ttlMinutes: CODE_TTL_MINUTES });
+  const settledAt = currentNow(deps);
   if (!result.ok) {
     // The member has already been told 「已发送」 and has already spent one of
     // their three sends per 15 minutes on a code that does not exist.
     console.error(
       `login: ${DELIVERY_ALARM} Feishu code delivery failed for member ${member.id}: ${result.reason ?? "unknown"}`
     );
+    // Durable ledger first (local, most reliable), Feishu alert second.
+    recordDeliveryOutcome(
+      deps,
+      { memberId: member.id, email, ok: false, reason: result.reason ?? "unknown" },
+      settledAt
+    );
+    await raiseOperatorAlert(
+      deps,
+      settledAt,
+      `成员 ${member.id} 的登录验证码经飞书投递失败（原因：${result.reason ?? "unknown"}）。`
+    );
+    return;
   }
+  recordDeliveryOutcome(deps, { memberId: member.id, email, ok: true }, settledAt);
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,11 @@ export interface PlatformServerDeps {
   /** Test seam for login.ts's out-of-band code delivery - see its module
    * header. Never set in production. */
   onLoginSendSettled?: LoginRouteDeps["onSendSettled"];
+  /** Operator escalation for failed login-code deliveries (routes/login.ts's
+   * raiseOperatorAlert). Unset in production, where the route uses
+   * shared-types' deliverOperationalAlertToFeishu; tests inject a fake that
+   * captures the alert instead of sending anything. */
+  loginOperationalAlert?: LoginRouteDeps["operationalAlert"];
   /** Injectable Feishu single-chat confirm notifier (Task 4, routes/
    * review.ts), fired fire-and-forget after `POST /api/reviews/:id/confirm`.
    * When omitted, routes/review.ts falls back to the REAL
@@ -171,7 +176,8 @@ export function createPlatformServer(deps: PlatformServerDeps): Server {
           db: deps.db,
           ...(deps.now ? { now: deps.now } : {}),
           ...(deps.loginCodeSender ? { loginCodeSender: deps.loginCodeSender } : {}),
-          ...(deps.onLoginSendSettled ? { onSendSettled: deps.onLoginSendSettled } : {})
+          ...(deps.onLoginSendSettled ? { onSendSettled: deps.onLoginSendSettled } : {}),
+          ...(deps.loginOperationalAlert ? { operationalAlert: deps.loginOperationalAlert } : {})
         },
         nonce
       )

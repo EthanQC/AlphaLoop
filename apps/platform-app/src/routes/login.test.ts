@@ -3,10 +3,18 @@ import type { AddressInfo } from "node:net";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiTokenRepository, MemberRepository, migrate, type Member } from "@packages/shared-types";
+import {
+  ApiTokenRepository,
+  MemberRepository,
+  migrate,
+  type Member,
+  type OperationalAlertPayload,
+  type OperationalAlertResult
+} from "@packages/shared-types";
 
 import type { LoginCodeSender } from "../data/login-code-notifier.js";
 import { __resetAccessJwtStateForTests } from "../identity.js";
+import { __resetLoginOperatorAlertThrottleForTests } from "./login.js";
 import { createPlatformServer } from "../server.js";
 import { SESSION_COOKIE_NAME, createSessionToken } from "../session.js";
 
@@ -51,6 +59,8 @@ describe("email-code login", () => {
   let sent: Array<{ openId: string; code: string; ttlMinutes: number }>;
   let sendResult: { ok: boolean; reason?: string };
   let pending: Array<Promise<void>>;
+  let operatorAlerts: OperationalAlertPayload[];
+  let operatorAlertResult: OperationalAlertResult;
 
   const fakeSender: LoginCodeSender = async ({ openId, code, ttlMinutes }) => {
     sent.push({ openId, code, ttlMinutes });
@@ -103,13 +113,22 @@ describe("email-code login", () => {
     sent = [];
     sendResult = { ok: true };
     pending = [];
+    operatorAlerts = [];
+    operatorAlertResult = { sent: true, target: "none", deliveries: [] };
+    // The alert-burst window is module state shared across this suite's tests
+    // (deliberately so in production - see login.ts's own comment).
+    __resetLoginOperatorAlertThrottleForTests();
 
     server = createPlatformServer({
       db,
       repoRoot: process.cwd(),
       now: () => clock,
       loginCodeSender: fakeSender,
-      onLoginSendSettled: (settled) => pending.push(settled)
+      onLoginSendSettled: (settled) => pending.push(settled),
+      loginOperationalAlert: async (payload) => {
+        operatorAlerts.push(payload);
+        return operatorAlertResult;
+      }
     });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => resolve());
@@ -626,6 +645,212 @@ describe("email-code login", () => {
       await requestCode("revoked@example.com");
 
       expect(errorSpy.mock.calls.flat().map(String).join("\n")).not.toContain("LOGIN-DELIVERY-FAILED");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Operator escalation + the delivery-outcome ledger (2026-07-30, J4
+  // follow-up). The stderr token above is layer 1; these pin layer 2 (the
+  // throttled operational alert) and layer 3 (login_delivery_log, the durable
+  // record the doctor's login-delivery-health check reads) - and that neither
+  // layer changed anything a member can observe.
+  // -------------------------------------------------------------------------
+
+  describe("operator escalation on delivery failure", () => {
+    function allDeliveryRows(): Array<Record<string, unknown>> {
+      return db.prepare("SELECT * FROM login_delivery_log ORDER BY created_at").all() as Array<Record<string, unknown>>;
+    }
+
+    it("alerts the operator through the operational-alert channel, naming the member but never the code or email", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu rejected the card" };
+
+      await requestCode(MEMBER_EMAIL);
+
+      expect(operatorAlerts).toHaveLength(1);
+      const alert = operatorAlerts[0] as OperationalAlertPayload;
+      expect(alert.title).toBe("登录验证码投递失败");
+      expect(alert.markdown).toContain("member_1");
+      expect(alert.markdown).toContain("Feishu rejected the card");
+      // What must NOT ride an alert that leaves this process: the code (which
+      // exists only in the card and the scrypt hash) and the member's address.
+      expect(alert.markdown).not.toContain(sent[0]?.code as string);
+      expect(alert.markdown).not.toContain(MEMBER_EMAIL);
+    });
+
+    it("sends ONE alert per failure burst, then a fresh one after the window", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      new MemberRepository(db).upsert(
+        makeMember({ id: "member_2", email: "second@example.com", feishuOpenId: "ou_member_2" })
+      );
+      sendResult = { ok: false, reason: "Feishu down" };
+
+      await requestCode(MEMBER_EMAIL); // failure 1 -> alert 1
+      advance(61_000);
+      await requestCode(MEMBER_EMAIL); // failure 2, same burst
+      advance(61_000);
+      await requestCode("second@example.com"); // failure 3, other member, same burst
+      expect(operatorAlerts).toHaveLength(1);
+
+      advance(15 * 60 * 1000); // past the burst window
+      await requestCode("second@example.com"); // failure 4 -> alert 2
+      expect(operatorAlerts).toHaveLength(2);
+    });
+
+    it("alerts for an active member with no feishu_open_id - the permanent config failure", async () => {
+      const { feishuOpenId: _dropped, ...withoutOpenId } = makeMember();
+      new MemberRepository(db).upsert(withoutOpenId as Member);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await requestCode(MEMBER_EMAIL);
+
+      expect(operatorAlerts).toHaveLength(1);
+      expect(operatorAlerts[0]?.markdown).toContain("member_1");
+      expect(operatorAlerts[0]?.markdown).toContain("feishu_open_id");
+    });
+
+    it("never alerts for successes or for traffic a stranger controls", async () => {
+      new MemberRepository(db).upsert(
+        makeMember({ id: "member_2", email: "revoked@example.com", feishuOpenId: "ou_member_2", status: "revoked" })
+      );
+
+      await requestCode(MEMBER_EMAIL); // delivered fine
+      await requestCode("nobody@example.com");
+      await requestCode("revoked@example.com");
+
+      expect(operatorAlerts).toHaveLength(0);
+    });
+
+    it("survives the alert channel itself failing - logged, without derailing the member's flow", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu down" };
+      operatorAlertResult = { sent: false, target: "none", reason: "alert channel down too", deliveries: [] };
+
+      const response = await requestCode(MEMBER_EMAIL);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("验证码已发送");
+      const logged = errorSpy.mock.calls.flat().map(String).join("\n");
+      expect(logged).toContain("operator alert");
+      expect(logged).toContain("alert channel down too");
+      // The delivery outcome still made it to the durable ledger even though
+      // both Feishu-facing layers failed - that is the doctor's input.
+      expect(allDeliveryRows()).toHaveLength(1);
+    });
+
+    it("survives the alert channel throwing", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu down" };
+      const throwingServer = createPlatformServer({
+        db,
+        repoRoot: process.cwd(),
+        now: () => clock,
+        loginCodeSender: fakeSender,
+        onLoginSendSettled: (settled) => pending.push(settled),
+        loginOperationalAlert: async () => {
+          throw new Error("transport exploded");
+        }
+      });
+      await new Promise<void>((resolve) => {
+        throwingServer.listen(0, "127.0.0.1", () => resolve());
+      });
+      const port = (throwingServer.address() as AddressInfo).port;
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/login`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ email: MEMBER_EMAIL }).toString(),
+          redirect: "manual"
+        });
+        await settle();
+        expect(response.status).toBe(200);
+        expect(errorSpy.mock.calls.flat().map(String).join("\n")).toContain("transport exploded");
+      } finally {
+        await new Promise<void>((resolve) => throwingServer.close(() => resolve()));
+      }
+    });
+  });
+
+  describe("the delivery-outcome ledger (login_delivery_log)", () => {
+    function allDeliveryRows(): Array<Record<string, unknown>> {
+      return db.prepare("SELECT * FROM login_delivery_log ORDER BY created_at").all() as Array<Record<string, unknown>>;
+    }
+
+    it("records a success row for a delivered code", async () => {
+      await requestCode(MEMBER_EMAIL);
+
+      const rows = allDeliveryRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ member_id: "member_1", ok: 1, reason: null });
+    });
+
+    it("records a failure row with the sanitized reason - never the code, never the email", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu rejected the card" };
+
+      await requestCode(MEMBER_EMAIL);
+
+      const rows = allDeliveryRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ member_id: "member_1", ok: 0, reason: "Feishu rejected the card" });
+      const serialized = JSON.stringify(rows);
+      expect(serialized).not.toContain(sent[0]?.code as string);
+      expect(serialized).not.toContain(MEMBER_EMAIL);
+    });
+
+    it("records the no-feishu_open_id impossibility so the doctor can see it", async () => {
+      const { feishuOpenId: _dropped, ...withoutOpenId } = makeMember();
+      new MemberRepository(db).upsert(withoutOpenId as Member);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await requestCode(MEMBER_EMAIL);
+
+      expect(allDeliveryRows()[0]).toMatchObject({ member_id: "member_1", ok: 0, reason: "no_feishu_open_id" });
+    });
+
+    it("writes NOTHING for unknown or revoked addresses - stranger traffic cannot grow the ledger", async () => {
+      new MemberRepository(db).upsert(
+        makeMember({ id: "member_2", email: "revoked@example.com", feishuOpenId: "ou_member_2", status: "revoked" })
+      );
+
+      await requestCode("nobody@example.com");
+      await requestCode("revoked@example.com");
+
+      expect(allDeliveryRows()).toHaveLength(0);
+    });
+
+    it("still reserves the throttle slot BEFORE the failed send - the reserve-before-send design is intact", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu down" };
+
+      await requestCode(MEMBER_EMAIL);
+
+      // The slot was burnt (ledger row written) even though nothing arrived:
+      // an outage must not hand out unlimited retries. The outcome row is what
+      // tells the doctor the slot bought nothing.
+      expect(db.prepare("SELECT COUNT(*) AS c FROM login_send_log WHERE scope = 'email'").get()).toEqual({ c: 1 });
+      expect(allDeliveryRows()[0]).toMatchObject({ ok: 0 });
+      // And the cooldown still applies to the NEXT request, failure or not.
+      await requestCode(MEMBER_EMAIL);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM login_send_log WHERE scope = 'email'").get()).toEqual({ c: 1 });
+    });
+
+    it("keeps the failure response byte-identical to the unknown-address response - no enumeration oracle, no member-visible error", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      sendResult = { ok: false, reason: "Feishu down" };
+      const failing = await requestCode(MEMBER_EMAIL);
+      const failingBody = await failing.text();
+
+      const unknown = await requestCode("nobody@example.com");
+      const unknownBody = await unknown.text();
+
+      expect(operatorAlerts).toHaveLength(1); // the alert fired...
+      expect(failing.status).toBe(200);
+      expect(failingBody).toContain("验证码已发送"); // ...and the member saw none of it
+      const normalize = (body: string, email: string): string =>
+        body.replace(email, "EMAIL").replace(/name="csp-nonce" content="[^"]*"/u, "NONCE");
+      expect(normalize(failingBody, MEMBER_EMAIL)).toBe(normalize(unknownBody, "nobody@example.com"));
     });
   });
 });
