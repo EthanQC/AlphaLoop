@@ -22,6 +22,7 @@ import {
   AuditLogRepository,
   MemberRepository,
   ProposalRepository,
+  loadLocalEnv,
   nowIso,
   openTradingDatabase,
   resolveRuntimePaths,
@@ -36,6 +37,17 @@ import { computeExposure } from "./portfolio-exposure.mjs";
 import { normalizeSymbol } from "./report-data.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+// 2026-07-30, found on the FIRST live run of the approval loop: this was the
+// only CLI in scripts/ that never loaded .env.local, so it only worked when the
+// parent process happened to export the right variables. The operator's real
+// click travelled Feishu → gateway → control agent → this CLI, and the control
+// agent's environment carries no BROKER_EXECUTOR_SHARED_SECRET - so the approve
+// POST went out with an empty X-AlphaLoop-Broker-Secret header and the executor
+// (correctly) refused the ticket: audit `ticket.rejected.unauthorized`,
+// payload {"reason":"secret_missing"}. Every test passed because tests inject
+// env/fetch directly; nothing exercised the CLI boundary. Same seam class as
+// the Phase-2 hysteresis bug: the caller's row is not the engine's row.
+loadLocalEnv(repoRoot);
 
 // Sentinel `decidedBy` for the expiry sweep (a cron job, not a member click) -
 // mirrors the shape of database.ts's `__legacy_system__` migration sentinel:
@@ -79,6 +91,7 @@ const COMMAND_FLAGS = {
   "approve-half": new Set(["token", "actor", "no-execute"]),
   reject: new Set(["token", "actor"]),
   list: new Set(["owner", "status"]),
+  resubmit: new Set(["id"]),
   sweep: new Set([])
 };
 
@@ -482,6 +495,56 @@ export function runReject(flags, options = {}) {
   return runDecision("rejected", flags, options);
 }
 
+/**
+ * Re-submits an APPROVED proposal whose executor call never produced a ticket.
+ *
+ * runDecision's own contract creates this state on purpose: an executor
+ * refusal/outage after the human decision is a WARNING, never a rollback - the
+ * owner's approval is already recorded and must not be un-decided by an infra
+ * failure. Its warning text has always said 「可重试执行」, but until 2026-07-30
+ * nothing implemented the retry. The first live run of the approval loop
+ * landed exactly here: the operator's click approved the proposal, and the
+ * ticket POST went out without the shared secret (see the loadLocalEnv note at
+ * the top of this file), so the proposal sat approved with no ticket and no
+ * way to move it that did not involve asking the operator to re-decide a
+ * decision they had already made.
+ *
+ * Guards: the proposal must exist, must be approved/approved_half, and must
+ * not already carry a ticket (the executor marks `executed` + ticket_id
+ * server-side on success, and ProposalRepository.markExecuted refuses to
+ * overwrite one ticket with another - resubmitting an executed proposal is a
+ * refusal here, not a second order). No token is consumed and no status
+ * changes on this path; the executor remains the only writer that can move
+ * approved → executed.
+ */
+export async function runResubmit(flags, options = {}) {
+  const proposalId = requireFlag(flags, "id");
+  return withDb(options, async (db) => {
+    const proposals = new ProposalRepository(db);
+    const proposal = proposals.getById(proposalId);
+    if (!proposal) {
+      throw new Error(`提案不存在：${proposalId}。`);
+    }
+    if (proposal.status !== "approved" && proposal.status !== "approved_half") {
+      throw new Error(`只有已批准且未出票的提案可以重试执行；${proposalId} 当前状态是 ${proposal.status}。`);
+    }
+    if (proposal.ticketId) {
+      throw new Error(`提案 ${proposalId} 已有工单 ${proposal.ticketId}，不能重复下单。`);
+    }
+
+    new AuditLogRepository(db).write("proposals", "resubmit", {
+      proposalId,
+      previousStatus: proposal.status
+    });
+
+    const executorResult = await submitToExecutor(proposal, options);
+    if (!executorResult.ok) {
+      throw new Error(`重试执行失败：${executorResult.error}`);
+    }
+    return { ok: true, proposalId, executor: executorResult };
+  });
+}
+
 export async function runList(flags, options = {}) {
   const ownerId = requireFlag(flags, "owner");
   const status = flags.status ? String(flags.status) : undefined;
@@ -548,6 +611,7 @@ const COMMANDS = {
   "approve-half": runApproveHalf,
   reject: runReject,
   list: runList,
+  resubmit: runResubmit,
   sweep: runSweep
 };
 

@@ -80,10 +80,12 @@ describe("G3: every repository write in apps/openclaw-config carries the fields 
     // commands were added ABOVE it, so `runRevoke`'s fetch-then-spread upsert
     // just shifted down. Same construct, same single blind spot - the list is
     // still three entries long, which is what makes this a ratchet.
+    // proposals.mjs's two entries moved 326->339 / 531->594 on 2026-07-30:
+    // the loadLocalEnv seam note and runResubmit were inserted above them.
     expect(real.unverifiable.map((entry: string) => entry.split(":").slice(0, 2).join(":"))).toEqual([
       "apps/openclaw-config/scripts/members.mjs:329",
-      "apps/openclaw-config/scripts/proposals.mjs:326",
-      "apps/openclaw-config/scripts/proposals.mjs:531"
+      "apps/openclaw-config/scripts/proposals.mjs:339",
+      "apps/openclaw-config/scripts/proposals.mjs:594"
     ]);
   });
 

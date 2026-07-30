@@ -624,3 +624,113 @@ describe("buildCliResult / dispatch", () => {
     expect(listed.proposals[0].status).toBe("approved_half");
   });
 });
+
+// ---------------------------------------------------------------------------
+// resubmit: the recovery half of runDecision's own no-rollback contract.
+// Found by the FIRST live run of the approval loop (2026-07-30): the operator's
+// click approved the proposal, the executor refused the unauthenticated ticket
+// POST, and the warning text 「可重试执行」 pointed at a retry that did not
+// exist. These tests drive a REAL http server so the assertion sits on the
+// executor-facing contract (the X-AlphaLoop-Broker-Secret header on the wire),
+// not on our own intermediate objects.
+// ---------------------------------------------------------------------------
+describe("runResubmit", () => {
+  async function approvedWithoutTicket(options: { dbPath: string }, db: DatabaseSync) {
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", netAssets: 100_000, marketValue: 10_000 });
+    const { transport } = makeFakeTransport();
+    const created = await cli.runCreate(
+      {
+        owner: "member_1",
+        symbol: "QQQM.US",
+        side: "buy",
+        quantity: "1",
+        "limit-price": "273.50",
+        reason: "resubmit 契约测试"
+      },
+      { ...options, transport }
+    );
+    // The REAL path into the stuck state: approve while the executor is
+    // unreachable. runDecision records the human decision, warns, and leaves
+    // the proposal approved with no ticket - exactly what the live click left.
+    const approved = await cli.runApprove(
+      { token: created.proposal.approvalToken, actor: "member_1" },
+      { ...options, transport, executorUrl: UNREACHABLE_EXECUTOR_URL }
+    );
+    expect(approved.warnings?.join(" ")).toContain("可重试执行");
+    return created.proposal.id as string;
+  }
+
+  it("re-POSTs an approved, ticketless proposal with the shared secret on the wire", async () => {
+    const { db, options } = makeDb();
+    const proposalId = await approvedWithoutTicket(options, db);
+
+    const { createServer } = await import("node:http");
+    const seen: Array<{ secret: string | undefined; body: string }> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        seen.push({ secret: req.headers["x-alphaloop-broker-secret"] as string | undefined, body });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, ticketId: "ticket_test_1" }));
+      });
+    });
+    await new Promise<void>((resolveListen) => { server.listen(0, "127.0.0.1", resolveListen); });
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    const previousSecret = process.env.BROKER_EXECUTOR_SHARED_SECRET;
+    process.env.BROKER_EXECUTOR_SHARED_SECRET = "seam-test-secret";
+    try {
+      const result = await cli.runResubmit(
+        { id: proposalId },
+        { ...options, executorUrl: `http://127.0.0.1:${port}` }
+      );
+      expect(result.ok).toBe(true);
+      expect(seen).toHaveLength(1);
+      // The wire-level assertion this bug demanded: the secret arrives in the
+      // header the executor actually reads.
+      expect(seen[0]?.secret).toBe("seam-test-secret");
+      expect(JSON.parse(seen[0]?.body ?? "{}").proposalId).toBe(proposalId);
+    } finally {
+      if (previousSecret === undefined) {
+        delete process.env.BROKER_EXECUTOR_SHARED_SECRET;
+      } else {
+        process.env.BROKER_EXECUTOR_SHARED_SECRET = previousSecret;
+      }
+      await new Promise<void>((resolveClose) => { server.close(() => resolveClose()); });
+    }
+  });
+
+  it("refuses a pending proposal - resubmit never bypasses the human decision", async () => {
+    const { db, options } = makeDb();
+    seedMember(db, "member_1");
+    seedSnapshot(db, { ownerId: "member_1", netAssets: 100_000, marketValue: 10_000 });
+    const { transport } = makeFakeTransport();
+    const created = await cli.runCreate(
+      { owner: "member_1", symbol: "QQQM.US", side: "buy", quantity: "1", "limit-price": "273.50", reason: "guard" },
+      { ...options, transport }
+    );
+    await expect(cli.runResubmit({ id: created.proposal.id }, options)).rejects.toThrow(/当前状态是 pending/u);
+  });
+
+  it("refuses an executed proposal - one approval is one ticket, never two", async () => {
+    const { db, options } = makeDb();
+    const proposalId = await approvedWithoutTicket(options, db);
+    new ProposalRepository(db).markExecuted(proposalId, "ticket_already");
+    await expect(cli.runResubmit({ id: proposalId }, options)).rejects.toThrow(/当前状态是 executed/u);
+  });
+
+  it("surfaces the executor's refusal instead of claiming success", async () => {
+    const { db, options } = makeDb();
+    const proposalId = await approvedWithoutTicket(options, db);
+    await expect(
+      cli.runResubmit({ id: proposalId }, { ...options, executorUrl: UNREACHABLE_EXECUTOR_URL })
+    ).rejects.toThrow(/重试执行失败/u);
+    // And the proposal is still recoverable: status untouched, no ticket.
+    const row = new ProposalRepository(db).getById(proposalId);
+    expect(row?.status).toBe("approved");
+    expect(row?.ticketId ?? null).toBeNull();
+  });
+});
