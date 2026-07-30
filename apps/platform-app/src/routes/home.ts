@@ -129,8 +129,10 @@ import { scanReports, type ReportIndexEntry } from "../reports/scanner.js";
 import { describeDisciplineStreak, renderComplianceLine } from "../render/compliance.js";
 import { renderEmptyState } from "../render/empty-state.js";
 import {
+  beijingDayAge,
   describeDataDay,
   describeDataInstant,
+  formatAccountAmount,
   formatAlertValue,
   formatBeijingShortTime
 } from "../render/format.js";
@@ -197,8 +199,10 @@ function computeHomeFreshness(snapshot: OwnerSnapshot | null, now: Date): Freshn
   return snapshotFreshness(snapshot.fetchedAt, now);
 }
 
-function formatNetAssets(value: number): string {
-  return `${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 美元`;
+// Currency comes from the snapshot the number came from - never assumed. See
+// data/snapshots.ts's OwnerSnapshot.reportingCurrency.
+function formatNetAssets(value: number, currency: string | null): string {
+  return formatAccountAmount(value, currency);
 }
 
 function formatSignedPercent(pct: number): string {
@@ -414,7 +418,10 @@ function renderPaperOverviewBlock(
     </section>`;
   }
 
-  const netAssetsDisplay = snapshot.netAssets === null ? "数据不足" : formatNetAssets(snapshot.netAssets);
+  const netAssetsDisplay =
+    snapshot.netAssets === null
+      ? "数据不足"
+      : formatNetAssets(snapshot.netAssets, snapshot.reportingCurrency);
   const { changeDisplay, changeClass } = computeDailyChange(snapshot, previousDay);
 
   const pillClass = freshnessPillClass(freshness);
@@ -523,7 +530,31 @@ function renderAlertFeedBlock(events: ReadonlyArray<AlertEventRow>, session: UsT
 // ⑤ 今日日报卡
 // ---------------------------------------------------------------------------
 
-function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
+/**
+ * The 今日日报卡 heading is a claim about WHEN, and the newest daily on disk is
+ * frequently not today's: the daily job had been dead for days at the end of
+ * 2026-07 (14 consecutive `run_log` failures on the mini, last success
+ * 2026-07-28) while this card kept presenting whatever it found under an
+ * unqualified 今日, with no age anywhere on it - the only pill it could show
+ * was `legacy`, which is about the report's FORMAT era, not its age. A reader
+ * checking whether today's report had landed got told it had.
+ *
+ * So the heading now states the age whenever the report is not today's, and
+ * from STALE_AFTER_DAYS on the pill turns into a warning. `beijingDayAge`
+ * returns null for a date it cannot parse, and then nothing is claimed at all.
+ */
+function renderDailyReportAge(entry: ReportIndexEntry, now: Date): { heading: string; pill: Html } {
+  const age = beijingDayAge(entry.date, now);
+  if (!age || age.days === 0) {
+    return { heading: "今日日报卡", pill: trustedHtml("") };
+  }
+  return {
+    heading: "最新日报卡",
+    pill: html`<span class="pill ${age.stale ? "warn" : ""}">${age.ago}</span>`
+  };
+}
+
+function renderDailyReportBlock(entry: ReportIndexEntry | undefined, now: Date): Html {
   if (!entry) {
     return html`<section class="card dt-w2 report">
       <h2>今日日报卡</h2>
@@ -546,8 +577,10 @@ function renderDailyReportBlock(entry: ReportIndexEntry | undefined): Html {
       ? html`<a class="btn" href="/${entry.type}/${entry.date}/me">我的个人页 →</a>`
       : trustedHtml("");
 
+  const { heading, pill: agePill } = renderDailyReportAge(entry, now);
+
   return html`<section class="card dt-w2 report">
-    <h2>今日日报卡 ${legacyPill}</h2>
+    <h2>${heading} ${agePill}${legacyPill}</h2>
     <h3>${entry.title}</h3>
     <div class="report-links">
       <a class="btn primary" href="/${entry.type}/${entry.date}">阅读全文</a>
@@ -697,6 +730,9 @@ interface HomeBodyData {
   disciplineContexts: DisciplineContextMatch;
   circuitPausedUntil: string | null;
   latestReview: TypedMonthlyReview | null;
+  /** Request clock, so the 今日日报卡 heading can state the report's real age
+   * rather than assert 今日. */
+  now: Date;
 }
 
 function renderHomeBody(data: HomeBodyData): Html {
@@ -710,7 +746,7 @@ function renderHomeBody(data: HomeBodyData): Html {
     </div>
     <div class="bento" style="margin-top:10px">
       ${renderAlertFeedBlock(data.alertEvents, data.session)}
-      ${renderDailyReportBlock(data.latestDaily)}
+      ${renderDailyReportBlock(data.latestDaily, data.now)}
     </div>
     <div class="bento" style="margin-top:10px">
       ${renderDisciplineBlock(
@@ -808,7 +844,8 @@ export function renderHomePage(
       disciplineStreak,
       disciplineContexts,
       circuitPausedUntil,
-      latestReview
+      latestReview,
+      now
     }),
     nonce,
     now

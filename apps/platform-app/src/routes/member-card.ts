@@ -59,7 +59,7 @@ import {
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { CONFIDENCE_LABELS } from "../reports/conclusion-box.js";
 import { renderEmptyState, renderInlineEmptyState } from "../render/empty-state.js";
-import { describeDataInstant, formatBeijingShortTime } from "../render/format.js";
+import { describeDataInstant, formatAccountAmount, formatBeijingShortTime } from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { renderPage, snapshotFreshness, unknownDataTime } from "../render/layout.js";
 
@@ -106,8 +106,10 @@ function requireIdentity(req: IncomingMessage, res: ServerResponse, db: Database
   return member;
 }
 
-function formatMoney(value: number): string {
-  return `${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 美元`;
+// Account total; currency comes from the snapshot, never assumed. See
+// data/snapshots.ts's OwnerSnapshot.reportingCurrency.
+function formatMoney(value: number, currency: string | null): string {
+  return formatAccountAmount(value, currency);
 }
 
 function formatSignedPercent(pct: number): string {
@@ -224,7 +226,8 @@ function renderPerformanceSection(view: PerformanceView): Html {
   }
 
   const { kpis } = view;
-  const netAssetsDisplay = kpis.netAssets === null ? "数据不足" : formatMoney(kpis.netAssets);
+  const netAssetsDisplay =
+    kpis.netAssets === null ? "数据不足" : formatMoney(kpis.netAssets, kpis.reportingCurrency);
   const cumulative =
     kpis.cumulativeChangePct === null
       ? { display: "数据不足", cls: "" }

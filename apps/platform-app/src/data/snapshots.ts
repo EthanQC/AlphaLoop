@@ -49,6 +49,22 @@ export interface OwnerSnapshot {
    * per-position degradation, must be surfaced, never swallowed. */
   degraded: boolean;
   degradedReason: string | null;
+  /**
+   * The currency `netAssets` is DENOMINATED IN, as the broker itself reported
+   * it (`raw.primaryAsset.currency`), or null when the blob does not say.
+   *
+   * Not cosmetic. Measured 2026-07-30 against the mini's live
+   * runtime/trading.sqlite: this deployment's Longbridge paper account reports
+   * `primaryAsset.currency = "HKD"` with `net_assets = 860251.88`, while its
+   * only funded cash bucket is USD 122,079.05. Every net-asset renderer used
+   * to hardcode " 美元", so the home page and /paper both told the operator
+   * they held "860,251.88 美元" - roughly eight times their actual value - and
+   * flatly contradicted the personal page, which reads the same field through
+   * scheduled-report.mjs's `translateCurrency` and correctly prints 港元.
+   * Nothing may claim a currency this field does not state; see
+   * render/format.ts's formatAccountAmount for the unknown-currency case.
+   */
+  reportingCurrency: string | null;
 }
 
 const SNAPSHOT_SELECT = `
@@ -76,9 +92,35 @@ function parseDegraded(raw: unknown): { degraded: boolean; degradedReason: strin
   }
 }
 
+/**
+ * Reads the account's reporting currency out of the snapshot `raw` blob.
+ * `primaryAsset` is the exact object official-paper-monitor.mjs persists from
+ * Longbridge's `trade assets` response (see report-data.mjs's
+ * normalizeOfficialPaperSnapshot), and `currency` is the field Longbridge
+ * itself uses to say what `net_assets`/`total_cash` are denominated in.
+ *
+ * Returns null - never a guessed "USD" - for a blob that has no primaryAsset,
+ * no currency, a blank one, or that does not parse. A caller must then decline
+ * to make a currency claim rather than print a plausible one.
+ */
+function parseReportingCurrency(raw: unknown): string | null {
+  try {
+    const parsed = JSON.parse(String(raw)) as { primaryAsset?: { currency?: unknown } | null };
+    const currency = parsed.primaryAsset?.currency;
+    if (typeof currency !== "string") {
+      return null;
+    }
+    const trimmed = currency.trim().toUpperCase();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
 function mapSnapshotRow(row: Record<string, unknown>): OwnerSnapshot {
   const { degraded, degradedReason } = parseDegraded(row.raw);
   return {
+    reportingCurrency: parseReportingCurrency(row.raw),
     id: String(row.id),
     ownerId: row.owner_id === null || row.owner_id === undefined ? null : String(row.owner_id),
     fetchedAt: String(row.fetched_at),
@@ -204,6 +246,12 @@ export interface SnapshotSeriesPoint {
   netAssets: number | null;
   marketValue: number;
   degraded: boolean;
+  /** Carried per point (not per series) because it is a property of the row
+   * the broker returned, and it CAN change between rows - on this deployment
+   * it is the same HKD for all 64 live rows, but a series that silently
+   * mixed two denominations into one curve would be exactly the kind of
+   * number nobody could trust. See OwnerSnapshot.reportingCurrency. */
+  reportingCurrency: string | null;
 }
 
 function toSeriesPoint(snapshot: OwnerSnapshot): SnapshotSeriesPoint {
@@ -211,7 +259,8 @@ function toSeriesPoint(snapshot: OwnerSnapshot): SnapshotSeriesPoint {
     fetchedAt: snapshot.fetchedAt,
     netAssets: snapshot.netAssets,
     marketValue: snapshot.marketValue,
-    degraded: snapshot.degraded
+    degraded: snapshot.degraded,
+    reportingCurrency: snapshot.reportingCurrency
   };
 }
 
@@ -344,6 +393,11 @@ export interface PaperKpis {
   cumulativeChangePct: number | null;
   /** 最大回撤: see computeMaxDrawdownSegment; always <= 0 when computable. */
   maxDrawdownPct: number | null;
+  /** The currency `netAssets` is denominated in - the LATEST point's, i.e. the
+   * same point `netAssets` itself came from. Null when the series is empty or
+   * that point's blob never stated one. See
+   * OwnerSnapshot.reportingCurrency. */
+  reportingCurrency: string | null;
 }
 
 /**
@@ -355,10 +409,12 @@ export interface PaperKpis {
  */
 export function computePaperKpis(series: ReadonlyArray<SnapshotSeriesPoint>): PaperKpis {
   const drawdown = computeMaxDrawdownSegment(series);
+  const latest = series.length > 0 ? (series[series.length - 1] as SnapshotSeriesPoint) : null;
   return {
-    netAssets: series.length > 0 ? (series[series.length - 1] as SnapshotSeriesPoint).netAssets : null,
+    netAssets: latest ? latest.netAssets : null,
     todayChangePct: computeTodayChangePct(series),
     cumulativeChangePct: computeCumulativeChangePct(series),
-    maxDrawdownPct: drawdown ? drawdown.pct : null
+    maxDrawdownPct: drawdown ? drawdown.pct : null,
+    reportingCurrency: latest ? latest.reportingCurrency : null
   };
 }

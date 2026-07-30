@@ -28,12 +28,31 @@ function seedSnapshot(
     positions?: unknown[];
     degraded?: boolean;
     degradedReason?: string | null;
+    /** Written into `raw.primaryAsset.currency`, exactly where
+     * official-paper-monitor.mjs puts Longbridge's own account currency.
+     * `undefined` omits primaryAsset entirely (a blob that never stated one);
+     * pass null to include primaryAsset with no currency key. */
+    reportingCurrency?: string | null;
   }
 ): void {
-  const raw = {
+  // Mirrors the REAL blob official-paper-monitor.mjs persists, measured
+  // 2026-07-30 against the mini's runtime/trading.sqlite: the top level
+  // carries source/fetchedAt/accountMode/check/assets/primaryAsset/positions/
+  // quotes/degraded/degradedReason, and `primaryAsset` is Longbridge's own
+  // asset row - `{net_assets, total_cash, currency, buy_power, cash_infos…}`
+  // with `currency: "HKD"` on this deployment. Only the fields the readers
+  // under test actually parse are populated here; the shape of THOSE fields
+  // is the producer's, not invented.
+  const raw: Record<string, unknown> = {
     degraded: opts.degraded ?? false,
     degradedReason: opts.degradedReason ?? null
   };
+  if (opts.reportingCurrency !== undefined) {
+    raw.primaryAsset =
+      opts.reportingCurrency === null
+        ? { net_assets: String(opts.netAssets ?? 0), total_cash: "0" }
+        : { net_assets: String(opts.netAssets ?? 0), total_cash: "0", currency: opts.reportingCurrency };
+  }
   db.prepare(`
     INSERT INTO official_paper_snapshots
       (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
@@ -120,8 +139,13 @@ describe("loadSnapshotSeriesForOwner", () => {
   });
 });
 
-function point(fetchedAt: string, netAssets: number | null, degraded = false): SnapshotSeriesPoint {
-  return { fetchedAt, netAssets, marketValue: 0, degraded };
+function point(
+  fetchedAt: string,
+  netAssets: number | null,
+  degraded = false,
+  reportingCurrency: string | null = null
+): SnapshotSeriesPoint {
+  return { fetchedAt, netAssets, marketValue: 0, degraded, reportingCurrency };
 }
 
 describe("computeMaxDrawdownSegment", () => {
@@ -184,7 +208,8 @@ describe("computePaperKpis", () => {
       netAssets: null,
       todayChangePct: null,
       cumulativeChangePct: null,
-      maxDrawdownPct: null
+      maxDrawdownPct: null,
+      reportingCurrency: null
     });
   });
 
@@ -246,5 +271,67 @@ describe("computePaperKpis", () => {
     expect(kpis.todayChangePct).toBeNull();
     expect(kpis.cumulativeChangePct).toBeNull();
     expect(kpis.maxDrawdownPct).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reporting currency (2026-07-30)
+// ---------------------------------------------------------------------------
+//
+// Regression cover for a live misstatement: the mini's Longbridge paper
+// account reports `primaryAsset.currency = "HKD"`, and every net-asset
+// renderer used to append a hardcoded " 美元", so /、/paper and /member each
+// told the operator their HK$860,251.88 was "860,251.88 美元".
+describe("OwnerSnapshot.reportingCurrency", () => {
+  it("reads the broker's own account currency out of the raw blob", () => {
+    const db = memoryDb();
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-07-29T19:30:04.000Z",
+      netAssets: 860251.88,
+      reportingCurrency: "HKD"
+    });
+    const series = loadSnapshotSeriesForOwner(db, "member_1", 10);
+    expect(series).toHaveLength(1);
+    expect((series[0] as SnapshotSeriesPoint).reportingCurrency).toBe("HKD");
+    expect(computePaperKpis(series).reportingCurrency).toBe("HKD");
+  });
+
+  it("is null - never a guessed USD - when the blob states no currency", () => {
+    const db = memoryDb();
+    // primaryAsset present but with no currency key.
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-07-29T19:30:04.000Z",
+      netAssets: 1000,
+      reportingCurrency: null
+    });
+    // No primaryAsset at all (pre-H4 style blob).
+    seedSnapshot(db, { ownerId: "member_2", fetchedAt: "2026-07-29T19:30:04.000Z", netAssets: 1000 });
+
+    for (const owner of ["member_1", "member_2"]) {
+      const series = loadSnapshotSeriesForOwner(db, owner, 10);
+      expect((series[0] as SnapshotSeriesPoint).reportingCurrency).toBeNull();
+      expect(computePaperKpis(series).reportingCurrency).toBeNull();
+    }
+  });
+
+  it("takes the currency from the SAME point 净值 came from (the latest)", () => {
+    const db = memoryDb();
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-07-20T13:30:00.000Z",
+      netAssets: 957876.46,
+      reportingCurrency: "USD"
+    });
+    seedSnapshot(db, {
+      ownerId: "member_1",
+      fetchedAt: "2026-07-29T19:30:04.000Z",
+      netAssets: 860251.88,
+      reportingCurrency: "HKD"
+    });
+    const kpis = computePaperKpis(loadSnapshotSeriesForOwner(db, "member_1", 10));
+    expect(kpis.netAssets).toBe(860251.88);
+    expect(kpis.reportingCurrency).toBe("HKD");
   });
 });

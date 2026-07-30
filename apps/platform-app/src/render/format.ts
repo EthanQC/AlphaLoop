@@ -232,6 +232,50 @@ export function formatLargeAmount(value: number | null | undefined, unit = "美�
   return `${value.toFixed(2)} ${unit}`;
 }
 
+/**
+ * Chinese labels for the currencies this deployment's broker can report an
+ * account in. Mirrors scheduled-report.mjs's `translateCurrency`, which the
+ * personal page already renders through - the two surfaces read the SAME
+ * `primaryAsset.currency` field and must not disagree about what it means.
+ * An unlisted code is rendered as the bare code rather than translated into a
+ * guess.
+ */
+const ACCOUNT_CURRENCY_LABELS: Record<string, string> = {
+  USD: "美元",
+  HKD: "港元",
+  CNH: "离岸人民币",
+  CNY: "人民币",
+  SGD: "新加坡元"
+};
+
+/** The label for a currency code, or the code itself when unknown. */
+export function accountCurrencyLabel(currency: string): string {
+  const key = currency.trim().toUpperCase();
+  return ACCOUNT_CURRENCY_LABELS[key] ?? key;
+}
+
+/**
+ * An account money amount WITH the currency the broker actually reported it
+ * in. `currency` comes from data/snapshots.ts's
+ * `OwnerSnapshot.reportingCurrency`; a null one means the snapshot blob never
+ * stated a currency, and the amount is then rendered with an explicit
+ * 币种未知 marker instead of a plausible-looking " 美元".
+ *
+ * This exists because three renderers (routes/home.ts, routes/paper.ts,
+ * routes/member-card.ts) each hardcoded " 美元" on a field that is HKD on the
+ * live deployment - see OwnerSnapshot.reportingCurrency for the measurement.
+ */
+export function formatAccountAmount(value: number | null | undefined, currency: string | null): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return MISSING_NUMBER_TEXT;
+  }
+  const amount = value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (currency === null || currency.trim().length === 0) {
+    return `${amount}（币种未知）`;
+  }
+  return `${amount} ${accountCurrencyLabel(currency)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Staleness (U2)
 // ---------------------------------------------------------------------------

@@ -68,7 +68,13 @@ import {
 import { loadPositionDailyMoves, type PositionDailyMove } from "../data/stock-facts.js";
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderEmptyState } from "../render/empty-state.js";
-import { describeDataDay, describeDataInstant, formatBeijingShortTime, formatPercentUnits } from "../render/format.js";
+import {
+  describeDataDay,
+  describeDataInstant,
+  formatAccountAmount,
+  formatBeijingShortTime,
+  formatPercentUnits
+} from "../render/format.js";
 import { html, joinHtml, trustedHtml, type Html } from "../render/html.js";
 import { freshnessPillClass, renderPage, unknownDataTime, type Freshness } from "../render/layout.js";
 
@@ -168,8 +174,12 @@ function listSwitchableMembers(db: DatabaseSync): Member[] {
   return new MemberRepository(db).listActive().filter((m) => m.id !== LEGACY_SYSTEM_MEMBER_ID);
 }
 
-function formatMoney(value: number): string {
-  return `${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 美元`;
+// Position prices below stay bare numbers (the 持仓 table has its own 币种
+// column from the position row). This one is the ACCOUNT total, whose currency
+// the broker states per snapshot - see data/snapshots.ts's
+// OwnerSnapshot.reportingCurrency for why it must not be hardcoded.
+function formatMoney(value: number, currency: string | null): string {
+  return formatAccountAmount(value, currency);
 }
 
 function formatOptionalNumber(value: unknown): string {
@@ -315,7 +325,8 @@ function renderHiddenPerformanceCard(target: Member): Html {
 // ---------------------------------------------------------------------------
 
 function renderKpiRowCard(kpis: PaperKpis): Html {
-  const netAssetsDisplay = kpis.netAssets === null ? "数据不足" : formatMoney(kpis.netAssets);
+  const netAssetsDisplay =
+    kpis.netAssets === null ? "数据不足" : formatMoney(kpis.netAssets, kpis.reportingCurrency);
   const today =
     kpis.todayChangePct === null
       ? { display: "数据不足", cls: "" }

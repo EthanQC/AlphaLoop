@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  accountCurrencyLabel,
   beijingDayAge,
   beijingInstantAge,
   describeDataDay,
   describeDataInstant,
+  formatAccountAmount,
   formatAlertValue,
   formatBeijingDateTime,
   formatBeijingDay,
@@ -141,5 +143,30 @@ describe("staleness", () => {
   it("describes a day and an instant for the topbar", () => {
     expect(describeDataDay("2026-07-27", NOW)).toBe("07-27（3 天前）");
     expect(describeDataInstant("2026-07-27T16:36:22.000Z", NOW)).toBe("07-28 00:36（2 天前）");
+  });
+});
+
+describe("formatAccountAmount", () => {
+  it("labels the amount with the currency the broker reported", () => {
+    // The mini's live figure: HK$860,251.88, previously rendered as 美元.
+    expect(formatAccountAmount(860251.88, "HKD")).toBe("860,251.88 港元");
+    expect(formatAccountAmount(860251.88, "USD")).toBe("860,251.88 美元");
+  });
+
+  it("says 币种未知 rather than guessing when no currency is known", () => {
+    expect(formatAccountAmount(1000, null)).toBe("1,000.00（币种未知）");
+    expect(formatAccountAmount(1000, "   ")).toBe("1,000.00（币种未知）");
+  });
+
+  it("passes an untranslated code through instead of inventing a label", () => {
+    expect(formatAccountAmount(1000, "JPY")).toBe("1,000.00 JPY");
+    expect(accountCurrencyLabel("jpy")).toBe("JPY");
+    expect(accountCurrencyLabel("hkd")).toBe("港元");
+  });
+
+  it("reports a missing/non-finite amount as missing, never 0", () => {
+    expect(formatAccountAmount(null, "HKD")).toBe("数据缺失");
+    expect(formatAccountAmount(Number.NaN, "HKD")).toBe("数据缺失");
+    expect(formatAccountAmount(Number.POSITIVE_INFINITY, "HKD")).toBe("数据缺失");
   });
 });

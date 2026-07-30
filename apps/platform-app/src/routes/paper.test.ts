@@ -38,9 +38,23 @@ function seedSnapshot(
     positions?: unknown[];
     degraded?: boolean;
     degradedReason?: string;
+    /** `raw.primaryAsset.currency`. Defaults to USD so these tests read
+     * naturally; official-paper-monitor.mjs always writes a primaryAsset (all
+     * 64 live snapshots carry one, reporting HKD - measured 2026-07-30), so a
+     * blob without it is a shape the producer never emits. */
+    reportingCurrency?: string | null;
   }
 ): void {
-  const raw = { degraded: opts.degraded ?? false, degradedReason: opts.degradedReason ?? null };
+  const currency = opts.reportingCurrency === undefined ? "USD" : opts.reportingCurrency;
+  const raw: Record<string, unknown> = {
+    degraded: opts.degraded ?? false,
+    degradedReason: opts.degradedReason ?? null,
+    primaryAsset: {
+      net_assets: String(opts.netAssets ?? 0),
+      total_cash: "0",
+      ...(currency === null ? {} : { currency })
+    }
+  };
   db.prepare(`
     INSERT INTO official_paper_snapshots
       (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)

@@ -41,9 +41,32 @@ function makeMember(overrides: Partial<Member> = {}): Member {
 
 function seedSnapshot(
   db: DatabaseSync,
-  opts: { ownerId: string | null; fetchedAt: string; netAssets?: number | null; positions?: unknown[]; degraded?: boolean; degradedReason?: string }
+  opts: {
+    ownerId: string | null;
+    fetchedAt: string;
+    netAssets?: number | null;
+    positions?: unknown[];
+    degraded?: boolean;
+    degradedReason?: string;
+    /** `raw.primaryAsset.currency`. Defaults to USD here so these tests read
+     * naturally; the LIVE deployment reports HKD on all 64 of its snapshots
+     * (measured 2026-07-30), and official-paper-monitor.mjs always writes a
+     * primaryAsset - so omitting it entirely, as this seeder used to, was a
+     * shape the real producer never emits. Pass null for the genuinely
+     * currency-less blob (see data/snapshots.test.ts for that path). */
+    reportingCurrency?: string | null;
+  }
 ): void {
-  const raw = { degraded: opts.degraded ?? false, degradedReason: opts.degradedReason ?? null };
+  const currency = opts.reportingCurrency === undefined ? "USD" : opts.reportingCurrency;
+  const raw: Record<string, unknown> = {
+    degraded: opts.degraded ?? false,
+    degradedReason: opts.degradedReason ?? null,
+    primaryAsset: {
+      net_assets: String(opts.netAssets ?? 0),
+      total_cash: "0",
+      ...(currency === null ? {} : { currency })
+    }
+  };
   db.prepare(`
     INSERT INTO official_paper_snapshots (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
     VALUES (?, ?, 'manual', ?, NULL, 0, ?, ?, ?)
@@ -328,6 +351,47 @@ describe("home route (GET /)", () => {
     expect(body).toContain('href="/daily/2026-07-14"');
     expect(body).toContain("历史存档");
     expect(body).not.toContain("还没有可读的日报。");
+  });
+
+  // 2026-07-30: the daily job died for days on the mini (14 straight run_log
+  // failures) while this card kept calling whatever it found 今日日报卡 with no
+  // age on it, so the page reported a landed report that had not landed.
+  it("states the report's age instead of claiming 今日 when the newest daily is old", async () => {
+    const { token } = seedMemberWithToken();
+    // NOW is Beijing 2026-07-14; this report is 4 days older.
+    writeDailyReport(repoRoot, "2026-07-10.md", "# 旧日报标题\n\n内容。\n");
+
+    const response = await authed("/", token);
+    const body = await response.text();
+
+    expect(body).toContain("最新日报卡");
+    expect(body).not.toContain("今日日报卡");
+    expect(body).toContain("4 天前");
+    // Past STALE_AFTER_DAYS the age pill is a warning, not a neutral note.
+    expect(body).toContain('class="pill warn"');
+  });
+
+  it("keeps the 今日日报卡 heading, with no age pill, when the newest daily IS today's", async () => {
+    const { token } = seedMemberWithToken();
+    writeDailyReport(repoRoot, "2026-07-14.md", "# 今日日报标题\n\n内容。\n");
+
+    const response = await authed("/", token);
+    const body = await response.text();
+
+    expect(body).toContain("今日日报卡");
+    expect(body).not.toContain("最新日报卡");
+    expect(body).not.toContain("今日</span>");
+  });
+
+  it("calls yesterday's daily 昨天 without the warning styling", async () => {
+    const { token } = seedMemberWithToken();
+    writeDailyReport(repoRoot, "2026-07-13.md", "# 昨日日报标题\n\n内容。\n");
+
+    const response = await authed("/", token);
+    const body = await response.text();
+
+    expect(body).toContain("最新日报卡");
+    expect(body).toContain("昨天");
   });
 
   // Task 6 (2026-07-28): the daily card is the home page's entry point to the
