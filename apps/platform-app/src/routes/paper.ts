@@ -58,10 +58,15 @@ import {
   computeMaxDrawdownSegment,
   computePaperKpis,
   loadLatestSnapshotForOwner,
+  loadQqqBenchmarkSeries,
   loadSnapshotSeriesForOwner,
+  resolveReturnSeries,
+  type BenchmarkSeries,
   type DrawdownSegment,
   type OwnerSnapshot,
   type PaperKpis,
+  type PerformanceBasisGap,
+  type ReturnSeriesGap,
   type SnapshotPosition,
   type SnapshotSeriesPoint
 } from "../data/snapshots.js";
@@ -69,6 +74,7 @@ import { loadPositionDailyMoves, type PositionDailyMove } from "../data/stock-fa
 import { renderUnauthorizedPage, resolveIdentity } from "../identity.js";
 import { renderEmptyState } from "../render/empty-state.js";
 import {
+  accountCurrencyLabel,
   describeDataDay,
   describeDataInstant,
   formatAccountAmount,
@@ -174,10 +180,10 @@ function listSwitchableMembers(db: DatabaseSync): Member[] {
   return new MemberRepository(db).listActive().filter((m) => m.id !== LEGACY_SYSTEM_MEMBER_ID);
 }
 
-// Position prices below stay bare numbers (the 持仓 table has its own 币种
-// column from the position row). This one is the ACCOUNT total, whose currency
-// the broker states per snapshot - see data/snapshots.ts's
-// OwnerSnapshot.reportingCurrency for why it must not be hardcoded.
+// The ACCOUNT total, whose currency the broker states per snapshot - see
+// data/snapshots.ts's OwnerSnapshot.reportingCurrency for why it must not be
+// hardcoded. Position prices are a different question and are handled by the
+// holdings table's own 币种 column (`renderPositionRow`).
 function formatMoney(value: number, currency: string | null): string {
   return formatAccountAmount(value, currency);
 }
@@ -209,6 +215,11 @@ interface PaperViewData {
    * of the SAME 战绩 surface the holdings table is, so it must never be
    * reachable when that surface is withheld. */
   dailyMoves: PositionDailyMove[];
+  /** The QQQ benchmark aligned to `series` (F2). Empty in every shape when the
+   * performance surface is withheld - `daily_facts` is not owner-scoped, but a
+   * benchmark aligned to a hidden member's SESSIONS would leak which days that
+   * member has snapshots for, so it stays behind the same gate. */
+  benchmark: BenchmarkSeries;
 }
 
 /** Held symbols, largest market value first - the same price/quantity fallback
@@ -241,8 +252,17 @@ function positionSymbolsByValue(positions: readonly SnapshotPosition[]): string[
  * site forgetting to check first.
  */
 function loadPaperViewData(db: DatabaseSync, target: Member, canSeePerformance: boolean): PaperViewData {
+  const emptyBenchmark: BenchmarkSeries = { symbolLabel: "QQQ", points: [], unalignedSessions: [], rejected: [] };
   if (!canSeePerformance) {
-    return { visible: false, snapshot: null, series: [], kpis: computePaperKpis([]), drawdown: null, dailyMoves: [] };
+    return {
+      visible: false,
+      snapshot: null,
+      series: [],
+      kpis: computePaperKpis([]),
+      drawdown: null,
+      dailyMoves: [],
+      benchmark: emptyBenchmark
+    };
   }
   const snapshot = loadLatestSnapshotForOwner(db, target.id);
   const series = loadSnapshotSeriesForOwner(db, target.id, SERIES_LIMIT);
@@ -252,7 +272,8 @@ function loadPaperViewData(db: DatabaseSync, target: Member, canSeePerformance: 
     series,
     kpis: computePaperKpis(series),
     drawdown: computeMaxDrawdownSegment(series),
-    dailyMoves: snapshot ? loadPositionDailyMoves(db, positionSymbolsByValue(snapshot.positions)) : []
+    dailyMoves: snapshot ? loadPositionDailyMoves(db, positionSymbolsByValue(snapshot.positions)) : [],
+    benchmark: loadQqqBenchmarkSeries(db, series)
   };
 }
 
@@ -324,6 +345,63 @@ function renderHiddenPerformanceCard(target: Member): Html {
 // KPI row
 // ---------------------------------------------------------------------------
 
+/** Chinese wording for every `PerformanceBasisGap`, so a page never prints a
+ * bare 数据不足 where the data layer knows the actual reason. Exhaustive by
+ * type: adding a gap variant without a phrase here fails typecheck. */
+const BASIS_GAP_TEXT: Record<PerformanceBasisGap, string> = {
+  "no-account-data": "快照里没有券商返回的账户资金段",
+  "no-currency-evidence": "快照里既没有入金的现金账户，也没有可估值的持仓",
+  "mixed-currencies": "现金与持仓跨多个币种，没有不经汇率折算就能得到的总额",
+  "position-not-valued": "有持仓连产出端自己都没能估出价（priceSource 为 zero 或没有价格）"
+};
+
+/**
+ * Why 今日/累计/最大回撤 are all missing, in words. F1: the point of naming the
+ * reason is that this page used to print a NUMBER here - 累计 -10.19%, 最大回撤
+ * -10.20% - for an account that never traded, because it differenced two
+ * broker-converted HKD aggregates across a rate-table jump. If the honest
+ * figure cannot be computed, the reason is the deliverable.
+ */
+function describeReturnGap(gap: ReturnSeriesGap): string {
+  if (gap.kind === "mixed-basis-currency") {
+    return `这段历史里账户的计价币种发生过变化（${gap.currencies.join(" → ")}），跨币种相减得不到收益率，本页不会替你挑一个汇率把它们接起来。`;
+  }
+  const reasons = gap.gaps.map((item) => BASIS_GAP_TEXT[item]).join("；");
+  const base = `可用于计算收益率的快照只有 ${gap.usable} 个（至少要 2 个）。`;
+  return reasons.length > 0 ? `${base}其余快照的原因：${reasons}。` : base;
+}
+
+/** Rates are quotients of two broker figures; 4 decimals is enough to make a
+ * peg break visible (7.8016 vs 7.0082) without implying more precision. */
+function formatRate(rate: number): string {
+  return rate.toFixed(4);
+}
+
+/**
+ * The disclosure that has to sit next to 净值 once we know that number is a
+ * converted aggregate. It says three things a reader cannot get from the
+ * number itself: which currency the money is actually in, that the printed
+ * figure went through the broker's rate table, and - when the implied rate
+ * moved - exactly when and by how much, so a step in 净值 that no trade caused
+ * is attributable instead of mysterious.
+ */
+function renderFxDisclosure(kpis: PaperKpis): Html {
+  const fx = kpis.fxConversion;
+  if (!fx) {
+    return trustedHtml("");
+  }
+  const lastChange = fx.rateChanges.at(-1);
+  const changeNote = lastChange
+    ? `这个折算率在本段历史里变过 ${fx.rateChanges.length} 次，最近一次是 ${formatBeijingShortTime(lastChange.fetchedAt)} 从 ${formatRate(lastChange.fromRate)} 跳到 ${formatRate(lastChange.toRate)}；净值在那一刻的跳动来自折算率，不是盈亏。`
+    : "这个折算率在本段历史里没有变过。";
+  return html`<p style="font-size:11.5px;color:var(--sub);margin:8px 0 0;line-height:1.7">
+    净值是券商按自己的汇率表折出的 ${accountCurrencyLabel(fx.reportingCurrency)} 口径；账户里的钱实际是
+    ${accountCurrencyLabel(fx.heldCurrency)}。按券商自己的两个数字反推，折算率区间
+    ${formatRate(fx.minRate)}–${formatRate(fx.maxRate)}（最新 ${formatRate(fx.latestRate)}）。${changeNote}
+    右侧三个百分比都按 ${accountCurrencyLabel(kpis.basisCurrency ?? fx.heldCurrency)} 口径算，不经过任何汇率。
+  </p>`;
+}
+
 function renderKpiRowCard(kpis: PaperKpis): Html {
   const netAssetsDisplay =
     kpis.netAssets === null ? "数据不足" : formatMoney(kpis.netAssets, kpis.reportingCurrency);
@@ -339,6 +417,13 @@ function renderKpiRowCard(kpis: PaperKpis): Html {
     kpis.maxDrawdownPct === null
       ? { display: "数据不足", cls: "" }
       : { display: `${kpis.maxDrawdownPct.toFixed(2)}%`, cls: kpis.maxDrawdownPct < 0 ? "d" : "" };
+  // Exactly one of these two notes renders: the reason the percentages are
+  // missing, or (when they are present) what they were measured in.
+  const gapNote = kpis.returnGap
+    ? html`<p style="font-size:11.5px;color:var(--sub);margin:8px 0 0;line-height:1.7">
+        今日 / 累计 / 最大回撤 都算不出来：${describeReturnGap(kpis.returnGap)}
+      </p>`
+    : renderFxDisclosure(kpis);
 
   return html`<section class="card w2 dt-w4">
     <h2>KPI</h2>
@@ -348,6 +433,7 @@ function renderKpiRowCard(kpis: PaperKpis): Html {
       <div class="kpi"><div class="num mono ${cumulative.cls}">${cumulative.display}</div><div class="lbl">累计</div></div>
       <div class="kpi"><div class="num mono ${drawdown.cls}">${drawdown.display}</div><div class="lbl">最大回撤</div></div>
     </div>
+    ${gapNote}
   </section>`;
 }
 
@@ -360,6 +446,9 @@ const CURVE_VIEW_HEIGHT = 64;
 const CURVE_Y_PADDING = 6;
 
 interface UsablePoint {
+  /** Index into the ORIGINAL series array (not into the usable subset), so a
+   * drawdown segment and a benchmark observation can both address a plotted
+   * point by the same key. */
   index: number;
   value: number;
 }
@@ -369,10 +458,32 @@ interface PlottedPoint extends UsablePoint {
   y: number;
 }
 
+/**
+ * The points this curve may plot: the series' FX-FREE BASIS values, via the
+ * same `resolveReturnSeries` gate the KPI numbers go through, so the picture
+ * and the figures can never be built from different sets.
+ *
+ * F1 (2026-07-30): this used to plot `netAssets`, which on the live account is
+ * a broker-converted HKD aggregate. The curve therefore showed a ~10% cliff
+ * between the 07-22 and 07-23 sessions - and the drawdown annotation pointed
+ * right at it - for an account that had not traded once. The cliff was the
+ * broker's implied HKD/USD rate stepping 7.8016 -> 7.0082. Fixing only the KPI
+ * numbers would have left the same lie in the picture.
+ */
 function usablePoints(series: ReadonlyArray<SnapshotSeriesPoint>): UsablePoint[] {
-  return series
-    .map((p, index) => ({ index, value: p.netAssets }))
-    .filter((p): p is UsablePoint => p.value !== null && Number.isFinite(p.value));
+  const resolved = resolveReturnSeries(series);
+  return resolved.ok ? resolved.points.map((point) => ({ index: point.index, value: point.value })) : [];
+}
+
+/** Rebases points to "% change from `baseline`" so two series measured in
+ * different units (one member's net worth vs. another's, or net worth vs. an
+ * index level) can share one y scale. Returns null for a zero baseline - there
+ * is no percentage off zero. */
+function indexToPercent(points: ReadonlyArray<UsablePoint>, baseline: number): UsablePoint[] | null {
+  if (baseline === 0 || !Number.isFinite(baseline)) {
+    return null;
+  }
+  return points.map((point) => ({ index: point.index, value: ((point.value - baseline) / baseline) * 100 }));
 }
 
 function plotPoints(points: ReadonlyArray<UsablePoint>, range: { min: number; max: number }): PlottedPoint[] {
@@ -406,26 +517,190 @@ function renderDrawdownHighlight(points: ReadonlyArray<PlottedPoint>, drawdown: 
   </g>`;
 }
 
-/** `toIndexedReturns` rebases a series to "% change from its first usable
- * point" - the normalization the compare overlay needs so two members'
- * curves (which can be at wildly different absolute net-asset levels) are
- * visually comparable on one shared scale, the same way an "indexed to 100"
- * chart works. Solo (non-compare) curves plot raw netAssets instead - no
- * rebasing needed with only one series on the chart. */
-function toIndexedReturns(series: ReadonlyArray<SnapshotSeriesPoint>): SnapshotSeriesPoint[] {
-  const baseline = series.find((p) => p.netAssets !== null && p.netAssets !== 0)?.netAssets;
-  if (baseline === undefined || baseline === null) {
-    return series.map((p) => ({ ...p, netAssets: null }));
+// ---------------------------------------------------------------------------
+// F2 (req §1.6): the QQQ benchmark overlay
+//
+// The alignment rule and the live measurement behind it live in
+// data/snapshots.ts's "F2" section header - read that first. What this half
+// owns is the DRAWING, and the one rule that matters here: a line between two
+// benchmark observations is a claim that nothing else happened in between. So
+// observations are joined only across CONSECUTIVE US sessions
+// (`BenchmarkPoint.joinsPrevious`, computed from the NYSE calendar); a session
+// with no accepted close breaks the line, and an observation with no
+// consecutive neighbour is drawn as a lone marker rather than wired into a
+// polyline that would interpolate over the hole.
+//
+// The benchmark is drawn on the SINGLE-MEMBER 净值曲线 only. In compare mode
+// each member's curve is rebased to its own first point, and a third line
+// rebased to a different session's close would put three series on one axis
+// with three different zero points - so compare mode gets the benchmark as a
+// stated note instead of a mis-based line.
+// ---------------------------------------------------------------------------
+
+/** One drawable run of benchmark observations. Length 1 renders as a marker,
+ * length >= 2 as a polyline. */
+type BenchmarkRun = PlottedPoint[];
+
+interface BenchmarkOverlay {
+  runs: BenchmarkRun[];
+  /** Indexed % return of the benchmark over the aligned window. */
+  benchmarkReturnPct: number;
+  /** Indexed % return of THIS ACCOUNT over the SAME window - the first to the
+   * last aligned session, not the full series - so the two numbers next to
+   * each other cover one identical span. */
+  selfReturnPct: number;
+  firstSession: string;
+  lastSession: string;
+  /** Every plotted self point, rebased onto the benchmark's baseline session. */
+  selfPoints: PlottedPoint[];
+}
+
+/**
+ * Rebases the account curve and the benchmark onto one shared % scale, both
+ * zeroed at the FIRST aligned session, and slices the benchmark into
+ * consecutive-session runs. Returns null whenever fewer than two sessions
+ * aligned (one point is not a curve, and its "return" would be 0% by
+ * construction - a fabricated flat line), or when the baseline values cannot
+ * carry a percentage.
+ */
+function buildBenchmarkOverlay(
+  selfUsable: ReadonlyArray<UsablePoint>,
+  benchmark: BenchmarkSeries
+): BenchmarkOverlay | null {
+  const aligned = benchmark.points.filter((point) => selfUsable.some((self) => self.index === point.seriesIndex));
+  const first = aligned[0];
+  const last = aligned[aligned.length - 1];
+  if (!first || !last || aligned.length < 2) {
+    return null;
   }
-  return series.map((p) => ({
-    ...p,
-    netAssets: p.netAssets === null ? null : ((p.netAssets - baseline) / baseline) * 100
-  }));
+
+  const selfByIndex = new Map(selfUsable.map((point) => [point.index, point.value]));
+  const selfBaseline = selfByIndex.get(first.seriesIndex);
+  if (selfBaseline === undefined) {
+    return null;
+  }
+  const selfIndexed = indexToPercent(selfUsable, selfBaseline);
+  const benchIndexed = indexToPercent(
+    aligned.map((point) => ({ index: point.seriesIndex, value: point.price })),
+    first.price
+  );
+  if (!selfIndexed || !benchIndexed) {
+    return null;
+  }
+
+  const range = {
+    min: Math.min(...selfIndexed.map((p) => p.value), ...benchIndexed.map((p) => p.value)),
+    max: Math.max(...selfIndexed.map((p) => p.value), ...benchIndexed.map((p) => p.value))
+  };
+  const selfPoints = plotPoints(selfIndexed, range);
+  // The benchmark shares the self curve's x axis: each observation sits at the
+  // x of the snapshot it was aligned to (that session's last snapshot), looked
+  // up rather than recomputed so the two series cannot drift apart.
+  const xByIndex = new Map(selfPoints.map((point) => [point.index, point.x]));
+
+  const runs: BenchmarkRun[] = [];
+  benchIndexed.forEach((point, i) => {
+    const x = xByIndex.get(point.index);
+    const source = aligned[i] as (typeof aligned)[number];
+    if (x === undefined) {
+      return;
+    }
+    const plotted: PlottedPoint = {
+      index: point.index,
+      value: point.value,
+      x,
+      y: CURVE_Y_PADDING + (CURVE_VIEW_HEIGHT - CURVE_Y_PADDING * 2)
+        - ((point.value - range.min) / (range.max - range.min || 1)) * (CURVE_VIEW_HEIGHT - CURVE_Y_PADDING * 2)
+    };
+    const currentRun = runs[runs.length - 1];
+    if (source.joinsPrevious && currentRun) {
+      currentRun.push(plotted);
+      return;
+    }
+    runs.push([plotted]);
+  });
+
+  const selfEnd = selfByIndex.get(last.seriesIndex);
+  if (selfEnd === undefined || selfBaseline === 0) {
+    return null;
+  }
+  return {
+    runs,
+    benchmarkReturnPct: ((last.price - first.price) / first.price) * 100,
+    selfReturnPct: ((selfEnd - selfBaseline) / selfBaseline) * 100,
+    firstSession: first.sessionDate,
+    lastSession: last.sessionDate,
+    selfPoints
+  };
+}
+
+function renderBenchmarkRuns(overlay: BenchmarkOverlay): Html {
+  const drawn = overlay.runs.map((run) => {
+    const marker = joinHtml(
+      run.map(
+        (point) =>
+          html`<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="2" fill="var(--series-3)"/>`
+      )
+    );
+    if (run.length < 2) {
+      return marker;
+    }
+    return html`<polyline points="${pointsToSvgString(run)}" fill="none" stroke="var(--series-3)" stroke-width="1.6" stroke-dasharray="5 3"/>${marker}`;
+  });
+  return html`<g data-role="benchmark-qqq" aria-label="QQQ 基准（每日收盘）">${joinHtml(drawn)}</g>`;
+}
+
+/** Which sessions could not be aligned, and why the rows behind them were not
+ * usable - the disclosure that replaces the drawn line for those sessions. */
+function renderBenchmarkGapNote(benchmark: BenchmarkSeries): Html {
+  const parts: string[] = [];
+  if (benchmark.unalignedSessions.length > 0) {
+    parts.push(`曲线覆盖的 ${benchmark.unalignedSessions.length} 个美股交易日没有可用收盘价（${benchmark.unalignedSessions.join("、")}），这些点整段跳过，不做插值`);
+  }
+  if (benchmark.rejected.length > 0) {
+    const reasons = benchmark.rejected.map((item) => `${item.filedUnder}：${item.reason}`).join("；");
+    parts.push(`daily_facts 里被排除的行——${reasons}`);
+  }
+  if (parts.length === 0) {
+    return trustedHtml("");
+  }
+  return html`<p style="font-size:11px;color:var(--sub);margin:4px 0 0;line-height:1.7">${parts.join("。")}。</p>`;
+}
+
+/**
+ * The benchmark status line. Three shapes, and none of them claims more than
+ * the table holds: a drawn comparison with both same-window returns; a stated
+ * "not enough aligned sessions" with the reasons; or, in compare mode, a
+ * pointer to the single-member view.
+ */
+function renderBenchmarkNote(benchmark: BenchmarkSeries, overlay: BenchmarkOverlay | null, compareMode: boolean): Html {
+  if (compareMode) {
+    return html`<div class="vs">基准对比（vs QQQ）：<span style="color:var(--sub)">基准线画在单人视图的净值曲线上——对比视图里两人曲线各以自己的首个数据点为基期，再叠一条以某个收盘日为基期的线会让三条线的零点互不相同。</span></div>`;
+  }
+  if (!overlay) {
+    return html`<div class="vs">基准对比（vs QQQ）：<span style="color:var(--sub)">对不上足够的交易日，这条线不画。</span>
+      ${renderBenchmarkGapNote(benchmark)}
+    </div>`;
+  }
+  const selfCls = overlay.selfReturnPct >= 0 ? "u" : "d";
+  const benchCls = overlay.benchmarkReturnPct >= 0 ? "u" : "d";
+  return html`<div class="vs">
+    <div class="legend-row" style="margin-bottom:3px">
+      <span class="swatch" style="background:var(--accent)"></span>本账户
+      <span class="swatch" style="background:var(--series-3);margin-left:10px"></span>QQQ（每日收盘）
+    </div>
+    同期（${overlay.firstSession} → ${overlay.lastSession} 两个美股收盘）：本账户
+    <span class="mono ${selfCls}">${formatSignedPercent(overlay.selfReturnPct)}</span>，QQQ
+    <span class="mono ${benchCls}">${formatSignedPercent(overlay.benchmarkReturnPct)}</span>。
+    本账户取每个交易日最后一张快照（收盘前最后一次抓取）与当日 QQQ 收盘价对齐；只有相邻交易日之间才连线。
+    ${renderBenchmarkGapNote(benchmark)}
+  </div>`;
 }
 
 function renderCurveCard(
   series: SnapshotSeriesPoint[],
   drawdown: DrawdownSegment | null,
+  benchmark: BenchmarkSeries,
   compare?: { otherSeries: SnapshotSeriesPoint[] | null; otherDisplayName: string; otherHidden: boolean }
 ): Html {
   if (series.length === 0) {
@@ -440,38 +715,48 @@ function renderCurveCard(
 
   const selfUsable = usablePoints(series);
   if (selfUsable.length < 2) {
+    // Same gate as the KPI row, so the two can never disagree about whether
+    // this account has a plottable series - and the reason is the KPI row's
+    // reason, restated for a reader looking at the empty chart.
+    const gap = resolveReturnSeries(series);
     return html`<section class="card w2 dt-w2">
       <h2>净值曲线</h2>
       ${renderEmptyState(
-        "只有一个可用数据点，画不出曲线。",
-        "曲线至少要两个带净值的快照；再跑一个交易日就会出现。这里不会用单点插值出一条假曲线。"
+        "画不出净值曲线：没有两个可比的净值点。",
+        gap.ok
+          ? "曲线至少要两个可用净值点；这里不会用单点插值出一条假曲线。"
+          : `${describeReturnGap(gap.gap)}曲线只画不经汇率折算的同币种净值，不会拿券商折出的汇总口径充数。`
       )}
     </section>`;
   }
 
-  // Honest note, not a phase name: `daily_facts` does carry `qqq.price` /
-  // `qqq.changePct` per trading day, but nothing in this page reads them into
-  // a second series yet, so there is no benchmark line to draw. Saying
-  // "基准对比 P6 完善" claimed the gap was a shipping phase (P6 shipped weeks
-  // ago); saying so plainly is the honest form. 2026-07-30.
-  const benchmarkNote = html`<div class="vs">基准对比（vs QQQ）：<span style="color:var(--sub)">基准曲线尚未接入本页——QQQ 每日收盘数据已入库，但这条曲线还没画上来</span></div>`;
-
   if (!compare) {
-    const range = { min: Math.min(...selfUsable.map((p) => p.value)), max: Math.max(...selfUsable.map((p) => p.value)) };
-    const points = plotPoints(selfUsable, range);
+    const overlay = buildBenchmarkOverlay(selfUsable, benchmark);
+    // With a benchmark, both series are rebased to % off the first aligned
+    // session (see buildBenchmarkOverlay). Rebasing is an affine transform, so
+    // the account curve's SHAPE - and therefore the drawdown annotation - is
+    // identical either way; only the shared y scale changes.
+    const points = overlay
+      ? overlay.selfPoints
+      : plotPoints(selfUsable, {
+          min: Math.min(...selfUsable.map((p) => p.value)),
+          max: Math.max(...selfUsable.map((p) => p.value))
+        });
     return html`<section class="card w2 dt-w2">
       <h2>净值曲线</h2>
       <svg width="100%" height="${CURVE_VIEW_HEIGHT}" viewBox="0 0 ${CURVE_VIEW_WIDTH} ${CURVE_VIEW_HEIGHT}" preserveAspectRatio="none" aria-label="净值曲线" role="img">
         <polyline points="${pointsToSvgString(points)}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        ${overlay ? renderBenchmarkRuns(overlay) : trustedHtml("")}
         ${renderDrawdownHighlight(points, drawdown)}
       </svg>
-      ${benchmarkNote}
+      ${renderBenchmarkNote(benchmark, overlay, false)}
     </section>`;
   }
 
-  // Compare mode: rebase both curves to indexed % returns so they share one scale.
-  const selfIndexed = toIndexedReturns(series);
-  const selfIndexedUsable = usablePoints(selfIndexed);
+  // Compare mode: rebase both members' curves to % off their own first usable
+  // point so two accounts at wildly different sizes share one scale.
+  const selfFirst = selfUsable[0] as UsablePoint;
+  const selfIndexedUsable = indexToPercent(selfUsable, selfFirst.value) ?? [];
 
   if (compare.otherHidden || !compare.otherSeries) {
     const range = {
@@ -490,12 +775,13 @@ function renderCurveCard(
         <polyline points="${pointsToSvgString(points)}" fill="none" stroke="var(--series-1)" stroke-width="2"/>
       </svg>
       ${hiddenNote}
-      ${benchmarkNote}
+      ${renderBenchmarkNote(benchmark, null, true)}
     </section>`;
   }
 
-  const otherIndexed = toIndexedReturns(compare.otherSeries);
-  const otherIndexedUsable = usablePoints(otherIndexed);
+  const otherUsable = usablePoints(compare.otherSeries);
+  const otherFirst = otherUsable[0];
+  const otherIndexedUsable = otherFirst ? indexToPercent(otherUsable, otherFirst.value) ?? [] : [];
   const allValues = [...selfIndexedUsable.map((p) => p.value), ...otherIndexedUsable.map((p) => p.value)];
   const range = { min: Math.min(...allValues), max: Math.max(...allValues) };
   const selfPoints = plotPoints(selfIndexedUsable, range);
@@ -508,13 +794,24 @@ function renderCurveCard(
       <polyline points="${pointsToSvgString(otherPoints)}" fill="none" stroke="var(--series-5)" stroke-width="2" stroke-dasharray="4 3"/>
     </svg>
     <div class="legend-row"><span class="swatch" style="background:var(--series-1)"></span>我<span class="swatch" style="background:var(--series-5);margin-left:10px"></span>${compare.otherDisplayName}</div>
-    ${benchmarkNote}
+    ${renderBenchmarkNote(benchmark, null, true)}
   </section>`;
 }
 
 // ---------------------------------------------------------------------------
 // Holdings table
 // ---------------------------------------------------------------------------
+
+/** The currency a position's 成本价/现价 are quoted in, as the broker's own
+ * position row states it (live rows carry `"USD"` for `QQQ.US`). A row that
+ * does not say gets an explicit marker, never a plausible-looking blank: two
+ * bare numbers in the same column are read as the same unit, and a US and an
+ * HK holding side by side are not. */
+function positionCurrencyText(position: SnapshotPosition): string {
+  return typeof position.currency === "string" && position.currency.trim().length > 0
+    ? accountCurrencyLabel(position.currency.trim().toUpperCase())
+    : "币种未知";
+}
 
 function renderPositionRow(position: SnapshotPosition): Html {
   const degradedLabel = position.priceSource ? PRICE_SOURCE_LABELS[position.priceSource] : undefined;
@@ -526,6 +823,7 @@ function renderPositionRow(position: SnapshotPosition): Html {
     <td class="mono num">${formatOptionalNumber(position.quantity)}</td>
     <td class="mono num">${formatOptionalNumber(position.costPrice)}</td>
     <td class="mono num">${formatOptionalNumber(position.price)}</td>
+    <td>${positionCurrencyText(position)}</td>
     <td>${badge}</td>
   </tr>`;
 }
@@ -546,7 +844,7 @@ function renderPositionsTableCard(snapshot: OwnerSnapshot | null): Html {
     <div style="overflow-x:auto">
       <table class="positions-table" style="width:100%;border-collapse:collapse;font-size:12.5px">
         <thead><tr>
-          <th>代码</th><th class="num">数量</th><th class="num">成本价</th><th class="num">现价</th><th>估值来源</th>
+          <th>代码</th><th class="num">数量</th><th class="num">成本价</th><th class="num">现价</th><th>币种</th><th>估值来源</th>
         </tr></thead>
         <tbody>${joinHtml(snapshot.positions.map(renderPositionRow))}</tbody>
       </table>
@@ -642,9 +940,18 @@ interface PositionShare {
   pct: number;
 }
 
+/** Either a real distribution, or the stated reason there isn't one. F1's
+ * class, one level down from the KPI row: `pct` here is one position's value
+ * over the TOTAL of all of them, so positions quoted in different currencies
+ * would produce weights summing to 100% that describe no portfolio at all. */
+type PositionDistribution =
+  | { ok: true; shares: PositionShare[] }
+  | { ok: false; reason: "empty" }
+  | { ok: false; reason: "mixed-currencies"; currencies: string[] };
+
 const MAX_DONUT_SLOTS = 5;
 
-function computePositionShares(positions: readonly SnapshotPosition[]): PositionShare[] {
+function computePositionShares(positions: readonly SnapshotPosition[]): PositionDistribution {
   const withValue = positions.map((p) => {
     const price =
       typeof p.price === "number" && Number.isFinite(p.price)
@@ -653,25 +960,34 @@ function computePositionShares(positions: readonly SnapshotPosition[]): Position
           ? p.costPrice
           : 0;
     const qty = typeof p.quantity === "number" && Number.isFinite(p.quantity) ? p.quantity : 0;
-    return { symbol: p.symbol, value: Math.max(0, price * qty) };
+    const currency =
+      typeof p.currency === "string" && p.currency.trim().length > 0 ? p.currency.trim().toUpperCase() : null;
+    return { symbol: p.symbol, value: Math.max(0, price * qty), currency };
   });
 
-  const total = withValue.reduce((sum, p) => sum + p.value, 0);
+  const held = withValue.filter((p) => p.value > 0);
+  const total = held.reduce((sum, p) => sum + p.value, 0);
   if (total <= 0) {
-    return [];
+    return { ok: false, reason: "empty" };
   }
 
-  const shares = withValue
-    .filter((p) => p.value > 0)
+  // Only the positions that actually contribute to the total matter here - a
+  // zero-value row cannot skew a weight, so its currency does not either.
+  const currencies = [...new Set(held.map((p) => p.currency ?? "未知"))];
+  if (currencies.length > 1) {
+    return { ok: false, reason: "mixed-currencies", currencies };
+  }
+
+  const shares = held
     .sort((a, b) => b.value - a.value)
     .map((p) => ({ symbol: p.symbol, pct: (p.value / total) * 100 }));
 
   if (shares.length <= MAX_DONUT_SLOTS) {
-    return shares;
+    return { ok: true, shares };
   }
   const top = shares.slice(0, MAX_DONUT_SLOTS);
   const restPct = shares.slice(MAX_DONUT_SLOTS).reduce((sum, p) => sum + p.pct, 0);
-  return [...top, { symbol: "其他", pct: restPct }];
+  return { ok: true, shares: [...top, { symbol: "其他", pct: restPct }] };
 }
 
 function renderDonutSvg(shares: readonly PositionShare[]): Html {
@@ -701,18 +1017,25 @@ function renderDonutLegend(shares: readonly PositionShare[]): Html {
 }
 
 function renderPositionDonutCard(snapshot: OwnerSnapshot | null): Html {
-  const shares = snapshot ? computePositionShares(snapshot.positions) : [];
-  if (shares.length === 0) {
+  const distribution: PositionDistribution = snapshot
+    ? computePositionShares(snapshot.positions)
+    : { ok: false, reason: "empty" };
+  if (!distribution.ok) {
     return html`<section class="card w2 dt-w2">
       <h2>仓位分布</h2>
-      ${renderEmptyState("没有可分布的仓位。", "环图按最近一次快照里的持仓市值切分；空仓时没有可画的份额。")}
+      ${distribution.reason === "empty"
+        ? renderEmptyState("没有可分布的仓位。", "环图按最近一次快照里的持仓市值切分；空仓时没有可画的份额。")
+        : renderEmptyState(
+            `持仓跨 ${distribution.currencies.join(" / ")} 多个币种，画不出仓位占比。`,
+            "占比是「单只市值 ÷ 全部持仓市值」；把不同币种的市值直接相加得出的百分比不描述任何真实组合，所以这里不画。要拿到占比，得先有一份可信的汇率来源。"
+          )}
     </section>`;
   }
   return html`<section class="card w2 dt-w2">
     <h2>仓位分布</h2>
     <div style="display:flex;align-items:center;gap:16px">
-      ${renderDonutSvg(shares)}
-      ${renderDonutLegend(shares)}
+      ${renderDonutSvg(distribution.shares)}
+      ${renderDonutLegend(distribution.shares)}
     </div>
   </section>`;
 }
@@ -844,7 +1167,7 @@ function renderPaperPage(
     const otherVisible = other ? other.showPerformance : false;
     const otherData = other ? loadPaperViewData(deps.db, other, otherVisible) : null;
 
-    const curveCard = renderCurveCard(self.series, self.drawdown, {
+    const curveCard = renderCurveCard(self.series, self.drawdown, self.benchmark, {
       otherSeries: other && otherVisible ? (otherData?.series ?? null) : null,
       otherDisplayName: other?.displayName ?? "",
       otherHidden: Boolean(other) && !otherVisible
@@ -865,7 +1188,7 @@ function renderPaperPage(
 
     const contentHtml = canSeePerformance
       ? html`<div class="bento" style="margin-top:10px">${renderKpiRowCard(data.kpis)}</div>
-        <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown)}${renderDailyMoveBarsCard(data.dailyMoves, now)}</div>
+        <div class="bento" style="margin-top:10px">${renderCurveCard(data.series, data.drawdown, data.benchmark)}${renderDailyMoveBarsCard(data.dailyMoves, now)}</div>
         <div class="bento" style="margin-top:10px">${renderPositionsTableCard(data.snapshot)}</div>
         <div class="bento" style="margin-top:10px">${renderPositionDonutCard(data.snapshot)}${proposalsCard}</div>`
       : html`<div class="bento" style="margin-top:10px">${renderHiddenPerformanceCard(viewed)}</div>`;

@@ -43,15 +43,37 @@ function seedSnapshot(
      * 64 live snapshots carry one, reporting HKD - measured 2026-07-30), so a
      * blob without it is a shape the producer never emits. */
     reportingCurrency?: string | null;
+    /**
+     * `raw.primaryAsset.cash_infos` - the per-currency cash buckets Longbridge
+     * returns. Defaults to a single bucket in the reporting currency holding
+     * `netAssets`, i.e. "the whole account is cash, in the currency it is
+     * reported in": the simplest REAL account shape, and the one that makes
+     * data/snapshots.ts's FX-free basis equal `netAssets` so these tests'
+     * percentage expectations stay readable.
+     *
+     * Tests that need the LIVE deployment's shape (HKD reporting over a USD
+     * cash bucket, i.e. a converted aggregate) pass it explicitly - see the
+     * F1 block at the bottom of this file.
+     */
+    cashInfos?: Array<{ currency: string; available_cash: string }>;
+    /** `raw.primaryAsset.total_cash`, in the reporting currency. Defaults to
+     * `netAssets` to match the default single-bucket shape above. */
+    totalCash?: string;
   }
 ): void {
   const currency = opts.reportingCurrency === undefined ? "USD" : opts.reportingCurrency;
+  const cashInfos =
+    opts.cashInfos ??
+    (currency === null
+      ? []
+      : [{ currency, available_cash: String(opts.netAssets ?? 0) }]);
   const raw: Record<string, unknown> = {
     degraded: opts.degraded ?? false,
     degradedReason: opts.degradedReason ?? null,
     primaryAsset: {
       net_assets: String(opts.netAssets ?? 0),
-      total_cash: "0",
+      total_cash: opts.totalCash ?? String(opts.netAssets ?? 0),
+      cash_infos: cashInfos,
       ...(currency === null ? {} : { currency })
     }
   };
@@ -187,8 +209,8 @@ describe("paper route (GET /paper)", () => {
       degraded: true,
       degradedReason: "行情读取失败：NVDA.US(按成本估值)",
       positions: [
-        { symbol: "NVDA.US", quantity: 2, costPrice: 800, price: 810, priceSource: "cost" },
-        { symbol: "AAPL.US", quantity: 1, costPrice: 200, price: 205, priceSource: "live" }
+        { symbol: "NVDA.US", currency: "USD", quantity: 2, costPrice: 800, price: 810, priceSource: "cost" },
+        { symbol: "AAPL.US", currency: "USD", quantity: 1, costPrice: 200, price: 205, priceSource: "live" }
       ]
     });
 
@@ -245,7 +267,7 @@ describe("paper route (GET /paper)", () => {
       ownerId: "member_b",
       fetchedAt: "2026-07-14T11:00:00.000Z",
       netAssets: 999999,
-      positions: [{ symbol: "SECRET.US", quantity: 1 }]
+      positions: [{ symbol: "SECRET.US", currency: "USD", quantity: 1, price: 10, priceSource: "live" }]
     });
 
     const spy = spyOnBoundParams(db);
@@ -495,8 +517,8 @@ describe("paper route (GET /paper)", () => {
       fetchedAt: "2026-07-14T11:30:00.000Z",
       netAssets: 1100,
       positions: [
-        { symbol: "TSM.US", quantity: 10, price: 394.525, priceSource: "live" },
-        { symbol: "NVDA.US", quantity: 5, price: 180, priceSource: "live" }
+        { symbol: "TSM.US", currency: "USD", quantity: 10, price: 394.525, priceSource: "live" },
+        { symbol: "NVDA.US", currency: "USD", quantity: 5, price: 180, priceSource: "live" }
       ]
     });
     await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
@@ -523,8 +545,8 @@ describe("paper route (GET /paper)", () => {
       fetchedAt: "2026-07-14T11:30:00.000Z",
       netAssets: 1100,
       positions: [
-        { symbol: "TSM.US", quantity: 10, price: 394.525, priceSource: "live" },
-        { symbol: "GOOG.US", quantity: 1, price: 200, priceSource: "live" }
+        { symbol: "TSM.US", currency: "USD", quantity: 10, price: 394.525, priceSource: "live" },
+        { symbol: "GOOG.US", currency: "USD", quantity: 1, price: 200, priceSource: "live" }
       ]
     });
     await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
@@ -546,7 +568,7 @@ describe("paper route (GET /paper)", () => {
       ownerId: "member_b",
       fetchedAt: "2026-07-14T11:30:00.000Z",
       netAssets: 5000,
-      positions: [{ symbol: "TSM.US", quantity: 99, price: 394.525, priceSource: "live" }]
+      positions: [{ symbol: "TSM.US", currency: "USD", quantity: 99, price: 394.525, priceSource: "live" }]
     });
     await produceQuoteFacts("TSM.US", { last: 394.525, prev_close: 403.41, volume: 8570295 }, "2026-07-14");
 
@@ -555,5 +577,345 @@ describe("paper route (GET /paper)", () => {
     expect(body).toContain("对方未公开战绩");
     expect(body).not.toContain("持仓当日涨跌");
     expect(body).not.toContain("-2.20%");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 / F2 (2026-07-30), at the RENDERED-PAGE level.
+//
+// Fixtures are the deployed mini's real blob shape and real numbers (see
+// data/snapshots.test.ts's F1/F2 blocks for the measurement), and the QQQ
+// `daily_facts` rows go in through report-facts.mjs's OWN buildDailyFacts /
+// persistDailyFacts - the producer - rather than hand-written INSERTs, so the
+// alignment is proved against the shape that producer actually writes.
+// ---------------------------------------------------------------------------
+describe("paper route: currency-artifact-free performance (F1) and the QQQ benchmark (F2)", () => {
+  let db: DatabaseSync;
+  let server: ReturnType<typeof createPlatformServer>;
+  let baseUrl: string;
+
+  // After the live series' last poll (2026-07-29T19:30Z), so the page reads as
+  // it does in production rather than as if the data were from the future.
+  const NOW = () => new Date("2026-07-30T04:00:00.000Z");
+  const USD_CASH = 122079.05;
+  const RATE_BEFORE = 7.801553911174768;
+  const RATE_AFTER = 7.008233189888027;
+
+  beforeEach(async () => {
+    db = memoryDb();
+    server = createPlatformServer({ db, repoRoot: "/tmp/does-not-matter", now: NOW });
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  function seedLiveShapeSnapshot(ownerId: string, fetchedAt: string, qqqPrice: number, impliedRate: number): void {
+    const totalCash = USD_CASH * impliedRate;
+    seedSnapshot(db, {
+      ownerId,
+      fetchedAt,
+      netAssets: totalCash + qqqPrice * impliedRate,
+      marketValue: qqqPrice,
+      reportingCurrency: "HKD",
+      totalCash: totalCash.toFixed(2),
+      cashInfos: [
+        { currency: "USD", available_cash: USD_CASH.toFixed(2) },
+        { currency: "HKD", available_cash: "0.00" }
+      ],
+      positions: [
+        { symbol: "QQQ.US", currency: "USD", quantity: 1, costPrice: 663.88, price: qqqPrice, priceSource: "live" }
+      ]
+    });
+  }
+
+  /** One poll per live US session, at the session's last poll instant. */
+  function seedLiveSessions(ownerId: string): void {
+    const sessions: Array<[string, number, number]> = [
+      ["2026-07-20T19:30:04.887Z", 697.5, RATE_BEFORE],
+      ["2026-07-21T19:30:05.017Z", 708.43, RATE_BEFORE],
+      ["2026-07-22T19:30:01.414Z", 707.36, RATE_BEFORE],
+      ["2026-07-23T19:30:00.788Z", 691.43, RATE_AFTER],
+      ["2026-07-24T19:30:03.123Z", 683.714, RATE_AFTER],
+      ["2026-07-27T19:30:01.253Z", 683.3, RATE_AFTER],
+      ["2026-07-28T19:30:03.115Z", 677.955, RATE_AFTER],
+      ["2026-07-29T19:30:04.594Z", 670.9, RATE_AFTER]
+    ];
+    for (const [fetchedAt, qqqPrice, rate] of sessions) {
+      seedLiveShapeSnapshot(ownerId, fetchedAt, qqqPrice, rate);
+    }
+  }
+
+  /** Writes a `qqq.price` row through report-facts.mjs's own producer. */
+  async function produceQqqDailyFact(tradingDay: string, last: number, timestamp: string): Promise<void> {
+    // eslint-disable-next-line import/no-unresolved -- plain .mjs, no dist
+    const reportFacts = await import("../../../openclaw-config/scripts/report-facts.mjs");
+    const facts = reportFacts.buildDailyFacts({
+      snapshot: null,
+      qqqQuote: { last, prev_close: last, timestamp },
+      macroEntries: [],
+      tradingDay
+    });
+    reportFacts.persistDailyFacts(db, tradingDay, facts);
+  }
+
+  /** The six live rows, verbatim - three real closes, three intraday quotes
+   * from late/manual runs, and one (2026-07-26) whose label sits two sessions
+   * away from the Friday close it holds. */
+  async function produceLiveQqqFacts(): Promise<void> {
+    await produceQqqDailyFact("2026-07-21", 696.06, "2026-07-20T20:00:00.000Z");
+    await produceQqqDailyFact("2026-07-26", 684.23, "2026-07-24T20:00:00.000Z");
+    await produceQqqDailyFact("2026-07-27", 677.96, "2026-07-27T15:52:37.000Z");
+    await produceQqqDailyFact("2026-07-28", 682.12, "2026-07-27T20:00:00.000Z");
+    await produceQqqDailyFact("2026-07-29", 668.47, "2026-07-29T14:34:12.000Z");
+    await produceQqqDailyFact("2026-07-30", 665.08, "2026-07-29T16:22:29.000Z");
+  }
+
+  function seedMemberWithToken(overrides: Partial<Member> = {}): { member: Member; token: string } {
+    const member = makeMember(overrides);
+    new MemberRepository(db).upsert(member);
+    return { member, token: new ApiTokenRepository(db).issue(member.id, "test").token };
+  }
+
+  function authed(path: string, token: string): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, { headers: { authorization: `Bearer ${token}` } });
+  }
+
+  it("does not print a double-digit 累计/最大回撤 for an account whose only move was the broker's HKD/USD rate", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedLiveSessions(member.id);
+
+    const body = await (await authed("/paper", token)).text();
+
+    // The old, netAssets-derived numbers. Never again, in any rounding.
+    expect(body).not.toContain("-10.19%");
+    expect(body).not.toContain("-10.20%");
+    // 净值 stays the broker's own HKD statement, correctly labelled.
+    expect(body).toContain("港元");
+    // 累计/最大回撤 are the real USD moves of one QQQ share against six figures
+    // of cash: (122079.05+670.90)/(122079.05+697.50)-1 = -0.0217%, and the
+    // deepest peak-to-trough over these eight closes is -0.0281%.
+    expect(body).toContain("-0.02%");
+    expect(body).toContain("-0.03%");
+    expect(body).not.toContain("数据不足");
+  });
+
+  it("discloses that 净值 is converted, when the rate moved, and what the percentages are measured in", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedLiveSessions(member.id);
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("净值是券商按自己的汇率表折出的 港元 口径");
+    expect(body).toContain("账户里的钱实际是\n    美元");
+    expect(body).toContain("7.0082");
+    expect(body).toContain("7.8016");
+    expect(body).toContain("净值在那一刻的跳动来自折算率，不是盈亏");
+    expect(body).toContain("不经过任何汇率");
+  });
+
+  it("says WHICH percentages could not be computed and WHY, instead of falling back to the converted aggregate", async () => {
+    const { member, token } = seedMemberWithToken();
+    // Two polls whose cash spans USD and HKD: no FX-free total exists.
+    for (const fetchedAt of ["2026-07-28T19:30:00.000Z", "2026-07-29T19:30:00.000Z"]) {
+      seedSnapshot(db, {
+        ownerId: member.id,
+        fetchedAt,
+        netAssets: 1000,
+        reportingCurrency: "HKD",
+        totalCash: "1000",
+        cashInfos: [
+          { currency: "USD", available_cash: "100" },
+          { currency: "HKD", available_cash: "220" }
+        ]
+      });
+    }
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("今日 / 累计 / 最大回撤 都算不出来");
+    expect(body).toContain("现金与持仓跨多个币种，没有不经汇率折算就能得到的总额");
+    // And the curve refuses for the same stated reason rather than plotting the
+    // broker's converted aggregate.
+    expect(body).toContain("画不出净值曲线：没有两个可比的净值点。");
+    expect(body).toContain("不会拿券商折出的汇总口径充数");
+  });
+
+  it("draws the QQQ benchmark from the sessions that align, and names the ones that do not", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedLiveSessions(member.id);
+    await produceLiveQqqFacts();
+
+    const body = await (await authed("/paper", token)).text();
+
+    // The dead claim is gone.
+    expect(body).not.toContain("基准曲线尚未接入本页");
+    expect(body).not.toContain("QQQ 每日收盘数据已入库");
+    // A real benchmark group is drawn, with QQQ's own same-window return next
+    // to this account's: 682.12/696.06-1 = -2.00%.
+    expect(body).toContain('data-role="benchmark-qqq"');
+    expect(body).toContain("QQQ（每日收盘）");
+    expect(body).toContain("同期（2026-07-20 → 2026-07-27 两个美股收盘）");
+    expect(body).toContain("-2.00%");
+    // The five sessions with no accepted close are named, not interpolated.
+    expect(body).toContain("2026-07-21、2026-07-22、2026-07-23、2026-07-28、2026-07-29");
+    expect(body).toContain("不做插值");
+    // And each rejected daily_facts row carries its reason.
+    expect(body).toContain("盘中报价");
+  });
+
+  it("draws a benchmark line only across consecutive sessions - a gap breaks it into separate runs", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedLiveSessions(member.id);
+    await produceLiveQqqFacts();
+
+    const body = await (await authed("/paper", token)).text();
+    const group = body.slice(body.indexOf('data-role="benchmark-qqq"'));
+    const groupEnd = group.slice(0, group.indexOf("</g>"));
+
+    // 07-20 is isolated (07-21..07-23 have no close), 07-24 -> 07-27 spans only
+    // a weekend and so is one drawable run: exactly ONE polyline, three markers.
+    expect(groupEnd.match(/<polyline/gu)).toHaveLength(1);
+    expect(groupEnd.match(/<circle/gu)).toHaveLength(3);
+  });
+
+  it("says the benchmark could not be drawn, with reasons, when no session aligns", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedLiveSessions(member.id);
+    // Only intraday rows: nothing is a close, so nothing aligns.
+    await produceQqqDailyFact("2026-07-29", 668.47, "2026-07-29T14:34:12.000Z");
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("对不上足够的交易日，这条线不画");
+    expect(body).not.toContain('data-role="benchmark-qqq"');
+    expect(body).toContain("2026-07-29 的盘中报价（抓取于收盘前），不是收盘价");
+  });
+
+  it("never reads daily_facts into a benchmark for a member who hides their performance", async () => {
+    const { token } = seedMemberWithToken({ id: "member_a", email: "a@example.com", displayName: "甲" });
+    new MemberRepository(db).upsert(
+      makeMember({ id: "member_b", email: "b@example.com", displayName: "乙", showPerformance: false })
+    );
+    seedLiveSessions("member_b");
+    await produceLiveQqqFacts();
+
+    const spy = spyOnBoundParams(db);
+    const body = await (await authed("/paper?member=member_b", token)).text();
+    spy.restore();
+
+    expect(body).toContain("对方未公开战绩");
+    expect(body).not.toContain('data-role="benchmark-qqq"');
+    expect(spy.params).not.toContain("qqq.price");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1's class, one level down: per-position figures (2026-07-30)
+// ---------------------------------------------------------------------------
+describe("paper route: per-position figures never mix currencies either", () => {
+  let db: DatabaseSync;
+  let server: ReturnType<typeof createPlatformServer>;
+  let baseUrl: string;
+
+  beforeEach(async () => {
+    db = memoryDb();
+    server = createPlatformServer({
+      db,
+      repoRoot: "/tmp/does-not-matter",
+      now: () => new Date("2026-07-14T12:00:00.000Z")
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  function seedMemberWithToken(): { member: Member; token: string } {
+    const member = makeMember();
+    new MemberRepository(db).upsert(member);
+    return { member, token: new ApiTokenRepository(db).issue(member.id, "test").token };
+  }
+
+  function authed(path: string, token: string): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, { headers: { authorization: `Bearer ${token}` } });
+  }
+
+  it("labels each holding's price with the currency the broker quoted it in", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1000,
+      positions: [
+        { symbol: "QQQ.US", currency: "USD", quantity: 1, costPrice: 663.88, price: 670.9, priceSource: "live" },
+        { symbol: "0700.HK", currency: "HKD", quantity: 100, costPrice: 400, price: 420, priceSource: "live" }
+      ]
+    });
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("<th>币种</th>");
+    expect(body).toContain("美元");
+    expect(body).toContain("港元");
+  });
+
+  it("says 币种未知 rather than leaving a bare price when a position row states no currency", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1000,
+      positions: [{ symbol: "MYSTERY.US", quantity: 1, price: 100, priceSource: "live" }]
+    });
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("币种未知");
+  });
+
+  it("refuses the 仓位分布 donut - naming the currencies - instead of adding HKD to USD to get weights", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1000,
+      positions: [
+        { symbol: "QQQ.US", currency: "USD", quantity: 1, price: 670.9, priceSource: "live" },
+        { symbol: "0700.HK", currency: "HKD", quantity: 100, price: 420, priceSource: "live" }
+      ]
+    });
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain("持仓跨 USD / HKD 多个币种，画不出仓位占比。");
+    expect(body).not.toContain('aria-label="仓位分布环图"');
+  });
+
+  it("still draws the donut when every holding is in ONE currency", async () => {
+    const { member, token } = seedMemberWithToken();
+    seedSnapshot(db, {
+      ownerId: member.id,
+      fetchedAt: "2026-07-14T11:30:00.000Z",
+      netAssets: 1000,
+      positions: [
+        { symbol: "QQQ.US", currency: "USD", quantity: 1, price: 600, priceSource: "live" },
+        { symbol: "NVDA.US", currency: "USD", quantity: 1, price: 400, priceSource: "live" }
+      ]
+    });
+
+    const body = await (await authed("/paper", token)).text();
+
+    expect(body).toContain('aria-label="仓位分布环图"');
+    expect(body).toContain("60.0%");
+    expect(body).toContain("40.0%");
   });
 });
