@@ -1454,6 +1454,18 @@ function parseNarrativeNumber(raw) {
 //      numbers are not expected to trace back to stock_facts any more than
 //      the daily/weekly gate's NUMERIC_MATCH_PATTERNS ever scans news bullets.
 const STOCK_ISO_DATE_PATTERN = /\d{4}-\d{2}-\d{2}/gu;
+// A wall-clock reading is a TIMESTAMP, never a claim about the security, so it
+// is stripped for the same reason the ISO date above is. Without this,
+// renderSymbolAsOfBullet's 「行情时点 2026-07-30 04:00（北京时间）」 fed the
+// matcher the bare tokens 04 and 00, and every symbol failed
+// stock.numeric_match on its own freshness disclosure - measured on the live
+// 2026-07-30 batch, which is how this was found.
+const STOCK_CLOCK_TIME_PATTERN = /\d{1,2}:\d{2}(?::\d{2})?/gu;
+// The same bullet states the report's own refresh cadence (「个股分析每 3 天更新
+// 一次」). That number describes THIS PIPELINE, not the security, so no
+// stock_facts row could ever back it. Anchored on the surrounding words rather
+// than on the digit so a changed interval needs no edit here.
+const STOCK_SELF_CADENCE_PATTERN = /每\s*\d+\s*天更新一次/gu;
 const STOCK_NUMBER_TOKEN_PATTERN = /-?\d[\d,]*\.?\d*/gu;
 const STOCK_DEGRADE_MARKER_PATTERN = new RegExp(
   `${escapeRegExp(NUMERIC_DEGRADE_MARKER)}|${escapeRegExp(NON_CHINESE_DEGRADE_MARKER)}`,
@@ -1466,7 +1478,12 @@ const EXEMPT_STOCK_SUBSECTION_HEADINGS = new Set([
 ]);
 
 function extractStockNumberTokens(text) {
-  const withoutDates = String(text ?? "").replace(STOCK_ISO_DATE_PATTERN, "");
+  // Order matters: the clock strip must run while the date is still adjacent,
+  // and the cadence phrase must go before the bare-number sweep sees its digit.
+  const withoutDates = String(text ?? "")
+    .replace(STOCK_ISO_DATE_PATTERN, "")
+    .replace(STOCK_CLOCK_TIME_PATTERN, "")
+    .replace(STOCK_SELF_CADENCE_PATTERN, "");
   const tokens = [];
   for (const match of withoutDates.matchAll(STOCK_NUMBER_TOKEN_PATTERN)) {
     const raw = match[0];

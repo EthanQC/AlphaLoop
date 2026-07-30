@@ -1437,14 +1437,26 @@ function buildStockRecord(
     history = stockHistoryFixture(),
     fundamentals = stockFundamentalsFixture(),
     optionChain = stockOptionChainFixture(),
-    news = stockNewsFixture()
-  }: { history?: unknown; fundamentals?: unknown; optionChain?: unknown; news?: Array<Record<string, unknown>> } = {}
+    news = stockNewsFixture(),
+    quote: quoteOverride
+  }: {
+    history?: unknown;
+    fundamentals?: unknown;
+    optionChain?: unknown;
+    news?: Array<Record<string, unknown>>;
+    /** Overrides the whole quote - used to pin an unusual as-of clock reading. */
+    quote?: Record<string, unknown>;
+  } = {}
 ) {
-  const quote = stockQuoteFixture({ symbol });
+  const quote = quoteOverride ? { ...quoteOverride, symbol } : stockQuoteFixture({ symbol });
   const analysis = buildDeterministicAnalysis(symbol, quote, news, { history, fundamentals, optionChain }, STOCK_GENERATED_AT);
   const facts = buildStockFacts({ symbol, quote, history, fundamentals, optionChain, news, tradingDay: STOCK_GENERATED_AT.slice(0, 10) });
   return {
-    record: { symbol, analysis, news } as Record<string, unknown>,
+    // `quote` belongs on the record: renderSymbolAsOfBullet reads
+    // record.quote?.timestamp for the 行情时点 clock. Leaving it off meant every
+    // fixture here rendered 「数据源未提供时间戳」 instead, so the clock branch -
+    // the one that took the live 2026-07-30 batch down - had no coverage at all.
+    record: { symbol, quote, analysis, news } as Record<string, unknown>,
     analysis,
     factsByKey: Object.fromEntries(facts.map((fact: { factKey: string }) => [fact.factKey, fact]))
   };
@@ -1539,6 +1551,41 @@ describe("stock.numeric_match: deterministic derivations are backed, fabrication
 
     expect(result.ok).toBe(false);
     expect(result.failures).toContain("stock.numeric_match:AAPL.US:777.77");
+  });
+
+  // Regression, found on the LIVE 2026-07-30 batch: every one of the five
+  // symbols failed this gate on the freshness bullet the staleness fix had just
+  // added. 「行情时点 2026-07-30 04:00（北京时间）… 个股分析每 3 天更新一次」 fed
+  // the matcher the bare tokens 04, 00 and 3 - a wall-clock reading and the
+  // report's own refresh interval, neither of which any stock_facts row could
+  // ever back. The whole batch was discarded over the sentence that exists to
+  // tell a reader how old the batch is.
+  it("does not read a timestamp or the report's own cadence as a claim about the security", () => {
+    // The default fixture's quote lands on 04:00 Shanghai, and 4 / 0 / 3 all
+    // happen to sit inside the facts table - so asserting on it would pass even
+    // with the bug reintroduced (verified: it did). Pick a clock reading nothing
+    // could plausibly back, so this test can only pass because the minutes were
+    // never treated as a number at all.
+    const { record, factsByKey, analysis } = buildStockRecord("AAPL.US", {
+      quote: stockQuoteFixture({ timestamp: "2026-07-15T23:41:00.000Z" })
+    });
+    const markdown = renderStockReport([{ record }]);
+    const deterministicText = ["quoteTechnicals", "valuation", "fundamentals", "analysts", "options", "paths", "conclusion"]
+      .map((key) => (analysis as Record<string, string[]>)[key].join("\n"))
+      .join("\n");
+
+    // The risky sentence really is in the rendered output - otherwise this test
+    // would pass by asserting on a report that never carried it.
+    expect(markdown).toContain("行情时点 2026-07-16 07:41（北京时间）");
+    expect(markdown).toMatch(/个股分析每 \d+ 天更新一次/u);
+
+    const result = validateStockNarrativeNumbers(
+      markdown,
+      { "AAPL.US": factsByKey },
+      { deterministicTextBySymbol: { "AAPL.US": deterministicText } }
+    );
+
+    expect(result.failures).toEqual([]);
   });
 });
 
