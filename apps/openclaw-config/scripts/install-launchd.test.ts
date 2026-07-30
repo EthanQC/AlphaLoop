@@ -97,6 +97,21 @@ interface LaunchctlStubOptions {
    * carry on regardless, bootstrapping the daemon next to it.
    */
   surviveBootoutLabels?: string[];
+  /**
+   * Task 28. Seconds a label stays visible to `print` after `bootout` when the
+   * job was started less than `bootoutDrainRecentWindowSeconds` ago. Models the
+   * drain measured on a real launchd (2026-07-30, throwaway agent with the real
+   * ai.openclaw.gateway plist's KeepAlive=true + ExitTimeOut=20): `bootout`
+   * returns 0 in ~35ms, `launchctl print` keeps answering for ~20.2s while the
+   * SIGTERM-slow process drains, the pid never changes (so it is a drain, NOT a
+   * KeepAlive restart), then the label vanishes. A TERM-obedient agent is gone
+   * in ~40ms - which is why every pre-task-28 test passed with the instant
+   * removal below: they modelled only the obedient case, and the mini's first
+   * full deploy run hit the other one three labels wide.
+   */
+  bootoutDrainSeconds?: number;
+  /** How recently started (seconds) a job must be for its bootout to drain. */
+  bootoutDrainRecentWindowSeconds?: number;
 }
 
 /**
@@ -124,11 +139,13 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
   const deadDir = join(options.stateDir, "dead");
   const loopDir = join(options.stateDir, "signalloop");
   const stickyDir = join(options.stateDir, "sticky");
+  const drainingDir = join(options.stateDir, "draining");
   mkdirSync(loadedDir, { recursive: true });
   mkdirSync(disabledDir, { recursive: true });
   mkdirSync(deadDir, { recursive: true });
   mkdirSync(loopDir, { recursive: true });
   mkdirSync(stickyDir, { recursive: true });
+  mkdirSync(drainingDir, { recursive: true });
   for (const label of options.disabledLabels ?? []) {
     writeFileSync(join(disabledDir, `system_${label}`), "");
   }
@@ -151,7 +168,13 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     "#!/bin/sh",
     `echo "$@" >> "${logPath}"`,
     `S="${options.stateDir}"`,
+    `DRAIN=${options.bootoutDrainSeconds ?? 0}`,
+    `WINDOW=${options.bootoutDrainRecentWindowSeconds ?? 0}`,
     'key() { printf "%s" "$1" | tr / _; }',
+    // Task 28: a drain that has run its course is resolved lazily, by whichever
+    // subcommand looks next - the same way the real launchd's removal becomes
+    // visible to the next `print` rather than being pushed anywhere.
+    'expire_drain() { if [ -f "$S/draining/$1" ] && [ "$(date +%s)" -ge "$(cat "$S/draining/$1")" ]; then rm -f "$S/draining/$1" "$S/loaded/$1"; fi; }',
     'case "$1" in',
     // Round 6: `print` answers with a real launchctl payload, not just an exit
     // code. The installer now judges the daemon on what this says (see
@@ -160,6 +183,7 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     // trivially pass or trivially fail. Field spellings and the single-tab
     // indent are copied from the mini's own output.
     '  print)',
+    '    expire_drain "$(key "$2")"',
     '    [ -f "$S/loaded/$(key "$2")" ] || exit 113',
     '    lbl="${2##*/}"',
     '    printf "%s = {\n" "$2"',
@@ -180,11 +204,24 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     "  bootout)",
     '    tgt="$2"',
     '    case "$3" in *.plist) tgt="$2/$(basename "$3" .plist)" ;; esac',
-    '    [ -f "$S/loaded/$(key "$tgt")" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
+    '    k="$(key "$tgt")"',
+    '    expire_drain "$k"',
+    '    [ -f "$S/loaded/$k" ] || { echo "Boot-out failed: 113: Could not find specified service" >&2; exit 113; }',
     // S3f: a "sticky" label reports success and stays loaded, which is what a
     // wedged agent does - bootout returns 0 and the job is still there.
     '    case "$tgt" in gui/*) [ -f "$S/sticky/${tgt##*/}" ] && exit 0 ;; esac',
-    '    rm -f "$S/loaded/$(key "$tgt")"; exit 0 ;;',
+    // Task 28: a second bootout landing mid-drain changes nothing - the first
+    // one already condemned the job, its removal just has not finished.
+    '    [ -f "$S/draining/$k" ] && exit 0',
+    // Task 28: booting out a RECENTLY-STARTED job does not remove it here and
+    // now. It returns 0 (measured: ~35ms on the real launchd) and the label
+    // stays visible to `print` for DRAIN more seconds - the ExitTimeOut window
+    // in which launchd is still escalating SIGTERM to SIGKILL.
+    '    if [ "$DRAIN" -gt 0 ]; then',
+    '      age=$(( $(date +%s) - $(stat -f %m "$S/loaded/$k") ))',
+    '      if [ "$age" -le "$WINDOW" ]; then echo $(( $(date +%s) + DRAIN )) > "$S/draining/$k"; exit 0; fi',
+    '    fi',
+    '    rm -f "$S/loaded/$k"; exit 0 ;;',
     "  bootstrap)",
     '    lbl="$(basename "$3" .plist)"',
     '    [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }',
@@ -193,6 +230,9 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
     '    case "$2" in gui/*) dom="$2" ;; *) dom="system" ;; esac',
     '    if [ -f "$S/disabled/$(key "$dom/$lbl")" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi',
     failLine,
+    // A fresh load starts a fresh life: any leftover drain marker from the
+    // previous incarnation must not be allowed to "expire" the new one.
+    '    rm -f "$S/draining/$(key "$dom/$lbl")"',
     '    touch "$S/loaded/$(key "$dom/$lbl")"; exit 0 ;;',
     "  kickstart)",
     '    [ -f "$S/loaded/$(key "$3")" ] || { echo "Could not find service" >&2; exit 113; }',
@@ -207,11 +247,36 @@ function writeLaunchctlStub(path: string, logPath: string, options: LaunchctlStu
 // `openclaw cron show` must fail (nothing installed yet) so the installer's
 // removeExistingJob() takes its "no existing job" path; `cron add` must return
 // parseable JSON, which is what the real CLI's --json flag emits.
-function writeOpenClawStub(path: string, logPath: string): void {
+//
+// Task 28: `gatewayInstallStartsAgent` makes `gateway install` DO what the
+// real CLI does, reduced to the part launchd sees - read off the mini's
+// archived copy: it renders ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+// (KeepAlive=true, ExitTimeOut=20) and STARTS it. That side effect is the
+// full-run defect's trigger, so the full-deploy suite opts in; every other
+// suite keeps the inert stub, because it is testing template rendering, not
+// the gateway handover.
+function writeOpenClawStub(
+  path: string,
+  logPath: string,
+  options: { gatewayInstallStartsAgent?: { launchctl: string; agentsDir: string; uid: number } } = {}
+): void {
+  const gateway = options.gatewayInstallStartsAgent;
+  const gatewayLines = gateway
+    ? [
+        'if [ "$1" = "gateway" ] && [ "$2" = "install" ]; then',
+        `  mkdir -p "${gateway.agentsDir}"`,
+        '  printf \'<?xml version="1.0" encoding="UTF-8"?>\\n<plist version="1.0"><dict><key>Label</key><string>ai.openclaw.gateway</string><key>KeepAlive</key><true/><key>ExitTimeOut</key><integer>20</integer></dict></plist>\\n\''
+          + ` > "${gateway.agentsDir}/ai.openclaw.gateway.plist"`,
+        `  "${gateway.launchctl}" bootstrap "gui/${gateway.uid}" "${gateway.agentsDir}/ai.openclaw.gateway.plist"`,
+        "  exit 0",
+        "fi"
+      ]
+    : [];
   const contents = [
     "#!/bin/sh",
     `echo "$@" >> "${logPath}"`,
     'if [ "$1" = "cron" ] && [ "$2" = "add" ]; then echo \'{"id":1}\'; exit 0; fi',
+    ...gatewayLines,
     'if [ "$1" = "gateway" ]; then exit 0; fi',
     "exit 1"
   ].join("\n");
@@ -288,6 +353,10 @@ function makeFakeMachine(prefix: string, stub: Omit<LaunchctlStubOptions, "state
       LAUNCHCTL: join(stubBinDir, "launchctl"),
       BOOTSTRAP_SETTLE_SECONDS: "0",
       VERIFY_SETTLE_SECONDS: "0",
+      // Task 28: 1s, not the production 30s - a sticky label (S3f) must fail
+      // the run in about a second here, not half a minute per label. Tests
+      // that exercise the drain itself override this with their own deadline.
+      BOOTOUT_SETTLE_SECONDS: "1",
       // Deploy receipts go to the fake machine's own runtime tree. Without
       // this the real installer would append to the repo's runtime/, which is
       // what test/runtime-write-guard.ts exists to stop.
@@ -1320,7 +1389,10 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     const { status, output } = runSystemDaemonsExpectingFailure(machine);
 
     expect(status).toBe(1);
-    expect(output).toMatch(/is STILL loaded after bootout/u);
+    // Task 28 put a real deadline on the re-check, so the message now names it:
+    // this label was polled for the whole BOOTOUT_SETTLE_SECONDS window (1s in
+    // this harness) and never left the job table - a wedge, not a drain.
+    expect(output).toMatch(/is STILL loaded \d+s after bootout/u);
     expect(output).toMatch(/refusing to bootstrap the daemon because both copies would then run/u);
     // The daemon was never bootstrapped, so the machine keeps exactly one copy
     // of platform-app running - the old one.
@@ -1328,6 +1400,42 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     expect(loadedUserLabels(machine)).toContain("com.alphaloop.platform-app");
     expect(existsSync(join(machine.agentsDir, "com.alphaloop.platform-app.plist"))).toBe(true);
   });
+
+  it("task 28: a freshly-started user agent whose bootout DRAINS is waited for - the handover converges on the first try", () => {
+    // The live failure (mini, 2026-07-29, reproduced twice): deploy.sh step 2
+    // had started gui/501/ai.openclaw.gateway seconds earlier via `openclaw
+    // gateway install`; step 3's bootout returned while launchd was still
+    // draining the process, the immediate re-check read "STILL loaded", and
+    // the whole run exited 1 - platform-app and cron-runner failed the same
+    // way in the same run. Fifteen minutes later a resume from step 3 passed,
+    // because the drains had finished in the background.
+    //
+    // The stub's timing is the measured one (see bootoutDrainSeconds): bootout
+    // returns 0 immediately, `print` keeps answering for the drain window,
+    // and nothing restarts the job - so the ONLY correct installer behaviour
+    // is to wait the drain out, and the only wrong ones are the old immediate
+    // re-check (fails healthy machines) and waiting forever (never fails
+    // wedged ones). S3f above pins the second half; this pins the first.
+    const machine = makeFakeMachine("alphaloop-t28-drain-", {
+      bootoutDrainSeconds: 1,
+      bootoutDrainRecentWindowSeconds: 3600
+    });
+    machine.env.BOOTOUT_SETTLE_SECONDS = "6";
+    seedRunningUserAgents(machine, [
+      "ai.openclaw.gateway",
+      "com.alphaloop.platform-app",
+      "com.openclaw.trading.cron-runner"
+    ]);
+
+    const output = runSystemDaemons(machine);
+
+    expect(output).not.toMatch(/STILL loaded/u);
+    expect(loadedSystemLabels(machine)).toEqual([...SYSTEM_LABELS].sort());
+    expect(loadedUserLabels(machine)).toEqual([]);
+    expect(archivedLabels(machine)).toEqual(
+      expect.arrayContaining(["ai.openclaw.gateway", "com.alphaloop.platform-app", "com.openclaw.trading.cron-runner"])
+    );
+  }, 30_000);
 
   it("S3d: an unwritable archive leaves plists on disk, and the gate now calls that out", async () => {
     const machine = makeFakeMachine("alphaloop-r6-archive-");
@@ -2254,4 +2362,194 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     expect(status).toBe(1);
     expect(receipts(runbook).at(-1)).toMatchObject({ step: 3, exitCode: 1 });
   });
+});
+
+// ===========================================================================
+// TASK 28 (2026-07-30): A FULL deploy.sh RUN COULD NOT PASS STEP 3.
+//
+// Reproduced twice on the mini: step 2 (`pnpm launchd:install-backup-alerts`
+// -> install-launchd.sh -> `openclaw gateway install`) installs AND STARTS the
+// user-level gui/501/ai.openclaw.gateway - the ordering the README mandates,
+// so that step 3 can boot it out. Step 3's bootout of that seconds-old agent
+// then returned while launchd was still draining the process, the immediate
+// re-check read STILL loaded, and the run exited 1 (platform-app and
+// cron-runner too, first run). A resume from step 3 fifteen minutes later
+// passed - the drains had finished in between. So the runbook, followed
+// exactly, always failed on the first try and always suggested its own
+// workaround.
+//
+// The suite above stubs pnpm and sudo entirely, so no test in it could see
+// this: nothing there ever put a freshly-started agent in front of step 3.
+// Here steps 2 and 3 are REAL - the real install-launchd.sh (whose `openclaw
+// gateway install` really starts the agent, via the stub CLI's opt-in) and
+// the real install-system-daemons.sh, sharing one stub-launchd job table
+// whose bootout drains like the measured launchd (see bootoutDrainSeconds).
+// Steps 0/1/4-8 stay stubs: they neither touch launchd nor did they fail.
+// ===========================================================================
+describe("task 28: a full deploy.sh run converges on the first try", () => {
+  const deployScript = fileURLToPath(new URL("./deploy.sh", import.meta.url));
+
+  interface FullDeploySandbox {
+    machine: FakeMachine;
+    root: string;
+    callLog: string;
+    env: NodeJS.ProcessEnv;
+  }
+
+  function makeFullDeploySandbox(prefix: string, stub: Omit<LaunchctlStubOptions, "stateDir"> = {}): FullDeploySandbox {
+    const machine = makeFakeMachine(prefix, stub);
+    writeOpenClawStub(join(machine.stubBinDir, "openclaw"), machine.openclawLog, {
+      gatewayInstallStartsAgent: {
+        launchctl: join(machine.stubBinDir, "launchctl"),
+        agentsDir: machine.agentsDir,
+        uid: process.getuid?.() ?? 0
+      }
+    });
+
+    const root = makeTempDir(`${prefix}repo-`);
+    const binDir = join(root, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const callLog = join(root, "calls.log");
+    writeFileSync(
+      join(root, ".env.local"),
+      "FEISHU_GROUP_CHAT_ID=oc_sandbox_group\nPLATFORM_PUBLIC_BASE_URL=\"https://alphaloop.invalid\"\n"
+    );
+
+    const stubBin = (name: string, body: string) => {
+      writeFileSync(join(binDir, name), ["#!/bin/sh", `echo "${name} $@" >> "${callLog}"`, body, "exit 0"].join("\n") + "\n");
+      chmodSync(join(binDir, name), 0o755);
+    };
+
+    stubBin("git", [
+      'if [ "$1" = "-C" ]; then shift 2; fi',
+      'case "$1" in',
+      '  status) exit 0 ;;',
+      '  pull) echo "Already up to date." ;;',
+      '  rev-parse) echo "cafe123" ;;',
+      "esac"
+    ].join("\n"));
+    // Step 2 is the REAL installer chain; every other pnpm subcommand is a
+    // no-op stand-in, same as the suite above.
+    stubBin("pnpm", [
+      'if [ "$1" = "launchd:install-backup-alerts" ]; then',
+      `  exec zsh "${scriptPath}"`,
+      "fi"
+    ].join("\n"));
+    stubBin("node", "");
+    stubBin("loginshell", "");
+    // sudo hands its argv straight through: `sudo zsh install-system-daemons.sh`
+    // becomes the REAL installer, inheriting this sandbox's seams
+    // (SYSTEM_DIR / LAUNCHCTL / TARGET_* / settle windows) from the
+    // environment - the same thing a NOPASSWD sudo -E would do.
+    writeFileSync(join(binDir, "sudo"), [
+      "#!/bin/sh",
+      'if [ "$1" = "-n" ]; then exit 0; fi',
+      `echo "sudo $@" >> "${callLog}"`,
+      'exec "$@"'
+    ].join("\n") + "\n");
+    chmodSync(join(binDir, "sudo"), 0o755);
+
+    return {
+      machine,
+      root,
+      callLog,
+      env: {
+        ...machine.env,
+        // The installer derives every runtime path from REPO_ROOT; pointing it
+        // at the sandbox root keeps the suite out of the real repo's runtime/.
+        REPO_ROOT: root,
+        PATH: `${binDir}:${machine.env.PATH ?? ""}`,
+        DEPLOY_RUNTIME_ROOT: join(root, "runtime"),
+        DEPLOY_SUDO: join(binDir, "sudo"),
+        DEPLOY_LOGIN_SHELL: join(binDir, "loginshell"),
+        DEPLOY_NODE: process.execPath,
+        DEPLOY_ACK_GATEWAY_RESTART: "yes",
+        // Production default is 30s; the stub's drain is 1s, so 6s keeps the
+        // deadline >> drain (the property under test) without the wait.
+        BOOTOUT_SETTLE_SECONDS: "6"
+      }
+    };
+  }
+
+  function runFullDeploy(sandbox: FullDeploySandbox): { status: number; output: string } {
+    const result = spawnSync("zsh", [deployScript], { env: sandbox.env, encoding: "utf8" });
+    if (result.error) {
+      throw result.error;
+    }
+    return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  }
+
+  /**
+   * Last receipt per step. Two writers both record step 3 (deploy.sh and
+   * install-system-daemons.sh itself), exactly as in production; the gate
+   * judges the latest row, so that is what these tests assert on.
+   */
+  function latestExitPerStep(sandbox: FullDeploySandbox): Map<number, number> {
+    const path = join(sandbox.root, "runtime", "deploy", "steps.jsonl");
+    const rows = existsSync(path)
+      ? readFileSync(path, "utf8").split(/\n/u).filter(Boolean).map((line) => JSON.parse(line) as { step: number; exitCode: number })
+      : [];
+    const latest = new Map<number, number>();
+    for (const row of rows) {
+      latest.set(row.step, row.exitCode);
+    }
+    return latest;
+  }
+
+  it("passes first try - step 3 waits out the gateway step 2 just started - and a re-run converges too", () => {
+    const sandbox = makeFullDeploySandbox("alphaloop-t28-full-", {
+      bootoutDrainSeconds: 1,
+      bootoutDrainRecentWindowSeconds: 3600
+    });
+
+    const first = runFullDeploy(sandbox);
+
+    expect(first.output).toMatch(/第 0 1 2 3 4 5 6 7 8 步 —— 全部退出 0/u);
+    expect(first.status).toBe(0);
+    // Step 2 really ran before step 3 and really started the user gateway -
+    // the README's mandated ordering, exercised rather than assumed.
+    const log = readFileSync(sandbox.callLog, "utf8");
+    expect(log.indexOf("pnpm launchd:install-backup-alerts")).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf("pnpm launchd:install-backup-alerts")).toBeLessThan(log.indexOf("sudo zsh"));
+    expect(readFileSync(sandbox.machine.openclawLog, "utf8")).toContain("gateway install");
+    expect([...latestExitPerStep(sandbox).entries()].sort((a, b) => a[0] - b[0]))
+      .toEqual([[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0], [8, 0]]);
+    // The handover happened: daemons up, the step-2 gateway taken over and
+    // archived, nothing left running in the user domain.
+    expect(loadedSystemLabels(sandbox.machine)).toEqual([...SYSTEM_LABELS].sort());
+    expect(loadedUserLabels(sandbox.machine)).not.toContain("ai.openclaw.gateway");
+    expect(archivedLabels(sandbox.machine)).toContain("ai.openclaw.gateway");
+
+    // Idempotence, and the system-domain half of the fix: run 2 boots out the
+    // eight daemons run 1 bootstrapped seconds ago - every one of them
+    // freshly-started, every bootout draining - and still converges.
+    const second = runFullDeploy(sandbox);
+
+    expect(second.status).toBe(0);
+    expect(second.output).toMatch(/第 0 1 2 3 4 5 6 7 8 步 —— 全部退出 0/u);
+    expect(loadedSystemLabels(sandbox.machine)).toEqual([...SYSTEM_LABELS].sort());
+    expect(loadedUserLabels(sandbox.machine)).not.toContain("ai.openclaw.gateway");
+  }, 55_000);
+
+  it("still fails closed, stopping the deploy at step 3, when an agent genuinely will not die", () => {
+    const sandbox = makeFullDeploySandbox("alphaloop-t28-wedged-", {
+      surviveBootoutLabels: ["ai.openclaw.gateway"]
+    });
+    // A wedged label is only declared after the full deadline, so keep the
+    // deadline short here - the property is the refusal, not the wait.
+    sandbox.env.BOOTOUT_SETTLE_SECONDS = "1";
+
+    const { status, output } = runFullDeploy(sandbox);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/is STILL loaded \d+s after bootout/u);
+    expect(output).toMatch(/部署在第 3 步（安装系统 daemon）失败/u);
+    const latest = latestExitPerStep(sandbox);
+    expect(latest.get(3)).toBe(1);
+    expect([...latest.keys()].sort((a, b) => a - b)).toEqual([0, 1, 2, 3]);
+    // The machine keeps the one copy it was running: the wedged user gateway
+    // stays, and its daemon is never bootstrapped next to it.
+    expect(loadedUserLabels(sandbox.machine)).toContain("ai.openclaw.gateway");
+    expect(loadedSystemLabels(sandbox.machine)).not.toContain("ai.openclaw.system.gateway");
+  }, 55_000);
 });

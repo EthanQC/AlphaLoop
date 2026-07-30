@@ -165,8 +165,13 @@ git -C ~/AlphaLoop fetch origin && git -C ~/AlphaLoop pull --ff-only origin main
 pnpm install && pnpm build
 
 # 2. 安装用户级任务（当前只有 com.alphaloop.rsshub），并顺带 `openclaw gateway install`。
-#    必须排在第 3 步之前：这一步会创建用户级 ai.openclaw.gateway，第 3 步会把它 bootout；
-#    顺序反了，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
+#    必须排在第 3 步之前：这一步会创建【并启动】用户级 ai.openclaw.gateway，第 3 步会把它
+#    bootout；顺序反了，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
+#    这个顺序的代价在 2026-07-30 修掉了（task 28）：bootout 一个刚启动、SIGTERM 收得慢的
+#    agent 时，launchctl 立即返回而 launchd 还要 drain 最多 ExitTimeOut=20 秒；第 3 步以前
+#    bootout 完立刻复查，所以【完整跑必挂在第 3 步、resume 才能过】（mini 实测两次）。现在
+#    第 3 步会按截止时间轮询等 drain 结束（BOOTOUT_SETTLE_SECONDS，默认 30 秒），完整跑
+#    第一次就能过；等满仍活着的 agent 依旧判失败、该服务拒绝交接。
 #    可重跑：每个模板都是 launchctl unload 之后再 load。
 pnpm launchd:install-backup-alerts
 
@@ -174,7 +179,9 @@ pnpm launchd:install-backup-alerts
 #    先干跑一次，确认这次会为哪个用户安装（不写任何文件、不建目录、不调 launchctl）：
 PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
 #    确认输出里的 target_user / target_home / node_bin 是部署机操作者本人的之后，再真正安装。
-#    它按【服务】逐个交接：①停掉该服务的用户级副本 → ②bootstrap 它的 daemon
+#    它按【服务】逐个交接：①停掉该服务的用户级副本——bootout 之后【等 launchd 真正把进程
+#    收走】（轮询，上限 BOOTOUT_SETTLE_SECONDS=30 秒；实测 SIGTERM 收得慢的进程要 drain 到
+#    ExitTimeOut=20 秒，期间 launchctl print 一直答得上来）→ ②bootstrap 它的 daemon
 #    → ③**验证它真的在跑**（不是"launchctl 认得它"）→ ④确认后才把该标签的用户级 plist
 #    【移进】备份目录（永远是移动，不是删除）。
 #    第 ③ 步是 2026-07-29 补的：之前它只问 `launchctl print` 退出码，那只能证明"注册过"。

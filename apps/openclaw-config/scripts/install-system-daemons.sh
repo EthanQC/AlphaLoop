@@ -144,6 +144,21 @@ BOOTSTRAP_SETTLE_SECONDS="${BOOTSTRAP_SETTLE_SECONDS:-2}"
 # user-level copy. See verify_daemon() for exactly what that does and does not
 # prove.
 VERIFY_SETTLE_SECONDS="${VERIFY_SETTLE_SECONDS:-3}"
+# Task 28 (2026-07-30): how long a `launchctl bootout` is given to SETTLE
+# before a label that is still in the job table is declared wedged. 30 because
+# the number is not free to choose: `bootout` of a SIGTERM-slow process
+# returns 0 immediately while launchd goes on draining the job for up to its
+# ExitTimeOut, and the one plist this script boots out that is not its own -
+# ai.openclaw.gateway, written by `openclaw gateway install` - carries
+# ExitTimeOut=20 (read off the mini's archived copy). Measured on a real
+# launchd (2026-07-30, throwaway agent with that plist's KeepAlive=true +
+# ExitTimeOut=20, process ignoring SIGTERM): bootout returned 0 in 35ms,
+# `launchctl print` kept answering for 20.2s, the pid never changed (a drain,
+# NOT a KeepAlive restart - so waiting is correct and disable-then-bootout is
+# not needed), then the label vanished. A TERM-obedient agent was gone in
+# ~40ms. 30s covers the 20s worst case with margin; a label still present
+# after that is genuinely wedged, and the fail-closed paths below fire.
+BOOTOUT_SETTLE_SECONDS="${BOOTOUT_SETTLE_SECONDS:-30}"
 OWNERSHIP_FILE="${OWNERSHIP_FILE:-${SCRIPT_DIR}/install-launchd-ownership.txt}"
 HEALTH_CHECKER="${HEALTH_CHECKER:-${SCRIPT_DIR}/launchd-health.mjs}"
 DEPLOY_LEDGER="${DEPLOY_LEDGER:-${SCRIPT_DIR}/deploy-ledger.mjs}"
@@ -828,7 +843,11 @@ done
 # running twice, a service whose daemon does not come up HEALTHY is left running
 # the same copy it was running before this script started, and re-running from
 # the top converges (every step is idempotent; each daemon is enabled and booted
-# out before it is bootstrapped).
+# out before it is bootstrapped). Task 28: the gap's length is now honest too -
+# a SIGTERM-slow copy is WAITED for while launchd drains it (up to
+# BOOTOUT_SETTLE_SECONDS, default 30s; measured worst case 20.2s against the
+# gateway plist's ExitTimeOut=20), instead of being declared wedged by a
+# re-check that ran microseconds after the bootout.
 #
 # What is NOT promised, and is not knowable from launchd: that a daemon this
 # script reports as running is doing its job. Step 8 of the runbook
@@ -944,6 +963,35 @@ EOF
 # still holding the port/database, starting the new one is the collision, and
 # the machine is strictly better off running only the old copy until a human
 # looks.
+#
+# Task 28 (2026-07-30). "Survives bootout" is decided by a DEADLINE now, not by
+# one immediate re-check. Measured live on the mini, twice: a FULL deploy.sh
+# run always failed here with 「is STILL loaded after bootout」 for
+# ai.openclaw.gateway (started seconds earlier by runbook step 2, exactly as
+# the README orders) plus platform-app and cron-runner, while a resume from
+# step 3 fifteen minutes later succeeded - the bootouts had settled in
+# between. The mechanism (measured on a real launchd, see
+# BOOTOUT_SETTLE_SECONDS): bootout returns immediately and the label stays in
+# the job table for up to the process's ExitTimeOut (20s on the gateway's own
+# plist) while launchd escalates SIGTERM to SIGKILL; the pid never changes, so
+# this is a drain to wait out, not a KeepAlive resurrection to disable. The
+# immediate re-check therefore condemned every label whose process did not die
+# in the microseconds between two launchctl invocations - and a full run
+# always presented it one, because step 2 had just started the gateway.
+# bootout_settled below polls until the label leaves the job table or the
+# deadline passes; only the deadline turns into the fail-closed path.
+bootout_settled() {
+  local target="$1"
+  local deadline=$(( $(date +%s) + BOOTOUT_SETTLE_SECONDS ))
+  while "${LAUNCHCTL}" print "${target}" >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "${deadline}" ]; then
+      return 1
+    fi
+    sleep 0.5
+  done
+  return 0
+}
+
 stop_user_agent() {
   local user_label="$1"
   local system_label="${2:-}"
@@ -951,8 +999,8 @@ stop_user_agent() {
     return 0
   fi
   "${LAUNCHCTL}" bootout "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1 || true
-  if "${LAUNCHCTL}" print "gui/${TARGET_UID}/${user_label}" >/dev/null 2>&1; then
-    echo "install-system-daemons: ERROR: gui/${TARGET_UID}/${user_label} is STILL loaded after bootout." >&2
+  if ! bootout_settled "gui/${TARGET_UID}/${user_label}"; then
+    echo "install-system-daemons: ERROR: gui/${TARGET_UID}/${user_label} is STILL loaded ${BOOTOUT_SETTLE_SECONDS}s after bootout." >&2
     if [ -n "${system_label}" ]; then
       printf "%s\n" "${user_label}" >> "${TMP_DIR}/still-loaded.${system_label}"
     fi
@@ -1062,19 +1110,24 @@ EOF
   # one port and one database - so this service is failed here, before anything
   # irreversible, and the machine keeps running the copy it already had.
   if [ -s "${TMP_DIR}/still-loaded.${system_label}" ]; then
-    record_failure "${system_label}" "user-level $(tr '\n' ' ' < "${TMP_DIR}/still-loaded.${system_label}")is STILL loaded after bootout; refusing to bootstrap the daemon because both copies would then run on the same port/database. Stop it by hand (launchctl bootout gui/${TARGET_UID}/<label>) and re-run."
+    record_failure "${system_label}" "user-level $(tr '\n' ' ' < "${TMP_DIR}/still-loaded.${system_label}")is STILL loaded ${BOOTOUT_SETTLE_SECONDS}s after bootout; refusing to bootstrap the daemon because both copies would then run on the same port/database. Stop it by hand (launchctl bootout gui/${TARGET_UID}/<label>) and re-run."
     restore_user_agents "${stopped_agents}"
     continue
   fi
 
   # --- 2. bring the daemon up ---------------------------------------------
+  # Task 28: the drain wait here used to be a fixed 20 x 0.25s = 5s beat, while
+  # the daemon plists this script writes carry no ExitTimeOut - so a re-deploy
+  # booting out a running, SIGTERM-slow daemon could exhaust the beat with the
+  # label still draining (launchd's default escalation window is the same 20s
+  # the user-agent side measured). Same deadline as the user domain now. On
+  # timeout the run proceeds: `bootstrap` on a still-registered label fails,
+  # and that failure takes the per-label fail-closed path below (record, keep
+  # the fallback, restore) - which is exactly what a wedged label deserves.
   "${LAUNCHCTL}" bootout "system/${system_label}" >/dev/null 2>&1 || true
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if ! "${LAUNCHCTL}" print "system/${system_label}" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.25
-  done
+  if ! bootout_settled "system/${system_label}"; then
+    echo "install-system-daemons: warning: system/${system_label} is still draining ${BOOTOUT_SETTLE_SECONDS}s after bootout; bootstrap below will decide." >&2
+  fi
   sleep "${BOOTSTRAP_SETTLE_SECONDS}"
 
   # Finding C3, second half: `enable` comes FIRST, before bootstrap and
