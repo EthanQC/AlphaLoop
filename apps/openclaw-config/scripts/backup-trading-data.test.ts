@@ -414,6 +414,18 @@ describe("parseRetentionDaysArg", () => {
   });
 });
 
+describe("readOptionalValueFlag", () => {
+  it("distinguishes an omitted flag from a present --memoryd-root with no value", () => {
+    expect(backup.readOptionalValueFlag([], "--memoryd-root")).toBeUndefined();
+    expect(backup.readOptionalValueFlag(["--memoryd-root", "/managed/memoryd"], "--memoryd-root"))
+      .toBe("/managed/memoryd");
+    expect(() => backup.readOptionalValueFlag(["--memoryd-root"], "--memoryd-root"))
+      .toThrow(/--memoryd-root requires a value/u);
+    expect(() => backup.readOptionalValueFlag(["--memoryd-root", "--dest", "/backups"], "--memoryd-root"))
+      .toThrow(/--memoryd-root requires a value/u);
+  });
+});
+
 describe("retention failure isolation", () => {
   it("still reports ok:true with the files it created when retention cleanup itself errors", () => {
     const dbDir = makeTempDir("alphaloop-retention-fail-db-");

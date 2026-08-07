@@ -269,6 +269,21 @@ function readFlagValue(argv, flag) {
 }
 
 /**
+ * Reads an optional flag whose presence promises a value. Omission returns
+ * undefined; a present flag with no value fails closed instead of silently
+ * disabling the requested managed backup.
+ */
+export function readOptionalValueFlag(argv, flag) {
+  const index = argv.indexOf(flag);
+  if (index < 0) return undefined;
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+/**
  * Parses the CLI's `--retention-days` value. `undefined` (flag omitted entirely) legitimately
  * means "use the default" - but a flag that WAS given and doesn't parse as a number (a typo, a
  * missing value swallowed by another flag, etc.) used to silently fall back to that same default
@@ -326,10 +341,10 @@ async function runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot
 async function main() {
   const args = process.argv.slice(2);
   const dest = resolve(readFlagValue(args, "--dest") ?? join(repoRoot, "runtime", "backups"));
-  const memorydRoot = readFlagValue(args, "--memoryd-root");
   const dbPath = resolveRuntimePaths(repoRoot).dbPath;
 
   try {
+    const memorydRoot = readOptionalValueFlag(args, "--memoryd-root");
     const retentionDays = parseRetentionDaysArg(readFlagValue(args, "--retention-days"));
     const result = await runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot });
     console.log(JSON.stringify(result));
