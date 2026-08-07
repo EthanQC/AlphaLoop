@@ -603,7 +603,7 @@ async function handleConfirm(
   // draft -> confirmed, one-way, idempotent on an already-confirmed review
   // (MonthlyReviewRepository.confirm's own contract) - a duplicate click
   // never throws or re-stamps confirmed_at.
-  repo.confirm(id, identity.id);
+  const confirmation = repo.confirmTransition(id, identity.id);
 
   const typed = loadReviewById(deps.db, id);
   if (!typed) {
@@ -611,6 +611,23 @@ async function handleConfirm(
     // here would mean it vanished mid-request, which should never happen in
     // practice, but this degrades honestly rather than throwing.
     sendJson(res, 500, { ok: false, error: "复盘确认后重新读取失败" });
+    return;
+  }
+
+  const alreadyConfirmed = !confirmation.transitioned;
+  if (alreadyConfirmed) {
+    if (isFormUrlEncoded(req)) {
+      res.writeHead(303, { Location: `/review/${id}` });
+      res.end();
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      alreadyConfirmed: true,
+      review: typed,
+      mirror: { mirrored: false, reason: "already_confirmed" },
+      notify: { delivered: false, reason: "already_confirmed" }
+    });
     return;
   }
 
@@ -640,7 +657,7 @@ async function handleConfirm(
     return;
   }
 
-  sendJson(res, 200, { ok: true, review: typed, mirror, notify });
+  sendJson(res, 200, { ok: true, alreadyConfirmed: false, review: typed, mirror, notify });
 }
 
 // ---------------------------------------------------------------------------

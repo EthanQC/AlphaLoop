@@ -139,6 +139,10 @@ describe("memoryd archiving", () => {
     const dbPath = join(dbDir, "trading.sqlite");
     seedTradingDb(dbPath);
     writeFileSync(join(memorydRoot, "notes.md"), "# memoryd notes");
+    writeFileSync(join(memorydRoot, "index.db"), "rebuildable sqlite index");
+    writeFileSync(join(memorydRoot, "index.db-wal"), "volatile wal");
+    writeFileSync(join(memorydRoot, "index.db-shm"), "volatile shm");
+    writeFileSync(join(memorydRoot, "interrupted.tmp"), "temporary write");
 
     const now = new Date("2026-07-12T01:00:00.000Z");
     const result = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, memorydRoot, now });
@@ -151,20 +155,45 @@ describe("memoryd archiving", () => {
     const listing = spawnSync("tar", ["-tzf", tgzPath], { encoding: "utf8" });
     expect(listing.status).toBe(0);
     expect(listing.stdout).toContain("notes.md");
+    expect(listing.stdout).not.toContain("index.db");
+    expect(listing.stdout).not.toContain("interrupted.tmp");
   });
 
-  it("skips the memoryd archive with a note instead of failing when the root is missing", () => {
+  it("atomically preserves the previous archive if a same-day tar rerun fails", () => {
+    const destDir = makeTempDir("alphaloop-memoryd-atomic-dest-");
+    const memorydRoot = makeTempDir("alphaloop-memoryd-atomic-root-");
+    const destPath = join(destDir, "memoryd-2026-07-12.tgz");
+    writeFileSync(join(memorydRoot, "notes.md"), "known-good");
+    backup.backupMemorydRoot(memorydRoot, destPath);
+    const goodBytes = readFileSync(destPath);
+
+    expect(() => backup.backupMemorydRoot(memorydRoot, destPath, {
+      spawnTar: (_command: string, args: string[]) => {
+        writeFileSync(args[1]!, "partial archive");
+        return { status: 1, stderr: Buffer.from("disk full") };
+      }
+    })).toThrow(/disk full/u);
+
+    expect(readFileSync(destPath).equals(goodBytes)).toBe(true);
+    expect(existsSync(`${destPath}.tmp`)).toBe(false);
+  });
+
+  it("fails before writing any backup when an explicitly configured memoryd root is missing", () => {
     const dbDir = makeTempDir("alphaloop-memoryd-missing-db-");
     const destDir = makeTempDir("alphaloop-memoryd-missing-dest-");
     const dbPath = join(dbDir, "trading.sqlite");
     seedTradingDb(dbPath);
     const missingRoot = join(destDir, "does-not-exist");
 
-    const result = backup.runBackup({ dbPath, dest: destDir, retentionDays: 30, memorydRoot: missingRoot, now: new Date("2026-07-12T01:00:00.000Z") });
+    expect(() => backup.runBackup({
+      dbPath,
+      dest: destDir,
+      retentionDays: 30,
+      memorydRoot: missingRoot,
+      now: new Date("2026-07-12T01:00:00.000Z")
+    })).toThrow(/memoryd.*not found|not.*directory/iu);
 
-    expect(result.ok).toBe(true);
-    expect(result.files).toEqual([join(destDir, "trading-2026-07-12.sqlite")]);
-    expect(result.skipped).toEqual([{ path: missingRoot, reason: "memoryd-root-missing" }]);
+    expect(existsSync(join(destDir, "trading-2026-07-12.sqlite"))).toBe(false);
     expect(existsSync(join(destDir, "memoryd-2026-07-12.tgz"))).toBe(false);
   });
 });

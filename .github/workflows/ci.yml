@@ -7,7 +7,10 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # The production/runtime contract is macOS launchd. Several acceptance
+    # tests intentionally execute zsh, plutil and launchctl, so Linux cannot
+    # exercise this gate and previously reported 62+ infrastructure failures.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

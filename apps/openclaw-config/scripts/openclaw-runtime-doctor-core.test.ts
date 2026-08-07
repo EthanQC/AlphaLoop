@@ -1503,6 +1503,38 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
       expect.objectContaining({ code: "platform-app-health.unreachable", severity: "warn" })
     ]));
   });
+
+  it("bounds a platform-app response whose headers arrive but JSON body never completes", async () => {
+    const reportPromise = doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      platformAppPort: 991,
+      platformAppHealthTimeoutMs: 25,
+      fetchImpl: async (url: string, init: RequestInit = {}) => {
+        if (Number(new URL(String(url)).port) !== 991) return stubbedLoopbackFetch(url, init);
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          })
+        };
+      }
+    });
+
+    const outcome = await Promise.race([
+      reportPromise,
+      new Promise<{ hung: true }>((resolve) => setTimeout(() => resolve({ hung: true }), 250))
+    ]);
+    expect(outcome).toMatchObject({ ok: false });
+    expect("findings" in outcome && outcome.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "platform-app-health.unexpected_body", severity: "error" })
+    ]));
+  });
 });
 
 describe("memoryd-health check", () => {
@@ -1522,21 +1554,25 @@ describe("memoryd-health check", () => {
   });
 
   it("performs a real MCP initialize exchange and closes the session", async () => {
-    const methods: string[] = [];
+    const requests: Array<{ method: string; protocolVersion: string | null }> = [];
     const probe = await doctor.probeMemorydMcp({
       url: "http://127.0.0.1:8766/mcp",
       fetchImpl: async (_url: RequestInfo | URL, init: RequestInit = {}) => {
-        methods.push(String(init.method));
+        requests.push({
+          method: String(init.method),
+          protocolVersion: new Headers(init.headers).get("mcp-protocol-version")
+        });
         if (init.method === "DELETE") return new Response(null, { status: 200 });
         return new Response(
-          `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd" } } })}\n\n`,
+          `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18", serverInfo: { name: "memoryd" } } })}\n\n`,
           { status: 200, headers: { "mcp-session-id": "doctor-session" } }
         );
       }
     });
 
     expect(probe).toMatchObject({ ok: true, serverName: "memoryd", sessionId: true });
-    expect(methods).toEqual(["POST", "DELETE"]);
+    expect(requests.map(({ method }) => method)).toEqual(["POST", "DELETE"]);
+    expect(requests[1]?.protocolVersion).toBe("2025-06-18");
   });
 
   it("bounds session cleanup so a wedged DELETE cannot hang the doctor", async () => {
@@ -1547,7 +1583,7 @@ describe("memoryd-health check", () => {
       fetchImpl: async (_url: RequestInfo | URL, init: RequestInit = {}) => {
         if (init.method !== "DELETE") {
           return new Response(
-            `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd" } } })}\n\n`,
+            `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18", serverInfo: { name: "memoryd" } } })}\n\n`,
             { status: 200, headers: { "mcp-session-id": "wedged-cleanup" } }
           );
         }
@@ -1559,6 +1595,32 @@ describe("memoryd-health check", () => {
 
     expect(probe).toMatchObject({ ok: true, serverName: "memoryd" });
     expect(Date.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("bounds an initialize response whose headers arrive but body never completes", async () => {
+    const probePromise = doctor.probeMemorydMcp({
+      url: "http://127.0.0.1:8766/mcp",
+      timeoutMs: 25,
+      fetchImpl: async (_url: RequestInfo | URL, init: RequestInit = {}) => {
+        if (init.method === "DELETE") return new Response(null, { status: 200 });
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: new Headers({ "mcp-session-id": "hanging-body" }),
+          text: () => new Promise<string>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          })
+        } as Response;
+      }
+    });
+
+    const outcome = await Promise.race([
+      probePromise,
+      new Promise<{ hung: true }>((resolve) => setTimeout(() => resolve({ hung: true }), 250))
+    ]);
+
+    expect(outcome).toMatchObject({ ok: false, kind: "unreachable" });
   });
 
   it("fails a deployed machine and only warns on a dev machine when MCP is unreachable", async () => {
@@ -1584,6 +1646,26 @@ describe("memoryd-health check", () => {
 
     expect(deployed.findings).toContainEqual(expect.objectContaining({ code: "memoryd-health.unreachable", severity: "error" }));
     expect(dev.findings).toContainEqual(expect.objectContaining({ code: "memoryd-health.unreachable", severity: "warn" }));
+  });
+
+  it("fails on a deploy target even when memoryd itself is the missing launchd label", async () => {
+    const launchdJobs = ALL_LAUNCHD_JOBS_LOADED.map((row) => (
+      row.label === "com.alphaloop.memoryd" ? { ...row, loadedDomains: [], state: null } : row
+    ));
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      memorydMcpProbe: { ok: false, kind: "unreachable", url: "http://127.0.0.1:8766/mcp", reason: "ECONNREFUSED" },
+      launchdJobs
+    });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({
+      code: "memoryd-health.unreachable",
+      severity: "error"
+    }));
   });
 
   it("reports malformed initialize responses and non-success HTTP statuses as deployed errors", async () => {
@@ -2128,6 +2210,39 @@ describe("broker-executor-health check (round-4 finding I5)", () => {
     expect(finding?.severity).toBe("error");
     expect(finding?.message).toContain("launchd 当前持有这个标签");
   });
+
+  it("bounds a broker-executor response whose headers arrive but JSON body never completes", async () => {
+    const reportPromise = doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...OUTSIDE_MARKET_HOURS,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      brokerExecutorPort: 992,
+      brokerExecutorHealthTimeoutMs: 25,
+      fetchImpl: async (url: string, init: RequestInit = {}) => {
+        if (Number(new URL(String(url)).port) !== 992) return stubbedLoopbackFetch(url, init);
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          })
+        };
+      }
+    });
+
+    const outcome = await Promise.race([
+      reportPromise,
+      new Promise<{ hung: true }>((resolve) => setTimeout(() => resolve({ hung: true }), 250))
+    ]);
+    expect(outcome).toMatchObject({ ok: false });
+    expect("findings" in outcome && outcome.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "broker-executor-health.unexpected_body", severity: "error" })
+    ]));
+  });
 });
 
 // Round-4 finding I5: daily-backup has no port and writes no run_log row -
@@ -2157,16 +2272,15 @@ describe("daily-backup-health check (round-4 finding I5)", () => {
   function seedRealBackup(runtimeRoot: string, whenMs: number): void {
     const dbDir = makeTempDir("alphaloop-doctor-backup-src-");
     const dbPath = join(dbDir, "trading.sqlite");
+    const memorydRoot = join(dbDir, "memoryd");
+    mkdirSync(memorydRoot, { recursive: true });
+    writeFileSync(join(memorydRoot, "state.txt"), "memoryd-state", "utf8");
     openTradingDatabase(dbPath).close();
     const result = runBackup({
       dbPath,
       dest: join(runtimeRoot, "backups"),
       retentionDays: 3650,
-      // Passed explicitly because runBackup destructures it with no default, so
-      // TypeScript reads it as required. `undefined` is what omitting it always
-      // meant at runtime: backup-trading-data.mjs:203 skips the memoryd tarball
-      // unless a root is given, which is the case this seed wants.
-      memorydRoot: undefined,
+      memorydRoot,
       now: new Date(whenMs)
     });
     expect(result.ok).toBe(true);
@@ -2211,6 +2325,47 @@ describe("daily-backup-health check (round-4 finding I5)", () => {
     expect(report.ok).toBe(true);
     expect(report.findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "daily-backup-health.never_ran", severity: "warn" })
+    ]));
+  });
+
+  it("fails when SQLite is backed up but the managed memoryd root is not", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    const dbDir = makeTempDir("alphaloop-doctor-backup-src-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+    runBackup({
+      dbPath,
+      dest: join(runtimeRoot, "backups"),
+      retentionDays: 3650,
+      now: new Date(NOW_MS)
+    });
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "daily-backup-health.memoryd_missing", severity: "error" })
+    ]));
+  });
+
+  it("fails when today's SQLite backup exists but the newest memoryd archive is two days old", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    seedRealBackup(runtimeRoot, NOW_MS - 2 * 24 * 60 * 60_000);
+    const dbDir = makeTempDir("alphaloop-doctor-backup-src-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    openTradingDatabase(dbPath).close();
+    runBackup({
+      dbPath,
+      dest: join(runtimeRoot, "backups"),
+      retentionDays: 3650,
+      now: new Date(NOW_MS)
+    });
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "daily-backup-health.memoryd_stale", severity: "error" })
     ]));
   });
 

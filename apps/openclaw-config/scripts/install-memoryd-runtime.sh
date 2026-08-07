@@ -28,6 +28,12 @@ elif [ ! -d "${SOURCE_DIR}/.git" ]; then
   exit 1
 fi
 
+ACTUAL_SOURCE_URL="$("${GIT_BIN}" -C "${SOURCE_DIR}" config --get remote.origin.url || true)"
+if [ "${ACTUAL_SOURCE_URL}" != "${SOURCE_URL}" ]; then
+  echo "install-memoryd-runtime: ${SOURCE_DIR} origin is ${ACTUAL_SOURCE_URL:-missing}, expected ${SOURCE_URL}; refusing to clean an unmanaged checkout." >&2
+  exit 1
+fi
+
 "${GIT_BIN}" -C "${SOURCE_DIR}" fetch --depth 1 origin "${SOURCE_REV}"
 "${GIT_BIN}" -C "${SOURCE_DIR}" checkout --detach --force "${SOURCE_REV}"
 ACTUAL_REV="$("${GIT_BIN}" -C "${SOURCE_DIR}" rev-parse HEAD)"
@@ -35,6 +41,12 @@ if [ "${ACTUAL_REV}" != "${SOURCE_REV}" ]; then
   echo "install-memoryd-runtime: expected ${SOURCE_REV}, checked out ${ACTUAL_REV}." >&2
   exit 1
 fi
+
+# This directory is dedicated to the pinned runtime. uv installs the local
+# project editable, so untracked Python files would otherwise remain importable
+# even when HEAD exactly matches SOURCE_REV. Clean only after verifying the
+# checkout's origin above; this must never run against an arbitrary directory.
+"${GIT_BIN}" -C "${SOURCE_DIR}" clean -ffd
 
 if [ ! -f "${SOURCE_DIR}/memoryd/uv.lock" ]; then
   echo "install-memoryd-runtime: pinned source has no memoryd/uv.lock." >&2

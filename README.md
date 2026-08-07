@@ -279,7 +279,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents.disabled/openclaw-system
 
 - `com.alphaloop.platform-app`（系统域，`KeepAlive`）——`pnpm --filter @apps/platform-app start`，日志 `logs/platform-app.log`。
 - `com.alphaloop.market-alerts`（系统域，每 300 秒）——盘中提醒轮询。
-- `com.alphaloop.daily-backup`（系统域，每天 05:30）——交易数据库备份。
+- `com.alphaloop.daily-backup`（系统域，每天 05:30）——交易数据库一致性快照 + memoryd Markdown 真源归档（在线 SQLite 索引不入包，恢复后重建）。
 - `com.openclaw.trading.cron-runner`（系统域，`KeepAlive`）——执行 openclaw cron 派发的日报/周报/个股分析。
 - `com.openclaw.trading.official-paper.poll` / `.pnl`（系统域，每小时 :30 / :00）——官方模拟盘轮询与收支变化表。
 - `ai.openclaw.system.gateway` / `com.openclaw.system.trading.broker-executor`（系统域，`KeepAlive`）。

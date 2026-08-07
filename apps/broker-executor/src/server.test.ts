@@ -152,7 +152,12 @@ describe("createBrokerExecutorServer", () => {
     let previousLive: string | undefined;
 
     function startServer(deps: Partial<BrokerExecutorServerDeps> = {}) {
-      server = createBrokerExecutorServer({ db, sharedSecret: SHARED_SECRET, ...deps });
+      server = createBrokerExecutorServer({
+        db,
+        sharedSecret: SHARED_SECRET,
+        executionContextResolver: () => ({ mode: "legacy-global", env: { ...process.env } }),
+        ...deps
+      });
       return new Promise<void>((resolve) => {
         server.listen(0, "127.0.0.1", () => resolve());
       });
@@ -769,6 +774,47 @@ describe("createBrokerExecutorServer", () => {
       expect(ownerResponse.status).toBe(200);
     });
 
+    it("blocks the second same-owner 6% naked short when that account's open risk reaches 12%", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      let orderCounter = 0;
+      const fn: LongbridgeExecFn = () => {
+        orderCounter += 1;
+        return JSON.stringify({ order_id: `ext_same_owner_short_${orderCounter}`, status: "Pending" });
+      };
+      await startServer({ execFn: fn });
+
+      const first = createApprovedProposal(db, {
+        ownerId: "mem_owner",
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 60,
+        limitPrice: 100
+      });
+      const firstResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: first.id })
+      });
+      expect(firstResponse.status).toBe(200);
+
+      const second = createApprovedProposal(db, {
+        ownerId: "mem_owner",
+        symbol: "NVDA.US",
+        side: "sell",
+        quantity: 60,
+        limitPrice: 100
+      });
+      const secondResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: second.id })
+      });
+
+      expect(secondResponse.status).toBe(400);
+      const body = await secondResponse.json();
+      expect(body.reasons.join(" ")).toMatch(/OpenClaw 官方模拟盘预算/u);
+    });
+
     it("threads ownerId/proposalId onto the lifecycle row from the server-built ticket (never trusts the request body's fields)", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       const { fn } = makeCountingExec({ order_id: "ext_thread_1", status: "Filled" });
@@ -797,6 +843,136 @@ describe("createBrokerExecutorServer", () => {
       expect(lifecycleRow.symbol).toBe("AAPL.US");
       expect(lifecycleRow.side).toBe("buy");
       expect(lifecycleRow.quantity).toBe(3);
+    });
+
+    it("resolves the execution environment from proposal.ownerId and passes it to both broker CLI calls", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      const resolvedOwners: string[] = [];
+      const seenTokens: Array<string | undefined> = [];
+      const fn: LongbridgeExecFn = (_command, args, options) => {
+        seenTokens.push(options.env.LONGBRIDGE_ACCESS_TOKEN);
+        return args[1] === "detail"
+          ? JSON.stringify({ status: "Pending" })
+          : JSON.stringify({ order_id: "ext_owner_env", status: "New" });
+      };
+      await startServer({
+        execFn: fn,
+        executionContextResolver: (ownerId) => {
+          resolvedOwners.push(ownerId);
+          return {
+            mode: "member",
+            env: {
+              ...process.env,
+              LONGBRIDGE_ACCESS_TOKEN: `token-for-${ownerId}`,
+              LONGBRIDGE_ACCOUNT_MODE: "paper",
+              LONGBRIDGE_OFFICIAL_PAPER_ENABLED: "true",
+              ALLOW_LIVE_EXECUTION: "false"
+            }
+          };
+        }
+      });
+      const proposal = createApprovedProposal(db, { ownerId: "mem_owner" });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+      expect(resolvedOwners).toEqual(["mem_owner"]);
+      expect(seenTokens).toEqual(["token-for-mem_owner", "token-for-mem_owner"]);
+    });
+
+    it("fails closed before recording or calling the broker when owner credentials cannot be resolved", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      let execCalls = 0;
+      await startServer({
+        execFn: () => {
+          execCalls += 1;
+          return "{}";
+        },
+        executionContextResolver: () => {
+          throw new Error("owner-specific credentials are missing");
+        }
+      });
+      const proposal = createApprovedProposal(db, { ownerId: "mem_owner" });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(503);
+      expect(execCalls).toBe(0);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM official_paper_order_lifecycle").get()).toEqual({ c: 0 });
+    });
+
+    it("never uses a legacy shared snapshot to authorize a member-account sell", async () => {
+      seedSnapshot(db, {
+        ownerId: null,
+        netAssets: 100_000,
+        marketValue: 10_000,
+        positions: [{ symbol: "TSLA.US", quantity: 100 }]
+      });
+      let execCalls = 0;
+      await startServer({
+        execFn: () => {
+          execCalls += 1;
+          return JSON.stringify({ order_id: "must_not_submit" });
+        },
+        executionContextResolver: () => ({
+          mode: "member",
+          env: {
+            ...process.env,
+            LONGBRIDGE_ACCESS_TOKEN: "owner-token",
+            LONGBRIDGE_ACCOUNT_MODE: "paper",
+            LONGBRIDGE_OFFICIAL_PAPER_ENABLED: "true",
+            ALLOW_LIVE_EXECUTION: "false"
+          }
+        })
+      });
+      const proposal = createApprovedProposal(db, {
+        ownerId: "mem_owner",
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 50,
+        limitPrice: 100
+      });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.reasons.join(" ")).toMatch(/新鲜可信官方模拟盘账户快照/u);
+      expect(execCalls).toBe(0);
+    });
+
+    it("allows the legacy single-account context to use its shared snapshot", async () => {
+      seedSnapshot(db, { ownerId: null, netAssets: 100_000, marketValue: 0 });
+      const { fn, callCount } = makeCountingExec({ order_id: "ext_legacy_shared", status: "Pending" });
+      await startServer({ execFn: fn });
+      const proposal = createApprovedProposal(db, {
+        ownerId: "mem_owner",
+        symbol: "AAPL.US",
+        side: "buy",
+        quantity: 10,
+        limitPrice: 100
+      });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+      expect(callCount()).toBe(2);
     });
 
     it("400s when a malformed (non-JSON) body is sent, after the secret check but before touching the database", async () => {

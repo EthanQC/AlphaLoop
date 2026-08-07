@@ -291,6 +291,7 @@ const PLATFORM_APP_HEALTH_DEFAULT_PORT = 4314;
 const PLATFORM_APP_HEALTH_TIMEOUT_MS = 1500;
 const MEMORYD_MCP_DEFAULT_URL = "http://127.0.0.1:8766/mcp";
 const MEMORYD_MCP_HEALTH_TIMEOUT_MS = 1500;
+const MEMORYD_MCP_PROTOCOL_VERSION = "2025-06-18";
 
 // How stale the market-alerts poller's run_log heartbeat can get before the
 // doctor treats it as "stopped ticking" - only checked while
@@ -1381,10 +1382,19 @@ async function checkPlatformAppHealth(snapshot) {
   const fetchImpl = typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch;
 
   let response;
+  let body;
+  let parseError;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     response = await fetchImpl(url, { signal: controller.signal });
+    if (response.ok) {
+      try {
+        body = await response.json();
+      } catch (error) {
+        parseError = error;
+      }
+    }
   } catch (fetchError) {
     // Round-5 finding D2: error when launchd is holding com.alphaloop.platform-app
     // (the daemon is supposed to be serving this port right now), warn when it
@@ -1409,10 +1419,7 @@ async function checkPlatformAppHealth(snapshot) {
     )];
   }
 
-  let body;
-  try {
-    body = await response.json();
-  } catch (parseError) {
+  if (parseError) {
     return [error(
       "platform-app-health.unexpected_body",
       `platform-app 健康检查响应无法解析为 JSON（${url}）：${describeError(parseError)}。`
@@ -1474,14 +1481,16 @@ export async function probeMemorydMcp({
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
     try {
-      return await fetchImpl(targetUrl, { ...init, signal: controller.signal });
+      const response = await fetchImpl(targetUrl, { ...init, signal: controller.signal });
+      const responseText = await response.text();
+      return { response, responseText };
     } finally {
       clearTimeout(timeout);
     }
   };
   let sessionId = null;
   try {
-    const response = await fetchBounded({
+    const exchange = await fetchBounded({
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1492,20 +1501,29 @@ export async function probeMemorydMcp({
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: "2025-06-18",
+          protocolVersion: MEMORYD_MCP_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: "alphaloop-doctor", version: "1" }
         }
       })
     });
+    const { response } = exchange;
     if (!response.ok) {
       return { ok: false, kind: "status", url: targetUrl, status: response.status, statusText: response.statusText };
     }
     sessionId = response.headers?.get?.("mcp-session-id") ?? null;
-    const message = parseMemorydMcpEvent(await response.text());
+    const message = parseMemorydMcpEvent(exchange.responseText);
     const serverName = message?.result?.serverInfo?.name;
-    if (message?.error || serverName !== "memoryd" || !sessionId) {
-      return { ok: false, kind: "body", url: targetUrl, serverName, sessionId: Boolean(sessionId) };
+    const protocolVersion = message?.result?.protocolVersion;
+    if (message?.error || serverName !== "memoryd" || protocolVersion !== MEMORYD_MCP_PROTOCOL_VERSION || !sessionId) {
+      return {
+        ok: false,
+        kind: "body",
+        url: targetUrl,
+        serverName,
+        protocolVersion,
+        sessionId: Boolean(sessionId)
+      };
     }
     return { ok: true, url: targetUrl, serverName, sessionId: true };
   } catch (probeError) {
@@ -1517,7 +1535,8 @@ export async function probeMemorydMcp({
           method: "DELETE",
           headers: {
             accept: "application/json, text/event-stream",
-            "mcp-session-id": sessionId
+            "mcp-session-id": sessionId,
+            "mcp-protocol-version": MEMORYD_MCP_PROTOCOL_VERSION
           }
         });
       } catch {
@@ -1549,12 +1568,15 @@ async function checkMemorydHealth(snapshot) {
     )];
   }
 
-  const severity = probeSeverityFor(snapshot, "com.alphaloop.memoryd");
+  // memoryd may be the one missing label after a partial deploy. In that
+  // state checking only its own loaded bit would mislabel a real deploy target
+  // as a normal developer machine, so use the machine-wide footprint gate.
+  const severity = deployTargetSeverityFor(snapshot);
   return [severity(
     "memoryd-health.unreachable",
     `memoryd MCP 健康检查不可达（${probe?.url ?? MEMORYD_MCP_DEFAULT_URL}）：${probe?.reason ?? "unknown error"}。`
       + (severity === error
-        ? `${LOADED_BUT_UNREACHABLE_SUFFIX}请看 logs/memoryd.err.log，并确认 pnpm memoryd:install-runtime 已完成。`
+        ? `这是部署目标（${describeDeployFootprint(snapshot)}）。请看 logs/memoryd.err.log，并确认 pnpm memoryd:install-runtime 及系统 daemon 安装已完成。`
         : "开发机上尚未安装 memoryd 是正常的；部署前请运行 pnpm memoryd:install-runtime。")
   )];
 }
@@ -1588,10 +1610,19 @@ async function checkBrokerExecutorHealth(snapshot) {
   const fetchImpl = typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch;
 
   let response;
+  let body;
+  let parseError;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     response = await fetchImpl(url, { signal: controller.signal });
+    if (response.ok) {
+      try {
+        body = await response.json();
+      } catch (error) {
+        parseError = error;
+      }
+    }
   } catch (fetchError) {
     const severity = probeSeverityFor(snapshot, "com.openclaw.system.trading.broker-executor");
     return [severity(
@@ -1614,10 +1645,7 @@ async function checkBrokerExecutorHealth(snapshot) {
     )];
   }
 
-  let body;
-  try {
-    body = await response.json();
-  } catch (parseError) {
+  if (parseError) {
     return [error(
       "broker-executor-health.unexpected_body",
       `broker-executor 健康检查响应无法解析为 JSON（${url}）：${describeError(parseError)}。`
@@ -1637,9 +1665,9 @@ async function checkBrokerExecutorHealth(snapshot) {
 // Round-4 finding I5 - "daily-backup-health" check. daily-backup is the
 // second of the four unprobed daemons, and unlike the KeepAlive services it
 // has no port and writes no run_log row: the only thing that proves it did
-// its job is the ARTIFACT it produces, `runtime/backups/trading-<日期>.sqlite`
-// (see backup-trading-data.mjs's runBackup). So "working" here means "the
-// newest backup file is dated today or yesterday".
+// its job is the pair of artifacts it produces:
+// `runtime/backups/trading-<日期>.sqlite` and `memoryd-<日期>.tgz`.
+// So "working" means both newest backup files are dated today or yesterday.
 //
 // The date comes from parseBackupFileDate/formatLocalDate imported from that
 // same producer module rather than a second copy of its file-name pattern
@@ -1663,16 +1691,17 @@ function checkDailyBackupHealth(snapshot, nowMs) {
   }
 
   const backupsDir = join(snapshot.runtimeRoot, "backups");
-  const stamps = existsSync(backupsDir)
-    ? readdirSync(backupsDir)
-      .filter((name) => name.startsWith("trading-"))
-      .map((name) => parseBackupFileDate(name))
-      .filter(Boolean)
-      .sort()
-    : [];
-  const newest = stamps.at(-1) ?? null;
+  const backupNames = existsSync(backupsDir) ? readdirSync(backupsDir) : [];
+  const newestFor = (prefix) => backupNames
+    .filter((name) => name.startsWith(`${prefix}-`))
+    .map((name) => parseBackupFileDate(name))
+    .filter(Boolean)
+    .sort()
+    .at(-1) ?? null;
+  const newestTrading = newestFor("trading");
+  const newestMemoryd = newestFor("memoryd");
 
-  if (!newest) {
+  if (!newestTrading) {
     return [warn(
       "daily-backup-health.never_ran",
       `com.alphaloop.daily-backup 已加载，但 ${backupsDir} 里没有任何 trading-<日期>.sqlite 备份——这个任务从未成功产出过。`
@@ -1680,15 +1709,33 @@ function checkDailyBackupHealth(snapshot, nowMs) {
     )];
   }
 
+  if (!newestMemoryd) {
+    return [error(
+      "daily-backup-health.memoryd_missing",
+      `com.alphaloop.daily-backup 已加载且有 SQLite 备份，但 ${backupsDir} 里没有 memoryd-<日期>.tgz。`
+        + `请确认 daemon 命令带 --memoryd-root，并手动跑一次 pnpm backup:daily -- --memoryd-root "$HOME/Library/Application Support/AlphaLoop/memoryd"。`
+    )];
+  }
+
   const todayStamp = formatLocalDate(new Date(nowMs), DAILY_BACKUP_TIMEZONE);
-  const ageDays = Math.round(
-    (Date.parse(`${todayStamp}T00:00:00Z`) - Date.parse(`${newest}T00:00:00Z`)) / 86_400_000
+  const ageDaysFor = (stamp) => Math.round(
+    (Date.parse(`${todayStamp}T00:00:00Z`) - Date.parse(`${stamp}T00:00:00Z`)) / 86_400_000
   );
-  if (Number.isFinite(ageDays) && ageDays >= DAILY_BACKUP_STALE_DAYS) {
+  const tradingAgeDays = ageDaysFor(newestTrading);
+  if (Number.isFinite(tradingAgeDays) && tradingAgeDays >= DAILY_BACKUP_STALE_DAYS) {
     return [error(
       "daily-backup-health.stale",
-      `每日备份已经 ${ageDays} 天没有产出：${backupsDir} 里最新的一份是 trading-${newest}.sqlite，今天是 ${todayStamp}。`
+      `每日备份已经 ${tradingAgeDays} 天没有产出：${backupsDir} 里最新的一份是 trading-${newestTrading}.sqlite，今天是 ${todayStamp}。`
         + `com.alphaloop.daily-backup 每天 05:30 跑一次，隔两天就说明至少漏了一次。请看 logs/daily-backup.err.log，或手动跑 pnpm backup:daily 复现。`
+    )];
+  }
+
+  const memorydAgeDays = ageDaysFor(newestMemoryd);
+  if (Number.isFinite(memorydAgeDays) && memorydAgeDays >= DAILY_BACKUP_STALE_DAYS) {
+    return [error(
+      "daily-backup-health.memoryd_stale",
+      `memoryd 备份已经 ${memorydAgeDays} 天没有产出：${backupsDir} 里最新的一份是 memoryd-${newestMemoryd}.tgz，今天是 ${todayStamp}。`
+        + `请看 logs/daily-backup.err.log，或用 --memoryd-root 手动复现。`
     )];
   }
 

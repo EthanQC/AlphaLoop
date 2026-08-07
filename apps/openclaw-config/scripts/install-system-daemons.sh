@@ -713,7 +713,7 @@ write_plist \
 write_plist \
   "${TMP_DIR}/com.alphaloop.daily-backup.plist" \
   "com.alphaloop.daily-backup" \
-  "${COMMON_ENV} cd '${REPO_ROOT}' && exec pnpm backup:daily" \
+  "${COMMON_ENV} cd '${REPO_ROOT}' && exec pnpm backup:daily -- --memoryd-root '${MEMORYD_DATA_ROOT}'" \
   "${REPO_LOG_DIR}/daily-backup.log" \
   "${REPO_LOG_DIR}/daily-backup.err.log" \
   "false" \

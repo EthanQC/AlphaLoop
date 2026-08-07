@@ -58,14 +58,15 @@ export function evaluateRisk(
     );
   }
 
-  if (ticket.environment === "paper" && trustedPaperFacts && ticket.side === "buy") {
-    // Phase 6 Task 4, Global Constraint ④: open (not-yet-filled) orders for
-    // this owner count against the budget too - otherwise two sequential
-    // 9.5% orders would each independently read "under the 10% cap" against
-    // the same account snapshot, when together they are 19%.
+  if (ticket.environment === "paper" && trustedPaperFacts && riskIncreasingNotional > 0) {
+    // The gate is direction-independent: buys and sell-to-open both increase
+    // account risk, while a sell fully covered by the held long has
+    // riskIncreasingNotional=0 and remains a permitted de-risking action.
+    // This owner's open not-yet-filled orders are account risk too, so splitting
+    // two 6% shorts (or two 9.5% buys) cannot bypass the 10% Constitution cap.
     const openOrdersNotionalUsd = trustedPaperFacts.openOrdersNotionalUsd ?? 0;
     const projectedOfficialPaperExposureUsd =
-      trustedPaperFacts.currentExposureUsd + openOrdersNotionalUsd + ticket.notionalUsd;
+      trustedPaperFacts.currentExposureUsd + openOrdersNotionalUsd + riskIncreasingNotional;
     const projectedOfficialPaperExposurePercent =
       (projectedOfficialPaperExposureUsd / trustedPaperFacts.accountNetLiq) * 100;
 

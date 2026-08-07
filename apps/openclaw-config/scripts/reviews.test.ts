@@ -680,16 +680,24 @@ describe("confirm", () => {
     expect(notifierArgs.lines.join("\n")).not.toContain("NaN");
   });
 
-  it("is idempotent: confirming an already-confirmed review a second time does not throw and stays confirmed", async () => {
+  it("is idempotent: a second confirmation skips memoryd and Feishu side effects", async () => {
     const { db, options } = makeDb();
     seedMember(db, OWNER_A);
     const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });
+    const memoryd = fakeMemorydBackend();
+    const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_once" }));
+    const confirmOptions = { ...options, memorydBackend: memoryd.backend, feishuNotifier };
 
-    await cli.runConfirm({ owner: OWNER_A, review: generated.review.id }, options);
-    const second = await cli.runConfirm({ owner: OWNER_A, review: generated.review.id }, options);
+    await cli.runConfirm({ owner: OWNER_A, review: generated.review.id }, confirmOptions);
+    const second = await cli.runConfirm({ owner: OWNER_A, review: generated.review.id }, confirmOptions);
 
     expect(second.ok).toBe(true);
+    expect(second.alreadyConfirmed).toBe(true);
     expect(second.review.status).toBe("confirmed");
+    expect(second.mirror).toEqual({ mirrored: false, reason: "already_confirmed" });
+    expect(second.notify).toEqual({ delivered: false, reason: "already_confirmed" });
+    expect(memoryd.calls).toHaveLength(1);
+    expect(feishuNotifier).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an unknown review id", async () => {

@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiTokenRepository,
@@ -505,13 +505,39 @@ describe("monthly review reading page + confirm endpoint", () => {
       expect(response.status).toBe(303);
     });
 
-    it("is idempotent: confirming an already-confirmed review succeeds again (no throw, no re-stamped confirmed_at change of status)", async () => {
-      const id = seedConfirmed(memberA.id, "2026-07");
-      const response = await post(`/api/reviews/${id}/confirm`, withBearer(tokenA));
-      expect(response.status).toBe(200);
-      const payload = (await response.json()) as { ok: boolean; review: { status: string } };
-      expect(payload.ok).toBe(true);
-      expect(payload.review.status).toBe("confirmed");
+    it("is idempotent: a duplicate confirm skips memoryd and Feishu side effects", async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      const memorydBackend = vi.fn(async () => ({ ok: true, memoryId: "mem_once" }));
+      const feishuNotifier = vi.fn(async () => ({ ok: true, messageId: "om_once" }));
+      server = createPlatformServer({ db, repoRoot, memorydBackend, feishuNotifier });
+      await new Promise<void>((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+          resolve();
+        });
+      });
+
+      const id = seedDraft(memberA.id, "2026-07");
+      const first = await post(`/api/reviews/${id}/confirm`, withBearer(tokenA));
+      expect(first.status).toBe(200);
+      const second = await post(`/api/reviews/${id}/confirm`, withBearer(tokenA));
+      expect(second.status).toBe(200);
+      const payload = (await second.json()) as {
+        ok: boolean;
+        alreadyConfirmed: boolean;
+        review: { status: string };
+        mirror: { mirrored: boolean; reason: string };
+        notify: { delivered: boolean; reason: string };
+      };
+      expect(payload).toMatchObject({
+        ok: true,
+        alreadyConfirmed: true,
+        review: { status: "confirmed" },
+        mirror: { mirrored: false, reason: "already_confirmed" },
+        notify: { delivered: false, reason: "already_confirmed" }
+      });
+      expect(memorydBackend).toHaveBeenCalledTimes(1);
+      expect(feishuNotifier).toHaveBeenCalledTimes(1);
     });
   });
 });

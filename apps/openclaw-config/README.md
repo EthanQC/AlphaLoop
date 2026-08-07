@@ -58,6 +58,14 @@ pnpm official-paper:poll
 pnpm official-paper:pnl
 ```
 
+多成员模式下，每位成员的执行凭据放在
+`~/.alphaloop/credentials/<member-id>/longbridge.env`。成员目录必须为 `0700`，
+凭据必须是当前运行用户拥有的普通文件且不能含 group/other 权限（推荐 `0600`，不能是符号链接）；
+`broker-executor` 会按提案的 `owner_id` 加载它，并把独立的 `HOME`/rate-limit
+目录只注入该次 Longbridge 子进程。只在数据库恰好有一个 active member、且整个成员凭据树为空时，
+才兼容原来的进程全局长桥环境；一旦出现第二位 active member 或任一成员凭据文件，缺少当前 owner
+凭据就会在落 lifecycle/调用券商之前 fail-closed。
+
 ## Launchd
 
 完整部署顺序见仓库根 `README.md` 的「部署机安装顺序」，这里只补充"为什么"。
@@ -102,6 +110,29 @@ sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
 pnpm launchd:install-user
 ```
 
+### memoryd 备份与恢复
+
+`com.alphaloop.daily-backup` 每天同时生成 `trading-YYYY-MM-DD.sqlite` 和
+`memoryd-YYYY-MM-DD.tgz`。memoryd 包只保存 Markdown 真源；在线写入的
+`index.db`、WAL/SHM 和临时文件被明确排除，避免 tar 得到跨时点 SQLite
+快照。归档先写同目录 `.tmp`，成功后原子替换，所以同日重跑失败不会
+截断上一份好包。
+
+恢复必须在 memoryd daemon 停止时解到一个空数据根，并从 Markdown 重建索引：
+
+```bash
+memoryd_root="$HOME/Library/Application Support/AlphaLoop/memoryd"
+sudo launchctl bootout system/com.alphaloop.memoryd
+mv "$memoryd_root" "${memoryd_root}.pre-restore-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$memoryd_root"
+tar -xzf runtime/backups/memoryd-YYYY-MM-DD.tgz -C "$memoryd_root"
+MEMORYD_DATA_ROOT="$memoryd_root" \
+  "$HOME/.local/share/alphaloop-memoryd/source/memoryd/.venv/bin/memoryd" rebuild-index
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.alphaloop.memoryd.plist
+```
+
+恢复前的目录用时间戳保留，可回滚；不要把旧 `index.db` 拷回新目录。
+
 历史包袱提醒：ac741d8 之前 `launchd:install-user` 和 `openclaw:cron:install` 各自会安装 plist，那时的文档要求"三条都跑一遍"。现在它们只剩退役逻辑，照旧文档跑会把运行中的服务全部下线而什么都装不上。
 
 只剩一条顺序约束：
@@ -142,7 +173,7 @@ pnpm launchd:install-user
 
 launchd 不保证 `RunAtLoad` 的 daemon 和 mihomo 绑上 7897 之间的先后，所以"开机时抢在 mihomo 前面"是真实存在的窗口。也就是说这 6 个服务加上 proxy 变量，好的时候没用，坏的时候把局部故障放大成全面故障。
 
-从代码看这 6 个到底连什么：`daily-backup` 根本不出网（`backup-trading-data.mjs` 只做本地 sqlite 拷贝）；`market-alerts` 和 `official-paper` poll/pnl 走本地 Longbridge CLI（`openapi.longportapp.com`）和飞书（`open.feishu.cn`），上面的 curl 已证明两者直连可达；`platform-app` 只监听本地端口；`cron-runner` 通过 `127.0.0.1` 连 gateway（`NO_PROXY` 本来就排除了它），真正发往 Anthropic 的流量是 gateway 进程出去的，不是 cron-runner。这一组里唯一被墙的目标是 `cron-runner` 派发的 `stock-analysis.mjs` 要取的 `news.google.com`（还有 `finnhub.io`）——而它走的正是 TUN 默认路由，恰好就是 7897 存在的那个前提。
+从代码看这 6 个到底连什么：`daily-backup` 根本不出网（`backup-trading-data.mjs` 只做本地 SQLite 快照与 memoryd Markdown tar 归档）；`market-alerts` 和 `official-paper` poll/pnl 走本地 Longbridge CLI（`openapi.longportapp.com`）和飞书（`open.feishu.cn`），上面的 curl 已证明两者直连可达；`platform-app` 只监听本地端口；`cron-runner` 通过 `127.0.0.1` 连 gateway（`NO_PROXY` 本来就排除了它），真正发往 Anthropic 的流量是 gateway 进程出去的，不是 cron-runner。这一组里唯一被墙的目标是 `cron-runner` 派发的 `stock-analysis.mjs` 要取的 `news.google.com`（还有 `finnhub.io`）——而它走的正是 TUN 默认路由，恰好就是 7897 存在的那个前提。
 
 保留 proxy 的那两个：`gateway` 是唯一目标确定被墙的服务（`api.anthropic.com`），而且这是当前 mini 上已验证在跑的配置（`/Library/LaunchDaemons/ai.openclaw.system.gateway.plist` 今天就带着这 8 个 key）。`broker-executor` 的目标是 Longbridge，按上面的逻辑其实也可以改直连，但它是下单链路，这次改动没有在 mini 上实跑验证过，所以**有意不动**。
 

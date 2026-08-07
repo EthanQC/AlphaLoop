@@ -55,10 +55,12 @@ describe("install-memoryd-runtime", () => {
     };
 
     execFileSync("zsh", [script], { env });
+    const checkout = join(installRoot, "source");
+    writeFileSync(join(checkout, "memoryd", "rogue.py"), "raise RuntimeError('untracked code must not survive')\n");
     execFileSync("zsh", [script], { env });
 
-    const checkout = join(installRoot, "source");
     expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: checkout, encoding: "utf8" }).trim()).toBe(revision);
+    expect(existsSync(join(checkout, "memoryd", "rogue.py"))).toBe(false);
     expect(existsSync(join(checkout, "memoryd", ".venv", "bin", "memoryd-mcp"))).toBe(true);
     expect(existsSync(join(home, "Library", "Application Support", "AlphaLoop", "memoryd"))).toBe(true);
     expect(readFileSync(uvLog, "utf8").trim().split("\n")).toEqual([

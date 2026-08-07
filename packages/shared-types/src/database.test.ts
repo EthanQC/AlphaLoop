@@ -3288,7 +3288,6 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
       ticketId: "t_yesterday", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
       side: "buy", quantity: 1, limitPrice: 100, submittedAt: "2026-07-14T23:00:00.000Z"
     });
-
     expect(repo.countSubmittedTodayForOwner("mem_owner", "2026-07-15T00:00:00.000Z")).toBe(2);
   });
 });
@@ -3543,6 +3542,18 @@ describe("MonthlyReviewRepository (Phase 9 Task 1, 2026-07-16 plan)", () => {
       const secondConfirm = repo.confirm(review.id, "mem_owner");
 
       expect(secondConfirm).toEqual(firstConfirm);
+    });
+
+    it("atomically reports which caller performed the draft-to-confirmed transition", () => {
+      const { repo } = setup();
+      const review = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07" });
+
+      const first = repo.confirmTransition(review.id, "mem_owner");
+      const staleSecondCaller = repo.confirmTransition(review.id, "mem_owner");
+
+      expect(first.transitioned).toBe(true);
+      expect(staleSecondCaller.transitioned).toBe(false);
+      expect(staleSecondCaller.review).toEqual(first.review);
     });
   });
 

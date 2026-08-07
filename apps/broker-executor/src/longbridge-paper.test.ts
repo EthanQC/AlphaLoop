@@ -176,6 +176,50 @@ describe("Longbridge paper output parsing", () => {
       expect(result.brokerOrderStage).toBe("filled");
       expect(result.fillPrice).toBe(101.5);
     });
+
+    it("uses the supplied owner-specific environment for submit, guard validation, and detail lookup", () => {
+      const seenEnvs: NodeJS.ProcessEnv[] = [];
+      const fakeExec: LongbridgeExecFn = (_command, args, options) => {
+        seenEnvs.push(options.env);
+        return args[1] === "detail"
+          ? JSON.stringify({ status: "Pending" })
+          : JSON.stringify({ order_id: "owner_order_1", status: "New" });
+      };
+      const ownerEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        LONGBRIDGE_ACCESS_TOKEN: "owner-specific-token",
+        LONGBRIDGE_ACCOUNT_MODE: "paper",
+        LONGBRIDGE_OFFICIAL_PAPER_ENABLED: "true",
+        ALLOW_LIVE_EXECUTION: "false",
+        HOME: "/tmp/member-home"
+      };
+
+      const result = executeLongbridgePaperOrder(baseTicket(), fakeExec, ownerEnv);
+
+      expect(result.externalOrderId).toBe("owner_order_1");
+      expect(seenEnvs).toHaveLength(2);
+      expect(seenEnvs.every((env) => env.LONGBRIDGE_ACCESS_TOKEN === "owner-specific-token")).toBe(true);
+      expect(seenEnvs.every((env) => env.HOME === "/tmp/member-home")).toBe(true);
+    });
+
+    it("checks the actual owner-specific execution env instead of the process-global paper guard", () => {
+      let calls = 0;
+      const fakeExec: LongbridgeExecFn = () => {
+        calls += 1;
+        return JSON.stringify({ order_id: "must_not_submit" });
+      };
+
+      const result = executeLongbridgePaperOrder(baseTicket(), fakeExec, {
+        ...process.env,
+        LONGBRIDGE_ACCOUNT_MODE: "live",
+        LONGBRIDGE_OFFICIAL_PAPER_ENABLED: "true",
+        ALLOW_LIVE_EXECUTION: "false"
+      });
+
+      expect(result.status).toBe("rejected");
+      expect(result.reasons.join(" ")).toMatch(/LONGBRIDGE_ACCOUNT_MODE=paper/u);
+      expect(calls).toBe(0);
+    });
   });
 });
 

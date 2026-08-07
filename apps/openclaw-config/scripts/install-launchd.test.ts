@@ -683,6 +683,8 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     expect(plistValue(plistFor("com.alphaloop.daily-backup"), "StartCalendarInterval.Hour")).toBe("5");
     expect(plistValue(plistFor("com.alphaloop.daily-backup"), "StartCalendarInterval.Minute")).toBe("30");
     expect(commandOf("com.alphaloop.daily-backup")).toContain("pnpm backup:daily");
+    expect(commandOf("com.alphaloop.daily-backup")).toContain("--memoryd-root '");
+    expect(commandOf("com.alphaloop.daily-backup")).toContain("Library/Application Support/AlphaLoop/memoryd'");
 
     expect(plistValue(plistFor("com.openclaw.trading.official-paper.poll"), "StartCalendarInterval.Minute")).toBe("30");
     expect(commandOf("com.openclaw.trading.official-paper.poll")).toContain("official-paper-monitor.mjs' poll");
@@ -1856,6 +1858,25 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     expect(analysis.findings.map((f) => f.code)).toContain("deploy-ledger.step_0_failed");
     expect(analysis.findings.find((f) => f.code === "deploy-ledger.step_0_failed")?.message)
       .toMatch(/DEPLOY_FROM_STEP=0/u);
+  });
+
+  it("a failed memoryd runtime install makes step 2 fail before the user-agent installer runs", () => {
+    const runbook = makeRunbook("alphaloop-memoryd-step2-failure-", {
+      FAIL_PNPM_SCRIPT: "memoryd:install-runtime"
+    });
+
+    const { status, output } = runDeploy(runbook);
+
+    expect(status).toBe(1);
+    expect(output).toMatch(/第 2 步（安装用户级 LaunchAgent）失败/u);
+    expect(calls(runbook)).toContain("pnpm memoryd:install-runtime");
+    expect(calls(runbook)).not.toContain("pnpm launchd:install-backup-alerts");
+    expect(calls(runbook)).not.toContain("sudo zsh");
+    expect(receipts(runbook)).toEqual([
+      expect.objectContaining({ step: 0, exitCode: 0 }),
+      expect.objectContaining({ step: 1, exitCode: 0 }),
+      expect.objectContaining({ step: 2, exitCode: 1 })
+    ]);
   });
 
   it("a dirty tracked file is caught BEFORE git is asked to pull, with the file named", () => {

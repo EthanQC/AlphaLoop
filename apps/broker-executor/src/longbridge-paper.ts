@@ -25,14 +25,15 @@ export type LongbridgeExecFn = (
 // Global Constraint ⑥: execFileSync now always carries an explicit timeout
 // (LONGBRIDGE_CLI_TIMEOUT_MS, default 45s) - previously unbounded, a hung CLI
 // process could block this whole (single-threaded) HTTP server forever.
-function resolveCliTimeoutMs(): number {
-  const raw = Number(process.env.LONGBRIDGE_CLI_TIMEOUT_MS ?? 45_000);
+function resolveCliTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = Number(env.LONGBRIDGE_CLI_TIMEOUT_MS ?? 45_000);
   return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
 }
 
 export function executeLongbridgePaperOrder(
   ticket: OrderTicket,
-  execFn: LongbridgeExecFn = execFileSync
+  execFn: LongbridgeExecFn = execFileSync,
+  executionEnv: NodeJS.ProcessEnv = process.env
 ): ExecutionResult {
   if (ticket.environment !== "paper") {
     return {
@@ -59,7 +60,8 @@ export function executeLongbridgePaperOrder(
     };
   }
 
-  const guardFailure = validateOfficialPaperGuard();
+  const cliEnv = buildLongbridgeCliEnv(executionEnv);
+  const guardFailure = validateOfficialPaperGuard(cliEnv);
   if (guardFailure) {
     return {
       ticketId: ticket.id,
@@ -103,7 +105,7 @@ export function executeLongbridgePaperOrder(
   // lookup failing after a known-good order_id does not cast doubt on the
   // order's existence the way a failed SUBMIT call does.
   const observedAt = new Date().toISOString();
-  const output = execFn(resolveLongbridgeCli(), [
+  const output = execFn(resolveLongbridgeCli(cliEnv), [
     "order",
     ticket.side,
     ticket.symbol,
@@ -121,12 +123,12 @@ export function executeLongbridgePaperOrder(
     "json"
   ], {
     encoding: "utf8",
-    env: buildLongbridgeCliEnv(),
-    timeout: resolveCliTimeoutMs()
+    env: cliEnv,
+    timeout: resolveCliTimeoutMs(cliEnv)
   });
   const submissionPayload = parseLongbridgeOutput(output);
   const externalOrderId = extractOrderId(submissionPayload);
-  const detailPayload = externalOrderId ? readOrderDetail(externalOrderId, execFn) : undefined;
+  const detailPayload = externalOrderId ? readOrderDetail(externalOrderId, execFn, cliEnv) : undefined;
   const statusPayload = detailPayload ?? submissionPayload;
   const brokerStatus = extractBrokerStatus(statusPayload);
   const brokerOrderStage = brokerStatus
@@ -208,8 +210,8 @@ export function mapBrokerStatusToStage(status: string): OfficialPaperOrderLifecy
   return mapBrokerStatusToStageDetailed(status).stage;
 }
 
-function buildLongbridgeCliEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+function buildLongbridgeCliEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...source };
   for (const key of [
     "LONGBRIDGE_ACCESS_TOKEN",
     "LONGPORT_ACCESS_TOKEN"
@@ -221,31 +223,35 @@ function buildLongbridgeCliEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function resolveLongbridgeCli(): string {
-  return process.env.LONGBRIDGE_CLI_PATH ?? `${homedir()}/.local/bin/longbridge`;
+function resolveLongbridgeCli(env: NodeJS.ProcessEnv): string {
+  return env.LONGBRIDGE_CLI_PATH ?? `${homedir()}/.local/bin/longbridge`;
 }
 
-function validateOfficialPaperGuard(): string[] | undefined {
+function validateOfficialPaperGuard(env: NodeJS.ProcessEnv): string[] | undefined {
   const reasons: string[] = [];
 
-  if (process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
+  if (env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED !== "true") {
     reasons.push("长桥官方模拟盘执行要求 LONGBRIDGE_OFFICIAL_PAPER_ENABLED=true。");
   }
 
-  if (process.env.LONGBRIDGE_ACCOUNT_MODE !== "paper") {
+  if (env.LONGBRIDGE_ACCOUNT_MODE !== "paper") {
     reasons.push("长桥官方模拟盘执行要求 LONGBRIDGE_ACCOUNT_MODE=paper。");
   }
 
-  if (process.env.ALLOW_LIVE_EXECUTION !== "false") {
+  if (env.ALLOW_LIVE_EXECUTION !== "false") {
     reasons.push("长桥官方模拟盘执行要求 ALLOW_LIVE_EXECUTION=false。");
   }
 
   return reasons.length > 0 ? reasons : undefined;
 }
 
-function readOrderDetail(orderId: string, execFn: LongbridgeExecFn): unknown | undefined {
+function readOrderDetail(
+  orderId: string,
+  execFn: LongbridgeExecFn,
+  executionEnv: NodeJS.ProcessEnv
+): unknown | undefined {
   try {
-    const output = execFn(resolveLongbridgeCli(), [
+    const output = execFn(resolveLongbridgeCli(executionEnv), [
       "order",
       "detail",
       orderId,
@@ -253,8 +259,8 @@ function readOrderDetail(orderId: string, execFn: LongbridgeExecFn): unknown | u
       "json"
     ], {
       encoding: "utf8",
-      env: buildLongbridgeCliEnv(),
-      timeout: resolveCliTimeoutMs()
+      env: executionEnv,
+      timeout: resolveCliTimeoutMs(executionEnv)
     });
 
     return parseLongbridgeOutput(output);

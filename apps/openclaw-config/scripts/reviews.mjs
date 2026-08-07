@@ -413,7 +413,22 @@ export async function runConfirm(flags, options = {}) {
   const reviewId = requireFlag(flags, "review");
 
   return withDb(options, async (db) => {
-    const review = new MonthlyReviewRepository(db).confirm(reviewId, ownerId);
+    const repo = new MonthlyReviewRepository(db);
+    const confirmation = repo.confirmTransition(reviewId, ownerId);
+    const review = confirmation.review;
+    const alreadyConfirmed = !confirmation.transitioned;
+
+    if (alreadyConfirmed) {
+      const mirror = { mirrored: false, reason: "already_confirmed" };
+      const notify = { delivered: false, reason: "already_confirmed" };
+      new AuditLogRepository(db).write("monthly_review", "confirm.idempotent", {
+        reviewId: review.id,
+        ownerId,
+        period: review.period,
+        sideEffectsSkipped: true
+      });
+      return { ok: true, alreadyConfirmed: true, review, mirror, notify };
+    }
 
     const summary =
       review.resultJson && typeof review.resultJson === "object" && !Array.isArray(review.resultJson) ? review.resultJson : {};
@@ -443,7 +458,7 @@ export async function runConfirm(flags, options = {}) {
       notified: notify.delivered
     });
 
-    return { ok: true, review, mirror, notify };
+    return { ok: true, alreadyConfirmed: false, review, mirror, notify };
   });
 }
 

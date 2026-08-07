@@ -154,27 +154,30 @@ function parseMcpResponse(text: string): any {
   throw new Error("memoryd MCP response did not contain a JSON event");
 }
 
-async function fetchWithTimeout(
+async function fetchTextWithTimeout(
   fetchImpl: typeof fetch,
   url: string,
   init: RequestInit,
   timeoutMs: number
-): Promise<Response> {
+): Promise<{ response: Response; responseText: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal });
+    const response = await fetchImpl(url, { ...init, signal: controller.signal });
+    const responseText = await response.text();
+    return { response, responseText };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function mcpHeaders(sessionId?: string | null): Record<string, string> {
+function mcpHeaders(sessionId?: string | null, protocolVersion?: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream"
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
+  if (protocolVersion) headers["mcp-protocol-version"] = protocolVersion;
   return headers;
 }
 
@@ -183,17 +186,19 @@ async function postMcp(
   url: string,
   payload: unknown,
   timeoutMs: number,
-  sessionId?: string | null
-): Promise<Response> {
-  const response = await fetchWithTimeout(fetchImpl, url, {
+  sessionId?: string | null,
+  protocolVersion?: string | null
+): Promise<{ response: Response; responseText: string }> {
+  const exchange = await fetchTextWithTimeout(fetchImpl, url, {
     method: "POST",
-    headers: mcpHeaders(sessionId),
+    headers: mcpHeaders(sessionId, protocolVersion),
     body: JSON.stringify(payload)
   }, timeoutMs);
+  const { response } = exchange;
   if (!response.ok) {
     throw new Error(`memoryd MCP request failed: HTTP ${response.status} ${response.statusText}`.trim());
   }
-  return response;
+  return exchange;
 }
 
 function toolResultFromMcp(message: any): MemorydBackendResult {
@@ -231,7 +236,7 @@ export function createMemorydBackend(options: MemorydBackendOptions = {}): Memor
   return async function memorydBackend(args: MemorydBackendArgs): Promise<MemorydBackendResult> {
     let sessionId: string | null = null;
     try {
-      const initializeResponse = await postMcp(fetchImpl, url, {
+      const initializeExchange = await postMcp(fetchImpl, url, {
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
@@ -241,30 +246,35 @@ export function createMemorydBackend(options: MemorydBackendOptions = {}): Memor
           clientInfo: { name: "alphaloop", version: "1" }
         }
       }, timeoutMs);
-      sessionId = initializeResponse.headers.get("mcp-session-id");
-      const initialized = parseMcpResponse(await initializeResponse.text());
-      if (initialized?.error || initialized?.result?.serverInfo?.name !== "memoryd" || !sessionId) {
+      sessionId = initializeExchange.response.headers.get("mcp-session-id");
+      const initialized = parseMcpResponse(initializeExchange.responseText);
+      if (
+        initialized?.error
+        || initialized?.result?.serverInfo?.name !== "memoryd"
+        || initialized?.result?.protocolVersion !== MCP_PROTOCOL_VERSION
+        || !sessionId
+      ) {
         throw new Error("memoryd MCP initialize response was invalid");
       }
 
       await postMcp(fetchImpl, url, {
         jsonrpc: "2.0",
         method: "notifications/initialized"
-      }, timeoutMs, sessionId);
+      }, timeoutMs, sessionId, MCP_PROTOCOL_VERSION);
 
-      const callResponse = await postMcp(fetchImpl, url, {
+      const callExchange = await postMcp(fetchImpl, url, {
         jsonrpc: "2.0",
         id: 2,
         method: "tools/call",
         params: { name: "mem_save", arguments: args }
-      }, timeoutMs, sessionId);
-      return toolResultFromMcp(parseMcpResponse(await callResponse.text()));
+      }, timeoutMs, sessionId, MCP_PROTOCOL_VERSION);
+      return toolResultFromMcp(parseMcpResponse(callExchange.responseText));
     } finally {
       if (sessionId) {
         try {
-          await fetchWithTimeout(fetchImpl, url, {
+          await fetchTextWithTimeout(fetchImpl, url, {
             method: "DELETE",
-            headers: mcpHeaders(sessionId)
+            headers: mcpHeaders(sessionId, MCP_PROTOCOL_VERSION)
           }, timeoutMs);
         } catch {
           // Cleanup is best-effort and cannot hide the write result.

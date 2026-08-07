@@ -157,16 +157,34 @@ export function backupTradingDatabase(dbPath, destPath) {
   renameSync(tmpPath, destPath);
 }
 
-/** Archives `memorydRoot` into a gzip tarball at `destPath`. */
-export function backupMemorydRoot(memorydRoot, destPath) {
-  const result = spawnSync("tar", ["-czf", destPath, "-C", memorydRoot, "."], {
-    stdio: ["ignore", "ignore", "pipe"]
-  });
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error(`tar exited with status ${result.status}: ${result.stderr?.toString("utf8") ?? ""}`);
+/**
+ * Archives memoryd's Markdown source of truth. The live SQLite index and its
+ * journal files are deliberately excluded: a tar walk cannot take a coherent
+ * online multi-file SQLite snapshot, and memoryd rebuilds these derived files
+ * from Markdown after restore.
+ */
+export function backupMemorydRoot(memorydRoot, destPath, { spawnTar = spawnSync } = {}) {
+  const tmpPath = `${destPath}.tmp`;
+  rmSync(tmpPath, { force: true });
+
+  const args = [
+    "-czf", tmpPath,
+    "--exclude", "./index.db",
+    "--exclude", "./index.db-*",
+    "--exclude", "./*.tmp",
+    "-C", memorydRoot,
+    "."
+  ];
+  try {
+    const result = spawnTar("tar", args, { stdio: ["ignore", "ignore", "pipe"] });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`tar exited with status ${result.status}: ${result.stderr?.toString("utf8") ?? ""}`);
+    }
+    renameSync(tmpPath, destPath);
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
+    throw error;
   }
 }
 
@@ -174,12 +192,20 @@ export function backupMemorydRoot(memorydRoot, destPath) {
  * Runs a full daily backup: trading DB snapshot, optional memoryd tarball, then retention cleanup.
  * Returns `{ ok, files, skipped, deleted }` and never touches process state — callers decide how
  * to report/exit.
+ * @param {{
+ *   dbPath: string,
+ *   dest: string,
+ *   retentionDays?: number,
+ *   memorydRoot?: string,
+ *   now?: Date,
+ *   timeZone?: string
+ * }} options
  */
 export function runBackup({
   dbPath,
   dest,
   retentionDays = 30,
-  memorydRoot,
+  memorydRoot = undefined,
   now = new Date(),
   timeZone = "Asia/Shanghai"
 }) {
@@ -188,6 +214,11 @@ export function runBackup({
   }
   if (!existsSync(dbPath)) {
     throw new Error(`Trading database not found: ${dbPath}`);
+  }
+  if (memorydRoot !== undefined) {
+    if (!memorydRoot || !existsSync(memorydRoot) || !statSync(memorydRoot).isDirectory()) {
+      throw new Error(`Configured memoryd root not found or not a directory: ${memorydRoot || "(empty)"}`);
+    }
   }
   // Validated here too (applyRetention validates it again below) so an invalid retentionDays is
   // rejected BEFORE this call does any work at all - not just before the retention sweep - and a
@@ -205,14 +236,10 @@ export function runBackup({
   backupTradingDatabase(dbPath, tradingBackupPath);
   files.push(tradingBackupPath);
 
-  if (memorydRoot) {
-    if (existsSync(memorydRoot) && statSync(memorydRoot).isDirectory()) {
-      const memorydBackupPath = join(dest, `memoryd-${dateStamp}.tgz`);
-      backupMemorydRoot(memorydRoot, memorydBackupPath);
-      files.push(memorydBackupPath);
-    } else {
-      skipped.push({ path: memorydRoot, reason: "memoryd-root-missing" });
-    }
+  if (memorydRoot !== undefined) {
+    const memorydBackupPath = join(dest, `memoryd-${dateStamp}.tgz`);
+    backupMemorydRoot(memorydRoot, memorydBackupPath);
+    files.push(memorydBackupPath);
   }
 
   // Retention is best-effort housekeeping: a fresh trading/memoryd snapshot has already been

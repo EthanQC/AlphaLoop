@@ -254,19 +254,24 @@ describe("createMemorydBackend", () => {
   }
 
   it("initializes MCP, calls mem_save with the exact record, and closes the session", async () => {
-    const requests: Array<{ method: string; body: any; sessionId: string | null }> = [];
+    const requests: Array<{ method: string; body: any; sessionId: string | null; protocolVersion: string | null }> = [];
     const fetchImpl = vi.fn(async (_url: string, init: RequestInit = {}) => {
       const body = init.body ? JSON.parse(String(init.body)) : null;
       requests.push({
         method: String(init.method),
         body,
-        sessionId: new Headers(init.headers).get("mcp-session-id")
+        sessionId: new Headers(init.headers).get("mcp-session-id"),
+        protocolVersion: new Headers(init.headers).get("mcp-protocol-version")
       });
       if (init.method === "DELETE") {
         return new Response(null, { status: 200 });
       }
       if (body?.method === "initialize") {
-        return sse({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd", version: "3.3.1" } } });
+        return sse({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: "2025-06-18", serverInfo: { name: "memoryd", version: "3.3.1" } }
+        });
       }
       if (body?.method === "notifications/initialized") {
         return new Response(null, { status: 202, headers: { "mcp-session-id": "session-1" } });
@@ -294,8 +299,53 @@ describe("createMemorydBackend", () => {
     expect(requests.map((request) => request.method)).toEqual(["POST", "POST", "POST", "DELETE"]);
     expect(requests[2]).toMatchObject({
       sessionId: "session-1",
+      protocolVersion: "2025-06-18",
       body: { method: "tools/call", params: { name: "mem_save", arguments: input } }
     });
+    expect(requests.slice(1).every((request) => request.protocolVersion === "2025-06-18")).toBe(true);
+  });
+
+  it("rejects an initialize response that negotiates an unsupported protocol version", async () => {
+    const backend = memorydMirror.createMemorydBackend({
+      fetchImpl: vi.fn(async (_url: string, init: RequestInit = {}) => {
+        const body = init.body ? JSON.parse(String(init.body)) : null;
+        if (body?.method === "initialize") {
+          return sse({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { protocolVersion: "2024-11-05", serverInfo: { name: "memoryd" } }
+          });
+        }
+        return new Response(null, { status: 200 });
+      })
+    });
+
+    await expect(backend({ scope: "scope", type: "fact", title: "title", content: "content", tags: [] }))
+      .rejects.toThrow(/initialize response was invalid/);
+  });
+
+  it("bounds an initialize response whose headers arrive but body never completes", async () => {
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit = {}) => {
+      if (init.method === "DELETE") return new Response(null, { status: 200 });
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "mcp-session-id": "hanging-body" }),
+        text: () => new Promise<string>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        })
+      } as Response;
+    });
+    const backend = memorydMirror.createMemorydBackend({ fetchImpl, timeoutMs: 25 });
+
+    const outcome = await Promise.race([
+      backend({ scope: "scope", type: "fact", title: "title", content: "content", tags: [] })
+        .then(() => "resolved", () => "rejected"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 250))
+    ]);
+
+    expect(outcome).toBe("rejected");
   });
 
   it("refuses a non-loopback endpoint before making any request", async () => {

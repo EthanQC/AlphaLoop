@@ -46,6 +46,10 @@ const VITEST_BIN = join(dirname(createRequire(join(ROOT, "package.json")).resolv
 
 const scratch: string[] = [];
 
+function stripAnsi(value: string): string {
+  return value.replace(/\u001B\[[0-9;]*m/gu, "");
+}
+
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   scratch.push(dir);
@@ -196,7 +200,7 @@ describe("J1: a detected violation fails the RUN, not just the log", () => {
       }
     );
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-
+    const plainOutput = stripAnsi(output);
     expect(
       result.status,
       `the run must FAIL. Vitest 4.1.7 logs a globalSetup teardown throw as "error during close" and ` +
@@ -208,7 +212,7 @@ describe("J1: a detected violation fails the RUN, not just the log", () => {
     expect(output).toContain("created: import-time.json");
     // The test itself passes: that is what makes this window invisible to the
     // per-test guard, and why a green summary must not mean a green run.
-    expect(output).toMatch(/Tests\s+1 passed/u);
+    expect(plainOutput).toMatch(/Tests\s+1 passed/u);
   });
 
   it("still goes red when the refusal comes from the SETUP phase", { timeout: 120_000 }, () => {
@@ -279,6 +283,7 @@ describe("H1: a test that writes into the guarded root actually fails", () => {
       }
     );
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    const plainOutput = stripAnsi(output);
 
     expect(result.status, `child vitest should have failed. Output:\n${output}`).not.toBe(0);
     expect(output).toContain("wrote into the repository's real runtime directory");
@@ -286,6 +291,6 @@ describe("H1: a test that writes into the guarded root actually fails", () => {
     expect(output).toContain("VIOLATION: writes a state file into the guarded runtime root");
     // The innocent case in the same file still passes: the guard is not just
     // failing everything it sees.
-    expect(output).toMatch(/1 failed \| 1 passed/u);
+    expect(plainOutput).toMatch(/1 failed \| 1 passed/u);
   });
 });

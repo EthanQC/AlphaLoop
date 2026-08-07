@@ -2808,6 +2808,11 @@ export interface UpsertMonthlyReviewDraftInput {
   resultJson?: MonthlyReviewResult;
 }
 
+export interface MonthlyReviewConfirmResult {
+  review: MonthlyReview;
+  transitioned: boolean;
+}
+
 export class MonthlyReviewRepository {
   constructor(private readonly db: DatabaseSync) {}
 
@@ -2880,24 +2885,31 @@ export class MonthlyReviewRepository {
   // ResearchTaskRepository.promoteVisibility above); an ALREADY-confirmed
   // review is an idempotent no-op (a duplicate confirm click - CLI or
   // Feishu - must not throw or re-stamp confirmed_at a second time).
-  confirm(id: string, ownerId: string): MonthlyReview {
-    const existing = this.getById(id);
-    if (!existing) {
+  // The conditional UPDATE is also the cross-process side-effect lease:
+  // exactly one caller receives transitioned=true and may mirror/notify.
+  confirmTransition(id: string, ownerId: string): MonthlyReviewConfirmResult {
+    const confirmedAt = nowIso();
+    const transition = this.db
+      .prepare(`
+        UPDATE monthly_reviews
+        SET status = 'confirmed', confirmed_at = ?, updated_at = ?
+        WHERE id = ? AND owner_id = ? AND status = 'draft'
+      `)
+      .run(confirmedAt, confirmedAt, id, ownerId);
+
+    const reloaded = this.getById(id);
+    if (!reloaded) {
       throw new Error(`Monthly review ${id} not found.`);
     }
-    if (existing.ownerId !== ownerId) {
+    if (reloaded.ownerId !== ownerId) {
       throw new Error(`Monthly review ${id} is not owned by ${ownerId}; refusing to confirm.`);
     }
-    if (existing.status === "confirmed") {
-      return existing;
-    }
 
-    const confirmedAt = nowIso();
-    this.db
-      .prepare(`UPDATE monthly_reviews SET status = 'confirmed', confirmed_at = ?, updated_at = ? WHERE id = ?`)
-      .run(confirmedAt, confirmedAt, id);
+    return { review: reloaded, transitioned: Number(transition.changes) === 1 };
+  }
 
-    return { ...existing, status: "confirmed", confirmedAt, updatedAt: confirmedAt };
+  confirm(id: string, ownerId: string): MonthlyReview {
+    return this.confirmTransition(id, ownerId).review;
   }
 
   getById(id: string): MonthlyReview | null {

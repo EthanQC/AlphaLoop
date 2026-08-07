@@ -157,7 +157,12 @@ export async function pollOfficialPaperPerMember(db, options = {}) {
 
   const results = [];
   for (const { member, creds } of credentialed) {
-    const snapshot = await fetchImpl(member, creds);
+    const env = buildMemberSubprocessEnv(creds);
+    // Per-member files may override LONGBRIDGE_ACCOUNT_MODE. Validate the
+    // fully merged subprocess environment before any broker read so a live
+    // account can never be fetched and mislabeled as official paper data.
+    assertOfficialPaperReportEnvironment(env);
+    const snapshot = await fetchImpl(member, creds, env);
     const snapshotId = saveSnapshot(db, snapshot, reason, member.id);
     results.push({ ownerId: member.id, snapshotId });
   }
@@ -170,8 +175,7 @@ export async function pollOfficialPaperPerMember(db, options = {}) {
 // buildMemberSubprocessEnv) and reuses fetchOfficialPaperSnapshot's exact
 // check/assets/positions/quotes sequence, just threaded with that env
 // instead of the ambient shared-account one.
-async function fetchOfficialPaperSnapshotForMember(member, creds) {
-  const env = buildMemberSubprocessEnv(creds);
+async function fetchOfficialPaperSnapshotForMember(member, creds, env = buildMemberSubprocessEnv(creds)) {
   return fetchOfficialPaperSnapshot({ env, rateLimitDir: creds.cachePaths.rateLimitDir });
 }
 

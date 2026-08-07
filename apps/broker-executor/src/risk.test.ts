@@ -288,6 +288,34 @@ describe("evaluateRisk", () => {
     expect(result.reasons.join(" ")).not.toMatch(/OpenClaw 官方模拟盘预算/u);
   });
 
+  it("blocks a second small naked short when the owner's open risk plus the new short exceeds the 10% account budget", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_second_small_short",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        symbol: "TSLA",
+        side: "sell",
+        quantity: 60,
+        conviction: "normal",
+        notionalUsd: 6_000
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        openOrdersNotionalUsd: 6_000,
+        heldQuantityForSymbol: 0
+      }
+    );
+
+    expect(result.status).toBe("block");
+    expect(result.reasons.join(" ")).toMatch(/OpenClaw 官方模拟盘预算/u);
+  });
+
   // FIX 2 (audit-class finding): the paper-sell exemption used to zero out
   // riskIncreasingNotional for EVERY paper sell regardless of whether the
   // owner actually held the position - a sell-to-open (naked short) of any

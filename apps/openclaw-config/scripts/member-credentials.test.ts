@@ -1,6 +1,6 @@
 // Phase 6 Task 6 (2026-07-15 plan): direct tests for the multi-account
 // credential loader - present/missing/wide-perms-warning/env isolation.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -95,6 +95,8 @@ describe("loadMemberCredentials: present credentials", () => {
     expect(creds?.cachePaths.rateLimitDir).toBe(join(root, "member_1", "rate-limit"));
     expect(existsSync(creds!.cachePaths.home)).toBe(true);
     expect(existsSync(creds!.cachePaths.rateLimitDir)).toBe(true);
+    expect(statSync(creds!.cachePaths.home).mode & 0o077).toBe(0);
+    expect(statSync(creds!.cachePaths.rateLimitDir).mode & 0o077).toBe(0);
   });
 
   it("returns no warnings for an owner-only (0600) credentials file", () => {
@@ -129,6 +131,11 @@ describe("loadMemberCredentials: present credentials", () => {
     expect(credsA?.cachePaths.rateLimitDir).not.toBe(credsB?.cachePaths.rateLimitDir);
     expect(credsA?.env.LONGBRIDGE_ACCESS_TOKEN).toBe("token-a");
     expect(credsB?.env.LONGBRIDGE_ACCESS_TOKEN).toBe("token-b");
+  });
+
+  it("rejects a member id that could escape the credentials root", () => {
+    const root = makeRoot();
+    expect(() => loadMemberCredentials("../outside", { rootDir: root })).toThrow(/member id/i);
   });
 });
 

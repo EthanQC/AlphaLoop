@@ -23,7 +23,7 @@
 // it just means that member has no linked broker account yet (the common
 // case for every member today). Callers degrade to "this member has no
 // account" (loadMemberCredentials returns null), never throw.
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -89,6 +89,9 @@ export function resolveCredentialsRoot(rootDir) {
  * @returns {MemberCredentials | null}
  */
 export function loadMemberCredentials(memberId, { rootDir } = {}) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(memberId) || memberId === "." || memberId === "..") {
+    throw new Error(`Unsafe member id for credentials lookup: ${JSON.stringify(memberId)}`);
+  }
   const root = resolveCredentialsRoot(rootDir);
   const memberDir = join(root, memberId);
   const envPath = join(memberDir, "longbridge.env");
@@ -125,8 +128,14 @@ export function loadMemberCredentials(memberId, { rootDir } = {}) {
     home: join(memberDir, ".longbridge-home"),
     rateLimitDir: join(memberDir, "rate-limit")
   };
-  mkdirSync(cachePaths.home, { recursive: true });
-  mkdirSync(cachePaths.rateLimitDir, { recursive: true });
+  mkdirSync(cachePaths.home, { recursive: true, mode: 0o700 });
+  mkdirSync(cachePaths.rateLimitDir, { recursive: true, mode: 0o700 });
+  // An earlier monitor version created these with the ambient umask (often
+  // 0755). They contain account-specific CLI/rate-limit state and are managed
+  // exclusively by this loader, so tighten an existing directory as well as
+  // setting the creation mode for a new one.
+  chmodSync(cachePaths.home, 0o700);
+  chmodSync(cachePaths.rateLimitDir, 0o700);
 
   return {
     env,

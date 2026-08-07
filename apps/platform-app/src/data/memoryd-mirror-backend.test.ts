@@ -14,13 +14,20 @@ function sse(payload: unknown, sessionId = "session-ts") {
 
 describe("platform memoryd MCP backend", () => {
   it("uses the real mem_save Streamable HTTP exchange", async () => {
-    const methods: string[] = [];
+    const requests: Array<{ method: string; protocolVersion: string | null }> = [];
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init: RequestInit = {}) => {
-      methods.push(String(init.method));
+      requests.push({
+        method: String(init.method),
+        protocolVersion: new Headers(init.headers).get("mcp-protocol-version")
+      });
       const body = init.body ? JSON.parse(String(init.body)) : null;
       if (init.method === "DELETE") return new Response(null, { status: 200 });
       if (body?.method === "initialize") {
-        return sse({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd" } } });
+        return sse({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: "2025-06-18", serverInfo: { name: "memoryd" } }
+        });
       }
       if (body?.method === "notifications/initialized") return new Response(null, { status: 202 });
       return sse({
@@ -38,7 +45,32 @@ describe("platform memoryd MCP backend", () => {
       content: "content",
       tags: ["record:thesis"]
     })).resolves.toEqual({ ok: true, memoryId: "mem-ts-1" });
-    expect(methods).toEqual(["POST", "POST", "POST", "DELETE"]);
+    expect(requests.map(({ method }) => method)).toEqual(["POST", "POST", "POST", "DELETE"]);
+    expect(requests.slice(1).every(({ protocolVersion }) => protocolVersion === "2025-06-18")).toBe(true);
+  });
+
+  it("bounds an initialize response whose headers arrive but body never completes", async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init: RequestInit = {}) => {
+      if (init.method === "DELETE") return new Response(null, { status: 200 });
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "mcp-session-id": "hanging-body" }),
+        text: () => new Promise<string>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        })
+      } as Response;
+    });
+    const backend = createMemorydBackend({ fetchImpl, timeoutMs: 25 });
+
+    const outcome = await Promise.race([
+      backend({ scope: "scope", type: "fact", title: "title", content: "content", tags: [] })
+        .then(() => "resolved", () => "rejected"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 250))
+    ]);
+
+    expect(outcome).toBe("rejected");
   });
 
   it("rejects non-loopback URLs", () => {

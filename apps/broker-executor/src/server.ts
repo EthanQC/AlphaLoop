@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   AuditLogRepository,
   ExecutionReportRepository,
+  MemberRepository,
   OfficialPaperOrderLifecycleRepository,
   ProposalRepository,
   type ExecutionResult,
@@ -27,6 +28,10 @@ import {
   rejectDisabledExecution
 } from "./execution-guards.js";
 import { executeLongbridgePaperOrder, type LongbridgeExecFn } from "./longbridge-paper.js";
+import {
+  resolveMemberExecutionContext,
+  type MemberExecutionContext
+} from "./member-execution-env.js";
 import { redactSensitiveJsonValue, redactSensitiveText } from "./redaction.js";
 import { evaluateRisk, type OfficialPaperRiskFacts } from "./risk.js";
 
@@ -82,6 +87,8 @@ export interface BrokerExecutorServerDeps {
   sharedSecret: string;
   /** Injectable longbridge CLI invoker; defaults to the real execFileSync (via longbridge-paper.ts's own default). Tests supply a fake so no real subprocess/CLI is ever spawned. */
   execFn?: LongbridgeExecFn;
+  /** Resolve the exact owner-scoped account mode/environment passed to Longbridge. */
+  executionContextResolver?: (ownerId: string) => MemberExecutionContext;
   /** Injectable clock for deterministic "today" boundaries in tests; defaults to wall clock. */
   now?: () => Date;
 }
@@ -105,6 +112,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
   const reports = new ExecutionReportRepository(db);
   const officialPaperOrders = new OfficialPaperOrderLifecycleRepository(db);
   const proposals = new ProposalRepository(db);
+  const members = new MemberRepository(db);
   const longbridgeAuth = resolveLongbridgeAuthState();
 
   const configuredLiveExecutionRequested = process.env.ALLOW_LIVE_EXECUTION === "true";
@@ -116,12 +124,12 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
     return deps.now ? deps.now() : new Date();
   }
 
-  // Per-owner official-paper account facts (own-row-first, NULL-owner row as
-  // fallback) - the SAME precedence rule market-alerts-store.mjs's
-  // loadLatestSnapshotForOwner already establishes elsewhere in this
-  // codebase, reimplemented here in TS against the same
-  // official_paper_snapshots table (this app has no JS/TS boundary-crossing
-  // import path to that .mjs module).
+  // Per-owner official-paper account facts. A NULL-owner snapshot is a legacy
+  // shared-account artifact and is only eligible when execution itself is in
+  // the single-active-member legacy-global mode. Member-credential mode must
+  // have the owner's own fresh row; mixing one account's snapshot with a
+  // different account's execution environment would invalidate every budget
+  // and covered-sell decision below.
   // FIX 2: `symbol` is the ticket's own symbol - the caller reads the held
   // LONG quantity for THIS symbol out of the same snapshot row's `positions`
   // JSON, so risk.ts's paper-sell exemption can be gated on it (a sell up to
@@ -132,7 +140,11 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
   // exact column) - parsed defensively; any missing/malformed positions data
   // yields heldQuantityForSymbol: undefined, which risk.ts's own default
   // (unknown position -> 0 held, conservative) then applies.
-  function readLatestOfficialPaperRiskFactsForOwner(ownerId: string, symbol: string): OfficialPaperRiskFacts | undefined {
+  function readLatestOfficialPaperRiskFactsForOwner(
+    ownerId: string,
+    symbol: string,
+    allowLegacySharedFallback: boolean
+  ): OfficialPaperRiskFacts | undefined {
     const ownRow = db
       .prepare(`
         SELECT fetched_at, net_assets, market_value, positions
@@ -143,7 +155,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
       `)
       .get(ownerId) as Record<string, unknown> | undefined;
 
-    const row = ownRow ?? (db
+    const legacyRow = allowLegacySharedFallback ? (db
       .prepare(`
         SELECT fetched_at, net_assets, market_value, positions
         FROM official_paper_snapshots
@@ -151,7 +163,8 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         ORDER BY fetched_at DESC
         LIMIT 1
       `)
-      .get() as Record<string, unknown> | undefined);
+      .get() as Record<string, unknown> | undefined) : undefined;
+    const row = ownRow ?? legacyRow;
 
     if (!row) {
       return undefined;
@@ -371,9 +384,34 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
           return;
         }
 
+        let executionContext: MemberExecutionContext;
+        try {
+          executionContext = deps.executionContextResolver
+            ? deps.executionContextResolver(proposal.ownerId)
+            : resolveMemberExecutionContext(proposal.ownerId, {
+                activeMemberIds: members.listActive().map((member) => member.id)
+              });
+        } catch (credentialError) {
+          const message = redactSensitiveText((credentialError as Error).message);
+          audit.write("broker-executor", "ticket.rejected.credentials", {
+            proposalId,
+            ticketId,
+            ownerId: proposal.ownerId,
+            error: message
+          });
+          sendJson(res, 503, {
+            error: `成员券商凭据不可用，已拒绝执行：${message}`
+          });
+          return;
+        }
+
         // ---- Global Constraint ④: per-owner risk, budget includes this
         // owner's own OPEN (not yet filled/cancelled/rejected) orders ----
-        let riskFacts = readLatestOfficialPaperRiskFactsForOwner(proposal.ownerId, proposal.symbol);
+        let riskFacts = readLatestOfficialPaperRiskFactsForOwner(
+          proposal.ownerId,
+          proposal.symbol,
+          executionContext.mode === "legacy-global"
+        );
         // FIX 1 (order-splitting naked short): the snapshot's held quantity
         // does not see this owner's own RESTING sell orders yet - without
         // deducting them, hold 100 -> sell A 100 (exempt, resting) -> sell B
@@ -399,7 +437,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         // dailyNewRiskPercent approximates "risk already committed today" by
         // this owner's currently-open notional as a percent of account net
         // liq - the same figure the budget gate below uses, since in this
-        // single-account paper-equity flow open orders are, in practice,
+        // per-owner paper-equity flow open orders are, in practice,
         // today's orders. Documented simplification: the plan only requires
         // this value be SERVER-computed (not caller-supplied), not a
         // particular formula.
@@ -438,7 +476,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         // ---- Global Constraint ⑥: execute (throw/timeout -> submit_unconfirmed) ----
         let execResult: ExecutionResult;
         try {
-          execResult = executeLongbridgePaperOrder(ticket, deps.execFn);
+          execResult = executeLongbridgePaperOrder(ticket, deps.execFn, executionContext.env);
         } catch (execError) {
           // FIX 5: (execError as Error).message may carry execFileSync stderr
           // verbatim (a spawn failure/timeout can echo back CLI output),

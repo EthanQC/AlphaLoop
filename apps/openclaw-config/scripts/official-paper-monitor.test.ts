@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   MemberRepository,
@@ -581,6 +581,13 @@ describe("runManualSnapshot: audit item (b) - environment assertion is no longer
 // function, never touching a real longbridge CLI/subprocess.
 describe("pollOfficialPaperPerMember", () => {
   const credentialsRoots: string[] = [];
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env.LONGBRIDGE_ACCOUNT_MODE = "paper";
+    process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED = "true";
+    process.env.ALLOW_LIVE_EXECUTION = "false";
+  });
 
   function makeCredentialsRoot(): string {
     const dir = mkdtempSync(join(tmpdir(), "alphaloop-official-paper-creds-"));
@@ -588,13 +595,18 @@ describe("pollOfficialPaperPerMember", () => {
     return dir;
   }
 
-  function seedMemberCredentials(root: string, memberId: string): void {
+  function seedMemberCredentials(root: string, memberId: string, accountMode = "paper"): void {
     const memberDir = join(root, memberId);
     mkdirSync(memberDir, { recursive: true });
-    writeFileSync(join(memberDir, "longbridge.env"), `LONGBRIDGE_ACCESS_TOKEN=token-${memberId}\n`, "utf8");
+    writeFileSync(
+      join(memberDir, "longbridge.env"),
+      `LONGBRIDGE_ACCESS_TOKEN=token-${memberId}\nLONGBRIDGE_ACCOUNT_MODE=${accountMode}\n`,
+      "utf8"
+    );
   }
 
   afterEach(() => {
+    process.env = { ...originalEnv };
     while (credentialsRoots.length > 0) {
       const dir = credentialsRoots.pop();
       if (dir) {
@@ -688,6 +700,20 @@ describe("pollOfficialPaperPerMember", () => {
     await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
 
     expect(seenTokens.sort()).toEqual(["token-member_1", "token-member_2"]);
+  });
+
+  it("rejects a member credential file that selects a live account before fetching or persisting", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_live");
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_live", "live");
+    const fetchImpl = vi.fn(async () => buildSnapshot());
+
+    await expect(officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root }))
+      .rejects.toThrow(/官方模拟盘/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM official_paper_snapshots").get() as { c: number };
+    expect(count.c).toBe(0);
   });
 });
 
