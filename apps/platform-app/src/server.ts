@@ -31,9 +31,8 @@ export interface PlatformServerDeps {
   now?: () => Date;
   /** Injectable memoryd mirror backend for the bearer-gated strategy write
    * API (Task 4, routes/api-strategy.ts); defaults to
-   * `createMemorydBackend()`'s P10-gated placeholder (fire-and-forget
-   * degrade - see data/memoryd-mirror.ts) when the real entrypoint
-   * (index.ts) doesn't supply one. */
+   * the real loopback-only `createMemorydBackend()` (best-effort degrade -
+   * see data/memoryd-mirror.ts) when the entrypoint doesn't supply one. */
   memorydBackend?: MemorydBackend;
   /** In-process research worker (Task 3, research/worker.ts) that
    * `POST /api/research` kicks, fire-and-forget, after a successful
