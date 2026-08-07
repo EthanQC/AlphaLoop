@@ -15,3 +15,4 @@ knowledge/notes/private-repo/
 
 # Playwright MCP session artifacts (local tooling, never part of the product)
 .playwright-mcp/
+.worktrees/
