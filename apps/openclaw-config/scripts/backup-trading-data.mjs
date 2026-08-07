@@ -263,11 +263,6 @@ export function runBackup({
   };
 }
 
-function readFlagValue(argv, flag) {
-  const index = argv.indexOf(flag);
-  return index < 0 ? undefined : argv[index + 1];
-}
-
 /**
  * Reads an optional flag whose presence promises a value. Omission returns
  * undefined; a present flag with no value fails closed instead of silently
@@ -277,7 +272,7 @@ export function readOptionalValueFlag(argv, flag) {
   const index = argv.indexOf(flag);
   if (index < 0) return undefined;
   const value = argv[index + 1];
-  if (value === undefined || value.startsWith("--")) {
+  if (value === undefined || value.trim() === "" || value.startsWith("--")) {
     throw new Error(`${flag} requires a value`);
   }
   return value;
@@ -302,6 +297,18 @@ export function parseRetentionDaysArg(rawValue, defaultValue = 30) {
     throw new Error(`--retention-days must be a number; received "${rawValue}"`);
   }
   return parsed;
+}
+
+/** Parses the complete CLI value-flag contract without swallowing flags. */
+export function parseBackupCliArgs(args, defaultDest) {
+  const destArg = readOptionalValueFlag(args, "--dest");
+  const retentionArg = readOptionalValueFlag(args, "--retention-days");
+  const memorydRoot = readOptionalValueFlag(args, "--memoryd-root");
+  return {
+    dest: resolve(destArg ?? defaultDest),
+    retentionDays: parseRetentionDaysArg(retentionArg),
+    memorydRoot
+  };
 }
 
 /**
@@ -340,12 +347,13 @@ async function runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot
 
 async function main() {
   const args = process.argv.slice(2);
-  const dest = resolve(readFlagValue(args, "--dest") ?? join(repoRoot, "runtime", "backups"));
   const dbPath = resolveRuntimePaths(repoRoot).dbPath;
 
   try {
-    const memorydRoot = readOptionalValueFlag(args, "--memoryd-root");
-    const retentionDays = parseRetentionDaysArg(readFlagValue(args, "--retention-days"));
+    const { dest, retentionDays, memorydRoot } = parseBackupCliArgs(
+      args,
+      join(repoRoot, "runtime", "backups")
+    );
     const result = await runBackupWithHeartbeat({ dbPath, dest, retentionDays, memorydRoot });
     console.log(JSON.stringify(result));
   } catch (error) {

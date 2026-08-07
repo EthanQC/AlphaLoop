@@ -414,15 +414,35 @@ describe("parseRetentionDaysArg", () => {
   });
 });
 
-describe("readOptionalValueFlag", () => {
-  it("distinguishes an omitted flag from a present --memoryd-root with no value", () => {
-    expect(backup.readOptionalValueFlag([], "--memoryd-root")).toBeUndefined();
-    expect(backup.readOptionalValueFlag(["--memoryd-root", "/managed/memoryd"], "--memoryd-root"))
-      .toBe("/managed/memoryd");
-    expect(() => backup.readOptionalValueFlag(["--memoryd-root"], "--memoryd-root"))
-      .toThrow(/--memoryd-root requires a value/u);
-    expect(() => backup.readOptionalValueFlag(["--memoryd-root", "--dest", "/backups"], "--memoryd-root"))
-      .toThrow(/--memoryd-root requires a value/u);
+describe("parseBackupCliArgs", () => {
+  it("parses all managed backup value flags", () => {
+    expect(backup.parseBackupCliArgs([
+      "--dest", "/backups",
+      "--retention-days", "14",
+      "--memoryd-root", "/managed/memoryd"
+    ], "/default-backups")).toEqual({
+      dest: "/backups",
+      retentionDays: 14,
+      memorydRoot: "/managed/memoryd"
+    });
+  });
+
+  it.each(["--dest", "--retention-days", "--memoryd-root"])(
+    "rejects %s when it is present without a value",
+    (flag) => {
+      expect(() => backup.parseBackupCliArgs([flag], "/default-backups"))
+        .toThrow(new RegExp(`${flag} requires a value`, "u"));
+      expect(() => backup.parseBackupCliArgs([flag, "--memoryd-root", "/managed/memoryd"], "/default-backups"))
+        .toThrow(new RegExp(`${flag} requires a value`, "u"));
+    }
+  );
+
+  it("uses defaults only when optional flags are truly absent", () => {
+    expect(backup.parseBackupCliArgs([], "/default-backups")).toEqual({
+      dest: "/default-backups",
+      retentionDays: 30,
+      memorydRoot: undefined
+    });
   });
 });
 
