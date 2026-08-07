@@ -7,7 +7,7 @@ INSTALL_ROOT="${MEMORYD_INSTALL_ROOT:-${TARGET_HOME}/.local/share/alphaloop-memo
 SOURCE_DIR="${INSTALL_ROOT}/source"
 DATA_ROOT="${MEMORYD_DATA_ROOT:-${TARGET_HOME}/Library/Application Support/AlphaLoop/memoryd}"
 SOURCE_URL="${MEMORYD_SOURCE_URL:-git@github.com:EthanQC/memory-system.git}"
-SOURCE_REV="${MEMORYD_SOURCE_REV:-$(sed -n '1p' "${SCRIPT_DIR}/memoryd-revision.txt")}" 
+SOURCE_REV="${MEMORYD_SOURCE_REV:-$(sed -n '1p' "${SCRIPT_DIR}/memoryd-revision.txt")}"
 GIT_BIN="${GIT_BIN:-git}"
 UV_BIN="${UV_BIN:-${TARGET_HOME}/.local/bin/uv}"
 
