@@ -632,7 +632,7 @@ describe("confirm", () => {
     expect(result.notify.reason).toMatch(/feishu unreachable/);
   });
 
-  it("the PRODUCTION default (no memorydBackend/feishuNotifier injected) degrades gracefully too - memoryd is still a P10 placeholder; the REAL feishu notifier degrades honestly for a member with no feishu_open_id", async () => {
+  it("the PRODUCTION defaults degrade gracefully when the loopback memoryd daemon is unavailable and the member has no feishu_open_id", async () => {
     const { db, options } = makeDb();
     seedMember(db, OWNER_A); // deliberately NO feishu_open_id
     const generated = await cli.runGenerate({ owner: OWNER_A, period: PERIOD }, { ...options, now: NOW });

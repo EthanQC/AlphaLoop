@@ -360,7 +360,8 @@ function makeFakeMachine(prefix: string, stub: Omit<LaunchctlStubOptions, "state
       // Deploy receipts go to the fake machine's own runtime tree. Without
       // this the real installer would append to the repo's runtime/, which is
       // what test/runtime-write-guard.ts exists to stop.
-      DEPLOY_RUNTIME_ROOT: join(home, "runtime")
+      DEPLOY_RUNTIME_ROOT: join(home, "runtime"),
+      MEMORYD_BIN: "/usr/bin/true"
     }
   };
 }
@@ -483,6 +484,7 @@ describe("launchd ownership manifest", () => {
       "ai.openclaw.system.gateway",
       "com.openclaw.system.trading.broker-executor",
       "com.alphaloop.platform-app",
+      "com.alphaloop.memoryd",
       "com.alphaloop.market-alerts",
       "com.alphaloop.daily-backup",
       "com.openclaw.trading.cron-runner",
@@ -652,6 +654,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     // Long-running services: KeepAlive relaunches them if they crash.
     for (const label of [
       "com.alphaloop.platform-app",
+      "com.alphaloop.memoryd",
       "com.openclaw.trading.cron-runner",
       "ai.openclaw.system.gateway",
       "com.openclaw.system.trading.broker-executor"
@@ -659,6 +662,12 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(plistValue(plistFor(label), "KeepAlive")).toBe("true");
     }
     expect(commandOf("com.alphaloop.platform-app")).toContain("pnpm --filter @apps/platform-app start");
+    // The fake machine deliberately overrides MEMORYD_BIN with a harmless
+    // executable; the rendered daemon must preserve that exact binary while
+    // still carrying the real MCP transport arguments.
+    expect(commandOf("com.alphaloop.memoryd")).toContain("'/usr/bin/true' --transport http --host 127.0.0.1 --port 8766");
+    expect(commandOf("com.alphaloop.memoryd")).toContain("MEMORYD_MCP_ADMIN='0'");
+    expect(commandOf("com.alphaloop.memoryd")).toContain("MEMORYD_DATA_ROOT=");
     expect(commandOf("com.openclaw.trading.cron-runner")).toContain("openclaw-cron-runner.mjs");
     // openclaw-cron-runner.mjs spawns每个 cron job via PNPM_BIN; a daemon that
     // lost it would boot fine and then ENOENT on every job.
@@ -775,7 +784,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(config.target_user).toBe(userInfo().username);
     });
 
-    it("refuses rather than installing eight daemons that run as root", () => {
+    it("refuses rather than installing nine daemons that run as root", () => {
       expect(() =>
         execFileSync("zsh", [systemDaemonsScript], {
           env: { ...process.env, TARGET_USER: "root", PRINT_CONFIG_ONLY: "1" },
@@ -798,7 +807,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     // Skipped under root ON PURPOSE, and this is not squeamishness: with no
     // SYSTEM_DIR override this case points the real installer at the real
     // /Library/LaunchDaemons, so as root it would sail past the guard it is
-    // testing and install eight daemons on the machine running the suite.
+    // testing and install nine daemons on the machine running the suite.
     // The guard is "am I root", so the only way to observe it firing is to
     // not be root.
     it.skipIf(process.getuid?.() === 0)("stops with the sudo command up front instead of failing halfway into /Library/LaunchDaemons", () => {
@@ -902,7 +911,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       "com.openclaw.trading.broker-executor"
     ];
 
-    it("keeps the other seven daemons up when one cannot bootstrap, instead of aborting the loop", () => {
+    it("keeps the other eight daemons up when one cannot bootstrap, instead of aborting the loop", () => {
       const machine = makeFakeMachine("alphaloop-daemons-c2-", { failBootstrapLabel: "com.alphaloop.market-alerts" });
       seedLegacyUserAgents(machine, MIGRATED_AGENTS);
 
@@ -911,7 +920,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       // Non-zero, because something really did fail - `|| true` would have
       // turned "broken" into "silently broken".
       expect(status).not.toBe(0);
-      // ...but the other seven are LOADED, not merely present as plist files.
+      // ...but the other eight are LOADED, not merely present as plist files.
       expect(loadedSystemLabels(machine)).toEqual(SYSTEM_LABELS.filter((l) => l !== "com.alphaloop.market-alerts").sort());
       expect(launchDaemonLabels(machine).sort()).toEqual([...SYSTEM_LABELS].sort());
     });
@@ -942,7 +951,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(output).toContain("com.alphaloop.platform-app");
       expect(output).toContain("Bootstrap failed: 5: Input/output error");
       // Names how many are up, so "it failed" is never read as "nothing runs".
-      expect(output).toMatch(/7 of 8 ARE running/u);
+      expect(output).toMatch(/8 of 9 ARE running/u);
       // Round-5 D1/D4: the failed service's own fallback is put back, and the
       // operator is told not to reach for the installer that used to delete it.
       expect(output).toMatch(/DO NOT run 'pnpm launchd:install-user' as a workaround/u);
@@ -1366,7 +1375,7 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     const { status, output } = runSystemDaemonsExpectingFailure(machine);
 
     expect(status).toBe(1);
-    expect(output).toMatch(/FAILED - 3 of 8 daemons did not come up/u);
+    expect(output).toMatch(/FAILED - 3 of 9 daemons did not come up/u);
     expect(output).toMatch(/com\.alphaloop\.platform-app: bootstrapped but NOT RUNNING/u);
     expect(output).toMatch(/com\.alphaloop\.market-alerts: its first run under launchd failed/u);
     expect(output).toMatch(/last exit code = 1/u);

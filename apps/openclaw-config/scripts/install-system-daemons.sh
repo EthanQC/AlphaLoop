@@ -56,6 +56,9 @@ TARGET_GID="$(id -g "${TARGET_USER}")"
 # it has to be a real node, not a name that happens to be there.
 NODE_BIN="${NODE_BIN:-${TARGET_HOME}/.local/node-v24/bin/node}"
 OPENCLAW_ENTRY="${TARGET_HOME}/.local/node-v24/lib/node_modules/openclaw/dist/index.js"
+MEMORYD_BIN="${MEMORYD_BIN:-${TARGET_HOME}/.local/share/alphaloop-memoryd/source/memoryd/.venv/bin/memoryd-mcp}"
+MEMORYD_DATA_ROOT="${MEMORYD_DATA_ROOT:-${TARGET_HOME}/Library/Application Support/AlphaLoop/memoryd}"
+MEMORYD_PORT="${MEMORYD_MCP_PORT:-8766}"
 PATH_ENV="${TARGET_HOME}/.local/node-v24/bin:${TARGET_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 OPENCLAW_PROXY_URL="${OPENCLAW_PROXY_URL:-http://127.0.0.1:7897}"
 OPENCLAW_NO_PROXY="${OPENCLAW_NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.local}"
@@ -211,14 +214,14 @@ fi
 # `deploy-ledger.unwritable`.
 #
 # Not covered: every exit that happens before the EXIT trap is installed leaves
-# no receipt. There are EIGHT of them, not the two this comment claimed until
+# no receipt. There are NINE of them, not the two this comment claimed until
 # 2026-07-29 - three above this line (TARGET_USER=root, no such user, no
-# ownership manifest) and five below it (no pnpm, the PRINT_CONFIG_ONLY
-# preflight, needs-root, no node, no health checker). Each is marked on its own
+# ownership manifest) and six below it (no pnpm, the PRINT_CONFIG_ONLY
+# preflight, needs-root, no node, no memoryd, no health checker). Each is marked on its own
 # `exit` line, and the count is re-run by the claim guard rather than trusted:
 #
-# @claim-count 8 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+\s+# pre-trap exit
-# @claim-count 13 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+
+# @claim-count 9 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+\s+# pre-trap exit
+# @claim-count 14 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+
 #
 # The second directive is the part that cannot be gamed: it counts EVERY `exit`
 # in the file, so adding one anywhere fails the suite until whoever added it
@@ -226,7 +229,7 @@ fi
 # here is exactly what happens without that.
 #
 # The two facts the original sentence got right are unchanged: none of these
-# eight paths changes anything on the machine (they are all above the `mktemp
+# nine paths changes anything on the machine (they are all above the `mktemp
 # -d`), and `deploy.sh` records step 3's exit code itself whichever way this
 # script exits.
 INSTALL_RESULT_RECORDED=""
@@ -320,14 +323,14 @@ daemon_uses_proxy() {
 # directory, writing a plist or calling launchctl. Documented in both READMEs
 # as the thing to run before the real `sudo` invocation, because every value
 # below is derived rather than typed and getting TARGET_USER wrong installs
-# eight daemons pointing at a home directory that isn't yours.
+# nine daemons pointing at a home directory that isn't yours.
 #
-# "Eight" is this script's most-repeated number (README, the run summary, the
+# "Nine" is this script's current daemon count (README, the run summary, the
 # gateway warning below), it is not written down anywhere in this file, and it
 # would go stale the day a ninth `system` row is added to the manifest. So it
 # is re-counted from the manifest itself on every `pnpm test`:
 #
-# @claim-count 8 :: apps/openclaw-config/scripts/install-launchd-ownership.txt :: ^system\s
+# @claim-count 9 :: apps/openclaw-config/scripts/install-launchd-ownership.txt :: ^system\s
 #
 # ⚠ WHAT THIS SCRIPT INTERRUPTS THAT IS NOT OURS (round 6).
 #
@@ -362,6 +365,9 @@ if [ -n "${PRINT_CONFIG_ONLY:-}" ]; then
   echo "system_dir=${SYSTEM_DIR}"
   echo "pnpm_bin=${PNPM_BIN}"
   echo "node_bin=${NODE_BIN}"
+  echo "memoryd_bin=${MEMORYD_BIN}"
+  echo "memoryd_data_root=${MEMORYD_DATA_ROOT}"
+  echo "memoryd_port=${MEMORYD_PORT}"
   echo "gateway_port=${GATEWAY_PORT}"
   echo "proxy_url=${OPENCLAW_PROXY_URL}"
   echo "proxy_labels=${OPENCLAW_PROXY_LABELS}"
@@ -387,15 +393,20 @@ if [ "${SYSTEM_DIR}" = "/Library/LaunchDaemons" ] && [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Same rule as PNPM_BIN, and for a stronger reason: NODE_BIN is written into
-# three of the eight plists AND is what runs the health check that decides
+# four of the nine plists AND is what runs the health check that decides
 # whether a service's fallback may be archived. A missing node used to produce
-# three daemons that load and then ENOENT on every run; from round 6 it would
+# four daemons that load and then ENOENT on every run; from round 6 it would
 # additionally make every verification unrunnable.
 if [ ! -x "${NODE_BIN}" ]; then
   echo "install-system-daemons: ${NODE_BIN} is not an executable node." >&2
-  echo "install-system-daemons: three of the daemons run node by this exact path, so installing them now" >&2
+  echo "install-system-daemons: four of the daemons run node by this exact path, so installing them now" >&2
   echo "install-system-daemons: would produce services that load and then fail every run with ENOENT." >&2
   echo "install-system-daemons: install node there for ${TARGET_USER}, or pass NODE_BIN=/path/to/node." >&2
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
+fi
+if [ ! -x "${MEMORYD_BIN}" ]; then
+  echo "install-system-daemons: ${MEMORYD_BIN} is not an executable memoryd-mcp." >&2
+  echo "install-system-daemons: run pnpm memoryd:install-runtime before installing daemons." >&2
   exit 1  # pre-trap exit: no deploy receipt is written for this path
 fi
 if [ ! -f "${HEALTH_CHECKER}" ]; then
@@ -406,7 +417,7 @@ if [ ! -f "${HEALTH_CHECKER}" ]; then
 fi
 
 # Past this point the script does write. The staging directory is created here
-# rather than at the top so the eight pre-trap exits above leave the machine
+# rather than at the top so the nine pre-trap exits above leave the machine
 # untouched (they are counted, not asserted - see the @claim-count directives
 # next to record_install_result),
 # and the trap removes it on every path out - including the manifest-drift
@@ -471,7 +482,7 @@ ${created}
 EOF
 }
 
-for owned_dir in "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"; do
+for owned_dir in "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${AGENTS_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}" "${MEMORYD_DATA_ROOT}"; do
   ensure_dir_owned "${owned_dir}"
 done
 # Only root can hand these to another user; when the operator runs this
@@ -480,7 +491,7 @@ done
 # have left root-owned log FILES inside a directory the operator owns.
 if [ "$(id -u)" -eq 0 ]; then
   chown -R "${TARGET_USER}:${TARGET_GID}" \
-    "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}"
+    "${LOG_DIR}" "${OPENCLAW_LOG_DIR}" "${REPO_LOG_DIR}" "${RUNTIME_LAUNCHD_DIR}" "${MEMORYD_DATA_ROOT}"
   # Not -R: AGENTS_DIR also holds the operator's own personal-OpenClaw agents,
   # and this script has no business rewriting the ownership of plists it did
   # not create. ensure_dir_owned already handled the directory itself when this
@@ -664,6 +675,14 @@ write_plist \
   "${REPO_LOG_DIR}/platform-app.err.log" \
   "true"
 
+write_plist \
+  "${TMP_DIR}/com.alphaloop.memoryd.plist" \
+  "com.alphaloop.memoryd" \
+  "${COMMON_ENV} export MEMORYD_DATA_ROOT='${MEMORYD_DATA_ROOT}'; export MEMORYD_MCP_ADMIN='0'; exec '${MEMORYD_BIN}' --transport http --host 127.0.0.1 --port ${MEMORYD_PORT}" \
+  "${REPO_LOG_DIR}/memoryd.log" \
+  "${REPO_LOG_DIR}/memoryd.err.log" \
+  "true"
+
 # Promoted from install-openclaw-cron.mjs's installCronRunnerService(). That
 # installer still owns the `openclaw cron add` jobs (they need the operator's
 # own gateway session and ~/.openclaw config); only the long-running runner
@@ -839,7 +858,7 @@ done
 # What that does and does not promise. A service cannot be handed over without a
 # gap - the old copy must stop before the new one starts, or two copies race on
 # the same trading database and the same port. What is true: the gap belongs to
-# ONE service, the other seven keep running through it, no service is ever
+# ONE service, the other eight keep running through it, no service is ever
 # running twice, a service whose daemon does not come up HEALTHY is left running
 # the same copy it was running before this script started, and re-running from
 # the top converges (every step is idempotent; each daemon is enabled and booted
@@ -857,7 +876,7 @@ done
 
 print_gateway_warning
 
-# Which daemon replaces a given user-level label. For the eight system labels
+# Which daemon replaces a given user-level label. For the nine system labels
 # the daemon has the same name; these two rows are the only places where the
 # old user-level name and the daemon that replaces it differ.
 # Single-sourced with the node installers: launchd-agent-archive.mjs holds the
@@ -1146,7 +1165,7 @@ EOF
   fi
 
   # FATAL FOR THIS LABEL, not for the run: record it, put this service's own
-  # fallback back, and keep going so the other seven are still installed.
+  # fallback back, and keep going so the other eight are still installed.
   bootstrap_output=""
   if ! bootstrap_output="$("${LAUNCHCTL}" bootstrap system "${system_plist}" 2>&1)"; then
     record_failure "${system_label}" "launchctl bootstrap system ${system_plist}: ${bootstrap_output}"

@@ -56,7 +56,7 @@ pnpm platform:start
 
 ## 部署机安装顺序（2026-07-29 起：跑一条脚本，不要粘贴命令块）
 
-无人值守的 8 个服务在 ac741d8 之后全部住在 `/Library/LaunchDaemons`（系统域，开机即起，不需要有人登录图形界面）；只有 `com.alphaloop.rsshub` 仍是用户级 LaunchAgent，因为它依赖用户级的 colima/docker socket。谁拥有哪个标签，唯一事实来源是 `apps/openclaw-config/scripts/install-launchd-ownership.txt`。
+无人值守的 9 个服务全部住在 `/Library/LaunchDaemons`（系统域，开机即起，不需要有人登录图形界面）；只有 `com.alphaloop.rsshub` 仍是用户级 LaunchAgent，因为它依赖用户级的 colima/docker socket。谁拥有哪个标签，唯一事实来源是 `apps/openclaw-config/scripts/install-launchd-ownership.txt`。
 
 ### ⚠ 跑之前必读：第 3 步会打断你自己的 OpenClaw agent
 
@@ -175,7 +175,7 @@ pnpm install && pnpm build
 #    可重跑：每个模板都是 launchctl unload 之后再 load。
 pnpm launchd:install-backup-alerts
 
-# 3. 安装 8 个无人值守服务到 /Library/LaunchDaemons。【需要 sudo，且会重启 gateway，见上面的警告】
+# 3. 安装 9 个无人值守服务到 /Library/LaunchDaemons。【需要 sudo，且会重启 gateway，见上面的警告】
 #    先干跑一次，确认这次会为哪个用户安装（不写任何文件、不建目录、不调 launchctl）：
 PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
 #    确认输出里的 target_user / target_home / node_bin 是部署机操作者本人的之后，再真正安装。

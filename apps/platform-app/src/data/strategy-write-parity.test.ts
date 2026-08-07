@@ -89,6 +89,82 @@ describe("strategy write parity: CLI store (.mjs) vs bearer-API port (.ts)", () 
 
     expect(rowB).toEqual(rowA);
   });
+
+  it("appendThesisJudgment persists identical columns from both writers", () => {
+    const dbA = freshDb();
+    const thesisA = store.createThesis(dbA, { ownerId: "m1", symbol: "AMD.US", direction: "bull" });
+    store.appendThesisJudgment(dbA, thesisA.id, { note: "验证需求", source: "manual" });
+    const rowA = dbA.prepare("SELECT note, source FROM thesis_history LIMIT 1").get();
+
+    const dbB = freshDb();
+    const thesisB = apiWrite.createThesis(dbB, { ownerId: "m1", symbol: "AMD.US", direction: "bull" });
+    apiWrite.appendThesisJudgment(dbB, thesisB.id, { note: "验证需求", source: "manual" });
+    const rowB = dbB.prepare("SELECT note, source FROM thesis_history LIMIT 1").get();
+
+    expect(rowB).toEqual(rowA);
+  });
+
+  it("thesis promotion persists the same visibility in both writers", () => {
+    const dbA = freshDb();
+    const thesisA = store.createThesis(dbA, { ownerId: "m1", symbol: "TSLA.US", direction: "bear", visibility: "system" });
+    const rowA = store.promoteThesisVisibility(dbA, thesisA.id, "m1");
+
+    const dbB = freshDb();
+    const thesisB = apiWrite.createThesis(dbB, { ownerId: "m1", symbol: "TSLA.US", direction: "bear", visibility: "system" });
+    const rowB = apiWrite.promoteThesisVisibilityToPublic(dbB, thesisB.id);
+
+    expect(rowB.visibility).toBe(rowA.visibility);
+  });
+
+  it("thesis demotion persists the same visibility in both writers", () => {
+    const dbA = freshDb();
+    const thesisA = store.createThesis(dbA, { ownerId: "m1", symbol: "META.US", direction: "bull", visibility: "public" });
+    const rowA = store.demoteThesisVisibility(dbA, thesisA.id, "m1");
+
+    const dbB = freshDb();
+    const thesisB = apiWrite.createThesis(dbB, { ownerId: "m1", symbol: "META.US", direction: "bull", visibility: "public" });
+    const rowB = apiWrite.demoteThesisVisibilityToSystem(dbB, thesisB.id);
+
+    expect(rowB.visibility).toBe(rowA.visibility);
+  });
+
+  it("disableRule persists identical state from both writers", () => {
+    const dbA = freshDb();
+    const ruleA = store.createRule(dbA, { ownerId: "m1", ruleText: "不追高", enforcement: "self" });
+    store.disableRule(dbA, ruleA.id, "m1");
+    const rowA = dbA.prepare("SELECT enabled, disabled_at IS NOT NULL AS has_disabled_at FROM discipline_rules LIMIT 1").get();
+
+    const dbB = freshDb();
+    const ruleB = apiWrite.createRule(dbB, { ownerId: "m1", ruleText: "不追高", enforcement: "self" });
+    apiWrite.disableRule(dbB, ruleB.id);
+    const rowB = dbB.prepare("SELECT enabled, disabled_at IS NOT NULL AS has_disabled_at FROM discipline_rules LIMIT 1").get();
+
+    expect(rowB).toEqual(rowA);
+  });
+
+  it("card promotion persists the same visibility in both writers", () => {
+    const dbA = freshDb();
+    const cardA = store.createCard(dbA, { ownerId: "m1", name: "回撤买入", visibility: "system" });
+    const rowA = store.promoteVisibility(dbA, cardA.id, "m1");
+
+    const dbB = freshDb();
+    const cardB = apiWrite.createCard(dbB, { ownerId: "m1", name: "回撤买入", visibility: "system" });
+    const rowB = apiWrite.promoteCardVisibilityToPublic(dbB, cardB.id);
+
+    expect(rowB.visibility).toBe(rowA.visibility);
+  });
+
+  it("card demotion persists the same visibility in both writers", () => {
+    const dbA = freshDb();
+    const cardA = store.createCard(dbA, { ownerId: "m1", name: "财报交易", visibility: "public" });
+    const rowA = store.demoteVisibility(dbA, cardA.id, "m1");
+
+    const dbB = freshDb();
+    const cardB = apiWrite.createCard(dbB, { ownerId: "m1", name: "财报交易", visibility: "public" });
+    const rowB = apiWrite.demoteCardVisibilityToSystem(dbB, cardB.id);
+
+    expect(rowB.visibility).toBe(rowA.visibility);
+  });
 });
 
 // Parity guard: memoryd record-type classification exists in TWO
@@ -104,10 +180,20 @@ describe("strategy write parity: CLI store (.mjs) vs bearer-API port (.ts)", () 
 // platform-app's own source cannot.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const memorydMirrorMjs: any = await import("../../../openclaw-config/scripts/memoryd-mirror.mjs");
-import { MEMORYD_TYPE_BY_RECORD as MEMORYD_TYPE_BY_RECORD_TS } from "./memoryd-mirror.js";
+import {
+  MEMORYD_TYPE_BY_RECORD as MEMORYD_TYPE_BY_RECORD_TS,
+  scopeForOwner as scopeForOwnerTs
+} from "./memoryd-mirror.js";
 
 describe("memoryd type map parity: CLI mirror (.mjs) vs bearer-API port (.ts)", () => {
   it("classifies every record type identically, key-for-key", () => {
     expect(MEMORYD_TYPE_BY_RECORD_TS).toEqual(memorydMirrorMjs.MEMORYD_TYPE_BY_RECORD);
+  });
+
+  it("derives the same traversal-safe owner scope", () => {
+    for (const ownerId of ["team/../../别的成员", "legacy-\uD800-owner"]) {
+      expect(scopeForOwnerTs(ownerId)).toBe(memorydMirrorMjs.scopeForOwner(ownerId));
+      expect(scopeForOwnerTs(ownerId)).not.toContain("/");
+    }
   });
 });

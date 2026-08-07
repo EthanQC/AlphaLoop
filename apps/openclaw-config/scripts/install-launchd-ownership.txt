@@ -42,6 +42,7 @@
 system   ai.openclaw.system.gateway
 system   com.openclaw.system.trading.broker-executor
 system   com.alphaloop.platform-app
+system   com.alphaloop.memoryd
 system   com.alphaloop.market-alerts
 system   com.alphaloop.daily-backup
 system   com.openclaw.trading.cron-runner

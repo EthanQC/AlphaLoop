@@ -185,8 +185,8 @@ describe("runThesisCreate", () => {
     expect(row).toBeDefined();
   });
 
-  // Same guarantee using the REAL default backend (createMemorydBackend(),
-  // P10-gated throw) - no memorydBackend option supplied at all.
+  // Same guarantee using the REAL default bounded loopback MCP backend
+  // (createMemorydBackend()) - no memorydBackend option supplied at all.
   it("with the default (unconfigured) memoryd backend, the create still succeeds and the row is written", async () => {
     const { db, dbPath } = makeDb();
     seedMember(db);
@@ -196,7 +196,7 @@ describe("runThesisCreate", () => {
 
     expect(result.ok).toBe(true);
     expect(result.mirror.mirrored).toBe(false);
-    expect(result.mirror.reason).toMatch(/P10 ignition/);
+    expect(result.mirror.reason).toMatch(/fetch failed|abort|ECONNREFUSED|memoryd MCP/i);
     const row = db.prepare(`SELECT id FROM theses WHERE id = ?`).get(result.thesis.id);
     expect(row).toBeDefined();
     warnSpy.mockRestore();

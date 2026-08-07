@@ -289,6 +289,8 @@ function runLaunchctl(args) {
 // checks whatever port the real process would actually bind to.
 const PLATFORM_APP_HEALTH_DEFAULT_PORT = 4314;
 const PLATFORM_APP_HEALTH_TIMEOUT_MS = 1500;
+const MEMORYD_MCP_DEFAULT_URL = "http://127.0.0.1:8766/mcp";
+const MEMORYD_MCP_HEALTH_TIMEOUT_MS = 1500;
 
 // How stale the market-alerts poller's run_log heartbeat can get before the
 // doctor treats it as "stopped ticking" - only checked while
@@ -391,6 +393,7 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
     { name: "scheduled-job-heartbeat", run: () => checkScheduledJobHeartbeats(snapshot, nowMs) },
     { name: "platform-app-health", run: () => checkPlatformAppHealth(snapshot) },
+    { name: "memoryd-health", run: () => checkMemorydHealth(snapshot) },
     { name: "broker-executor-health", run: () => checkBrokerExecutorHealth(snapshot) },
     { name: "daily-backup-health", run: () => checkDailyBackupHealth(snapshot, nowMs) },
     { name: "official-paper-health", run: () => checkOfficialPaperHealth(snapshot, nowMs) },
@@ -1424,6 +1427,136 @@ async function checkPlatformAppHealth(snapshot) {
   }
 
   return [];
+}
+
+function parseMemorydMcpEvent(text) {
+  const source = String(text ?? "").trim();
+  if (!source) throw new Error("empty MCP response");
+  if (source.startsWith("{")) return JSON.parse(source);
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trim();
+    if (data) return JSON.parse(data);
+  }
+  throw new Error("response contained no JSON MCP event");
+}
+
+function requireLoopbackMemorydMcpUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value));
+  } catch {
+    throw new Error(`memoryd MCP URL is invalid: ${String(value)}`);
+  }
+  const loopbackHosts = new Set(["127.0.0.1", "localhost", "[::1]"]);
+  if (parsed.protocol !== "http:" || !loopbackHosts.has(parsed.hostname)) {
+    throw new Error(`memoryd MCP URL must use loopback HTTP, received ${parsed.origin}`);
+  }
+  return parsed.toString();
+}
+
+export async function probeMemorydMcp({
+  url = process.env.MEMORYD_MCP_URL ?? MEMORYD_MCP_DEFAULT_URL,
+  fetchImpl = fetch,
+  timeoutMs = MEMORYD_MCP_HEALTH_TIMEOUT_MS
+} = {}) {
+  const configuredTimeout = Number(timeoutMs);
+  const boundedTimeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : MEMORYD_MCP_HEALTH_TIMEOUT_MS;
+  let targetUrl;
+  try {
+    targetUrl = requireLoopbackMemorydMcpUrl(url);
+  } catch (configurationError) {
+    return { ok: false, kind: "unreachable", url: String(url), reason: describeError(configurationError) };
+  }
+  const fetchBounded = async (init) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
+    try {
+      return await fetchImpl(targetUrl, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  let sessionId = null;
+  try {
+    const response = await fetchBounded({
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "alphaloop-doctor", version: "1" }
+        }
+      })
+    });
+    if (!response.ok) {
+      return { ok: false, kind: "status", url: targetUrl, status: response.status, statusText: response.statusText };
+    }
+    sessionId = response.headers?.get?.("mcp-session-id") ?? null;
+    const message = parseMemorydMcpEvent(await response.text());
+    const serverName = message?.result?.serverInfo?.name;
+    if (message?.error || serverName !== "memoryd" || !sessionId) {
+      return { ok: false, kind: "body", url: targetUrl, serverName, sessionId: Boolean(sessionId) };
+    }
+    return { ok: true, url: targetUrl, serverName, sessionId: true };
+  } catch (probeError) {
+    return { ok: false, kind: "unreachable", url: targetUrl, reason: describeError(probeError) };
+  } finally {
+    if (sessionId) {
+      try {
+        await fetchBounded({
+          method: "DELETE",
+          headers: {
+            accept: "application/json, text/event-stream",
+            "mcp-session-id": sessionId
+          }
+        });
+      } catch {
+        // The initialized response already proved service health. Session
+        // cleanup failure is not a daemon-health failure.
+      }
+    }
+  }
+}
+
+async function checkMemorydHealth(snapshot) {
+  const probe = snapshot.memorydMcpProbe ?? await probeMemorydMcp({
+    url: snapshot.memorydMcpUrl ?? process.env.MEMORYD_MCP_URL ?? MEMORYD_MCP_DEFAULT_URL,
+    fetchImpl: typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch,
+    timeoutMs: snapshot.memorydMcpHealthTimeoutMs ?? MEMORYD_MCP_HEALTH_TIMEOUT_MS
+  });
+  if (probe?.ok) return [];
+
+  if (probe?.kind === "status") {
+    return [error(
+      "memoryd-health.unexpected_status",
+      `memoryd MCP 健康检查返回非预期状态（${probe.url}）：HTTP ${probe.status} ${probe.statusText ?? ""}。`
+    )];
+  }
+  if (probe?.kind === "body") {
+    return [error(
+      "memoryd-health.unexpected_body",
+      `memoryd MCP initialize 响应不符合预期（${probe.url}）：server=${probe.serverName ?? "missing"}，session=${probe.sessionId ? "present" : "missing"}。`
+    )];
+  }
+
+  const severity = probeSeverityFor(snapshot, "com.alphaloop.memoryd");
+  return [severity(
+    "memoryd-health.unreachable",
+    `memoryd MCP 健康检查不可达（${probe?.url ?? MEMORYD_MCP_DEFAULT_URL}）：${probe?.reason ?? "unknown error"}。`
+      + (severity === error
+        ? `${LOADED_BUT_UNREACHABLE_SUFFIX}请看 logs/memoryd.err.log，并确认 pnpm memoryd:install-runtime 已完成。`
+        : "开发机上尚未安装 memoryd 是正常的；部署前请运行 pnpm memoryd:install-runtime。")
+  )];
 }
 
 // Round-4 finding I5 - "broker-executor-health" check. broker-executor was

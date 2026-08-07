@@ -60,6 +60,7 @@ import {
   AuditLogRepository,
   createId,
   ExecutionReportRepository,
+  MemberRepository,
   openTradingDatabase,
   ProposalRepository
 } from "../../../packages/shared-types/dist/index.js";
@@ -81,6 +82,18 @@ export const DEFAULT_ORPHAN_CORRELATION_WINDOW_MS = 30 * 60 * 1000;
 // order of magnitude as the orphan correlation window above) before this
 // file concludes the order never reached the broker at all.
 export const DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Shared-account reconciliation has the same owner semantics as the snapshot
+// writer: exactly one active member is attributable; zero or multiple active
+// members are explicitly shared rather than silently written as a new NULL
+// owner. Historical NULL rows remain legal, but every fresh reconciliation
+// write now satisfies schema v4's "new writes carry owner_id" contract.
+export const RECONCILE_SHARED_OWNER_SENTINEL = "__shared__";
+
+export function resolveReconciliationOwnerId(db) {
+  const activeMembers = new MemberRepository(db).listActive();
+  return activeMembers.length === 1 ? activeMembers[0].id : RECONCILE_SHARED_OWNER_SENTINEL;
+}
 
 // Mirrors apps/broker-executor/src/server.ts's own `deriveTicketId` (that
 // file derives `ticket_prop_<proposalId>`, deterministically, with no DB
@@ -146,6 +159,7 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
   const audit = new AuditLogRepository(db);
   const proposals = new ProposalRepository(db);
   const reports = new ExecutionReportRepository(db);
+  const sharedAccountOwnerId = resolveReconciliationOwnerId(db);
 
   const ordersPayload = await fetchOrders();
   const executionsPayload = await fetchExecutions();
@@ -188,7 +202,8 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
     // ---- 1. Already known: matched by external_order_id -----------------
     const existingByExternalId = getLifecycleByExternalOrderId(db, externalOrderId);
     if (existingByExternalId) {
-      updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes });
+      const ownerId = resolveLifecycleOwnerId(proposals, existingByExternalId, sharedAccountOwnerId);
+      updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes, ownerId });
       matched.push({
         externalOrderId,
         ticketId: existingByExternalId.ticket_id ?? null,
@@ -236,10 +251,12 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 
     if (correlation?.kind === "adopt") {
       const candidate = correlation.row;
-      claimOrphanLifecycleRow(db, candidate.id, { externalOrderId, brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes });
+      const ownerId = resolveLifecycleOwnerId(proposals, candidate, sharedAccountOwnerId);
+      claimOrphanLifecycleRow(db, candidate.id, { externalOrderId, brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes, ownerId });
       audit.write("reconcile", "orphan_broker_order_adopted", {
         externalOrderId,
         ticketId: candidate.ticket_id,
+        ownerId,
         symbol,
         side,
         quantity,
@@ -313,13 +330,15 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
       submittedAt,
       observedAt,
       raw,
-      notes
+      notes,
+      ownerId: sharedAccountOwnerId
     });
     audit.write("reconcile", "orphan_broker_order", {
       externalOrderId,
       symbol,
       side,
       quantity,
+      ownerId: sharedAccountOwnerId,
       lifecycleStage: stage,
       reason: "no lifecycle row matched by external_order_id, and no submit_unconfirmed/submitting lifecycle row correlates within the adoption window"
     });
@@ -539,16 +558,40 @@ function getLifecycleByExternalOrderId(db, externalOrderId) {
     .get(externalOrderId) ?? null;
 }
 
+/**
+ * @param {import("../../../packages/shared-types/dist/index.js").ProposalRepository} proposals
+ * @param {Record<string, unknown>} lifecycleRow
+ * @param {string} sharedAccountOwnerId
+ */
+function resolveLifecycleOwnerId(proposals, lifecycleRow, sharedAccountOwnerId) {
+  const existingOwnerId = String(lifecycleRow?.owner_id ?? "").trim();
+  if (existingOwnerId) return existingOwnerId;
+
+  const proposalId = proposalIdFromTicketId(lifecycleRow?.ticket_id);
+  if (proposalId) {
+    try {
+      const proposal = proposals.getById(proposalId);
+      if (proposal?.ownerId) return proposal.ownerId;
+    } catch {
+      // Reconciliation still has the explicit shared-account attribution
+      // below; a stale/broken proposal lookup cannot stop broker truth from
+      // being recorded.
+    }
+  }
+  return sharedAccountOwnerId;
+}
+
 // Finding #2 fix: this UPDATE never mentions ticket_id - a row matched by
 // external_order_id can NEVER have its ticket_id changed by a routine status
 // refresh, structurally, not via a COALESCE direction that could later be
 // flipped back by accident.
-function updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus, localStatus, stage, observedAt, raw, notes }) {
+function updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus, localStatus, stage, observedAt, raw, notes, ownerId }) {
   db.prepare(`
     UPDATE official_paper_order_lifecycle
-    SET broker_status = ?, local_status = ?, lifecycle_stage = ?, last_observed_at = ?, raw = ?, notes = ?
+    SET broker_status = ?, local_status = ?, lifecycle_stage = ?, last_observed_at = ?, raw = ?, notes = ?,
+        owner_id = COALESCE(NULLIF(owner_id, ''), ?)
     WHERE external_order_id = ?
-  `).run(brokerStatus, localStatus, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), externalOrderId);
+  `).run(brokerStatus, localStatus, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), ownerId, externalOrderId);
 }
 
 // Adoption: fills in external_order_id (guaranteed NULL on a
@@ -558,12 +601,13 @@ function updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus, localSta
 // SET clause - the row's own pre-existing ticket_id (the whole reason it was
 // adoptable) passes through completely untouched, it is only ever READ back
 // out by the caller for the adopted-event payload.
-function claimOrphanLifecycleRow(db, rowId, { externalOrderId, brokerStatus, localStatus, stage, observedAt, raw, notes }) {
+function claimOrphanLifecycleRow(db, rowId, { externalOrderId, brokerStatus, localStatus, stage, observedAt, raw, notes, ownerId }) {
   const result = db.prepare(`
     UPDATE official_paper_order_lifecycle
-    SET external_order_id = ?, broker_status = ?, local_status = ?, lifecycle_stage = ?, last_observed_at = ?, raw = ?, notes = ?
+    SET external_order_id = ?, broker_status = ?, local_status = ?, lifecycle_stage = ?, last_observed_at = ?, raw = ?, notes = ?,
+        owner_id = COALESCE(NULLIF(owner_id, ''), ?)
     WHERE id = ? AND external_order_id IS NULL
-  `).run(externalOrderId, brokerStatus, localStatus, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), rowId);
+  `).run(externalOrderId, brokerStatus, localStatus, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), ownerId, rowId);
 
   if (Number(result.changes) !== 1) {
     throw new Error(`Failed to claim lifecycle row ${rowId} for external order ${externalOrderId} (already claimed or missing).`);
@@ -578,20 +622,21 @@ function claimOrphanLifecycleRow(db, rowId, { externalOrderId, brokerStatus, loc
 // the "matched" branch instead, so in practice this ON CONFLICT branch is a
 // defensive no-op - kept anyway as a second layer of the same finding-#2
 // protection (it, too, never touches ticket_id).
-function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity, limitPrice, brokerStatus, localStatus, stage, submittedAt, observedAt, raw, notes }) {
+function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity, limitPrice, brokerStatus, localStatus, stage, submittedAt, observedAt, raw, notes, ownerId }) {
   db.prepare(`
     INSERT INTO official_paper_order_lifecycle
     (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
      side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
-     last_observed_at, raw, notes)
-    VALUES (?, NULL, ?, 'longbridge-paper', 'paper', 'paper', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     last_observed_at, raw, notes, owner_id)
+    VALUES (?, NULL, ?, 'longbridge-paper', 'paper', 'paper', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(external_order_id) DO UPDATE SET
       broker_status = excluded.broker_status,
       local_status = excluded.local_status,
       lifecycle_stage = excluded.lifecycle_stage,
       last_observed_at = excluded.last_observed_at,
       raw = excluded.raw,
-      notes = excluded.notes
+      notes = excluded.notes,
+      owner_id = COALESCE(NULLIF(official_paper_order_lifecycle.owner_id, ''), excluded.owner_id)
   `).run(
     `lb_order_${externalOrderId}`,
     externalOrderId,
@@ -606,7 +651,8 @@ function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity,
     submittedAt,
     observedAt,
     JSON.stringify(raw),
-    JSON.stringify(notes)
+    JSON.stringify(notes),
+    ownerId
   );
 }
 

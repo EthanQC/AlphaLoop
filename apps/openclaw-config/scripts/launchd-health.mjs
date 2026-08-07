@@ -92,6 +92,10 @@ export const LAUNCHD_SERVICE_HEALTH = {
     residency: "resident",
     probe: "platform-app-health（127.0.0.1:4314/health 返回 200 且 service=platform-app）"
   },
+  "com.alphaloop.memoryd": {
+    residency: "resident",
+    probe: "memoryd-health（127.0.0.1:8766/mcp 完成 MCP initialize）"
+  },
   "com.openclaw.trading.cron-runner": {
     residency: "resident",
     probe: "runner-listeners（18792 上恰好一个监听进程）"

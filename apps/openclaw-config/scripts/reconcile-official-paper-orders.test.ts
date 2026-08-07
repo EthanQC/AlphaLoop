@@ -279,6 +279,39 @@ describe("orphan adoption via submit_unconfirmed correlation", () => {
     console.log("ORPHAN ADOPTION before:", JSON.stringify(before), "\nORPHAN ADOPTION after:", JSON.stringify(after));
   });
 
+  it("backfills a legacy NULL owner from the linked proposal in both adoption and matched refreshes", async () => {
+    const db = makeDb();
+    seedMember(db, "member_owner");
+    const proposal = seedProposal(db, {
+      ownerId: "member_owner", symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 200
+    });
+    const ticketId = `ticket_prop_${proposal.id}`;
+    insertLifecycleRow(db, {
+      id: "row_owner_backfill", ticketId, externalOrderId: null,
+      symbol: "AMZN.US", side: "buy", quantity: 6, limitPrice: 200,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_OWNER_BACKFILL", symbol: "AMZN.US", side: "Buy", quantity: 6,
+        price: 200, status: "New", created_at: "2026-07-15T14:02:00.000Z"
+      })
+    ]);
+    expect(getRow(db, "row_owner_backfill").owner_id).toBe("member_owner");
+
+    // Recreate a legacy NULL on the now-matched row to cover the other branch.
+    db.prepare(`UPDATE official_paper_order_lifecycle SET owner_id = NULL WHERE id = ?`).run("row_owner_backfill");
+    await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_OWNER_BACKFILL", symbol: "AMZN.US", side: "Buy", quantity: 6,
+        price: 200, status: "Filled", created_at: "2026-07-15T14:02:00.000Z"
+      })
+    ]);
+    expect(getRow(db, "row_owner_backfill").owner_id).toBe("member_owner");
+  });
+
   it("does not adopt a submit_unconfirmed row outside the correlation window", async () => {
     const db = makeDb();
     insertLifecycleRow(db, {
@@ -314,11 +347,35 @@ describe("orphan with no correlation match -> ticket_id NULL + audit", () => {
     const row = getRowByExternalOrderId(db, "EXT7");
     expect(row?.ticket_id).toBeNull();
     expect(row?.symbol).toBe("NVDA.US");
+    expect(row?.owner_id).toBe("__shared__");
     expect(result.orphaned).toEqual([{
       externalOrderId: "EXT7", ticketId: null, symbol: "NVDA.US", side: "buy", quantity: 2,
       brokerStatus: "New", lifecycleStage: "submitted", localStatus: "submitted"
     }]);
     expect(auditActions(db)).toContain("orphan_broker_order");
+  });
+
+  it("attributes a shared-account orphan to the sole active member", async () => {
+    const db = makeDb();
+    seedMember(db, "member_only");
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_OWNER_ONLY", symbol: "META.US" })
+    ]);
+
+    expect(getRowByExternalOrderId(db, "EXT_OWNER_ONLY")?.owner_id).toBe("member_only");
+  });
+
+  it("uses the explicit shared sentinel instead of guessing when multiple members are active", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    seedMember(db, "member_b");
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_OWNER_SHARED", symbol: "GOOG.US" })
+    ]);
+
+    expect(getRowByExternalOrderId(db, "EXT_OWNER_SHARED")?.owner_id).toBe("__shared__");
   });
 });
 

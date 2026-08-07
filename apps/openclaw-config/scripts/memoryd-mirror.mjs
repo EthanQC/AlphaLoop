@@ -7,28 +7,21 @@
 // 数据的唯一真源；memoryd 只做全文镜像（fire-and-forget，不可用不影响任何 SQL
 // 路径与纪律硬检查）" - by the time mirrorRecord below is ever called, the
 // caller's SQL write has ALREADY COMMITTED. memoryd being slow, unreachable,
-// or altogether unconfigured must never surface as an error to that caller,
-// never roll back anything, and never block/delay the response - hence
+// or altogether unconfigured must never surface as an error to that caller or
+// roll back anything. The bounded loopback call therefore degrades to an
+// honest result instead of becoming a SQL-path dependency - hence
 // every failure mode this module can observe (backend throw, backend
 // rejection, backend returning {ok:false}) degrades to a warned, honestly
 // labeled `{mirrored:false, reason}` instead of propagating.
 //
-// This follows the SAME injectable-backend/P10-gated-throw shape this
-// codebase already established twice for exactly this "real integration is
-// out of scope today, but callers can wire in the SHAPE now" situation:
-//   - news-agent-search.mjs's createOpenclawSearchBackend (restricted-agent
-//     search - P10 real gateway).
-//   - narrative-engine.mjs's createNarrativeLlmBackend (LLM narrative
-//     generation - P10 real runtime).
-// Both real backends are documented, throwing placeholders; every test
-// exercises a FAKE backend instead. This module's createMemorydBackend
-// mirrors that exact pattern for memoryd (P10 real dedicated instance +
-// loopback HTTP API).
+// createMemorydBackend below is the real dedicated-instance integration. It
+// speaks Streamable HTTP MCP over loopback only, validates the memoryd server
+// identity and mem_save result, and bounds every transport step with a timeout.
 //
 // Backend interface (injected, never constructed by mirrorRecord itself):
 //   async ({ scope, type, title, content, tags }) => { ok: boolean, memoryId?: string, reason?: string }
 // matching memoryd's own mem_save tool shape (scope/type/title/content/tags),
-// so a real P10 HTTP backend is a thin wrapper with no shape translation.
+// so the real MCP backend is a thin wrapper with no shape translation.
 
 // ---------------------------------------------------------------------------
 // Type mapping: strategy-memory record type -> memoryd mem_save `type`
@@ -75,13 +68,28 @@ function resolveMemorydType(recordType) {
 // collides with owner Y's (plan: "per-owner scope" - system-visible records
 // must never leak across members even inside memoryd's own storage, not
 // just at the SQL read layer). Deliberately a PURE string template over
-// `ownerId` (no hashing/randomness) - same `ownerId` in must always produce
-// the SAME scope out, forever, so a later mirror call for the same owner
+// `ownerId` (no hashing/randomness). Percent-encoding preserves ordinary
+// UUID-like ids byte-for-byte while preventing a slash-bearing imported id
+// from becoming a filesystem traversal inside memoryd's scope directory.
+// The same `ownerId` in must always produce the SAME scope out, forever, so a later mirror call for the same owner
 // (e.g. a second thesis judgment) lands in the SAME memoryd scope as the
 // first, and so tests can assert the exact literal without depending on
 // this module's internals.
+function encodeScopeComponent(value) {
+  let encoded = "";
+  for (const byte of new TextEncoder().encode(String(value ?? ""))) {
+    const unreserved =
+      (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || (byte >= 0x30 && byte <= 0x39)
+      || [0x21, 0x27, 0x28, 0x29, 0x2a, 0x2d, 0x2e, 0x5f, 0x7e].includes(byte);
+    encoded += unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return encoded;
+}
+
 export function scopeForOwner(ownerId) {
-  return `alphaloop-member-${String(ownerId ?? "")}`;
+  return `alphaloop-member-${encodeScopeComponent(ownerId)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,15 +104,10 @@ export function scopeForOwner(ownerId) {
 // no lower-level "unsafe" variant that could throw and get called by mistake
 // where the safe one was intended.
 //
-// Callers are expected to pass an explicitly-injected `backend` (a fake in
-// every test in this repo today; createMemorydBackend()'s real, P10-gated
-// placeholder in production). Because createMemorydBackend() always throws
-// until P10 stands up a real memoryd HTTP endpoint, production callers that
-// wire in that default backend will ALWAYS observe {mirrored:false} today -
-// this is CORRECT and INTENDED (see this module's header): the SQL write
-// this mirrors has already committed regardless, and memoryd is a
-// best-effort full-text mirror on top, not a dependency of any SQL path or
-// discipline hard-check.
+// Callers pass an explicitly-injected backend in tests and the real loopback
+// MCP backend in production. The SQL write this mirrors has already committed,
+// and memoryd remains a best-effort full-text mirror rather than a dependency
+// of any SQL path or discipline hard-check.
 //
 // Never throws / never rejects - every failure mode below (backend throws
 // synchronously, backend's returned promise rejects, backend resolves with
@@ -149,25 +152,143 @@ export async function mirrorRecord(backend, { ownerId, recordType, title, conten
 }
 
 // ---------------------------------------------------------------------------
-// P10 wiring point
+// Real loopback MCP backend
 // ---------------------------------------------------------------------------
 
-// Real memoryd backend (a dedicated MEMORYD_DATA_ROOT instance reachable over
-// a loopback-only HTTP API, per-owner scope) is OUT OF SCOPE for this task
-// (plan's "明确不做": "memoryd 真实例/真 scope/向量层（P10）"). This factory
-// exists so callers can already wire in the SHAPE of the real backend today
-// - createMemorydBackend() returns a function matching the `backend`
-// interface mirrorRecord accepts - while the function it returns simply
-// throws until P10 stands up the real instance. Mirrors
-// news-agent-search.mjs's createOpenclawSearchBackend / narrative-engine.mjs's
-// createNarrativeLlmBackend exactly: every test in memoryd-mirror.test.ts
-// instead injects a fake backend; this placeholder is never exercised by a
-// passing test path other than asserting it throws (and asserting
-// mirrorRecord correctly degrades because of it).
-export function createMemorydBackend() {
-  return async function memorydBackend() {
-    throw new Error(
-      "memoryd backend requires P10 ignition (dedicated MEMORYD_DATA_ROOT instance, loopback HTTP API, per-owner scope)"
-    );
+const DEFAULT_MEMORYD_MCP_URL = "http://127.0.0.1:8766/mcp";
+const DEFAULT_MEMORYD_TIMEOUT_MS = 2_500;
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+function requireLoopbackMcpUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value));
+  } catch {
+    throw new Error(`memoryd MCP URL is invalid: ${String(value)}`);
+  }
+  const loopbackHosts = new Set(["127.0.0.1", "localhost", "[::1]"]);
+  if (url.protocol !== "http:" || !loopbackHosts.has(url.hostname)) {
+    throw new Error(`memoryd MCP URL must use loopback HTTP, received ${url.origin}`);
+  }
+  return url.toString();
+}
+
+function parseMcpResponse(text) {
+  const source = String(text ?? "").trim();
+  if (!source) throw new Error("memoryd MCP response was empty");
+  if (source.startsWith("{")) return JSON.parse(source);
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trim();
+    if (data) return JSON.parse(data);
+  }
+  throw new Error("memoryd MCP response did not contain a JSON event");
+}
+
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mcpHeaders(sessionId) {
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream"
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+  return headers;
+}
+
+async function postMcp(fetchImpl, url, payload, timeoutMs, sessionId = null) {
+  const response = await fetchWithTimeout(fetchImpl, url, {
+    method: "POST",
+    headers: mcpHeaders(sessionId),
+    body: JSON.stringify(payload)
+  }, timeoutMs);
+  if (!response.ok) {
+    throw new Error(`memoryd MCP request failed: HTTP ${response.status} ${response.statusText}`.trim());
+  }
+  return response;
+}
+
+function toolResultFromMcp(message) {
+  if (message?.error) {
+    throw new Error(`memoryd MCP error: ${message.error.message ?? JSON.stringify(message.error)}`);
+  }
+  const result = message?.result;
+  let structured = result?.structuredContent;
+  if (!structured && typeof result?.content?.[0]?.text === "string") {
+    try {
+      structured = JSON.parse(result.content[0].text);
+    } catch {
+      // A display-only string cannot prove that the write succeeded.
+    }
+  }
+  if (result?.isError || structured?.ok !== true) {
+    const reason = structured?.reason
+      ?? result?.content?.find?.((item) => item?.type === "text")?.text
+      ?? "memoryd mem_save returned no successful structured result";
+    return { ok: false, reason: String(reason) };
+  }
+  return { ok: true, memoryId: structured.memory_id ?? structured.memoryId };
+}
+
+export function createMemorydBackend(options = {}) {
+  const url = requireLoopbackMcpUrl(options.url ?? process.env.MEMORYD_MCP_URL ?? DEFAULT_MEMORYD_MCP_URL);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const configuredTimeout = Number(options.timeoutMs ?? process.env.MEMORYD_MCP_TIMEOUT_MS ?? DEFAULT_MEMORYD_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : DEFAULT_MEMORYD_TIMEOUT_MS;
+
+  return async function memorydBackend(args) {
+    let sessionId = null;
+    try {
+      const initializeResponse = await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "alphaloop", version: "1" }
+        }
+      }, timeoutMs);
+      sessionId = initializeResponse.headers.get("mcp-session-id");
+      const initialized = parseMcpResponse(await initializeResponse.text());
+      if (initialized?.error || initialized?.result?.serverInfo?.name !== "memoryd" || !sessionId) {
+        throw new Error("memoryd MCP initialize response was invalid");
+      }
+
+      await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      }, timeoutMs, sessionId);
+
+      const callResponse = await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "mem_save", arguments: args }
+      }, timeoutMs, sessionId);
+      return toolResultFromMcp(parseMcpResponse(await callResponse.text()));
+    } finally {
+      if (sessionId) {
+        try {
+          await fetchWithTimeout(fetchImpl, url, {
+            method: "DELETE",
+            headers: mcpHeaders(sessionId)
+          }, timeoutMs);
+        } catch {
+          // Session cleanup is best-effort and cannot change the SQL-first
+          // mirror result.
+        }
+      }
+    }
   };
 }

@@ -26,6 +26,17 @@ describe("scopeForOwner", () => {
     const b = memorydMirror.scopeForOwner("owner_2");
     expect(a).not.toBe(b);
   });
+
+  it("encodes path separators and unicode so an owner id cannot escape its scope directory", () => {
+    expect(memorydMirror.scopeForOwner("team/../../别的成员"))
+      .toBe("alphaloop-member-team%2F..%2F..%2F%E5%88%AB%E7%9A%84%E6%88%90%E5%91%98");
+  });
+
+  it("remains total for malformed imported Unicode instead of breaking the SQL-first path", () => {
+    expect(() => memorydMirror.scopeForOwner("legacy-\uD800-owner")).not.toThrow();
+    expect(memorydMirror.scopeForOwner("legacy-\uD800-owner"))
+      .toBe("alphaloop-member-legacy-%EF%BF%BD-owner");
+  });
 });
 
 // ===========================================================================
@@ -228,26 +239,77 @@ describe("mirrorRecord: fire-and-forget contract", () => {
 });
 
 // ===========================================================================
-// createMemorydBackend: documented P10 wiring point
+// createMemorydBackend: real loopback MCP transport
 // ===========================================================================
 
 describe("createMemorydBackend", () => {
-  it("returns a function that always throws/rejects with the documented P10-gate message", async () => {
-    // createMemorydBackend returns `async function memorydBackend()` - it
-    // declares no parameters because it ignores them and throws. The call site
-    // passes the record the CLI would pass, so the cast states what the seam
-    // really accepts rather than the zero-arity TypeScript infers.
-    const backend = memorydMirror.createMemorydBackend() as (args: unknown) => Promise<never>;
-    await expect(
-      backend({ scope: "alphaloop-member-owner_1", type: "fact", title: "t", content: "c", tags: [] })
-    ).rejects.toThrow(
-      "memoryd backend requires P10 ignition (dedicated MEMORYD_DATA_ROOT instance, loopback HTTP API, per-owner scope)"
-    );
+  function sse(payload: unknown, sessionId = "session-1") {
+    return new Response(`event: message\ndata: ${JSON.stringify(payload)}\n\n`, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        "mcp-session-id": sessionId
+      }
+    });
+  }
+
+  it("initializes MCP, calls mem_save with the exact record, and closes the session", async () => {
+    const requests: Array<{ method: string; body: any; sessionId: string | null }> = [];
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit = {}) => {
+      const body = init.body ? JSON.parse(String(init.body)) : null;
+      requests.push({
+        method: String(init.method),
+        body,
+        sessionId: new Headers(init.headers).get("mcp-session-id")
+      });
+      if (init.method === "DELETE") {
+        return new Response(null, { status: 200 });
+      }
+      if (body?.method === "initialize") {
+        return sse({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd", version: "3.3.1" } } });
+      }
+      if (body?.method === "notifications/initialized") {
+        return new Response(null, { status: 202, headers: { "mcp-session-id": "session-1" } });
+      }
+      return sse({
+        jsonrpc: "2.0",
+        id: 2,
+        result: {
+          content: [{ type: "text", text: "saved" }],
+          structuredContent: { ok: true, memory_id: "mem-real-1" },
+          isError: false
+        }
+      });
+    });
+    const backend = memorydMirror.createMemorydBackend({ fetchImpl });
+    const input = {
+      scope: "alphaloop-member-owner_1",
+      type: "decision",
+      title: "t",
+      content: "c",
+      tags: ["visibility:system"]
+    };
+
+    await expect(backend(input)).resolves.toEqual({ ok: true, memoryId: "mem-real-1" });
+    expect(requests.map((request) => request.method)).toEqual(["POST", "POST", "POST", "DELETE"]);
+    expect(requests[2]).toMatchObject({
+      sessionId: "session-1",
+      body: { method: "tools/call", params: { name: "mem_save", arguments: input } }
+    });
   });
 
-  it("the real backend, when injected into mirrorRecord, degrades to {mirrored:false} rather than throwing", async () => {
+  it("refuses a non-loopback endpoint before making any request", async () => {
+    const fetchImpl = vi.fn();
+    expect(() => memorydMirror.createMemorydBackend({ url: "https://memory.example.com/mcp", fetchImpl }))
+      .toThrow(/loopback/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("a protocol failure still degrades through mirrorRecord without unwinding SQL", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const backend = memorydMirror.createMemorydBackend();
+    const backend = memorydMirror.createMemorydBackend({
+      fetchImpl: vi.fn(async () => new Response("not an MCP event", { status: 200 }))
+    });
 
     const result = await memorydMirror.mirrorRecord(backend, {
       ownerId: "owner_1",
@@ -258,7 +320,7 @@ describe("createMemorydBackend", () => {
     });
 
     expect(result.mirrored).toBe(false);
-    expect(result.reason).toMatch(/P10 ignition/);
+    expect(result.reason).toMatch(/MCP/);
     warnSpy.mockRestore();
   });
 });

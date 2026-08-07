@@ -62,7 +62,8 @@ function at<T>(rows: readonly T[], index: number, what: string): T {
 // isolation, without the pre-existing gateway/runner checks also firing.
 const HEALTHY_LISTENERS = {
   gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
-  cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }]
+  cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
+  memorydMcpProbe: { ok: true, url: "http://127.0.0.1:8766/mcp", serverName: "memoryd", sessionId: true }
 };
 
 // Round-3 finding F2: "everything is installed correctly" is now derived from
@@ -315,6 +316,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       { label: "ai.openclaw.system.gateway", domain: "system", slug: "gateway" },
       { label: "com.openclaw.system.trading.broker-executor", domain: "system", slug: "broker-executor" },
       { label: "com.alphaloop.platform-app", domain: "system", slug: "platform-app" },
+      { label: "com.alphaloop.memoryd", domain: "system", slug: "memoryd" },
       { label: "com.alphaloop.market-alerts", domain: "system", slug: "market-alerts" },
       { label: "com.alphaloop.daily-backup", domain: "system", slug: "daily-backup" },
       { label: "com.openclaw.trading.cron-runner", domain: "system", slug: "cron-runner" },
@@ -780,7 +782,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     expect(findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "launchd-jobs.rsshub.last_run_failed", severity: "error" })
     ]));
-    expect(findings).toHaveLength(7);
+    expect(findings).toHaveLength(8);
   });
 
   it("REPLAY - after the migration, with every service actually up: zero launchd findings", async () => {
@@ -826,6 +828,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
       "launchd-jobs.broker-executor.not_running",
       "launchd-jobs.cron-runner.not_running",
       "launchd-jobs.gateway.not_running",
+      "launchd-jobs.memoryd.not_running",
       "launchd-jobs.platform-app.not_running"
     ]);
     expect(findings.filter((finding) => finding.code.endsWith(".last_run_failed"))).toHaveLength(5);
@@ -858,6 +861,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
       "launchd-jobs.broker-executor.restarted_after_failure",
       "launchd-jobs.cron-runner.restarted_after_failure",
       "launchd-jobs.gateway.restarted_after_failure",
+      "launchd-jobs.memoryd.restarted_after_failure",
       "launchd-jobs.platform-app.restarted_after_failure"
     ]);
   });
@@ -888,6 +892,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
       "launchd-jobs.broker-executor.crash_looping",
       "launchd-jobs.cron-runner.crash_looping",
       "launchd-jobs.gateway.crash_looping",
+      "launchd-jobs.memoryd.crash_looping",
       "launchd-jobs.platform-app.crash_looping"
     ]);
     const platformApp = launchdFindings(report).find((f) => f.code === "launchd-jobs.platform-app.crash_looping");
@@ -1497,6 +1502,120 @@ describe("platform-app-health check (Phase 3 Task 8)", () => {
     expect(report.findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "platform-app-health.unreachable", severity: "warn" })
     ]));
+  });
+});
+
+describe("memoryd-health check", () => {
+  it("refuses a non-loopback probe URL without making a network request", async () => {
+    let requested = false;
+    const probe = await doctor.probeMemorydMcp({
+      url: "http://10.0.0.8:8766/mcp",
+      fetchImpl: async () => {
+        requested = true;
+        return new Response(null, { status: 200 });
+      }
+    });
+
+    expect(probe).toMatchObject({ ok: false, kind: "unreachable" });
+    expect(probe.reason).toMatch(/loopback/i);
+    expect(requested).toBe(false);
+  });
+
+  it("performs a real MCP initialize exchange and closes the session", async () => {
+    const methods: string[] = [];
+    const probe = await doctor.probeMemorydMcp({
+      url: "http://127.0.0.1:8766/mcp",
+      fetchImpl: async (_url: RequestInfo | URL, init: RequestInit = {}) => {
+        methods.push(String(init.method));
+        if (init.method === "DELETE") return new Response(null, { status: 200 });
+        return new Response(
+          `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd" } } })}\n\n`,
+          { status: 200, headers: { "mcp-session-id": "doctor-session" } }
+        );
+      }
+    });
+
+    expect(probe).toMatchObject({ ok: true, serverName: "memoryd", sessionId: true });
+    expect(methods).toEqual(["POST", "DELETE"]);
+  });
+
+  it("bounds session cleanup so a wedged DELETE cannot hang the doctor", async () => {
+    const startedAt = Date.now();
+    const probe = await doctor.probeMemorydMcp({
+      url: "http://127.0.0.1:8766/mcp",
+      timeoutMs: 25,
+      fetchImpl: async (_url: RequestInfo | URL, init: RequestInit = {}) => {
+        if (init.method !== "DELETE") {
+          return new Response(
+            `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "memoryd" } } })}\n\n`,
+            { status: 200, headers: { "mcp-session-id": "wedged-cleanup" } }
+          );
+        }
+        return await new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("cleanup aborted")), { once: true });
+        });
+      }
+    });
+
+    expect(probe).toMatchObject({ ok: true, serverName: "memoryd" });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("fails a deployed machine and only warns on a dev machine when MCP is unreachable", async () => {
+    const failedProbe = { ok: false, kind: "unreachable", url: "http://127.0.0.1:8766/mcp", reason: "ECONNREFUSED" };
+    const deployed = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      memorydMcpProbe: failedProbe,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
+    });
+    const dev = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      memorydMcpProbe: failedProbe,
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED
+    });
+
+    expect(deployed.findings).toContainEqual(expect.objectContaining({ code: "memoryd-health.unreachable", severity: "error" }));
+    expect(dev.findings).toContainEqual(expect.objectContaining({ code: "memoryd-health.unreachable", severity: "warn" }));
+  });
+
+  it("reports malformed initialize responses and non-success HTTP statuses as deployed errors", async () => {
+    const common = {
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED
+    };
+    const wrongBody = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...common,
+      memorydMcpProbe: {
+        ok: false, kind: "body", url: "http://127.0.0.1:8766/mcp",
+        serverName: "not-memoryd", sessionId: false
+      }
+    });
+    const wrongStatus = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...common,
+      memorydMcpProbe: {
+        ok: false, kind: "status", url: "http://127.0.0.1:8766/mcp",
+        status: 503, statusText: "Service Unavailable"
+      }
+    });
+
+    expect(wrongBody.findings).toContainEqual(expect.objectContaining({
+      code: "memoryd-health.unexpected_body", severity: "error"
+    }));
+    expect(wrongStatus.findings).toContainEqual(expect.objectContaining({
+      code: "memoryd-health.unexpected_status", severity: "error"
+    }));
   });
 });
 

@@ -424,7 +424,8 @@ describe("monthly review reading page + confirm endpoint", () => {
       expect(payload.ok).toBe(true);
       expect(payload.review.status).toBe("confirmed");
       expect(payload.review.confirmedAt).toBeTruthy();
-      // memoryd's default backend is still a P10-gated placeholder; the
+      // memoryd's default is the real bounded loopback MCP backend; no daemon
+      // is running in this isolated route test, so it degrades honestly. The
       // Feishu default is the REAL data/feishu-review-notifier.ts notifier,
       // which degrades honestly here because memberA has no feishu_open_id
       // seeded. Confirm itself must still succeed either way (the SQL status

@@ -12,8 +12,8 @@
  * COMMITTED. Every failure mode this module can observe (backend throws
  * synchronously, backend's returned promise rejects, backend resolves with
  * `{ok:false}`) degrades to a warned, honestly labeled
- * `{mirrored:false, reason}` instead of propagating - it never blocks or
- * unwinds the write it mirrors.
+ * `{mirrored:false, reason}` instead of propagating. The loopback call is
+ * timeout-bounded and can never unwind the write it mirrors.
  */
 
 // memoryd's mem_save tool accepts exactly six `type` values: session /
@@ -38,12 +38,24 @@ function resolveMemorydType(recordType: string): string {
   return MEMORYD_TYPE_BY_RECORD[recordType] ?? DEFAULT_MEMORYD_TYPE;
 }
 
-/** Deterministic per-owner memoryd scope - same `ownerId` in always produces
- * the same scope out (a pure string template, no hashing/randomness), so a
- * later mirror call for the same owner lands in the same memoryd scope as
- * the first. Identical formula to memoryd-mirror.mjs's scopeForOwner. */
+/** Deterministic per-owner memoryd scope. Percent-encoding preserves ordinary
+ * ids while preventing slash-bearing imported ids from traversing memoryd's
+ * scope directory. Identical formula to memoryd-mirror.mjs's scopeForOwner. */
+function encodeScopeComponent(value: string): string {
+  let encoded = "";
+  for (const byte of new TextEncoder().encode(String(value ?? ""))) {
+    const unreserved =
+      (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || (byte >= 0x30 && byte <= 0x39)
+      || [0x21, 0x27, 0x28, 0x29, 0x2a, 0x2d, 0x2e, 0x5f, 0x7e].includes(byte);
+    encoded += unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return encoded;
+}
+
 export function scopeForOwner(ownerId: string): string {
-  return `alphaloop-member-${String(ownerId ?? "")}`;
+  return `alphaloop-member-${encodeScopeComponent(ownerId)}`;
 }
 
 export interface MemorydBackendArgs {
@@ -61,7 +73,7 @@ export interface MemorydBackendResult {
 }
 
 /** Injected, never constructed by mirrorRecord itself - matches memoryd's own
- * mem_save tool shape (scope/type/title/content/tags), so a real P10 HTTP
+ * mem_save tool shape (scope/type/title/content/tags), so the real MCP
  * backend is a thin wrapper with no shape translation. */
 export type MemorydBackend = (args: MemorydBackendArgs) => Promise<MemorydBackendResult>;
 
@@ -106,19 +118,158 @@ export async function mirrorRecord(backend: MemorydBackend, record: MirrorRecord
   }
 }
 
-/**
- * Real memoryd backend (a dedicated MEMORYD_DATA_ROOT instance reachable
- * over a loopback-only HTTP API, per-owner scope) is OUT OF SCOPE for this
- * task (plan's "明确不做": "memoryd 真实例/真 scope/向量层（P10）"). This
- * factory exists so callers (createPlatformServer's default deps) can
- * already wire in the SHAPE of the real backend today - the function it
- * returns simply throws until P10 stands up the real instance. Mirrors
- * memoryd-mirror.mjs's own createMemorydBackend exactly.
- */
-export function createMemorydBackend(): MemorydBackend {
-  return async function memorydBackend(): Promise<MemorydBackendResult> {
-    throw new Error(
-      "memoryd backend requires P10 ignition (dedicated MEMORYD_DATA_ROOT instance, loopback HTTP API, per-owner scope)"
-    );
+export interface MemorydBackendOptions {
+  url?: string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+const DEFAULT_MEMORYD_MCP_URL = "http://127.0.0.1:8766/mcp";
+const DEFAULT_MEMORYD_TIMEOUT_MS = 2_500;
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+function requireLoopbackMcpUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`memoryd MCP URL is invalid: ${value}`);
+  }
+  const loopbackHosts = new Set(["127.0.0.1", "localhost", "[::1]"]);
+  if (url.protocol !== "http:" || !loopbackHosts.has(url.hostname)) {
+    throw new Error(`memoryd MCP URL must use loopback HTTP, received ${url.origin}`);
+  }
+  return url.toString();
+}
+
+function parseMcpResponse(text: string): any {
+  const source = text.trim();
+  if (!source) throw new Error("memoryd MCP response was empty");
+  if (source.startsWith("{")) return JSON.parse(source);
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trim();
+    if (data) return JSON.parse(data);
+  }
+  throw new Error("memoryd MCP response did not contain a JSON event");
+}
+
+async function fetchWithTimeout(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mcpHeaders(sessionId?: string | null): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream"
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+  return headers;
+}
+
+async function postMcp(
+  fetchImpl: typeof fetch,
+  url: string,
+  payload: unknown,
+  timeoutMs: number,
+  sessionId?: string | null
+): Promise<Response> {
+  const response = await fetchWithTimeout(fetchImpl, url, {
+    method: "POST",
+    headers: mcpHeaders(sessionId),
+    body: JSON.stringify(payload)
+  }, timeoutMs);
+  if (!response.ok) {
+    throw new Error(`memoryd MCP request failed: HTTP ${response.status} ${response.statusText}`.trim());
+  }
+  return response;
+}
+
+function toolResultFromMcp(message: any): MemorydBackendResult {
+  if (message?.error) {
+    throw new Error(`memoryd MCP error: ${message.error.message ?? JSON.stringify(message.error)}`);
+  }
+  const result = message?.result;
+  let structured = result?.structuredContent;
+  if (!structured && typeof result?.content?.[0]?.text === "string") {
+    try {
+      structured = JSON.parse(result.content[0].text);
+    } catch {
+      // A display-only string cannot prove that the write succeeded.
+    }
+  }
+  if (result?.isError || structured?.ok !== true) {
+    const reason = structured?.reason
+      ?? result?.content?.find?.((item: any) => item?.type === "text")?.text
+      ?? "memoryd mem_save returned no successful structured result";
+    return { ok: false, reason: String(reason) };
+  }
+  return { ok: true, memoryId: structured.memory_id ?? structured.memoryId };
+}
+
+/** Real, loopback-only MCP backend. SQL has already committed before this
+ * runs, so transport/protocol failures still degrade in mirrorRecord. */
+export function createMemorydBackend(options: MemorydBackendOptions = {}): MemorydBackend {
+  const url = requireLoopbackMcpUrl(options.url ?? process.env.MEMORYD_MCP_URL ?? DEFAULT_MEMORYD_MCP_URL);
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const configuredTimeout = Number(options.timeoutMs ?? process.env.MEMORYD_MCP_TIMEOUT_MS ?? DEFAULT_MEMORYD_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : DEFAULT_MEMORYD_TIMEOUT_MS;
+
+  return async function memorydBackend(args: MemorydBackendArgs): Promise<MemorydBackendResult> {
+    let sessionId: string | null = null;
+    try {
+      const initializeResponse = await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "alphaloop", version: "1" }
+        }
+      }, timeoutMs);
+      sessionId = initializeResponse.headers.get("mcp-session-id");
+      const initialized = parseMcpResponse(await initializeResponse.text());
+      if (initialized?.error || initialized?.result?.serverInfo?.name !== "memoryd" || !sessionId) {
+        throw new Error("memoryd MCP initialize response was invalid");
+      }
+
+      await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      }, timeoutMs, sessionId);
+
+      const callResponse = await postMcp(fetchImpl, url, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "mem_save", arguments: args }
+      }, timeoutMs, sessionId);
+      return toolResultFromMcp(parseMcpResponse(await callResponse.text()));
+    } finally {
+      if (sessionId) {
+        try {
+          await fetchWithTimeout(fetchImpl, url, {
+            method: "DELETE",
+            headers: mcpHeaders(sessionId)
+          }, timeoutMs);
+        } catch {
+          // Cleanup is best-effort and cannot hide the write result.
+        }
+      }
+    }
   };
 }

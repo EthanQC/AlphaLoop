@@ -40,11 +40,10 @@
  * The memoryd mirror backend (T2, data/memoryd-mirror.ts) is injectable via
  * `ApiStrategyRouteDeps.memorydBackend`, threaded through from
  * `PlatformServerDeps` (server.ts) exactly like `now` is - defaults to
- * `createMemorydBackend()`'s P10-gated placeholder (always degrades to
- * `{mirrored:false}` today) when the real caller (index.ts) doesn't supply
- * one. A mirror failure NEVER fails the HTTP write - the SQL row has already
- * committed by the time `mirrorRecord` is even called (see that module's own
- * header).
+ * the real loopback-only `createMemorydBackend()` when the caller (index.ts)
+ * doesn't supply one. A mirror failure NEVER fails the HTTP write - the SQL
+ * row has already committed by the time `mirrorRecord` is even called (see
+ * that module's own header).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
@@ -84,8 +83,8 @@ import {
 
 export interface ApiStrategyRouteDeps {
   db: DatabaseSync;
-  /** Injectable memoryd mirror backend (Task 2); defaults to
-   * `createMemorydBackend()` (P10-gated, always degrades) when omitted. */
+  /** Injectable memoryd mirror backend (Task 2); defaults to the real
+   * loopback-only `createMemorydBackend()` when omitted. */
   memorydBackend?: MemorydBackend;
 }
 

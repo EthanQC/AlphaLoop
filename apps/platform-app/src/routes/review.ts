@@ -43,8 +43,8 @@
  * api-research.ts's submit endpoint, this one reads no body fields at all -
  * the id comes from the URL, and there is nothing else to confirm.
  *
- * POST-CONFIRM SIDE EFFECTS (memoryd mirror - still a P10-gated placeholder
- * by default - + the REAL Feishu single-chat confirm card via
+ * POST-CONFIRM SIDE EFFECTS (the real loopback memoryd MCP mirror + the REAL
+ * Feishu single-chat confirm card via
  * data/feishu-review-notifier.ts, both fire-and-forget, both degrading
  * gracefully) - this is the TS port, for the platform's own HTTP surface, of
  * apps/openclaw-config/scripts/reviews.mjs's `runConfirm` CLI flow: confirm's
@@ -141,8 +141,8 @@ export interface ReviewRouteDeps {
   db: DatabaseSync;
   /** Injectable clock for deterministic tests; defaults to wall clock. */
   now?: () => Date;
-  /** Injectable memoryd mirror backend; defaults to createMemorydBackend()'s
-   * P10-gated placeholder (fire-and-forget degrade) when omitted. */
+  /** Injectable memoryd mirror backend; defaults to the real loopback-only
+   * createMemorydBackend() (best-effort degrade) when omitted. */
   memorydBackend?: MemorydBackend;
   /** Injectable Feishu confirm notifier; defaults to the REAL
    * createFeishuReviewNotifier({db}) (data/feishu-review-notifier.ts -

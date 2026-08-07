@@ -636,6 +636,7 @@ step_build() {
 }
 
 step_user_agents() {
+  (cd "${REPO_ROOT}" && pnpm memoryd:install-runtime)
   (cd "${REPO_ROOT}" && pnpm launchd:install-backup-alerts)
 }
 
