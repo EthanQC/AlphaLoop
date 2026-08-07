@@ -126,9 +126,9 @@ export interface OfficialPaperOrderLifecycle {
   // Phase 6 Task 4: the record-before-execute row is INSERTed before the
   // broker call happens - at that moment there is no external_order_id yet
   // (that only exists once the broker replies). Was `string` (required);
-  // widened to optional. `external_order_id` in the DDL keeps its UNIQUE
-  // constraint (collisions among REAL broker order ids are still caught) but
-  // drops NOT NULL (migration v11) so this pre-broker-call row can exist.
+  // widened to optional. The final DDL keeps real broker ids unique within an
+  // owner/account scope (migration v20) but drops NOT NULL (migration v11) so
+  // this pre-broker-call row can exist.
   externalOrderId?: string;
   provider: "longbridge-paper";
   environment: "paper";

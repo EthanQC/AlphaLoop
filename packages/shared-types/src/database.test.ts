@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import {
   migrate,
   getSchemaVersion,
@@ -2026,7 +2026,7 @@ describe("v11 official_paper_order_lifecycle.external_order_id nullable migratio
   // assertion; the two checks below are loosened to "at least" the same way
   // v10's own fresh-db test already was.
 
-  it("a fresh db lands at least at v11, with external_order_id nullable (NOT NULL dropped, UNIQUE kept) and the new owner index present", () => {
+  it("a fresh db keeps external_order_id nullable and the lifecycle indexes present", () => {
     const db = memoryDb();
     migrate(db);
 
@@ -3179,6 +3179,35 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     expect(repo.sumOpenNotionalForOwner("mem_owner")).toBe(450);
   });
 
+  it("returns an untrusted sentinel when an active order has no positive finite price", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "t_unpriced_external", ownerId: "mem_owner", symbol: "IBM.US", assetClass: "stock",
+      side: "buy", quantity: 3, submittedAt: nowIso()
+    });
+    repo.finalizeExecution("t_unpriced_external", {
+      externalOrderId: "ext_unpriced_external", brokerStatus: "New", localStatus: "submitted",
+      lifecycleStage: "submitted", notes: [], observedAt: nowIso()
+    });
+
+    expect(repo.sumOpenNotionalForOwner("mem_owner")).toBeNaN();
+  });
+
+  it("counts filled notional after a snapshot until a newer snapshot can absorb it", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "t_filled_after_snapshot", ownerId: "mem_owner", symbol: "AAPL.US", assetClass: "stock",
+      side: "buy", quantity: 60, limitPrice: 100, submittedAt: "2026-08-08T01:01:00.000Z"
+    });
+    repo.finalizeExecution("t_filled_after_snapshot", {
+      externalOrderId: "ext_filled_after_snapshot", brokerStatus: "Filled", localStatus: "accepted",
+      lifecycleStage: "filled", notes: [], observedAt: "2026-08-08T01:01:01.000Z"
+    });
+
+    expect(repo.sumOpenNotionalForOwner("mem_owner", "2026-08-08T01:00:00.000Z")).toBe(6_000);
+    expect(repo.sumOpenNotionalForOwner("mem_owner", "2026-08-08T01:02:00.000Z")).toBe(0);
+  });
+
   // FIX 1 (2026-07 adversarial audit, order-splitting naked short): the
   // paper-sell risk exemption reads held quantity from the latest account
   // snapshot, which does NOT yet reflect the owner's own resting sell
@@ -3244,6 +3273,21 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "NVDA.US")).toBe(0);
   });
 
+  it("counts a filled sell after the snapshot until refreshed holdings absorb it", () => {
+    const { repo } = setup();
+    repo.insertSubmitting({
+      ticketId: "t_filled_sell_after_snapshot", ownerId: "mem_owner", symbol: "TSLA.US", assetClass: "stock",
+      side: "sell", quantity: 100, limitPrice: 100, submittedAt: "2026-08-08T01:01:00.000Z"
+    });
+    repo.finalizeExecution("t_filled_sell_after_snapshot", {
+      externalOrderId: "ext_filled_sell_after_snapshot", brokerStatus: "Filled", localStatus: "accepted",
+      lifecycleStage: "filled", notes: [], observedAt: "2026-08-08T01:01:01.000Z"
+    });
+
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "TSLA", "2026-08-08T01:00:00.000Z")).toBe(100);
+    expect(repo.sumOpenSellQuantityForOwnerSymbol("mem_owner", "TSLA", "2026-08-08T01:02:00.000Z")).toBe(0);
+  });
+
   it("save() upsert protects an already-assigned ticket_id (audit #2 direction): a later same-order write cannot overwrite it, only fill a null one", () => {
     const { db, repo } = setup();
     const base = {
@@ -3272,6 +3316,52 @@ describe("OfficialPaperOrderLifecycleRepository record-before-execute additions 
     repo.save({ ...base, id: "life_2", externalOrderId: "EXT-2", ticketId: "ticket_filled_in" });
     const row2 = db.prepare("SELECT ticket_id FROM official_paper_order_lifecycle WHERE external_order_id = 'EXT-2'").get() as { ticket_id: string };
     expect(row2.ticket_id).toBe("ticket_filled_in");
+  });
+
+  it("scopes an external broker order id to its owner account", () => {
+    const { db, repo } = setup();
+    seedMember(db, "mem_other");
+    const base = {
+      externalOrderId: "EXT-SAME-ACCOUNT-LOCAL-ID",
+      provider: "longbridge-paper" as const,
+      environment: "paper" as const,
+      accountMode: "paper" as const,
+      symbol: "AAPL.US",
+      assetClass: "stock" as const,
+      side: "buy" as const,
+      quantity: 1,
+      limitPrice: 100,
+      brokerStatus: "New",
+      localStatus: "accepted" as const,
+      lifecycleStage: "submitted" as const,
+      submittedAt: nowIso(),
+      lastObservedAt: nowIso(),
+      raw: null,
+      notes: []
+    };
+
+    repo.save({ ...base, id: "life_owner_a", ownerId: "mem_owner", ticketId: "ticket_a" });
+    repo.save({ ...base, id: "life_owner_b", ownerId: "mem_other", ticketId: "ticket_b" });
+    repo.save({
+      ...base,
+      id: "life_owner_a_replay",
+      ownerId: "mem_owner",
+      ticketId: "ticket_wrong",
+      brokerStatus: "Filled",
+      lifecycleStage: "filled"
+    });
+
+    const rows = db.prepare(`
+      SELECT id, owner_id, ticket_id, broker_status
+      FROM official_paper_order_lifecycle
+      WHERE external_order_id = ? ORDER BY owner_id
+    `).all(base.externalOrderId) as Array<{
+      id: string; owner_id: string; ticket_id: string; broker_status: string
+    }>;
+    expect(rows).toEqual([
+      { id: "life_owner_b", owner_id: "mem_other", ticket_id: "ticket_b", broker_status: "New" },
+      { id: "life_owner_a", owner_id: "mem_owner", ticket_id: "ticket_a", broker_status: "Filled" }
+    ]);
   });
 
   it("countSubmittedTodayForOwner counts only rows at/after the given day-start for that owner", () => {
@@ -3490,6 +3580,55 @@ describe("MonthlyReviewRepository (Phase 9 Task 1, 2026-07-16 plan)", () => {
       const reloaded = repo.getById(review.id);
       expect(reloaded?.status).toBe("confirmed");
       expect(reloaded?.resultJson).toEqual({ headline: "v1" });
+    });
+
+    it("atomically refuses a cron upsert when another connection confirms after its stale pre-read", () => {
+      const { db, repo } = setup();
+      const original = repo.upsertDraft({ ownerId: "mem_owner", period: "2026-07", resultJson: { headline: "signed-v1" } });
+      let injected = false;
+      const racingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "prepare") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!injected && /SELECT \* FROM monthly_reviews WHERE owner_id = \? AND period = \?/u.test(sql)) {
+              return new Proxy(statement, {
+                get(statementTarget, statementProperty) {
+                  if (statementProperty !== "get") {
+                    const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                    return typeof value === "function" ? value.bind(statementTarget) : value;
+                  }
+                  return (...args: SQLInputValue[]) => {
+                    const staleDraft = statementTarget.get(...args);
+                    target.prepare(`
+                      UPDATE monthly_reviews
+                      SET status = 'confirmed', confirmed_at = ?, updated_at = ?
+                      WHERE id = ? AND status = 'draft'
+                    `).run("2026-08-08T00:00:00.000Z", "2026-08-08T00:00:00.000Z", original.id);
+                    injected = true;
+                    return staleDraft;
+                  };
+                }
+              });
+            }
+            return statement;
+          };
+        }
+      });
+      const racingRepo = new MonthlyReviewRepository(racingDb);
+
+      expect(() => racingRepo.upsertDraft({
+        ownerId: "mem_owner",
+        period: "2026-07",
+        resultJson: { headline: "cron-v2-must-not-overwrite" }
+      })).toThrow(/already confirmed/iu);
+
+      const persisted = repo.getById(original.id);
+      expect(persisted?.status).toBe("confirmed");
+      expect(persisted?.resultJson).toEqual({ headline: "signed-v1" });
     });
 
     it("allows omitting resultJson (writes a real SQL NULL, not the JSON string 'null')", () => {
@@ -4214,8 +4353,8 @@ describe("v19 login_delivery_log (delivery outcomes for the email-code login)", 
     createdAt: "2026-07-01T00:00:00.000Z"
   };
 
-  it("SCHEMA_VERSION is 19", () => {
-    expect(SCHEMA_VERSION).toBe(19);
+  it("SCHEMA_VERSION remains at least 19 after later migrations", () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(19);
   });
 
   it("a fresh db lands at v19 with the table, its indexes, and a nullable member_id FK", () => {

@@ -289,6 +289,8 @@ function runLaunchctl(args) {
 // checks whatever port the real process would actually bind to.
 const PLATFORM_APP_HEALTH_DEFAULT_PORT = 4314;
 const PLATFORM_APP_HEALTH_TIMEOUT_MS = 1500;
+const CRON_RUNNER_HEALTH_DEFAULT_PORT = 18792;
+const CRON_RUNNER_HEALTH_TIMEOUT_MS = 1500;
 const MEMORYD_MCP_DEFAULT_URL = "http://127.0.0.1:8766/mcp";
 const MEMORYD_MCP_HEALTH_TIMEOUT_MS = 1500;
 const MEMORYD_MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -299,6 +301,26 @@ const MEMORYD_MCP_PROTOCOL_VERSION = "2025-06-18";
 // legitimately skips every tick, see market-alerts-poll.mjs's off-hours
 // early return, so a long gap there is expected, not a symptom).
 const ALERTS_STALE_HEARTBEAT_MS = 30 * 60_000;
+
+// Timestamps from another local process can legitimately lead this process
+// by a few minutes while NTP settles. A farther-future value cannot prove
+// freshness: without this upper bound, `now - latest <= maxAge` stays true
+// indefinitely for a corrupt or poisoned future timestamp.
+const FRESHNESS_MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+function isFreshTimestamp(timestampMs, nowMs, maxAgeMs) {
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+    return false;
+  }
+  const ageMs = nowMs - timestampMs;
+  return ageMs >= -FRESHNESS_MAX_FUTURE_SKEW_MS && ageMs <= maxAgeMs;
+}
+
+function isTimestampTooFarInFuture(timestampMs, nowMs) {
+  return Number.isFinite(timestampMs)
+    && Number.isFinite(nowMs)
+    && timestampMs - nowMs > FRESHNESS_MAX_FUTURE_SKEW_MS;
+}
 
 // Mirrors market-alerts-poll.mjs's own ESCALATION_THRESHOLD - by the time the
 // poller's own escalation card would have fired, the doctor should already
@@ -389,6 +411,11 @@ export async function analyzeOpenClawRuntimeSnapshot(snapshot = {}) {
     { name: "gateway-listeners", run: () => checkGatewayListeners(gatewayPids) },
     { name: "gateway-restart-storm", run: () => checkGatewayRestartStorm(gatewayErrorLines, nowMs, gatewayErrorWindowMs) },
     { name: "runner-listeners", run: () => checkRunnerListeners(runnerPids) },
+    // A listener count proves only that a process owns 18792. The runner's
+    // own /health contract is the authoritative discovery/alert/job state.
+    // When listener cardinality is already wrong, that finding is decisive
+    // and there is no single runner instance whose health could clear it.
+    { name: "runner-health", run: () => runnerPids.length === 1 ? checkCronRunnerHealth(snapshot) : [] },
     { name: "runner-recent-failures", run: () => checkRecentRunnerFailures(recentRunnerResults) },
     { name: "launchd-jobs", run: () => checkLaunchdJobs(snapshot, nowMs) },
     { name: "alerts-poller-health", run: () => checkAlertsPollerHealth(snapshot, nowMs) },
@@ -491,6 +518,153 @@ function checkRunnerListeners(runnerPids) {
     findings.push(error("runner.duplicate_listener", `18792 出现多个 runner 监听 PID：${runnerPids.join("、")}。`));
   }
   return findings;
+}
+
+async function fetchResponseTextBounded(url, {
+  fetchImpl = fetch,
+  timeoutMs,
+  fallbackTimeoutMs,
+  init = {}
+} = {}) {
+  const configuredTimeout = Number(timeoutMs);
+  const boundedTimeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : fallbackTimeoutMs;
+  const controller = new AbortController();
+  let timeout;
+  const deadline = new Promise((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`HTTP probe timed out after ${boundedTimeoutMs}ms.`));
+    }, boundedTimeoutMs);
+    timeout.unref?.();
+  });
+  const exchange = (async () => {
+    const response = await fetchImpl(url, { ...init, signal: controller.signal });
+    const responseText = await response.text();
+    return { response, responseText };
+  })();
+  // A fetch/body implementation that ignores AbortSignal may settle after
+  // the deadline. Observe that late rejection so it cannot become unhandled.
+  exchange.catch(() => {});
+  try {
+    return await Promise.race([exchange, deadline]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Probes the cron-runner's real health surface. Unlike the listener check,
+ * this observes discovery gaps, degraded alert channels, halted jobs and
+ * run-log failures exposed by openclaw-cron-runner.mjs itself.
+ */
+export async function probeCronRunnerHealth({
+  port = process.env.OPENCLAW_CRON_RUNNER_PORT ?? CRON_RUNNER_HEALTH_DEFAULT_PORT,
+  fetchImpl = fetch,
+  timeoutMs = CRON_RUNNER_HEALTH_TIMEOUT_MS
+} = {}) {
+  const configuredPort = Number(port);
+  const url = `http://127.0.0.1:${configuredPort}/health`;
+  if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535) {
+    return { ok: false, kind: "unreachable", url, reason: `invalid cron-runner port: ${String(port)}` };
+  }
+
+  let exchange;
+  try {
+    exchange = await fetchResponseTextBounded(url, {
+      fetchImpl,
+      timeoutMs,
+      fallbackTimeoutMs: CRON_RUNNER_HEALTH_TIMEOUT_MS
+    });
+  } catch (probeError) {
+    return { ok: false, kind: "unreachable", url, reason: describeError(probeError) };
+  }
+
+  const { response, responseText } = exchange;
+  if (response.status !== 200 && response.status !== 503) {
+    return {
+      ok: false,
+      kind: "status",
+      url,
+      status: response.status,
+      statusText: response.statusText
+    };
+  }
+
+  let body;
+  try {
+    body = JSON.parse(responseText);
+  } catch (parseError) {
+    return {
+      ok: false,
+      kind: "body",
+      url,
+      status: response.status,
+      reason: `invalid JSON: ${describeError(parseError)}`
+    };
+  }
+
+  if (response.status === 200) {
+    if (body?.ok === true && body?.service === "openclaw-cron-runner") {
+      return { ok: true, url, status: 200, body };
+    }
+    return { ok: false, kind: "body", url, status: 200, body };
+  }
+
+  if (response.status === 503) {
+    const errors = Array.isArray(body?.errors)
+      ? body.errors.filter((entry) => typeof entry === "string" && entry.trim().length > 0)
+      : [];
+    const validDegradedBody = body?.ok === false
+      && body?.service === "openclaw-cron-runner"
+      && errors.length === body?.errors?.length
+      && errors.length > 0;
+    if (validDegradedBody) {
+      return { ok: false, kind: "degraded", url, status: 503, errors, body };
+    }
+    return { ok: false, kind: "body", url, status: 503, body };
+  }
+
+  return { ok: false, kind: "body", url, status: response.status, body };
+}
+
+async function checkCronRunnerHealth(snapshot) {
+  const probe = snapshot.cronRunnerHealthProbe ?? await probeCronRunnerHealth({
+    port: snapshot.cronRunnerPort ?? process.env.OPENCLAW_CRON_RUNNER_PORT ?? CRON_RUNNER_HEALTH_DEFAULT_PORT,
+    fetchImpl: typeof snapshot.fetchImpl === "function" ? snapshot.fetchImpl : fetch,
+    timeoutMs: snapshot.cronRunnerHealthTimeoutMs ?? CRON_RUNNER_HEALTH_TIMEOUT_MS
+  });
+  if (probe?.ok) return [];
+
+  if (probe?.kind === "degraded") {
+    return [error(
+      "runner-health.degraded",
+      `openclaw-cron-runner 健康检查报告降级（${probe.url}，HTTP 503）：${probe.errors.join("；")}。`
+    )];
+  }
+  if (probe?.kind === "status") {
+    return [error(
+      "runner-health.unexpected_status",
+      `openclaw-cron-runner 健康检查返回非预期状态（${probe.url}）：HTTP ${probe.status} ${probe.statusText ?? ""}。`
+    )];
+  }
+  if (probe?.kind === "body") {
+    return [error(
+      "runner-health.unexpected_body",
+      `openclaw-cron-runner 健康检查响应不符合契约（${probe.url}，HTTP ${probe.status ?? "unknown"}）：`
+        + `${probe.reason ?? JSON.stringify(probe.body)}。`
+    )];
+  }
+  const severity = deployTargetSeverityFor(snapshot);
+  return [severity(
+    "runner-health.unreachable",
+    `openclaw-cron-runner 健康检查不可达（${probe?.url ?? `http://127.0.0.1:${CRON_RUNNER_HEALTH_DEFAULT_PORT}/health`}）：`
+      + `${probe?.reason ?? "unknown error"}。`
+      + (severity === error
+        ? ` 这台机器已经部署过（${describeDeployFootprint(snapshot)}），因此该状态会阻断验收。`
+        : " 未发现部署痕迹；开发机可以不运行该服务。")
+  )];
 }
 
 function checkRecentRunnerFailures(recentRunnerResults) {
@@ -1477,17 +1651,12 @@ export async function probeMemorydMcp({
   } catch (configurationError) {
     return { ok: false, kind: "unreachable", url: String(url), reason: describeError(configurationError) };
   }
-  const fetchBounded = async (init) => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
-    try {
-      const response = await fetchImpl(targetUrl, { ...init, signal: controller.signal });
-      const responseText = await response.text();
-      return { response, responseText };
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
+  const fetchBounded = (init) => fetchResponseTextBounded(targetUrl, {
+    fetchImpl,
+    timeoutMs: boundedTimeoutMs,
+    fallbackTimeoutMs: MEMORYD_MCP_HEALTH_TIMEOUT_MS,
+    init
+  });
   let sessionId = null;
   try {
     const exchange = await fetchBounded({
@@ -1722,6 +1891,14 @@ function checkDailyBackupHealth(snapshot, nowMs) {
     (Date.parse(`${todayStamp}T00:00:00Z`) - Date.parse(`${stamp}T00:00:00Z`)) / 86_400_000
   );
   const tradingAgeDays = ageDaysFor(newestTrading);
+  const memorydAgeDays = ageDaysFor(newestMemoryd);
+  if (tradingAgeDays < 0 || memorydAgeDays < 0) {
+    return [error(
+      "daily-backup-health.future_timestamp",
+      `每日备份文件名晚于当前日期，不能作为新鲜备份证明：trading-${newestTrading}.sqlite、memoryd-${newestMemoryd}.tgz，今天是 ${todayStamp}。`
+        + `备份文件名只有日期、无法应用 5 分钟时钟偏差，因此任何未来日期都按异常收口；请检查机器时钟与备份目录。`
+    )];
+  }
   if (Number.isFinite(tradingAgeDays) && tradingAgeDays >= DAILY_BACKUP_STALE_DAYS) {
     return [error(
       "daily-backup-health.stale",
@@ -1730,7 +1907,6 @@ function checkDailyBackupHealth(snapshot, nowMs) {
     )];
   }
 
-  const memorydAgeDays = ageDaysFor(newestMemoryd);
   if (Number.isFinite(memorydAgeDays) && memorydAgeDays >= DAILY_BACKUP_STALE_DAYS) {
     return [error(
       "daily-backup-health.memoryd_stale",
@@ -1778,6 +1954,20 @@ function checkStockAnalysisHealth(snapshot, nowMs) {
     }
 
     const freshness = computeStockAnalysisFreshness(db, new Date(nowMs));
+    const latestRunAtMs = freshness.latestRunAt ? Date.parse(freshness.latestRunAt) : Number.NaN;
+    if (freshness.latestRunAt !== null && (
+      !Number.isFinite(latestRunAtMs)
+      || isTimestampTooFarInFuture(latestRunAtMs, nowMs)
+    )) {
+      const timestampText = Number.isFinite(latestRunAtMs)
+        ? `超过当前时间允许的 5 分钟时钟偏差`
+        : "无法解析";
+      return [error(
+        "stock-analysis-health.stale",
+        `个股分析最新交付记录 created_at=${freshness.latestRunAt}，时间戳${timestampText}，不能证明当前展示批次新鲜。`
+          + `请检查机器时钟与 stock_analysis_runs 归档记录；在恢复可信产出前，站内展示的支撑位/阻力位/估值不可当作当前价位使用。`
+      )];
+    }
     if (!freshness.stale) {
       return [];
     }
@@ -1802,10 +1992,11 @@ function checkStockAnalysisHealth(snapshot, nowMs) {
 // Round-4 finding I5 - "official-paper-health" check, covering the last two
 // unprobed daemons (com.openclaw.trading.official-paper.poll and .pnl).
 // Neither writes run_log and neither binds a port; what each one produces is
-// a ROW in official_paper_snapshots tagged with its own `reason` (see
-// official-paper-monitor.mjs's saveSnapshot call sites: "hourly_poll" for the
-// poll job, "post_open_pnl" for the pnl job). So "working" = "a row carrying
-// my reason exists, and it is recent".
+// ROWS in official_paper_snapshots tagged with their own `reason` (see
+// official-paper-monitor.mjs's saveSnapshot call sites). The legacy shared-
+// account mode writes "hourly_poll" / "post_open_pnl"; credential-isolated
+// accounts write the corresponding "*_per_member" reasons. So "working" =
+// the active reason family exists and every account row is recent.
 //
 // Both jobs fire on the clock but no-op outside their window (the plists run
 // them hourly; the scripts' own shouldRunOfficialPaperHourlyPoll /
@@ -1872,8 +2063,14 @@ function checkOfficialPaperHealth(snapshot, nowMs) {
   return withReadOnlyTradingDb(snapshot.dbPath, "official-paper-health", "官方模拟盘轮询/收支任务", (db) => {
     const findings = [];
     if (judgePoll) {
+      const pollFamily = selectOfficialPaperReasonFamily(
+        db,
+        "hourly_poll",
+        "hourly_poll_per_member",
+        { batchWindowMs: 30 * 60_000 }
+      );
       findings.push(...checkOfficialPaperReason(db, nowMs, {
-        reason: "hourly_poll",
+        ...pollFamily,
         code: "poll",
         job: "com.openclaw.trading.official-paper.poll",
         description: "官方模拟盘每小时轮询",
@@ -1882,8 +2079,9 @@ function checkOfficialPaperHealth(snapshot, nowMs) {
       }));
     }
     if (judgePnl) {
+      const pnlFamily = selectOfficialPaperReasonFamily(db, "post_open_pnl", "post_open_pnl_per_member");
       const pnlFindings = checkOfficialPaperReason(db, nowMs, {
-        reason: "post_open_pnl",
+        ...pnlFamily,
         code: "pnl",
         job: "com.openclaw.trading.official-paper.pnl",
         description: "官方模拟盘开盘后收支报告",
@@ -1892,19 +2090,73 @@ function checkOfficialPaperHealth(snapshot, nowMs) {
       });
       findings.push(...pnlFindings);
       if (pnlFindings.length === 0 && snapshot.repoRoot) {
-        findings.push(...checkOfficialPaperPnlArtifact(db, snapshot.repoRoot));
+        findings.push(...checkOfficialPaperPnlArtifact(db, snapshot.repoRoot, pnlFamily));
       }
     }
     return findings;
   });
 }
 
-function checkOfficialPaperReason(db, nowMs, options) {
-  const row = db
-    .prepare(`SELECT COUNT(*) AS row_count, MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = ?`)
-    .get(options.reason);
+function selectOfficialPaperReasonFamily(db, legacyReason, perMemberReason, options = {}) {
+  const rows = db.prepare(`
+    SELECT reason, MAX(fetched_at) AS latest
+    FROM official_paper_snapshots
+    WHERE reason IN (?, ?)
+    GROUP BY reason
+  `).all(legacyReason, perMemberReason);
+  const byReason = new Map(rows.map((row) => [String(row.reason), row.latest ? String(row.latest) : null]));
+  const legacyLatest = byReason.get(legacyReason) ?? null;
+  const perMemberLatest = byReason.get(perMemberReason) ?? null;
+  const legacyMs = legacyLatest ? Date.parse(legacyLatest) : Number.NaN;
+  const perMemberMs = perMemberLatest ? Date.parse(perMemberLatest) : Number.NaN;
 
-  if (Number(row?.row_count ?? 0) === 0) {
+  // A historical per-member row must not lock doctor into that family after
+  // credentials are withdrawn and the newer successful runs return to the
+  // legacy shared account. Equal timestamps prefer per-member because that is
+  // the more specific format and avoids a same-run legacy row masking it.
+  const perOwner = perMemberLatest !== null && (
+    legacyLatest === null
+    || (Number.isFinite(perMemberMs) && (!Number.isFinite(legacyMs) || perMemberMs >= legacyMs))
+  );
+  const latest = perOwner ? perMemberLatest : legacyLatest;
+  const latestMs = latest ? Date.parse(latest) : Number.NaN;
+  return {
+    reason: perOwner ? perMemberReason : legacyReason,
+    perOwner,
+    batchDate: perOwner && latest ? latest.slice(0, 10) : null,
+    batchSince: perOwner && Number.isFinite(latestMs) && options.batchWindowMs
+      ? new Date(latestMs - options.batchWindowMs).toISOString()
+      : null
+  };
+}
+
+function checkOfficialPaperReason(db, nowMs, options) {
+  // In per-member mode, limit owners to the observable latest run batch: a
+  // 30-minute window around the latest hourly poll, or the latest PnL report
+  // date. This keeps withdrawn/retired accounts from poisoning health forever.
+  // A credentialed account that fails before writing its first row is covered
+  // by the scheduled-job heartbeat/non-zero exit; SQLite alone has no
+  // credential inventory from which to infer that missing owner without
+  // reading secret-adjacent filesystem state in the doctor.
+  const rows = options.perOwner
+    ? options.batchSince
+      ? db.prepare(`
+          SELECT owner_id, COUNT(*) AS row_count, MAX(fetched_at) AS latest
+          FROM official_paper_snapshots
+          WHERE reason = ? AND fetched_at >= ?
+          GROUP BY owner_id
+        `).all(options.reason, options.batchSince)
+      : db.prepare(`
+        SELECT owner_id, COUNT(*) AS row_count, MAX(fetched_at) AS latest
+        FROM official_paper_snapshots
+        WHERE reason = ? AND substr(fetched_at, 1, 10) = ?
+        GROUP BY owner_id
+      `).all(options.reason, options.batchDate)
+    : [db
+        .prepare(`SELECT NULL AS owner_id, COUNT(*) AS row_count, MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = ?`)
+        .get(options.reason)];
+
+  if (rows.length === 0 || rows.every((row) => Number(row?.row_count ?? 0) === 0)) {
     return [warn(
       `official-paper-health.${options.code}.never_ran`,
       `${options.job} 已加载，但 official_paper_snapshots 里没有任何 reason=${options.reason} 的记录——${options.description}从未成功写入过数据。`
@@ -1912,20 +2164,25 @@ function checkOfficialPaperReason(db, nowMs, options) {
     )];
   }
 
-  const latest = row?.latest ? String(row.latest) : null;
-  const latestMs = latest ? Date.parse(latest) : Number.NaN;
-  // A non-empty table whose MAX(fetched_at) is unusable counts as stale, for
-  // the same reason checkNewsEngineHealth treats an all-NULL timestamp column
-  // that way: "we cannot prove freshness" must never pass as "fresh".
-  if (!Number.isFinite(latestMs) || Number(nowMs) - latestMs > options.staleMs) {
+  return rows.flatMap((row) => {
+    const latest = row?.latest ? String(row.latest) : null;
+    const latestMs = latest ? Date.parse(latest) : Number.NaN;
+    // A non-empty table whose MAX(fetched_at) is unusable counts as stale, for
+    // the same reason checkNewsEngineHealth treats an all-NULL timestamp
+    // column that way: "we cannot prove freshness" must never pass as "fresh".
+    if (isFreshTimestamp(latestMs, Number(nowMs), options.staleMs)) {
+      return [];
+    }
+    const ownerText = options.perOwner ? `、owner_id=${String(row?.owner_id ?? "空")}` : "";
+    const freshnessText = isTimestampTooFarInFuture(latestMs, Number(nowMs))
+      ? `fetched_at 超过当前时间允许的 5 分钟时钟偏差（${latest}）`
+      : `已经超过${options.staleText}没有新记录（最近一次 fetched_at=${latest ?? "未知"}）`;
     return [error(
       `official-paper-health.${options.code}.stale`,
-      `${options.description}已经超过${options.staleText}没有新记录（当前处于美股常规交易时段，最近一次 reason=${options.reason} 的 fetched_at=${latest ?? "未知"}）。`
+      `${options.description}${freshnessText}（当前处于美股常规交易时段，reason=${options.reason}${ownerText}）。`
         + `${options.job} 很可能正在失败——请看它的错误日志。`
     )];
-  }
-
-  return [];
+  });
 }
 
 // The pnl job writes its snapshot row FIRST and renders
@@ -1933,23 +2190,39 @@ function checkOfficialPaperReason(db, nowMs, options) {
 // monitor.mjs's sendPnlReport), so a fresh row with no matching markdown is
 // exactly the half-finished run a row-only probe would call healthy. The date
 // is derived the way the producer derives it: `fetchedAt.slice(0, 10)`.
-function checkOfficialPaperPnlArtifact(db, repoRoot) {
-  const row = db
-    .prepare(`SELECT MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = 'post_open_pnl'`)
-    .get();
-  const latest = row?.latest ? String(row.latest) : null;
-  if (!latest) {
-    return [];
-  }
-  const markdownPath = join(repoRoot, "reports", "official-paper", `${latest.slice(0, 10)}-post-open.md`);
-  if (existsSync(markdownPath)) {
-    return [];
-  }
-  return [error(
-    "official-paper-health.pnl.report_missing",
-    `官方模拟盘收支任务写入了 ${latest} 的快照，但对应的报告文件不存在（${markdownPath}）——这一次运行只完成了一半，`
-      + `报告渲染或投递环节失败了。请看 runtime/launchd/com.openclaw.trading.official-paper.pnl.err.log。`
-  )];
+function checkOfficialPaperPnlArtifact(db, repoRoot, family) {
+  const rows = family.perOwner
+    ? db.prepare(`
+        SELECT owner_id, MAX(fetched_at) AS latest
+        FROM official_paper_snapshots
+        WHERE reason = ? AND substr(fetched_at, 1, 10) = ?
+        GROUP BY owner_id
+      `).all(family.reason, family.batchDate)
+    : [db
+        .prepare(`SELECT NULL AS owner_id, MAX(fetched_at) AS latest FROM official_paper_snapshots WHERE reason = ?`)
+        .get(family.reason)];
+
+  return rows.flatMap((row) => {
+    const latest = row?.latest ? String(row.latest) : null;
+    if (!latest) {
+      return [];
+    }
+    const ownerId = family.perOwner && typeof row?.owner_id === "string" ? row.owner_id : null;
+    const safeOwner = ownerId && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(ownerId) && ownerId !== "." && ownerId !== "..";
+    const filename = family.perOwner && safeOwner
+      ? `${latest.slice(0, 10)}-post-open--${ownerId}.md`
+      : `${latest.slice(0, 10)}-post-open.md`;
+    const markdownPath = join(repoRoot, "reports", "official-paper", filename);
+    if ((!family.perOwner || safeOwner) && existsSync(markdownPath)) {
+      return [];
+    }
+    const ownerText = family.perOwner ? `（owner_id=${ownerId ?? "空"}）` : "";
+    return [error(
+      "official-paper-health.pnl.report_missing",
+      `官方模拟盘收支任务写入了 ${latest}${ownerText} 的快照，但对应的报告文件不存在（${markdownPath}）——这一次运行只完成了一半，`
+        + `报告渲染或投递环节失败了。请看 runtime/launchd/com.openclaw.trading.official-paper.pnl.err.log。`
+    )];
+  });
 }
 
 // Phase 4 Task 8 (news engine deployment wiring) - "rsshub-health" check:
@@ -2064,11 +2337,14 @@ function checkNewsEngineHealth(snapshot, nowMs) {
     }
 
     const lastMs = stats.lastPublishedAt ? Date.parse(stats.lastPublishedAt) : NaN;
-    const isStale = !Number.isFinite(lastMs) || nowMs - lastMs > NEWS_ENGINE_STALE_THRESHOLD_MS;
+    const isStale = !isFreshTimestamp(lastMs, nowMs, NEWS_ENGINE_STALE_THRESHOLD_MS);
     if (isStale) {
+      const freshnessText = isTimestampTooFarInFuture(lastMs, nowMs)
+        ? "最近事件时间超过当前时间允许的 5 分钟时钟偏差"
+        : "超过 48 小时无新事件";
       return [warn(
         "news-engine-health.stale",
-        `新闻引擎超过 48 小时无新事件（news_events 共 ${stats.eventCount} 条事件，最近一次 last_published_at=${stats.lastPublishedAt ?? "未知"}）。请检查 RSSHub/Finnhub 采集与 openclaw cron 是否正常运行。`
+        `新闻引擎${freshnessText}（news_events 共 ${stats.eventCount} 条事件，最近一次 last_published_at=${stats.lastPublishedAt ?? "未知"}）。请检查 RSSHub/Finnhub 采集与 openclaw cron 是否正常运行。`
       )];
     }
 
@@ -2280,9 +2556,11 @@ function checkAlertsPollerHealth(snapshot, nowMs) {
       dbFindings.push(warn("alerts-poller-health.never_ran", "提醒器从未运行过（run_log 中没有 market-alerts 记录）。"));
     } else {
       const lastRunMs = Date.parse(lastRun);
-      const isStale = Number.isFinite(lastRunMs) && nowMs - lastRunMs > ALERTS_STALE_HEARTBEAT_MS;
+      const isStale = !isFreshTimestamp(lastRunMs, nowMs, ALERTS_STALE_HEARTBEAT_MS);
       if (isStale) {
-        dbFindings.push(...checkStaleHeartbeatMarketHours(lastRun, nowMs));
+        dbFindings.push(...checkStaleHeartbeatMarketHours(lastRun, nowMs, {
+          future: isTimestampTooFarInFuture(lastRunMs, nowMs)
+        }));
       }
     }
 
@@ -2343,11 +2621,14 @@ function checkScheduledJobHeartbeats(snapshot, nowMs) {
       }
 
       const lastRunMs = Date.parse(lastRun);
-      if (!Number.isFinite(lastRunMs) || nowMs - lastRunMs > entry.staleAfterMs) {
+      if (!isFreshTimestamp(lastRunMs, nowMs, entry.staleAfterMs)) {
+        const freshnessText = isTimestampTooFarInFuture(lastRunMs, nowMs)
+          ? "超过当前时间允许的 5 分钟时钟偏差"
+          : `已超过 ${Math.round(entry.staleAfterMs / 3_600_000)} 小时没有新记录`;
         findings.push(warn(
           `scheduled-job-heartbeat.${entry.job}.stale`,
           `${entry.displayName}（${entry.label}）最近一次 run_log 心跳是 ${lastRun}，`
-            + `已超过 ${Math.round(entry.staleAfterMs / 3_600_000)} 小时没有新记录——该任务可能已停止运行。`
+            + `${freshnessText}——该任务可能已停止运行或本机时钟/记录异常。`
         ));
       }
 
@@ -2374,7 +2655,7 @@ function checkScheduledJobHeartbeats(snapshot, nowMs) {
 // up. Isolated into its own helper so the stale-heartbeat finding itself is
 // reported (not silently swallowed) even when the market-hours qualifier
 // can't be evaluated at all.
-function checkStaleHeartbeatMarketHours(lastRun, nowMs) {
+function checkStaleHeartbeatMarketHours(lastRun, nowMs, { future = false } = {}) {
   const findings = [];
   let isMarketHours;
   try {
@@ -2387,7 +2668,7 @@ function checkStaleHeartbeatMarketHours(lastRun, nowMs) {
     ));
     findings.push(warn(
       "alerts-poller-health.stale_heartbeat_unknown_market_hours",
-      `提醒器最近一次运行是 ${lastRun}，距今已超过 30 分钟没有新的 run_log 记录；由于交易日历无法覆盖当前年份，无法判断当前是否处于交易时段来确认这是否异常，请人工核实提醒器状态。`
+      `提醒器最近一次运行是 ${lastRun}，${future ? "超过当前时间允许的 5 分钟时钟偏差" : "距今已超过 30 分钟没有新的 run_log 记录"}；由于交易日历无法覆盖当前年份，无法判断当前是否处于交易时段来确认这是否异常，请人工核实提醒器状态。`
     ));
     return findings;
   }
@@ -2395,7 +2676,7 @@ function checkStaleHeartbeatMarketHours(lastRun, nowMs) {
   if (isMarketHours) {
     findings.push(warn(
       "alerts-poller-health.stale_heartbeat",
-      `提醒器最近一次运行是 ${lastRun}，距今已超过 30 分钟没有新的 run_log 记录，且当前正处于美股常规交易时段——poller 可能已停止运行（launchd 未加载、进程崩溃或系统休眠）。`
+      `提醒器最近一次运行是 ${lastRun}，${future ? "超过当前时间允许的 5 分钟时钟偏差" : "距今已超过 30 分钟没有新的 run_log 记录"}，且当前正处于美股常规交易时段——poller 可能已停止运行，或本机时钟/记录异常。`
     ));
   }
 

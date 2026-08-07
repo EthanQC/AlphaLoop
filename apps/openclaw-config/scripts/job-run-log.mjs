@@ -269,10 +269,21 @@ export function recentFailures(db, job, limit = 10) {
  */
 export function consecutiveFailureCount(db, job, limit = RUN_LOG_LOOKBACK_LIMIT) {
   const rows = db
-    .prepare(`SELECT ok FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
+    .prepare(`SELECT ok, evidence FROM run_log WHERE job = ? ORDER BY rowid DESC LIMIT ?`)
     .all(String(job), Math.max(1, Number(limit ?? RUN_LOG_LOOKBACK_LIMIT)));
   let count = 0;
   for (const row of rows) {
+    // Outside a job's actual trading window the launcher still ticks. Such a
+    // row proves process liveness but is neutral for workload health: it must
+    // neither increment nor clear the last due run's failure streak.
+    try {
+      const evidence = JSON.parse(String(row.evidence ?? "[]"));
+      if (Array.isArray(evidence) && evidence.some((item) => item?.event === "scheduled_not_due")) {
+        continue;
+      }
+    } catch {
+      // Preserve historical ok/fail semantics for malformed legacy evidence.
+    }
     if (Number(row.ok) === 1) {
       break;
     }

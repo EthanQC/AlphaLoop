@@ -632,7 +632,7 @@ step_pull() {
 }
 
 step_build() {
-  (cd "${REPO_ROOT}" && pnpm install && pnpm build)
+  (cd "${REPO_ROOT}" && pnpm install --frozen-lockfile && pnpm build)
 }
 
 step_user_agents() {

@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  OfficialPaperOrderLifecycleRepository,
   ProposalRepository,
   createId,
   migrate,
@@ -41,21 +42,40 @@ function seedSnapshot(
     netAssets: number;
     marketValue: number;
     fetchedAt?: string;
-    positions?: Array<{ symbol: string; quantity: number }>;
+    reason?: string;
+    reportingCurrency?: string | null;
+    cashInfos?: Array<{ currency: string; available_cash: string }>;
+    positions?: Array<{
+      symbol: string;
+      quantity: number;
+      available?: number;
+      currency?: string;
+      priceSource?: string;
+      price?: number;
+    }>;
   }
 ): void {
+  const positions = (opts.positions ?? []).map((position) => ({ currency: "USD", ...position }));
+  const primaryAsset = {
+    net_assets: String(opts.netAssets),
+    total_cash: "0",
+    ...(opts.reportingCurrency === null ? {} : { currency: opts.reportingCurrency ?? "USD" }),
+    ...(opts.cashInfos === undefined ? {} : { cash_infos: opts.cashInfos })
+  };
   db
     .prepare(`
       INSERT INTO official_paper_snapshots
       (id, fetched_at, reason, net_assets, total_cash, market_value, positions, raw, owner_id)
-      VALUES (?, ?, 'scheduled', ?, 0, ?, ?, '{}', ?)
+      VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
     `)
     .run(
       createId("snapshot"),
       opts.fetchedAt ?? nowIso(),
+      opts.reason ?? "hourly_poll",
       opts.netAssets,
       opts.marketValue,
-      JSON.stringify(opts.positions ?? []),
+      JSON.stringify(positions),
+      JSON.stringify({ primaryAsset, positions }),
       opts.ownerId
     );
 }
@@ -453,6 +473,60 @@ describe("createBrokerExecutorServer", () => {
       expect(callCount()).toBe(callsAfterFirst);
     });
 
+    it("repairs the report and proposal on replay after a post-submit local write failure without re-submitting", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      const { fn, callCount } = makeCountingExec({
+        order_id: "ext_repair_after_report_failure",
+        status: "Filled",
+        executed_price: "100.00"
+      });
+      await startServer({ execFn: fn });
+
+      const approved = createApprovedProposal(db, { quantity: 1, limitPrice: 100 });
+      const requestInit = {
+        method: "POST" as const,
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: approved.id })
+      };
+      db.exec(`
+        CREATE TRIGGER fail_execution_report_insert
+        BEFORE INSERT ON execution_reports
+        BEGIN
+          SELECT RAISE(ABORT, 'injected execution report write failure');
+        END;
+      `);
+
+      const first = await fetch(`${baseUrl(server)}/v1/tickets`, requestInit);
+      expect(first.status).toBe(500);
+      expect(callCount()).toBeGreaterThan(0);
+      const callsAfterBrokerAccepted = callCount();
+      const lifecycleAfterFailure = db
+        .prepare(`SELECT external_order_id, lifecycle_stage FROM official_paper_order_lifecycle WHERE ticket_id = ?`)
+        .get(deriveTicketId(approved.id)) as { external_order_id: string | null; lifecycle_stage: string };
+      expect(lifecycleAfterFailure).toMatchObject({
+        external_order_id: "ext_repair_after_report_failure",
+        lifecycle_stage: "filled"
+      });
+      expect(new ProposalRepository(db).getById(approved.id)?.status).toBe("approved");
+      expect((db.prepare(`SELECT COUNT(*) AS count FROM execution_reports`).get() as { count: number }).count).toBe(0);
+
+      db.exec(`DROP TRIGGER fail_execution_report_insert;`);
+      const replay = await fetch(`${baseUrl(server)}/v1/tickets`, requestInit);
+      expect(replay.status).toBe(200);
+      const replayBody = await replay.json();
+      expect(replayBody).toMatchObject({
+        replay: true,
+        externalOrderId: "ext_repair_after_report_failure"
+      });
+      expect(typeof replayBody.reportId).toBe("string");
+      expect(callCount()).toBe(callsAfterBrokerAccepted);
+      expect(new ProposalRepository(db).getById(approved.id)).toMatchObject({
+        status: "executed",
+        ticketId: deriveTicketId(approved.id)
+      });
+      expect((db.prepare(`SELECT COUNT(*) AS count FROM execution_reports`).get() as { count: number }).count).toBe(1);
+    });
+
     it("submit_unconfirmed (507) when the CLI call throws, marks lifecycle stage submit_unconfirmed and the proposal failed - and does NOT re-execute on replay", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       const { fn, callCount } = makeThrowingExec("spawn ENOENT: longbridge binary not found");
@@ -585,6 +659,32 @@ describe("createBrokerExecutorServer", () => {
       expect(secondLifecycle).toBeUndefined();
     });
 
+    it("fails closed when a broker-observed active order has no trustworthy price", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      const lifecycle = new OfficialPaperOrderLifecycleRepository(db);
+      lifecycle.insertSubmitting({
+        ticketId: "external_unpriced", ownerId: "mem_owner", symbol: "IBM.US", assetClass: "stock",
+        side: "buy", quantity: 100, submittedAt: nowIso()
+      });
+      lifecycle.finalizeExecution("external_unpriced", {
+        externalOrderId: "ext_unpriced", brokerStatus: "New", localStatus: "submitted",
+        lifecycleStage: "submitted", notes: [], observedAt: nowIso()
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_execute", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(callCount()).toBe(0);
+      expect((await response.json()).reasons.join(" ")).toMatch(/新鲜可信/);
+    });
+
     // FIX 2 end-to-end: a sell-to-open (owner holds no position) over the
     // 10% budget must be BLOCKED at the HTTP layer, wiring the snapshot's
     // positions JSON through to risk.ts's heldQuantityForSymbol gate.
@@ -611,6 +711,238 @@ describe("createBrokerExecutorServer", () => {
       expect(body.reasons.join(" ")).toMatch(/单个想法暴露/);
     });
 
+    it("fails closed on a below-budget sell-to-open because short exposure is not yet observable", async () => {
+      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0, positions: [] });
+      const { fn, callCount } = makeCountingExec({ order_id: "ext_small_short", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 10,
+        limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/卖空|多头持仓/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("blocks a buy when a fresh snapshot contains a cost/zero-priced position", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        positions: [{ symbol: "NVDA.US", quantity: 10, priceSource: "zero", price: 0 }]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "ext_degraded_buy", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/估值|实时价格/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("rebuilds a HKD-reporting account on a USD basis before applying the USD ticket cap", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 860_613.64,
+        marketValue: 721.89,
+        reportingCurrency: "HKD",
+        cashInfos: [
+          { currency: "USD", available_cash: "122079.05" },
+          { currency: "HKD", available_cash: "0.00" }
+        ],
+        positions: [
+          { symbol: "QQQ.US", currency: "USD", quantity: 1, priceSource: "live", price: 721.89 }
+        ]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_execute_fx_mixed", status: "New" });
+      await startServer({ execFn: fn });
+
+      // $13,000 is only 1.51% if the HKD number 860,613.64 is incorrectly
+      // treated as USD, but exceeds 10% of the verifiable USD basis:
+      // 122,079.05 cash + 721.89 QQQ = 122,800.94 USD.
+      const proposal = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 130, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/官方模拟盘预算/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("rejects an approved HK-market proposal before creating an execution lease or calling the broker", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        reportingCurrency: "USD",
+        positions: []
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_execute_hkd_ticket", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "0700.HK", quantity: 100, limitPrice: 300 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { error: string }).error).toMatch(/美股|\.US|美元/u);
+      expect(callCount()).toBe(0);
+      expect(
+        db.prepare("SELECT 1 FROM official_paper_order_lifecycle WHERE ticket_id = ?")
+          .get(deriveTicketId(proposal.id))
+      ).toBeUndefined();
+    });
+
+    it("fails closed for new USD risk when a non-USD account has no trustworthy conversion basis", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 860_613.64,
+        marketValue: 721.89,
+        reportingCurrency: "HKD",
+        // Both buckets are funded, but raw carries no broker FX quote that
+        // can translate the HKD amount into the USD ticket basis.
+        cashInfos: [
+          { currency: "USD", available_cash: "122079.05" },
+          { currency: "HKD", available_cash: "1000.00" }
+        ],
+        positions: [
+          { symbol: "QQQ.US", currency: "USD", quantity: 1, priceSource: "live", price: 721.89 }
+        ]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_execute_fx_unknown", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/币种|美元|估值/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("keeps a covered sell available when currency conversion is unavailable", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 860_613.64,
+        marketValue: 20_000,
+        reportingCurrency: "HKD",
+        positions: [
+          { symbol: "TSLA.US", currency: "USD", quantity: 200, available: 200, priceSource: "live", price: 100 }
+        ]
+      });
+      const { fn } = makeCountingExec({ order_id: "ext_fx_unknown_derisk", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 200,
+        limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+    });
+
+    it("keeps same-USD snapshots on the normal budget path", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        reportingCurrency: "USD",
+        positions: []
+      });
+      const { fn } = makeCountingExec({ order_id: "ext_same_usd", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+    });
+
+    it("recomputes gross exposure from mixed long/short positions instead of trusting a net market_value", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        // Simulates a historical/netted row: +8k long and -4k short were
+        // persisted as 4k. Gross is 12k, already over the 10% cap.
+        marketValue: 4_000,
+        positions: [
+          { symbol: "AAPL.US", quantity: 80, priceSource: "live", price: 100 },
+          { symbol: "TSLA.US", quantity: -40, priceSource: "live", price: 100 }
+        ]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "ext_netted_buy", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "NVDA.US", quantity: 1, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/官方模拟盘预算/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("never lowers a larger recorded exposure when the position array is empty", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 9_000,
+        positions: []
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "ext_preserve_exposure", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, { symbol: "NVDA.US", quantity: 20, limitPrice: 100 });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/官方模拟盘预算/u);
+      expect(callCount()).toBe(0);
+    });
+
     // Companion: a sell fully within the held long is NOT blocked, even
     // though the same notional would be over budget for a naked short.
     it("allows a de-risking sell within the held long over the same notional that would block a naked short", async () => {
@@ -618,7 +950,7 @@ describe("createBrokerExecutorServer", () => {
         ownerId: "mem_owner",
         netAssets: 100_000,
         marketValue: 20_000,
-        positions: [{ symbol: "TSLA.US", quantity: 200 }]
+        positions: [{ symbol: "TSLA.US", quantity: 200, available: 200 }]
       });
       const { fn } = makeCountingExec({ order_id: "ext_derisk", status: "New" });
       await startServer({ execFn: fn });
@@ -638,6 +970,110 @@ describe("createBrokerExecutorServer", () => {
       expect(response.status).toBe(200);
     });
 
+    it("sums duplicate positive position rows for the same symbol before evaluating a covered sell", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 15_000,
+        positions: [
+          { symbol: "TSLA.US", quantity: 60, available: 60 },
+          { symbol: "TSLA.US", quantity: 40, available: 40 }
+        ]
+      });
+      const { fn } = makeCountingExec({ order_id: "ext_duplicate_positive", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 100,
+        limitPrice: 150
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(200);
+    });
+
+    it("nets mixed-sign duplicate position rows before allowing a covered sell", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 7_000,
+        positions: [
+          { symbol: "TSLA.US", quantity: 40, available: 10 },
+          { symbol: "TSLA.US", quantity: -30, available: 0 }
+        ]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_sell_mixed_position", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "TSLA.US",
+        side: "sell",
+        quantity: 40,
+        limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/卖空|多头持仓/u);
+      expect(callCount()).toBe(0);
+    });
+
+    it("does not treat frozen shares with available zero as covered-sell capacity", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 10_000,
+        positions: [{ symbol: "AAPL.US", quantity: 100, available: 0 }]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_sell_frozen", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "AAPL.US", side: "sell", quantity: 100, limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(callCount()).toBe(0);
+    });
+
+    it("caps covered-sell capacity at available when it is below total quantity", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 10_000,
+        positions: [{ symbol: "AAPL.US", quantity: 100, available: 25 }]
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "must_not_sell_beyond_available", status: "New" });
+      await startServer({ execFn: fn });
+
+      const proposal = createApprovedProposal(db, {
+        symbol: "AAPL.US", side: "sell", quantity: 50, limitPrice: 100
+      });
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(callCount()).toBe(0);
+    });
+
     // FIX 1 (order-splitting naked short): the sell exemption must not
     // double-spend the SAME held shares across sequential sells. Hold 150 ->
     // sell A 150 (within held, exempt, resting at the broker) -> sell B 150
@@ -650,9 +1086,9 @@ describe("createBrokerExecutorServer", () => {
         ownerId: "mem_owner",
         netAssets: 100_000,
         marketValue: 15_000,
-        positions: [{ symbol: "TSLA.US", quantity: 150 }]
+        positions: [{ symbol: "TSLA.US", quantity: 150, available: 150 }]
       });
-      // external_order_id is UNIQUE - mint a fresh id per execution.
+      // A single owner/account cannot reuse an external broker order id.
       let orderCounter = 0;
       const fn: LongbridgeExecFn = () => {
         orderCounter += 1;
@@ -709,9 +1145,13 @@ describe("createBrokerExecutorServer", () => {
         ownerId: "mem_owner",
         netAssets: 100_000,
         marketValue: 15_000,
-        positions: [{ symbol: "AAPL.US", quantity: 100 }]
+        positions: [{ symbol: "AAPL.US", quantity: 100, available: 100 }]
       });
-      const { fn } = makeCountingExec({ order_id: "ext_bare_symbol", status: "New" });
+      const cliCalls: string[][] = [];
+      const fn: LongbridgeExecFn = (_command, args) => {
+        cliCalls.push([...args]);
+        return JSON.stringify({ order_id: "ext_bare_symbol", status: "New" });
+      };
       await startServer({ execFn: fn });
 
       // 100 shares * $150 = $15,000 = 15% of net liq: over the 10% cap for a
@@ -730,14 +1170,17 @@ describe("createBrokerExecutorServer", () => {
       });
 
       expect(response.status).toBe(200);
+      expect(cliCalls[0]?.[2]).toBe("AAPL.US");
+      expect(
+        db.prepare("SELECT symbol FROM official_paper_order_lifecycle WHERE ticket_id = ?")
+          .get(deriveTicketId(proposal.id))
+      ).toEqual({ symbol: "AAPL.US" });
     });
 
     it("per-owner risk isolation: a DIFFERENT owner's open order does not count against this owner's budget", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       seedSnapshot(db, { ownerId: "mem_other", netAssets: 100_000, marketValue: 0 });
-      // external_order_id is UNIQUE across the whole lifecycle table, so this
-      // fake must mint a DIFFERENT id per call (two real orders in this test,
-      // one per owner) - a fixed literal would collide on the second insert.
+      // Mint realistic distinct broker ids for the two submitted orders.
       let orderCounter = 0;
       const fn: LongbridgeExecFn = () => {
         orderCounter += 1;
@@ -774,7 +1217,7 @@ describe("createBrokerExecutorServer", () => {
       expect(ownerResponse.status).toBe(200);
     });
 
-    it("blocks the second same-owner 6% naked short when that account's open risk reaches 12%", async () => {
+    it("blocks each same-owner 6% naked short before filled short exposure can disappear", async () => {
       seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
       let orderCounter = 0;
       const fn: LongbridgeExecFn = () => {
@@ -795,7 +1238,8 @@ describe("createBrokerExecutorServer", () => {
         headers: AUTH_HEADERS,
         body: JSON.stringify({ proposalId: first.id })
       });
-      expect(firstResponse.status).toBe(200);
+      expect(firstResponse.status).toBe(400);
+      expect(((await firstResponse.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/卖空|多头持仓/u);
 
       const second = createApprovedProposal(db, {
         ownerId: "mem_owner",
@@ -812,7 +1256,76 @@ describe("createBrokerExecutorServer", () => {
 
       expect(secondResponse.status).toBe(400);
       const body = await secondResponse.json();
-      expect(body.reasons.join(" ")).toMatch(/OpenClaw 官方模拟盘预算/u);
+      expect(body.reasons.join(" ")).toMatch(/卖空|多头持仓/u);
+      expect(orderCounter).toBe(0);
+    });
+
+    it("counts an immediately filled buy until a newer snapshot absorbs it", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        fetchedAt: new Date(Date.now() - 60_000).toISOString(),
+        positions: []
+      });
+      let orderCounter = 0;
+      const fn: LongbridgeExecFn = () => {
+        orderCounter += 1;
+        return JSON.stringify({ order_id: `ext_filled_buy_${orderCounter}`, status: "Filled" });
+      };
+      await startServer({ execFn: fn });
+
+      const first = createApprovedProposal(db, { symbol: "AAPL.US", quantity: 60, limitPrice: 100 });
+      const firstResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: first.id })
+      });
+      expect(firstResponse.status).toBe(200);
+
+      const second = createApprovedProposal(db, { symbol: "MSFT.US", quantity: 60, limitPrice: 100 });
+      const secondResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: second.id })
+      });
+
+      expect(secondResponse.status).toBe(400);
+      expect(((await secondResponse.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/官方模拟盘预算/u);
+    });
+
+    it("deducts an immediately filled sell from stale snapshot holdings before another sell", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 10_000,
+        fetchedAt: new Date(Date.now() - 60_000).toISOString(),
+        positions: [{ symbol: "TSLA.US", quantity: 100, available: 100, priceSource: "live", price: 100 }]
+      });
+      let orderCounter = 0;
+      const fn: LongbridgeExecFn = () => {
+        orderCounter += 1;
+        return JSON.stringify({ order_id: `ext_filled_sell_${orderCounter}`, status: "Filled" });
+      };
+      await startServer({ execFn: fn });
+
+      const first = createApprovedProposal(db, { symbol: "TSLA.US", side: "sell", quantity: 100, limitPrice: 100 });
+      const firstResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: first.id })
+      });
+      expect(firstResponse.status).toBe(200);
+
+      const second = createApprovedProposal(db, { symbol: "TSLA.US", side: "sell", quantity: 100, limitPrice: 100 });
+      const secondResponse = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: second.id })
+      });
+
+      expect(secondResponse.status).toBe(400);
+      expect(((await secondResponse.json()) as { reasons: string[] }).reasons.join(" ")).toMatch(/卖空|多头持仓/u);
     });
 
     it("threads ownerId/proposalId onto the lifecycle row from the server-built ticket (never trusts the request body's fields)", async () => {
@@ -846,7 +1359,12 @@ describe("createBrokerExecutorServer", () => {
     });
 
     it("resolves the execution environment from proposal.ownerId and passes it to both broker CLI calls", async () => {
-      seedSnapshot(db, { ownerId: "mem_owner", netAssets: 100_000, marketValue: 0 });
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        reason: "hourly_poll_per_member"
+      });
       const resolvedOwners: string[] = [];
       const seenTokens: Array<string | undefined> = [];
       const fn: LongbridgeExecFn = (_command, args, options) => {
@@ -951,6 +1469,63 @@ describe("createBrokerExecutorServer", () => {
       const body = await response.json();
       expect(body.reasons.join(" ")).toMatch(/新鲜可信官方模拟盘账户快照/u);
       expect(execCalls).toBe(0);
+    });
+
+    it("never uses a same-owner legacy snapshot to authorize a member-account order", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        reason: "hourly_poll"
+      });
+      let execCalls = 0;
+      await startServer({
+        execFn: () => {
+          execCalls += 1;
+          return JSON.stringify({ order_id: "wrong-account" });
+        },
+        executionContextResolver: () => ({
+          mode: "member",
+          env: {
+            ...process.env,
+            LONGBRIDGE_ACCESS_TOKEN: "owner-token",
+            LONGBRIDGE_ACCOUNT_MODE: "paper",
+            LONGBRIDGE_OFFICIAL_PAPER_ENABLED: "true",
+            ALLOW_LIVE_EXECUTION: "false"
+          }
+        })
+      });
+      const proposal = createApprovedProposal(db, { ownerId: "mem_owner" });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(execCalls).toBe(0);
+    });
+
+    it("never uses a same-owner per-member snapshot after switching back to legacy execution", async () => {
+      seedSnapshot(db, {
+        ownerId: "mem_owner",
+        netAssets: 100_000,
+        marketValue: 0,
+        reason: "hourly_poll_per_member"
+      });
+      const { fn, callCount } = makeCountingExec({ order_id: "wrong-account", status: "Pending" });
+      await startServer({ execFn: fn });
+      const proposal = createApprovedProposal(db, { ownerId: "mem_owner" });
+
+      const response = await fetch(`${baseUrl(server)}/v1/tickets`, {
+        method: "POST",
+        headers: AUTH_HEADERS,
+        body: JSON.stringify({ proposalId: proposal.id })
+      });
+
+      expect(response.status).toBe(400);
+      expect(callCount()).toBe(0);
     });
 
     it("allows the legacy single-account context to use its shared snapshot", async () => {

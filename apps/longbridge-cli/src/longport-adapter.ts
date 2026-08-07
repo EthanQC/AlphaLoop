@@ -56,7 +56,8 @@ import type {
   AdapterSessionQuote,
   AdapterSubmitRequest,
   FinanceCalendarRequest,
-  LongbridgeAdapter
+  LongbridgeAdapter,
+  OrderHistoryRequest
 } from "./adapter.js";
 import type { EnvLike, Region, RegionEndpoints, RegionResolution, ResolvedCredentials } from "./env.js";
 import { endpointsForRegion } from "./env.js";
@@ -376,6 +377,24 @@ class LongportAdapter implements LongbridgeAdapter {
 
   async getTodayExecutions(): Promise<AdapterExecution[]> {
     const executions = await this.trade().todayExecutions();
+    return executions.map(mapExecution);
+  }
+
+  async getHistoryOrders(req: OrderHistoryRequest): Promise<AdapterOrder[]> {
+    const orders = await this.trade().historyOrders({
+      startAt: new Date(req.startAt),
+      endAt: new Date(req.endAt),
+      ...(req.symbol !== undefined ? { symbol: req.symbol } : {})
+    });
+    return orders.map(mapOrder);
+  }
+
+  async getHistoryExecutions(req: OrderHistoryRequest): Promise<AdapterExecution[]> {
+    const executions = await this.trade().historyExecutions({
+      startAt: new Date(req.startAt),
+      endAt: new Date(req.endAt),
+      ...(req.symbol !== undefined ? { symbol: req.symbol } : {})
+    });
     return executions.map(mapExecution);
   }
 

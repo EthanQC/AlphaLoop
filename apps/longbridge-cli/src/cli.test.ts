@@ -75,6 +75,29 @@ describe("parseArgv", () => {
     expect(parseArgv(["order", "executions", "--format", "json"]).command).toEqual({ kind: "order-executions" });
   });
 
+  it("parses bounded order and execution history windows", () => {
+    const startAt = "2026-07-15T19:00:00.000Z";
+    const endAt = "2026-07-16T15:00:00.000Z";
+    expect(parseArgv([
+      "order", "history", "--symbol", "aapl.us", "--start", startAt, "--end", endAt, "--format", "json"
+    ]).command).toEqual({ kind: "order-history", symbol: "AAPL.US", startAt, endAt });
+    expect(parseArgv([
+      "order", "history", "executions", "--start", startAt, "--end", endAt, "--format", "json"
+    ]).command).toEqual({ kind: "order-history-executions", startAt, endAt });
+  });
+
+  it("requires valid ordered RFC3339 instants for order history", () => {
+    expect(() => parseArgv([
+      "order", "history", "--start", "2026-07-15", "--end", "2026-07-16T15:00:00.000Z", "--format", "json"
+    ])).toThrow(UsageError);
+    expect(() => parseArgv([
+      "order", "history", "--start", "2026-07-16T15:00:00.000Z", "--end", "2026-07-15T19:00:00.000Z", "--format", "json"
+    ])).toThrow(UsageError);
+    expect(() => parseArgv([
+      "order", "history", "--start", "2026-07-15T19:00:00.000Z", "--format", "json"
+    ])).toThrow(UsageError);
+  });
+
   it("parses `order detail <id>` and rejects a missing id", () => {
     expect(parseArgv(["order", "detail", "1043998", "--format", "json"]).command).toEqual({
       kind: "order-detail",

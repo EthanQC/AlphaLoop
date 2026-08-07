@@ -63,11 +63,14 @@ export function resolveMemberExecutionContext(
     ?? process.env.ALPHALOOP_CREDENTIALS_ROOT
     ?? join(homedir(), ".alphaloop", "credentials");
   const baseEnv = { ...(options.baseEnv ?? process.env) };
+  if (pathEntryExists(credentialsRoot)) {
+    assertSecureDirectory(credentialsRoot, "member credentials root");
+  }
   const ownerEnvPath = join(credentialsRoot, ownerId, "longbridge.env");
 
   if (!pathEntryExists(ownerEnvPath)) {
     const legacyAllowed = options.activeMemberIds.length === 1
-      && !hasAnyMemberCredentialFile(credentialsRoot);
+      && isMemberCredentialTreeEmpty(credentialsRoot);
     if (!legacyAllowed) {
       throw new Error(
         `Owner-specific credentials for ${ownerId} are missing; refusing multi-member broker execution.`
@@ -112,28 +115,26 @@ function assertSafeMemberId(memberId: string): void {
   }
 }
 
-function hasAnyMemberCredentialFile(root: string): boolean {
-  if (!existsSync(root)) return false;
-  try {
-    return readdirSync(root, { withFileTypes: true }).some((entry) => {
-      // A symlink inside the credentials root is suspicious state, not proof
-      // that the tree is empty and eligible for legacy shared-account mode.
-      if (entry.isSymbolicLink()) return true;
-      return entry.isDirectory() && pathEntryExists(join(root, entry.name, "longbridge.env"));
-    });
-  } catch {
-    // An unreadable credentials root is not equivalent to an empty root. The
-    // conservative result disables the shared-account compatibility path.
-    return true;
-  }
+function isMemberCredentialTreeEmpty(root: string): boolean {
+  if (!pathEntryExists(root)) return true;
+  assertSecureDirectory(root, "member credentials root");
+
+  // The ambient account is a migration-only compatibility path. Any entry in
+  // the credentials root means migration state exists (or is suspicious), so
+  // only a genuinely empty, secure root may use the shared legacy account.
+  return readdirSync(root, { withFileTypes: true }).length === 0;
 }
 
 function pathEntryExists(path: string): boolean {
   try {
     lstatSync(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
   }
 }
 

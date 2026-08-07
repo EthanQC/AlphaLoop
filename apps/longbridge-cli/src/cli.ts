@@ -43,6 +43,8 @@ export type Command =
   | FinanceCalendarCommand
   | { kind: "order-list" }
   | { kind: "order-executions" }
+  | { kind: "order-history"; startAt: string; endAt: string; symbol?: string | undefined }
+  | { kind: "order-history-executions"; startAt: string; endAt: string; symbol?: string | undefined }
   | { kind: "order-detail"; orderId: string }
   | OrderSubmitCommand;
 
@@ -62,7 +64,8 @@ const VALUE_FLAGS = new Set([
   "--star",
   "--start",
   "--end",
-  "--outside-rth"
+  "--outside-rth",
+  "--symbol"
 ]);
 
 const BOOL_FLAGS = new Set(["--yes", "--help", "-h"]);
@@ -202,6 +205,17 @@ function assertIsoDate(raw: string, label: string): string {
   return raw;
 }
 
+function assertIsoInstant(raw: string, label: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(raw)) {
+    throw new UsageError(`${label} 必须是 UTC RFC3339 时间（如 2026-07-15T19:00:00.000Z），收到: ${raw}`);
+  }
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new UsageError(`${label} 不是有效时间，收到: ${raw}`);
+  }
+  return parsed.toISOString();
+}
+
 function requirePositional(tokens: TokenizedArgv, index: number, label: string): string {
   const value = tokens.positionals[index];
   if (value === undefined || value === "") {
@@ -228,6 +242,27 @@ function parseOrderCommand(tokens: TokenizedArgv): Command {
     assertAllowedFlags(tokens, []);
     assertNoExtraPositionals(tokens, 2);
     return { kind: "order-executions" };
+  }
+
+  if (sub === "history") {
+    assertAllowedFlags(tokens, ["--start", "--end", "--symbol"]);
+    const historyKind = tokens.positionals[2];
+    if (historyKind !== undefined && historyKind !== "executions") {
+      throw new UsageError(`未知的 order history 子命令: ${historyKind}`);
+    }
+    assertNoExtraPositionals(tokens, historyKind === undefined ? 2 : 3);
+    const startAt = assertIsoInstant(lastFlag(tokens, "--start") ?? "", "--start");
+    const endAt = assertIsoInstant(lastFlag(tokens, "--end") ?? "", "--end");
+    const symbol = lastFlag(tokens, "--symbol")?.trim().toUpperCase();
+    if (tokens.flags.has("--symbol") && !symbol) {
+      throw new UsageError("--symbol 需要非空标的代码");
+    }
+    if (new Date(startAt).getTime() >= new Date(endAt).getTime()) {
+      throw new UsageError("--start 必须早于 --end");
+    }
+    return historyKind === "executions"
+      ? { kind: "order-history-executions", startAt, endAt, ...(symbol ? { symbol } : {}) }
+      : { kind: "order-history", startAt, endAt, ...(symbol ? { symbol } : {}) };
   }
 
   if (sub === "detail") {
@@ -419,6 +454,10 @@ export const HELP_TEXT = `longbridge — Longbridge/LongPort OpenAPI 命令行�
                                           财经日历（类别: report/dividend/split/ipo/macrodata/closed/meeting/merge）
   order                                   今日订单列表（TradeContext.todayOrders）
   order executions                        今日成交列表（TradeContext.todayExecutions）
+  order history [--symbol <SYMBOL>] --start <RFC3339> --end <RFC3339>
+                                          历史订单列表（TradeContext.historyOrders）
+  order history executions [--symbol <SYMBOL>] --start <RFC3339> --end <RFC3339>
+                                          历史成交列表（TradeContext.historyExecutions）
   order detail <ORDER_ID>                 订单详情（TradeContext.orderDetail）
   order <buy|sell> <SYMBOL> <QTY> --price <X.XX> [--order-type LO] [--tif Day]
         [--remark <文本>] [--outside-rth RTHOnly|AnyTime|Overnight] --yes

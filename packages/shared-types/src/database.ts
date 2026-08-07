@@ -83,7 +83,7 @@ export function normalizeSymbol(value: unknown): string {
   return symbol;
 }
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 export function getSchemaVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -1163,6 +1163,92 @@ const MIGRATIONS: MigrationStep[] = [
       CREATE INDEX IF NOT EXISTS login_delivery_log_email_idx ON login_delivery_log(email_hash, created_at);
       CREATE INDEX IF NOT EXISTS login_delivery_log_created_idx ON login_delivery_log(created_at);
     `);
+  },
+  (db) => {
+    // v20: Longbridge order ids are account-local identifiers. Multi-account
+    // reconciliation therefore keys lifecycle identity by (owner_id,
+    // external_order_id), not external_order_id globally. Historical NULL
+    // owners are preserved for attribution recovery and protected by a
+    // partial unique index; every fresh repository write uses an explicit
+    // owner scope.
+    const tableExists = db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'official_paper_order_lifecycle'`)
+      .get();
+    if (!tableExists) {
+      db.exec(`
+        CREATE TABLE official_paper_order_lifecycle (
+          id TEXT PRIMARY KEY,
+          ticket_id TEXT,
+          external_order_id TEXT,
+          provider TEXT NOT NULL,
+          environment TEXT NOT NULL,
+          account_mode TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          asset_class TEXT NOT NULL,
+          side TEXT NOT NULL,
+          quantity REAL NOT NULL,
+          limit_price REAL,
+          broker_status TEXT NOT NULL,
+          local_status TEXT NOT NULL,
+          lifecycle_stage TEXT NOT NULL,
+          submitted_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          raw TEXT NOT NULL,
+          notes TEXT NOT NULL,
+          owner_id TEXT DEFAULT '__shared__',
+          UNIQUE(owner_id, external_order_id)
+        );
+        CREATE INDEX official_paper_order_lifecycle_status_idx
+          ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
+        CREATE INDEX official_paper_order_lifecycle_owner_idx
+          ON official_paper_order_lifecycle(owner_id, lifecycle_stage, submitted_at);
+        CREATE UNIQUE INDEX official_paper_order_lifecycle_legacy_external_idx
+          ON official_paper_order_lifecycle(external_order_id) WHERE owner_id IS NULL;
+      `);
+      return;
+    }
+
+    db.exec(`
+      CREATE TABLE official_paper_order_lifecycle_v20 (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT,
+        external_order_id TEXT,
+        provider TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        account_mode TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        asset_class TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        limit_price REAL,
+        broker_status TEXT NOT NULL,
+        local_status TEXT NOT NULL,
+        lifecycle_stage TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        raw TEXT NOT NULL,
+        notes TEXT NOT NULL,
+        owner_id TEXT DEFAULT '__shared__',
+        UNIQUE(owner_id, external_order_id)
+      );
+      INSERT INTO official_paper_order_lifecycle_v20
+        (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+         side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+         last_observed_at, raw, notes, owner_id)
+      SELECT
+        id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
+        side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
+        last_observed_at, raw, notes, owner_id
+      FROM official_paper_order_lifecycle;
+      DROP TABLE official_paper_order_lifecycle;
+      ALTER TABLE official_paper_order_lifecycle_v20 RENAME TO official_paper_order_lifecycle;
+      CREATE INDEX official_paper_order_lifecycle_status_idx
+        ON official_paper_order_lifecycle(symbol, lifecycle_stage, last_observed_at);
+      CREATE INDEX official_paper_order_lifecycle_owner_idx
+        ON official_paper_order_lifecycle(owner_id, lifecycle_stage, submitted_at);
+      CREATE UNIQUE INDEX official_paper_order_lifecycle_legacy_external_idx
+        ON official_paper_order_lifecycle(external_order_id) WHERE owner_id IS NULL;
+    `);
   }
 ];
 
@@ -1307,8 +1393,8 @@ export class ExecutionReportRepository {
 export class OfficialPaperOrderLifecycleRepository {
   constructor(private readonly db: DatabaseSync) {}
 
-  // Upsert-by-external_order_id: structurally requires a REAL external order
-  // id (that is the ON CONFLICT key below), so - unlike the domain type,
+  // Upsert by account-scoped external_order_id: structurally requires a REAL
+  // external order id (part of the ON CONFLICT key below), so - unlike the domain type,
   // which widened externalOrderId to optional for the pre-broker-call
   // "submitting" row (see insertSubmitting below) - this method's own
   // parameter re-narrows it back to required.
@@ -1318,9 +1404,9 @@ export class OfficialPaperOrderLifecycleRepository {
         INSERT INTO official_paper_order_lifecycle
         (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
          side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
-         last_observed_at, raw, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(external_order_id) DO UPDATE SET
+         last_observed_at, raw, notes, owner_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(owner_id, external_order_id) DO UPDATE SET
           -- Protect an already-assigned ticket_id: an existing non-null value
           -- WINS, and an incoming value only fills a currently-null one. The
           -- reverse direction (excluded first) was audit finding #2 - a later
@@ -1363,7 +1449,8 @@ export class OfficialPaperOrderLifecycleRepository {
         record.submittedAt,
         record.lastObservedAt,
         toJson(record.raw ?? null),
-        toJson(record.notes)
+        toJson(record.notes),
+        record.ownerId ?? "__shared__"
       );
   }
 
@@ -1498,7 +1585,7 @@ export class OfficialPaperOrderLifecycleRepository {
   // (there is no price to size notional from) rather than throwing - the
   // caller-side gate that requires a limit price before recording happens
   // upstream of this being called at all.
-  sumOpenNotionalForOwner(ownerId: string): number {
+  sumOpenNotionalForOwner(ownerId: string, snapshotFetchedAt?: string): number {
     // "Open" = every non-terminal stage an order can occupy after it has been
     // sent but before it settles. This list MUST cover every stage
     // longbridge-paper.ts's mapBrokerStatusToStage / the reconcile mapper can
@@ -1521,20 +1608,45 @@ export class OfficialPaperOrderLifecycleRepository {
     //                          reopened the exact audit finding #3
     //                          double-commit window this method exists to
     //                          close, just for a different unmapped status.
-    // Terminal stages (filled/cancelled/rejected/expired/unknown) are excluded:
-    // a filled order transitions into the next account snapshot's market_value,
-    // so counting it here too would double-count once the hourly snapshot
-    // catches up.
-    const row = this.db
-      .prepare(`
-        SELECT COALESCE(SUM(quantity * COALESCE(limit_price, 0)), 0) AS notional
+    // Terminal stages cancelled/rejected/expired/unknown are excluded. Filled
+    // rows are counted only when first observed as filled at/after the
+    // snapshot used by the caller. Reconcile deliberately preserves that
+    // first-filled timestamp on later identical Filled observations; the next
+    // snapshot therefore absorbs the fill exactly once instead of every poll
+    // moving the row back into this conservative pre-refresh window.
+    const rows = snapshotFetchedAt
+      ? this.db.prepare(`
+        SELECT quantity, limit_price
+        FROM official_paper_order_lifecycle
+        WHERE owner_id = ?
+          AND (
+            lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed', 'unknown_broker_status')
+            OR (lifecycle_stage = 'filled' AND COALESCE(last_observed_at, submitted_at) >= ?)
+          )
+      `).all(ownerId, snapshotFetchedAt) as Array<{ quantity: unknown; limit_price: unknown }>
+      : this.db.prepare(`
+        SELECT quantity, limit_price
         FROM official_paper_order_lifecycle
         WHERE owner_id = ?
           AND lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed', 'unknown_broker_status')
       `)
-      .get(ownerId) as { notional: number } | undefined;
+      .all(ownerId) as Array<{ quantity: unknown; limit_price: unknown }>;
 
-    return Number(row?.notional ?? 0);
+    let total = 0;
+    for (const row of rows) {
+      const quantity = Number(row.quantity);
+      const price = Number(row.limit_price);
+      // Reconciled broker/orphan orders do not pass through the proposal's
+      // limit-price gate. If one is live but unpriced, treating it as $0 would
+      // authorize more risk against an unknowable commitment. NaN is an
+      // intentional untrusted sentinel: risk.ts rejects non-finite facts.
+      if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+        return Number.NaN;
+      }
+      total += quantity * price;
+      if (!Number.isFinite(total)) return Number.NaN;
+    }
+    return total;
   }
 
   // FIX 1 (2026-07 adversarial audit, order-splitting naked short): risk.ts's
@@ -1553,10 +1665,20 @@ export class OfficialPaperOrderLifecycleRepository {
   // in depth for FIX 2's bare-vs-Longbridge-suffixed symbol mismatch:
   // 'TSLA' and 'TSLA.US' are the same instrument), which is why the
   // per-symbol filter runs in TS rather than in the SQL WHERE clause.
-  sumOpenSellQuantityForOwnerSymbol(ownerId: string, symbol: string): number {
+  sumOpenSellQuantityForOwnerSymbol(ownerId: string, symbol: string, snapshotFetchedAt?: string): number {
     const targetSymbol = normalizeSymbol(symbol);
-    const rows = this.db
-      .prepare(`
+    const rows = snapshotFetchedAt
+      ? this.db.prepare(`
+        SELECT symbol, quantity
+        FROM official_paper_order_lifecycle
+        WHERE owner_id = ?
+          AND side = 'sell'
+          AND (
+            lifecycle_stage IN ('submitting', 'submitted', 'accepted', 'pending', 'submit_unconfirmed', 'unknown_broker_status')
+            OR (lifecycle_stage = 'filled' AND COALESCE(last_observed_at, submitted_at) >= ?)
+          )
+      `).all(ownerId, snapshotFetchedAt) as Array<{ symbol: unknown; quantity: unknown }>
+      : this.db.prepare(`
         SELECT symbol, quantity
         FROM official_paper_order_lifecycle
         WHERE owner_id = ?
@@ -2853,13 +2975,14 @@ export class MonthlyReviewRepository {
     const now = nowIso();
     const resultJson = input.resultJson !== undefined ? toJson(input.resultJson) : null;
 
-    this.db
+    const write = this.db
       .prepare(`
         INSERT INTO monthly_reviews (id, owner_id, period, result_json, status, confirmed_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'draft', NULL, ?, ?)
         ON CONFLICT(owner_id, period) DO UPDATE SET
           result_json = excluded.result_json,
           updated_at = excluded.updated_at
+        WHERE monthly_reviews.status = 'draft'
       `)
       .run(createId("monthly_review"), input.ownerId, input.period, resultJson, now, now);
 
@@ -2874,6 +2997,16 @@ export class MonthlyReviewRepository {
     if (!reloaded) {
       throw new Error(
         `Monthly review upsert for owner ${input.ownerId}, period ${input.period} failed unexpectedly (row missing immediately after write).`
+      );
+    }
+    // The pre-read above gives callers a clear early error, but it is not the
+    // concurrency gate: another process may confirm the row after that read.
+    // The ON CONFLICT ... WHERE status='draft' clause is the atomic guard. A
+    // zero-change conflict means the row became confirmed in that window, so
+    // return neither stale input nor a misleading success result.
+    if (Number(write.changes) === 0 && reloaded.status === "confirmed") {
+      throw new Error(
+        `Monthly review for owner ${input.ownerId}, period ${input.period} is already confirmed; refusing to overwrite with a new draft.`
       );
     }
     return reloaded;

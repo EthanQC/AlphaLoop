@@ -212,6 +212,26 @@ describe("doctor: 个股分析 stopped producing without ever failing", () => {
     expect(report.findings.some((entry) => entry.code.startsWith("stock-analysis-health."))).toBe(false);
   });
 
+  it("accepts five minutes of clock skew but rejects a farther-future delivered batch timestamp", async () => {
+    const nowIso = "2026-07-30T13:00:00.000Z";
+    const nowMs = Date.parse(nowIso);
+    const withinDbPath = join(makeTempDir("alphaloop-doctor-stock-analysis-"), "trading.sqlite");
+    seedWatchedPool(withinDbPath);
+    archiveBatch(withinDbPath, new Date(nowMs + 4 * 60_000).toISOString());
+
+    const withinReport = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(withinDbPath, nowIso));
+    expect(withinReport.findings.some((entry) => entry.code.startsWith("stock-analysis-health."))).toBe(false);
+
+    const futureDbPath = join(makeTempDir("alphaloop-doctor-stock-analysis-"), "trading.sqlite");
+    seedWatchedPool(futureDbPath);
+    archiveBatch(futureDbPath, new Date(nowMs + 6 * 60_000).toISOString());
+
+    const futureReport = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(futureDbPath, nowIso));
+    const finding = findingFor(futureReport, "stock-analysis-health.stale");
+    expect(finding.severity).toBe("error");
+    expect(finding.message).toContain("5 分钟时钟偏差");
+  });
+
   it("reports stock-analysis-health.never_ran when a watched pool has produced nothing at all", async () => {
     const dir = makeTempDir("alphaloop-doctor-stock-analysis-");
     const dbPath = join(dir, "trading.sqlite");

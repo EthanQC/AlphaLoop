@@ -214,14 +214,15 @@ fi
 # `deploy-ledger.unwritable`.
 #
 # Not covered: every exit that happens before the EXIT trap is installed leaves
-# no receipt. There are NINE of them, not the two this comment claimed until
+# no receipt. There are TEN of them, not the two this comment claimed until
 # 2026-07-29 - three above this line (TARGET_USER=root, no such user, no
-# ownership manifest) and six below it (no pnpm, the PRINT_CONFIG_ONLY
-# preflight, needs-root, no node, no memoryd, no health checker). Each is marked on its own
+# ownership manifest) and seven below it (no pnpm, the PRINT_CONFIG_ONLY
+# preflight, unsafe memoryd data root, needs-root, no node, no memoryd, no
+# health checker). Each is marked on its own
 # `exit` line, and the count is re-run by the claim guard rather than trusted:
 #
-# @claim-count 9 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+\s+# pre-trap exit
-# @claim-count 14 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+
+# @claim-count 10 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+\s+# pre-trap exit
+# @claim-count 15 :: apps/openclaw-config/scripts/install-system-daemons.sh :: ^\s*exit [0-9]+
 #
 # The second directive is the part that cannot be gamed: it counts EVERY `exit`
 # in the file, so adding one anywhere fails the suite until whoever added it
@@ -229,7 +230,7 @@ fi
 # here is exactly what happens without that.
 #
 # The two facts the original sentence got right are unchanged: none of these
-# nine paths changes anything on the machine (they are all above the `mktemp
+# ten paths changes anything on the machine (they are all above the `mktemp
 # -d`), and `deploy.sh` records step 3's exit code itself whichever way this
 # script exits.
 INSTALL_RESULT_RECORDED=""
@@ -379,6 +380,67 @@ if [ -n "${PRINT_CONFIG_ONLY:-}" ]; then
   exit 0  # pre-trap exit: no deploy receipt is written for this path
 fi
 
+# MEMORYD_DATA_ROOT is later handed to root-owned `mkdir -p` and `chown -R`.
+# A typo such as `/`, /Users, TARGET_HOME or REPO_ROOT would recursively
+# rewrite ownership far beyond AlphaLoop. Keep the mutable tree inside one
+# explicit application-data namespace and reject symlinked path components so
+# an apparently safe lexical child cannot redirect the recursive chown.
+validate_memoryd_data_root() {
+  local allowed_root="${TARGET_HOME}/Library/Application Support/AlphaLoop"
+  local probe="${MEMORYD_DATA_ROOT}"
+  local parent
+
+  # Keep the lexical target unambiguous before comparing it with the allowed
+  # namespace. A trailing or repeated slash can make a value that looks like
+  # a child (for example `${allowed_root}//`) resolve to the namespace root
+  # itself when passed to the later recursive chown.
+  case "${MEMORYD_DATA_ROOT}" in
+    *//*|*/)
+      echo "install-system-daemons: MEMORYD_DATA_ROOT must not contain empty path components: ${MEMORYD_DATA_ROOT}" >&2
+      return 1
+      ;;
+  esac
+  case "${MEMORYD_DATA_ROOT}" in
+    "${allowed_root}/"?*) ;;
+    *)
+      echo "install-system-daemons: unsafe MEMORYD_DATA_ROOT: ${MEMORYD_DATA_ROOT}" >&2
+      echo "install-system-daemons: it must be a child of ${allowed_root}/" >&2
+      return 1
+      ;;
+  esac
+  case "${MEMORYD_DATA_ROOT}" in
+    *"/../"*|*"/./"*|*"/.."|*"/.")
+      echo "install-system-daemons: MEMORYD_DATA_ROOT must not contain dot path components: ${MEMORYD_DATA_ROOT}" >&2
+      return 1
+      ;;
+  esac
+
+  while :; do
+    if [ -L "${probe}" ]; then
+      echo "install-system-daemons: MEMORYD_DATA_ROOT path must not traverse a symlink: ${probe}" >&2
+      return 1
+    fi
+    if [ "${probe}" = "${TARGET_HOME}" ]; then
+      break
+    fi
+    parent="$(dirname "${probe}")"
+    if [ "${parent}" = "${probe}" ]; then
+      echo "install-system-daemons: MEMORYD_DATA_ROOT escaped TARGET_HOME: ${MEMORYD_DATA_ROOT}" >&2
+      return 1
+    fi
+    probe="${parent}"
+  done
+  if [ -e "${MEMORYD_DATA_ROOT}" ] && [ ! -d "${MEMORYD_DATA_ROOT}" ]; then
+    echo "install-system-daemons: MEMORYD_DATA_ROOT exists but is not a directory: ${MEMORYD_DATA_ROOT}" >&2
+    return 1
+  fi
+  return 0
+}
+
+if ! validate_memoryd_data_root; then
+  exit 1  # pre-trap exit: no deploy receipt is written for this path
+fi
+
 # /Library/LaunchDaemons is root-owned, and so is the system launchd domain
 # this script bootstraps into. Failing here with the exact command to re-run
 # beats failing halfway through with a bare "Permission denied" after some of
@@ -417,7 +479,7 @@ if [ ! -f "${HEALTH_CHECKER}" ]; then
 fi
 
 # Past this point the script does write. The staging directory is created here
-# rather than at the top so the nine pre-trap exits above leave the machine
+# rather than at the top so the ten pre-trap exits above leave the machine
 # untouched (they are counted, not asserted - see the @claim-count directives
 # next to record_install_result),
 # and the trap removes it on every path out - including the manifest-drift

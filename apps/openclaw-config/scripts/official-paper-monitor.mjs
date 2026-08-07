@@ -13,7 +13,11 @@ import {
   sendInteractiveCard
 } from "../../../packages/shared-types/dist/index.js";
 import { runLongbridgeJsonWithRetry } from "./_longbridge.mjs";
-import { buildMemberSubprocessEnv, loadMemberCredentials } from "./member-credentials.mjs";
+import {
+  buildMemberSubprocessEnv,
+  isMemberCredentialTreeEmpty,
+  loadMemberCredentials
+} from "./member-credentials.mjs";
 import { computeExposure } from "./portfolio-exposure.mjs";
 import {
   SCHEDULED_JOB_OFFICIAL_PAPER_PNL,
@@ -70,24 +74,36 @@ export function resolveSnapshotOwnerId(db) {
 // fills happen), already holds the Longbridge session, and a reconcile needs
 // the same freshness the snapshot does. Reconcile failure must not cost the
 // snapshot - the two results are reported separately, never merged.
-async function reconcileAfterPoll(db) {
+async function reconcileAfterPoll(db, options = {}) {
   try {
     const { reconcileOfficialPaperOrders } = await import("./reconcile-official-paper-orders.mjs");
-    const result = await reconcileOfficialPaperOrders(db);
+    const result = await reconcileOfficialPaperOrders(db, options);
     return { ok: true, ...result };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
+async function reconcileMemberAfterPoll(db, { ownerId, env, rateLimitDir }) {
+  return reconcileAfterPoll(db, {
+    explicitOwnerId: ownerId,
+    execOptions: { env, rateLimitDir }
+  });
+}
+
 // Exported (2026-07-30) so the reconcile wiring is testable at the seam that
 // broke: `deps.perMember` / `deps.reconcile` are injection points ONLY - the
 // CLI dispatch below passes neither, so production always runs the real pair.
 export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
-  const { reconcile = reconcileAfterPoll, perMember = pollOfficialPaperPerMember } = deps;
+  const {
+    reconcile = reconcileAfterPoll,
+    perMember = pollOfficialPaperPerMember,
+    fetchShared = fetchOfficialPaperSnapshot
+  } = deps;
   if (!forceRun && !shouldRunOfficialPaperHourlyPoll(new Date())) {
-    console.log(JSON.stringify({ skipped: true, reason: "outside_us_hourly_poll_window" }, null, 2));
-    return;
+    const skipped = { skipped: true, reason: "outside_us_hourly_poll_window" };
+    console.log(JSON.stringify(skipped, null, 2));
+    return skipped;
   }
 
   // Task 6 (2026-07-15 phase6 plan): try per-member polling FIRST. As long as
@@ -101,13 +117,19 @@ export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
   // task's scope).
   const perMemberResults = await perMember(db);
   if (perMemberResults) {
-    const reconcileResult = await reconcile(db);
-    console.log(JSON.stringify({ polled: true, perMember: true, snapshots: perMemberResults, reconcile: reconcileResult }, null, 2));
+    console.log(JSON.stringify({ polled: true, perMember: true, snapshots: perMemberResults }, null, 2));
+    const failures = perMemberResults.filter((result) => result.reconcile?.ok !== true);
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures.map((result) => new Error(`${result.ownerId}: ${result.reconcile?.error ?? "reconciliation failed"}`)),
+        `Official-paper reconciliation failed for ${failures.length} member account(s).`
+      );
+    }
     return;
   }
 
   assertOfficialPaperReportEnvironment();
-  const snapshot = await fetchOfficialPaperSnapshot();
+  const snapshot = await fetchShared();
   const snapshotId = saveSnapshot(db, snapshot, "hourly_poll");
   const reflection = buildStrategyReflection(snapshot);
   const reflectionId = createId("paper_reflection");
@@ -118,6 +140,9 @@ export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
 
   const reconcileResult = await reconcile(db);
   console.log(JSON.stringify({ polled: true, snapshotId, reflectionId, summary: reflection.summary, reconcile: reconcileResult }, null, 2));
+  if (reconcileResult?.ok !== true) {
+    throw new Error(`Official-paper reconciliation failed: ${reconcileResult?.error ?? "unknown error"}`);
+  }
 }
 
 // Task 6 (2026-07-15 phase6 plan): per-member polling loop. For every
@@ -127,9 +152,11 @@ export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
 // Members with no credentials file are silently skipped (an ordinary
 // member has no linked broker account today) - NOT an error.
 //
-// - Zero credentialed members (the ubiquitous case right now) -> returns
-//   `null`, the explicit "nothing to do here, use the H4 shared-account
-//   path" signal `pollOfficialPaper` above branches on.
+// - Zero credentialed members AND a genuinely empty credential tree ->
+//   returns `null`, the explicit "nothing to do here, use the H4 shared-
+//   account path" signal `pollOfficialPaper` above branches on. Any unknown,
+//   inactive or unsafe tree entry fails closed instead of silently selecting
+//   the ambient shared account.
 // - One or more credentialed members -> fetches EACH member's OWN snapshot
 //   with THEIR OWN env/cache isolation (buildMemberSubprocessEnv) and saves
 //   it with `owner_id = member.id` (never the resolveSnapshotOwnerId
@@ -144,7 +171,12 @@ export async function pollOfficialPaper(db, forceRun = false, deps = {}) {
 // subprocess env and calls the SAME `fetchOfficialPaperSnapshot` the H4
 // shared path uses, just parameterized per member.
 export async function pollOfficialPaperPerMember(db, options = {}) {
-  const { fetchImpl = fetchOfficialPaperSnapshotForMember, credentialsRootDir, reason = "hourly_poll_per_member" } = options;
+  const {
+    fetchImpl = fetchOfficialPaperSnapshotForMember,
+    reconcileImpl = reconcileMemberAfterPoll,
+    credentialsRootDir,
+    reason = "hourly_poll_per_member"
+  } = options;
 
   const activeMembers = new MemberRepository(db).listActive();
   const credentialed = activeMembers
@@ -152,6 +184,11 @@ export async function pollOfficialPaperPerMember(db, options = {}) {
     .filter((entry) => entry.creds !== null);
 
   if (credentialed.length === 0) {
+    if (!isMemberCredentialTreeEmpty({ rootDir: credentialsRootDir })) {
+      throw new Error(
+        "Member credential tree is non-empty but no active member credential could be loaded; refusing legacy shared-account fallback."
+      );
+    }
     return null;
   }
 
@@ -164,7 +201,12 @@ export async function pollOfficialPaperPerMember(db, options = {}) {
     assertOfficialPaperReportEnvironment(env);
     const snapshot = await fetchImpl(member, creds, env);
     const snapshotId = saveSnapshot(db, snapshot, reason, member.id);
-    results.push({ ownerId: member.id, snapshotId });
+    const reconcile = await reconcileImpl(db, {
+      ownerId: member.id,
+      env,
+      rateLimitDir: creds.cachePaths.rateLimitDir
+    });
+    results.push({ ownerId: member.id, snapshotId, reconcile });
   }
   return results;
 }
@@ -179,9 +221,25 @@ async function fetchOfficialPaperSnapshotForMember(member, creds, env = buildMem
   return fetchOfficialPaperSnapshot({ env, rateLimitDir: creds.cachePaths.rateLimitDir });
 }
 
-async function sendPnlReport(db, forceRun = false) {
+export async function sendPnlReport(db, forceRun = false, options = {}) {
+  const { perMemberImpl = sendPnlReportsPerMember } = options;
   if (!forceRun && !shouldRunOfficialPaperPnlReport(new Date())) {
-    console.log(JSON.stringify({ skipped: true, reason: "outside_post_open_pnl_window" }, null, 2));
+    const skipped = { skipped: true, reason: "outside_post_open_pnl_window" };
+    console.log(JSON.stringify(skipped, null, 2));
+    return skipped;
+  }
+
+  const perMemberResults = await perMemberImpl(db);
+  if (perMemberResults) {
+    const delivered = perMemberResults.every((result) => result.delivered === true);
+    console.log(JSON.stringify({ delivered, perMember: true, reports: perMemberResults }, null, 2));
+    if (!delivered) {
+      const failures = perMemberResults.filter((result) => result.delivered !== true);
+      throw new AggregateError(
+        failures.map((result) => new Error(`${result.ownerId}: ${result.deliveryReason ?? "delivery failed"}`)),
+        `Official-paper PnL delivery failed for ${failures.length} member account(s).`
+      );
+    }
     return;
   }
 
@@ -210,16 +268,15 @@ async function sendPnlReport(db, forceRun = false) {
     scope
   }));
   // 2026-07-26: same reasoning as stock-analysis.mjs - the snapshot is
-  // already persisted by this point, so a Feishu delivery failure must not
-  // throw the whole run away. deliverReportToFeishu returns {sent:false,
-  // reason} instead of throwing; report it honestly and exit non-zero.
+  // already persisted by this point. Finish emitting the artifact/result,
+  // then throw so the scheduled heartbeat records ok=0 instead of trusting a
+  // process.exitCode side channel it cannot observe.
   if (!delivery.sent) {
     console.error(JSON.stringify({
       ok: false,
       step: "feishu-delivery",
       reason: delivery.reason ?? "模拟盘收支变化报告未发送。"
     }));
-    process.exitCode = 1;
   }
 
   console.log(JSON.stringify({
@@ -239,6 +296,80 @@ async function sendPnlReport(db, forceRun = false) {
     },
     ...(delivery.sent ? {} : { deliveryReason: delivery.reason })
   }, null, 2));
+  if (!delivery.sent) {
+    throw new Error(`Official-paper PnL delivery failed: ${delivery.reason ?? "模拟盘收支变化报告未发送。"}`);
+  }
+}
+
+/**
+ * Generates one owner-private PnL report for every credentialed member. The
+ * member's snapshot, comparison baselines, artifact filename and Feishu scope
+ * all carry the same owner id. `null` means the credential tree is empty and
+ * the caller may use the legacy single shared-account path.
+ */
+export async function sendPnlReportsPerMember(db, options = {}) {
+  const {
+    credentialsRootDir,
+    reportsRootDir = reportsDir,
+    fetchImpl = fetchOfficialPaperSnapshotForMember,
+    deliverImpl = deliverReportToFeishu
+  } = options;
+  const activeMembers = new MemberRepository(db).listActive();
+  const credentialed = activeMembers
+    .map((member) => ({ member, creds: loadMemberCredentials(member.id, { rootDir: credentialsRootDir }) }))
+    .filter((entry) => entry.creds !== null);
+  if (credentialed.length === 0) {
+    if (!isMemberCredentialTreeEmpty({ rootDir: credentialsRootDir })) {
+      throw new Error(
+        "Member credential tree is non-empty but no active member credential could be loaded; refusing legacy shared-account fallback."
+      );
+    }
+    return null;
+  }
+
+  mkdirSync(reportsRootDir, { recursive: true });
+  const results = [];
+  const failures = [];
+  for (const { member, creds } of credentialed) {
+    try {
+      const env = buildMemberSubprocessEnv(creds);
+      assertOfficialPaperReportEnvironment(env);
+      const snapshot = await fetchImpl(member, creds, env);
+      const snapshotId = saveSnapshot(db, snapshot, MEMBER_OFFICIAL_PAPER_REPORT_REASON, member.id);
+      const previousDay = findComparisonSnapshot(db, snapshot.fetchedAt, "previous_day", member.id);
+      const previousWeek = findComparisonSnapshot(db, snapshot.fetchedAt, "previous_week", member.id);
+      const markdown = renderPnlReport(snapshot, previousDay, previousWeek);
+      const label = snapshot.fetchedAt.slice(0, 10);
+      const markdownPath = join(reportsRootDir, `${label}-post-open--${member.id}.md`);
+      writeFileSync(markdownPath, `${markdown}\n`, "utf8");
+      const scope = resolvePnlReportScope(db, snapshotId, { explicitOwnerArtifact: true });
+      const delivery = await deliverImpl(buildPnlDeliveryPayload({
+        current: snapshot,
+        previousDay,
+        previousWeek,
+        markdown,
+        markdownPath,
+        scope
+      }));
+      results.push({
+        ownerId: member.id,
+        snapshotId,
+        markdownPath,
+        delivered: delivery.sent,
+        ...(delivery.sent ? {} : { deliveryReason: delivery.reason })
+      });
+    } catch (error) {
+      failures.push({ ownerId: member.id, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => new Error(`${failure.ownerId}: ${failure.error}`)),
+      `Official-paper PnL failed for ${failures.length} member account(s).`
+    );
+  }
+  return results;
 }
 
 /** The `reason` the platform keys its /official-paper attribution on
@@ -246,6 +377,10 @@ async function sendPnlReport(db, forceRun = false) {
  * other reason produced no `<date>-post-open.md` and is invisible to that
  * query, so it can never be the basis for a card either. */
 const OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl";
+/** Per-member artifact rows are distinguished from the legacy one-file-per-
+ * date path so the platform can authorize them without inspecting a file or
+ * mistaking two member rows for an ambiguous legacy artifact. */
+const MEMBER_OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl_per_member";
 
 /** `owner_id` values that are NOT a member. Mirrors routes/reports.ts's
  * NON_MEMBER_OWNER_IDS exactly: this file's own "could not attribute" sentinel
@@ -336,7 +471,7 @@ export function resolveOfficialPaperDateAttribution(db, reportDate) {
  *     There is no DM to send to, and "no DM available" must never degrade into
  *     "send it to the group".
  */
-export function resolvePnlReportScope(db, snapshotId) {
+export function resolvePnlReportScope(db, snapshotId, options = {}) {
   const row = db
     .prepare("SELECT fetched_at, reason FROM official_paper_snapshots WHERE id = ?")
     .get(snapshotId);
@@ -346,26 +481,49 @@ export function resolvePnlReportScope(db, snapshotId) {
       reason: `快照 ${snapshotId} 在 official_paper_snapshots 里不存在，无法确认这份账户数据属于谁`
     };
   }
-  if (row.reason !== OFFICIAL_PAPER_REPORT_REASON) {
+  const expectedReason = options.explicitOwnerArtifact
+    ? MEMBER_OFFICIAL_PAPER_REPORT_REASON
+    : OFFICIAL_PAPER_REPORT_REASON;
+  if (row.reason !== expectedReason) {
     // The platform only attributes post_open_pnl rows; a card built on any
     // other reason would be claiming an owner for a page that has none.
     return {
       visibility: "owner-unresolved",
-      reason: `本次快照的 reason 是 ${String(row.reason)}，平台只按 ${OFFICIAL_PAPER_REPORT_REASON} 快照判定 /official-paper 的归属，两边无法对齐`
+      reason: `本次快照的 reason 是 ${String(row.reason)}，当前报告路径只接受 ${expectedReason} 快照，两边无法对齐`
     };
   }
 
-  const attribution = resolveOfficialPaperDateAttribution(db, String(row.fetched_at).slice(0, 10));
-  if (attribution.kind !== "owner") {
-    return { visibility: "owner-unresolved", reason: attribution.reason };
+  let ownerId;
+  if (options.explicitOwnerArtifact) {
+    const ownerRow = db.prepare("SELECT owner_id FROM official_paper_snapshots WHERE id = ?").get(snapshotId);
+    const explicitOwnerId = typeof ownerRow?.owner_id === "string" ? ownerRow.owner_id.trim() : "";
+    if (!explicitOwnerId || NON_MEMBER_OWNER_IDS.has(explicitOwnerId)) {
+      return { visibility: "owner-unresolved", reason: `快照 ${snapshotId} 没有可用的成员归属，不能生成成员私有报告` };
+    }
+    ownerId = explicitOwnerId;
+  } else {
+    const attribution = resolveOfficialPaperDateAttribution(db, String(row.fetched_at).slice(0, 10));
+    if (attribution.kind !== "owner") {
+      return { visibility: "owner-unresolved", reason: attribution.reason };
+    }
+    ownerId = attribution.ownerId;
   }
-  const ownerId = attribution.ownerId;
 
   const member = new MemberRepository(db).getById(ownerId);
   if (!member) {
     return {
       visibility: "owner-unresolved",
       reason: `快照归属 ${ownerId}，但成员表里没有这个成员，无法确认收件人`
+    };
+  }
+  // Membership can be revoked after the account fetch/snapshot write but
+  // before delivery. Re-read the row at scope resolution time and refuse the
+  // DM unless the recipient is still active; a stale loop-local member object
+  // is not authorization to disclose current account balances.
+  if (member.status !== "active") {
+    return {
+      visibility: "owner-unresolved",
+      reason: `成员 ${member.displayName}（${ownerId}）已撤权，不能再接收模拟盘账户报告`
     };
   }
 
@@ -854,21 +1012,34 @@ export function estimateMarketValue(snapshot) {
     const price = typeof position.price === "number" && Number.isFinite(position.price)
       ? position.price
       : toNumber(position.costPrice) ?? 0;
-    return sum + position.quantity * price;
+    // Constitution budget is a gross-exposure cap. Long and short positions
+    // cannot cancel each other here: a negative quantity contributes its
+    // absolute notional just like a positive one.
+    return sum + Math.abs(position.quantity) * Math.abs(price);
   }, 0);
 }
 
-function findComparisonSnapshot(db, fetchedAt, mode) {
+export function findComparisonSnapshot(db, fetchedAt, mode, ownerId) {
   const currentMs = new Date(fetchedAt).getTime();
   const offsetMs = mode === "previous_day" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
   // The LIMIT comes from the same constant the "no baseline" disclosure quotes,
   // so the sentence can never describe a search this query does not run.
-  const rows = db.prepare(`
-    SELECT raw FROM official_paper_snapshots
-    WHERE fetched_at < ?
-    ORDER BY fetched_at DESC
-    LIMIT ${COMPARISON_LOOKBACK_ROWS}
-  `).all(fetchedAt);
+  const rows = ownerId
+    ? db.prepare(`
+        SELECT raw FROM official_paper_snapshots
+        WHERE fetched_at < ?
+          AND owner_id = ?
+          AND reason IN ('hourly_poll_per_member', 'post_open_pnl_per_member')
+        ORDER BY fetched_at DESC
+        LIMIT ${COMPARISON_LOOKBACK_ROWS}
+      `).all(fetchedAt, ownerId)
+    : db.prepare(`
+        SELECT raw FROM official_paper_snapshots
+        WHERE fetched_at < ?
+          AND reason IN ('hourly_poll', 'post_open_pnl')
+        ORDER BY fetched_at DESC
+        LIMIT ${COMPARISON_LOOKBACK_ROWS}
+      `).all(fetchedAt);
   const target = rows.find((row) => currentMs - new Date(JSON.parse(String(row.raw)).fetchedAt).getTime() >= offsetMs);
   if (!target) {
     return null;

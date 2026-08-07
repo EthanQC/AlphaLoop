@@ -38,6 +38,9 @@ export interface ReportIndexEntry {
   type: ReportType;
   /** `YYYY-MM-DD`, parsed from the filename. */
   date: string;
+  /** Owner encoded in a per-member official-paper artifact filename. Legacy
+   * shared-account artifacts omit it and are attributed from SQLite. */
+  ownerId?: string;
   /** Absolute path to the report's markdown source. */
   mdPath: string;
   /** First `# ` heading line in the file, else the filename (without ext). */
@@ -64,6 +67,7 @@ const CIRCLE_VISIBLE_REPORT_TYPES: readonly ReportType[] = REPORT_TYPES.filter(
 
 const PLAIN_DATE_RE = /^(\d{4}-\d{2}-\d{2})\.md$/u;
 const OFFICIAL_PAPER_RE = /^(\d{4}-\d{2}-\d{2})-post-open\.md$/u;
+const OWNER_OFFICIAL_PAPER_RE = /^(\d{4}-\d{2}-\d{2})-post-open--([A-Za-z0-9][A-Za-z0-9._-]*)\.md$/u;
 const HEADING_RE = /^#\s+(.+)$/u;
 
 interface DirCacheEntry {
@@ -78,14 +82,20 @@ interface DirCacheEntry {
 // key or with the real repo's reports/ directory.
 const dirCache = new Map<string, DirCacheEntry>();
 
-function parseFilename(type: ReportType, filename: string): string | undefined {
+function parseFilename(type: ReportType, filename: string): { date: string; ownerId?: string } | undefined {
   if (filename === "README.md") {
     return undefined;
   }
   if (type === "official-paper") {
-    return OFFICIAL_PAPER_RE.exec(filename)?.[1];
+    const memberMatch = OWNER_OFFICIAL_PAPER_RE.exec(filename);
+    if (memberMatch?.[1] && memberMatch[2] && memberMatch[2] !== "." && memberMatch[2] !== "..") {
+      return { date: memberMatch[1], ownerId: memberMatch[2] };
+    }
+    const legacyDate = OFFICIAL_PAPER_RE.exec(filename)?.[1];
+    return legacyDate ? { date: legacyDate } : undefined;
   }
-  return PLAIN_DATE_RE.exec(filename)?.[1];
+  const date = PLAIN_DATE_RE.exec(filename)?.[1];
+  return date ? { date } : undefined;
 }
 
 function extractTitle(content: string, fallback: string): string {
@@ -144,17 +154,17 @@ function scanDirectory(repoRoot: string, type: ReportType): ReportIndexEntry[] {
 
   const entries: ReportIndexEntry[] = [];
   for (const filename of readdirSync(dir)) {
-    const date = parseFilename(type, filename);
-    if (!date) {
+    const parsed = parseFilename(type, filename);
+    if (!parsed) {
       continue;
     }
     const mdPath = join(dir, filename);
     const fallbackTitle = filename.replace(/\.md$/u, "");
     const { title, legacy } = readEntryMetadata(type, mdPath, fallbackTitle);
-    entries.push({ type, date, mdPath, title, legacy });
+    entries.push({ type, date: parsed.date, ...(parsed.ownerId ? { ownerId: parsed.ownerId } : {}), mdPath, title, legacy });
   }
 
-  entries.sort((a, b) => b.date.localeCompare(a.date));
+  entries.sort((a, b) => b.date.localeCompare(a.date) || (a.ownerId ?? "").localeCompare(b.ownerId ?? ""));
   dirCache.set(dir, { mtimeMs: dirStat.mtimeMs, entries });
   return entries;
 }

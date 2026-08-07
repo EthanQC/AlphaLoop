@@ -79,12 +79,21 @@ export function buildDegradedQuoteSnapshot(symbol, { fetchedAt = new Date().toIS
 
 export function normalizeOfficialPosition(row) {
   if (!row || typeof row !== "object") {
-    return null;
+    throw new Error("Longbridge 官方模拟盘持仓格式异常：每一行都必须是对象。");
   }
 
   const symbol = String(row.symbol ?? "").toUpperCase();
   const quantity = toNumber(row.quantity);
-  if (!symbol || quantity === undefined || quantity <= 0) {
+  if (!symbol) {
+    throw new Error("Longbridge 官方模拟盘持仓缺少标的 symbol。");
+  }
+  if (quantity === undefined) {
+    throw new Error(`Longbridge 官方模拟盘持仓 ${symbol} 的数量 quantity 格式异常。`);
+  }
+  // Zero is not a position. A negative quantity is: Longbridge's stock
+  // position schema has no separate side field, so dropping it would erase a
+  // short from the persisted account snapshot and understate gross exposure.
+  if (quantity === 0) {
     return null;
   }
 

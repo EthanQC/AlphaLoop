@@ -119,6 +119,58 @@ describe("runScheduledJobWithHeartbeat", () => {
     expect(lastRunAt(db, SCHEDULED_JOB_OFFICIAL_PAPER_POLL)).toBe("2026-07-30T09:30:00.000Z");
   });
 
+  it("records a not-due invocation as a neutral heartbeat without clearing an open failure", async () => {
+    const db = makeDb();
+    recordJobRun(db, {
+      job: SCHEDULED_JOB_OFFICIAL_PAPER_PNL,
+      startedAt: "2026-07-30T10:00:00.000Z",
+      ok: false,
+      failedStep: "run"
+    });
+
+    const result = await runScheduledJobWithHeartbeat(
+      db,
+      { job: SCHEDULED_JOB_OFFICIAL_PAPER_PNL, now: () => new Date("2026-07-30T11:00:00.000Z") },
+      () => ({ skipped: true, reason: "outside_post_open_pnl_window" })
+    );
+
+    expect(result).toEqual({ skipped: true, reason: "outside_post_open_pnl_window" });
+    expect(lastRunAt(db, SCHEDULED_JOB_OFFICIAL_PAPER_PNL)).toBe("2026-07-30T11:00:00.000Z");
+    expect(consecutiveFailureCount(db, SCHEDULED_JOB_OFFICIAL_PAPER_PNL)).toBe(1);
+    const latest = db.prepare(`
+      SELECT ok, evidence FROM run_log
+      WHERE job = ? ORDER BY rowid DESC LIMIT 1
+    `).get(SCHEDULED_JOB_OFFICIAL_PAPER_PNL) as { ok: number; evidence: string };
+    expect(latest.ok).toBe(1);
+    expect(JSON.parse(latest.evidence)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: "scheduled_not_due" })
+    ]));
+  });
+
+  it("does not send a recovery card for a neutral not-due heartbeat", async () => {
+    const db = makeDb();
+    recordJobRun(db, {
+      job: SCHEDULED_JOB_OFFICIAL_PAPER_PNL,
+      startedAt: "2026-07-30T10:00:00.000Z",
+      ok: false,
+      evidence: [{ event: "escalation_sent", at: "2026-07-30T10:00:00.000Z" }]
+    });
+    const sent: Card[] = [];
+
+    await runScheduledJobWithHeartbeat(
+      db,
+      {
+        job: SCHEDULED_JOB_OFFICIAL_PAPER_PNL,
+        now: () => new Date("2026-07-30T11:00:00.000Z"),
+        sendCard: async (card: Card) => { sent.push(card); return { ok: true }; }
+      },
+      () => ({ skipped: true, reason: "outside_post_open_pnl_window" })
+    );
+
+    expect(sent).toHaveLength(0);
+    expect(lastRecoveryAt(db, SCHEDULED_JOB_OFFICIAL_PAPER_PNL)).toBeNull();
+  });
+
   it("stays silent for the first two failures and escalates on the third", async () => {
     const db = makeDb();
     const sent: Card[] = [];

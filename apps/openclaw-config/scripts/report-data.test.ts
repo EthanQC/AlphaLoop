@@ -67,6 +67,7 @@ describe("report data normalization", () => {
           currency: "USD",
           market: "US"
         },
+        { symbol: "TSLA.US", quantity: "-2", available: "0", cost_price: "250", currency: "USD", market: "US" },
         { symbol: "AAPL.US", quantity: "0" }
       ]
     });
@@ -78,13 +79,36 @@ describe("report data normalization", () => {
       cachedRegion: "cn",
       okRegions: ["cn"]
     });
-    expect(snapshot.positions).toHaveLength(1);
+    expect(snapshot.positions).toHaveLength(2);
     expect(snapshot.positions[0]).toMatchObject({
       symbol: "QQQ.US",
       quantity: 1,
       costPrice: 663.88,
       assetClass: "etf"
     });
+    expect(snapshot.positions[1]).toMatchObject({ symbol: "TSLA.US", quantity: -2, costPrice: 250 });
+  });
+
+  it("fails closed when any official position row has an invalid symbol or quantity", () => {
+    const base = {
+      fetchedAt: "2026-05-30T08:00:00.000Z",
+      check: {
+        session: { token: "valid" },
+        connectivity: { global: { ok: true } },
+        region: { active: "global", cached: "global" }
+      },
+      assets: [{ net_assets: "100000", total_cash: "50000", currency: "USD" }]
+    };
+
+    expect(() => helpers.normalizeOfficialPaperSnapshot({
+      ...base,
+      positions: [{ symbol: "", quantity: "1", cost_price: "100" }]
+    })).toThrow(/持仓.*标的|symbol/u);
+
+    expect(() => helpers.normalizeOfficialPaperSnapshot({
+      ...base,
+      positions: [{ symbol: "AAPL.US", quantity: "not-a-number", cost_price: "100" }]
+    })).toThrow(/持仓.*数量|quantity/u);
   });
 
   it("rejects official paper reports unless the safety environment is exact", () => {

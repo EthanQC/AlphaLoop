@@ -776,6 +776,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
           PRINT_CONFIG_ONLY: "1",
           PNPM_BIN: "/usr/bin/true",
           SYSTEM_DIR: scratchSystemDir,
+          MEMORYD_DATA_ROOT: "/",
           TMPDIR: scratchTmp
         },
         encoding: "utf8"
@@ -783,6 +784,46 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
 
       expect(readdirSync(scratchTmp)).toEqual([]);
       expect(existsSync(scratchSystemDir)).toBe(false);
+    });
+
+    it("rejects destructive memoryd roots before creating a staging directory", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-memoryd-root-");
+      const scratchTmp = makeTempDir("alphaloop-daemons-memoryd-root-tmp-");
+      const allowedRoot = join(machine.home, "Library", "Application Support", "AlphaLoop");
+      machine.env.TMPDIR = scratchTmp;
+
+      for (const dangerousRoot of [
+        "/",
+        machine.home,
+        repoRoot,
+        allowedRoot,
+        `${allowedRoot}//`,
+        `${allowedRoot}///`,
+        `${join(allowedRoot, "memoryd")}/`,
+        join(allowedRoot, "memoryd", "..", "..", "..", "escape")
+      ]) {
+        machine.env.MEMORYD_DATA_ROOT = dangerousRoot;
+        const failure = runSystemDaemonsExpectingFailure(machine);
+        expect(failure.output).toMatch(/MEMORYD_DATA_ROOT|memoryd data root/iu);
+        expect(readdirSync(scratchTmp)).toEqual([]);
+      }
+    });
+
+    it("rejects a memoryd root that traverses an existing symlink before any write", () => {
+      const machine = makeFakeMachine("alphaloop-daemons-memoryd-symlink-");
+      const scratchTmp = makeTempDir("alphaloop-daemons-memoryd-symlink-tmp-");
+      const allowedRoot = join(machine.home, "Library", "Application Support", "AlphaLoop");
+      const outside = makeTempDir("alphaloop-daemons-memoryd-outside-");
+      mkdirSync(allowedRoot, { recursive: true });
+      const linkedRoot = join(allowedRoot, "memoryd-link");
+      symlinkSync(outside, linkedRoot);
+      machine.env.TMPDIR = scratchTmp;
+      machine.env.MEMORYD_DATA_ROOT = linkedRoot;
+
+      const failure = runSystemDaemonsExpectingFailure(machine);
+
+      expect(failure.output).toMatch(/symlink/iu);
+      expect(readdirSync(scratchTmp)).toEqual([]);
     });
 
     it("resolves SUDO_USER under sudo, because `id -un` there is root and root is the wrong answer", () => {
@@ -1933,9 +1974,16 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     expect(output).toMatch(/本次执行的步骤：第 0 1 2 3 4 5 6 7 8 步 —— 全部退出 0/u);
     expect(receipts(runbook).map((entry) => entry.step)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
     expect(receipts(runbook).every((entry) => entry.exitCode === 0)).toBe(true);
+    expect(calls(runbook)).toContain("pnpm install --frozen-lockfile");
 
     const analysis = await gateFromLedger(runbook);
     expect(analysis.findings.filter((f) => f.code.startsWith("deploy-ledger."))).toEqual([]);
+  });
+
+  it("keeps the CI dependency graph frozen to the reviewed lockfile", () => {
+    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "ci.yml"), "utf8");
+    expect(workflow).toContain("pnpm install --frozen-lockfile");
+    expect(workflow).not.toContain("--frozen-lockfile=false");
   });
 
   it("refuses to start at all until the gateway-restart warning is acknowledged", () => {

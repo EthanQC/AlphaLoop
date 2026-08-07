@@ -9,7 +9,7 @@
 //   3. audit item (b): the manual `snapshot` path now asserts the paper-
 //      account environment, same as poll/pnl, instead of skipping it.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -56,6 +56,14 @@ function makeDb(): { db: DatabaseSync; dbPath: string } {
   const dbPath = join(dir, "trading.sqlite");
   const db = openTradingDatabase(dbPath);
   return { db, dbPath };
+}
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
 }
 
 afterEach(() => {
@@ -113,6 +121,49 @@ describe("resolveSnapshotOwnerId", () => {
     seedMember(db, "member_revoked", { status: "revoked" });
 
     expect(officialPaperMonitor.resolveSnapshotOwnerId(db)).toBe("member_1");
+  });
+});
+
+describe("findComparisonSnapshot account-family isolation", () => {
+  it("ignores a closer same-owner legacy snapshot for a member account", () => {
+    const { db } = makeDb();
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-06T12:00:00.000Z",
+      primaryAsset: { net_assets: "100", total_cash: "50" }
+    }), "hourly_poll_per_member", "member_1");
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-07T11:00:00.000Z",
+      primaryAsset: { net_assets: "119", total_cash: "59" }
+    }), "hourly_poll", "member_1");
+
+    const comparison = officialPaperMonitor.findComparisonSnapshot(
+      db,
+      "2026-08-08T12:00:00.000Z",
+      "previous_day",
+      "member_1"
+    );
+
+    expect(comparison?.primaryAsset?.net_assets).toBe("100");
+  });
+
+  it("ignores a closer per-member snapshot after switching back to legacy mode", () => {
+    const { db } = makeDb();
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-06T12:00:00.000Z",
+      primaryAsset: { net_assets: "100", total_cash: "50" }
+    }), "hourly_poll", "member_1");
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-07T11:00:00.000Z",
+      primaryAsset: { net_assets: "119", total_cash: "59" }
+    }), "hourly_poll_per_member", "member_1");
+
+    const comparison = officialPaperMonitor.findComparisonSnapshot(
+      db,
+      "2026-08-08T12:00:00.000Z",
+      "previous_day"
+    );
+
+    expect(comparison?.primaryAsset?.net_assets).toBe("100");
   });
 });
 
@@ -378,6 +429,17 @@ describe("estimateMarketValue", () => {
 
     expect(officialPaperMonitor.estimateMarketValue(snapshot)).toBe(900);
   });
+
+  it("uses absolute position quantity so a short contributes to gross exposure", () => {
+    const snapshot = {
+      positions: [
+        { symbol: "NVDA.US", quantity: 3, priceSource: "live", price: 100 },
+        { symbol: "TSLA.US", quantity: -2, priceSource: "live", price: 250 }
+      ]
+    };
+
+    expect(officialPaperMonitor.estimateMarketValue(snapshot)).toBe(800);
+  });
 });
 
 describe("buildStrategyReflection: discloses degradation instead of trusting the value", () => {
@@ -582,6 +644,7 @@ describe("runManualSnapshot: audit item (b) - environment assertion is no longer
 describe("pollOfficialPaperPerMember", () => {
   const credentialsRoots: string[] = [];
   const originalEnv = { ...process.env };
+  const reconcileImpl = async () => ({ ok: true });
 
   beforeEach(() => {
     process.env.LONGBRIDGE_ACCOUNT_MODE = "paper";
@@ -597,12 +660,14 @@ describe("pollOfficialPaperPerMember", () => {
 
   function seedMemberCredentials(root: string, memberId: string, accountMode = "paper"): void {
     const memberDir = join(root, memberId);
-    mkdirSync(memberDir, { recursive: true });
+    mkdirSync(memberDir, { recursive: true, mode: 0o700 });
+    chmodSync(memberDir, 0o700);
     writeFileSync(
       join(memberDir, "longbridge.env"),
       `LONGBRIDGE_ACCESS_TOKEN=token-${memberId}\nLONGBRIDGE_ACCOUNT_MODE=${accountMode}\n`,
-      "utf8"
+      { encoding: "utf8", mode: 0o600 }
     );
+    chmodSync(join(memberDir, "longbridge.env"), 0o600);
   }
 
   afterEach(() => {
@@ -637,6 +702,31 @@ describe("pollOfficialPaperPerMember", () => {
     expect(result).toBeNull();
   });
 
+  it("refuses legacy fallback when only an inactive member credential exists", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_active");
+    seedMember(db, "member_inactive", { status: "revoked" });
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_inactive");
+
+    await expect(officialPaperMonitor.pollOfficialPaperPerMember(db, { credentialsRootDir: root }))
+      .rejects.toThrow(/credential tree|shared-account|legacy/iu);
+    await expect(officialPaperMonitor.sendPnlReportsPerMember(db, { credentialsRootDir: root }))
+      .rejects.toThrow(/credential tree|shared-account|legacy/iu);
+  });
+
+  it("refuses legacy fallback for an unknown empty credential directory", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_active");
+    const root = makeCredentialsRoot();
+    mkdirSync(join(root, "unknown-member"), { mode: 0o700 });
+
+    await expect(officialPaperMonitor.pollOfficialPaperPerMember(db, { credentialsRootDir: root }))
+      .rejects.toThrow(/credential tree|shared-account|legacy/iu);
+    await expect(officialPaperMonitor.sendPnlReportsPerMember(db, { credentialsRootDir: root }))
+      .rejects.toThrow(/credential tree|shared-account|legacy/iu);
+  });
+
   it("2 credentialed members -> 2 owner-tagged snapshot rows, each with THAT member's fetch result", async () => {
     const { db } = makeDb();
     seedMember(db, "member_1");
@@ -651,7 +741,7 @@ describe("pollOfficialPaperPerMember", () => {
         primaryAsset: { net_assets: member.id === "member_1" ? "1000" : "2000", total_cash: "0" }
       });
 
-    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, reconcileImpl, credentialsRootDir: root });
 
     expect(result).toHaveLength(2);
     expect(result?.map((entry: { ownerId: string }) => entry.ownerId).sort()).toEqual(["member_1", "member_2"]);
@@ -673,7 +763,7 @@ describe("pollOfficialPaperPerMember", () => {
     // member_no_account intentionally gets no longbridge.env file.
 
     const fetchImpl = async () => buildSnapshot();
-    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, reconcileImpl, credentialsRootDir: root });
 
     expect(result).toHaveLength(1);
     expect(result?.[0]).toMatchObject({ ownerId: "member_1" });
@@ -697,7 +787,7 @@ describe("pollOfficialPaperPerMember", () => {
       return buildSnapshot();
     };
 
-    await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root });
+    await officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, reconcileImpl, credentialsRootDir: root });
 
     expect(seenTokens.sort()).toEqual(["token-member_1", "token-member_2"]);
   });
@@ -709,11 +799,133 @@ describe("pollOfficialPaperPerMember", () => {
     seedMemberCredentials(root, "member_live", "live");
     const fetchImpl = vi.fn(async () => buildSnapshot());
 
-    await expect(officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, credentialsRootDir: root }))
+    await expect(officialPaperMonitor.pollOfficialPaperPerMember(db, { fetchImpl, reconcileImpl, credentialsRootDir: root }))
       .rejects.toThrow(/官方模拟盘/);
     expect(fetchImpl).not.toHaveBeenCalled();
     const count = db.prepare("SELECT COUNT(*) AS c FROM official_paper_snapshots").get() as { c: number };
     expect(count.c).toBe(0);
+  });
+
+  it("reconciles each member account with the same isolated environment used for its snapshot", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    seedMember(db, "member_2");
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_1");
+    seedMemberCredentials(root, "member_2");
+    const reconciled: Array<{ ownerId: string; token: string | undefined; rateLimitDir: string }> = [];
+
+    const result = await officialPaperMonitor.pollOfficialPaperPerMember(db, {
+      credentialsRootDir: root,
+      fetchImpl: async () => buildSnapshot(),
+      reconcileImpl: async (_db: unknown, input: { ownerId: string; env: Record<string, string>; rateLimitDir: string }) => {
+        reconciled.push({
+          ownerId: input.ownerId,
+          token: input.env.LONGBRIDGE_ACCESS_TOKEN,
+          rateLimitDir: input.rateLimitDir
+        });
+        return { ok: true, ownerId: input.ownerId };
+      }
+    });
+
+    expect(reconciled.map((entry) => [entry.ownerId, entry.token])).toEqual([
+      ["member_1", "token-member_1"],
+      ["member_2", "token-member_2"]
+    ]);
+    expect(reconciled.every((entry) => entry.rateLimitDir?.includes(entry.ownerId))).toBe(true);
+    expect(result?.every((entry: { reconcile?: { ok?: boolean } }) => entry.reconcile?.ok === true)).toBe(true);
+  });
+
+  it("writes and delivers one owner-private PnL artifact per credentialed account on the same date", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    seedMember(db, "member_2", { feishuOpenId: "ou_member_2" });
+    const root = makeCredentialsRoot();
+    seedMemberCredentials(root, "member_1");
+    seedMemberCredentials(root, "member_2");
+    const outputDir = join(root, "reports");
+    mkdirSync(outputDir, { mode: 0o700 });
+
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-06T14:00:00.000Z",
+      primaryAsset: { net_assets: "100", total_cash: "50" }
+    }), "hourly_poll_per_member", "member_1");
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-06T14:00:00.000Z",
+      primaryAsset: { net_assets: "1000", total_cash: "500" }
+    }), "hourly_poll_per_member", "member_2");
+    // The legacy shared-account path historically stamped the sole active
+    // member's owner id too.  It is closer to the target than the real member
+    // baseline on purpose: a query scoped only by owner_id would select this
+    // different account and report +1 instead of +20.
+    officialPaperMonitor.saveSnapshot(db, buildSnapshot({
+      fetchedAt: "2026-08-07T13:00:00.000Z",
+      primaryAsset: { net_assets: "119", total_cash: "59" }
+    }), "hourly_poll", "member_1");
+
+    const deliveries: Array<Record<string, unknown>> = [];
+    const results = await officialPaperMonitor.sendPnlReportsPerMember(db, {
+      credentialsRootDir: root,
+      reportsRootDir: outputDir,
+      fetchImpl: async (member: { id: string }) => buildSnapshot({
+        fetchedAt: "2026-08-08T14:00:00.000Z",
+        primaryAsset: {
+          net_assets: member.id === "member_1" ? "120" : "1100",
+          total_cash: member.id === "member_1" ? "60" : "550"
+        }
+      }),
+      deliverImpl: async (payload: Record<string, unknown>) => {
+        deliveries.push(payload);
+        return { sent: true };
+      }
+    });
+
+    expect(results).toHaveLength(2);
+    expect(existsSync(join(outputDir, "2026-08-08-post-open--member_1.md"))).toBe(true);
+    expect(existsSync(join(outputDir, "2026-08-08-post-open--member_2.md"))).toBe(true);
+    expect(deliveries.map((payload) => (payload.scope as { ownerOpenId?: string }).ownerOpenId).sort())
+      .toEqual(["ou_member_1", "ou_member_2"]);
+    const memberOne = deliveries.find((payload) => (payload.scope as { ownerOpenId?: string }).ownerOpenId === "ou_member_1");
+    expect(String(memberOne?.markdown)).toContain("+20.00 USD");
+    expect(String(memberOne?.markdown)).not.toContain("+1.00 USD");
+    expect(String(memberOne?.markdown)).not.toContain("+1000.00 USD");
+
+    const rows = db.prepare(`
+      SELECT owner_id, COUNT(*) AS count
+      FROM official_paper_snapshots WHERE reason = 'post_open_pnl_per_member'
+      GROUP BY owner_id ORDER BY owner_id
+    `).all() as Array<{ owner_id: string; count: number }>;
+    expect(rows).toEqual([
+      { owner_id: "member_1", count: 1 },
+      { owner_id: "member_2", count: 1 }
+    ]);
+  });
+
+  it("reports delivered=false when any member delivery fails", async () => {
+    const { db } = makeDb();
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (line: unknown) => { logs.push(String(line)); };
+    try {
+      await expect(officialPaperMonitor.sendPnlReport(db, true, {
+          perMemberImpl: async () => [
+            { ownerId: "member_1", delivered: true },
+            { ownerId: "member_2", delivered: false, deliveryReason: "飞书拒绝" }
+          ]
+        }))
+        .rejects.toThrow(/1 member account|delivery/iu);
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(JSON.parse(logs.join("\n"))).toMatchObject({
+      delivered: false,
+      perMember: true,
+      reports: [
+        { ownerId: "member_1", delivered: true },
+        { ownerId: "member_2", delivered: false }
+      ]
+    });
   });
 });
 
@@ -795,6 +1007,18 @@ describe("resolvePnlReportScope: the card's recipient is the page's owner (spec 
     const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
     expect(scope.visibility).toBe("owner-unresolved");
     expect(scope.reason).toContain("飞书 open_id");
+  });
+
+  it("declares owner-unresolved when the attributed member was revoked before delivery", () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1", { feishuOpenId: "ou_member_1" });
+    const snapshotId = officialPaperMonitor.saveSnapshot(db, buildSnapshot(), "post_open_pnl");
+    db.prepare("UPDATE members SET status = 'revoked' WHERE id = ?").run("member_1");
+
+    const scope = officialPaperMonitor.resolvePnlReportScope(db, snapshotId);
+
+    expect(scope.visibility).toBe("owner-unresolved");
+    expect(scope.reason).toContain("已撤权");
   });
 
   // 2026-07-28 (spec drift R4/F9). This function used to read ONE row - this
@@ -1228,7 +1452,7 @@ describe("official-paper PnL Feishu delivery payload (spec drift A3)", () => {
 // the wiring at the injection seam so it cannot silently detach again.
 // ---------------------------------------------------------------------------
 describe("pollOfficialPaper runs reconciliation after every successful poll", () => {
-  it("calls reconcile once after the per-member branch and reports its result separately", async () => {
+  it("never runs one ambient/shared reconcile after the per-member branch already reconciled each account", async () => {
     const { db } = makeDb();
     const calls: string[] = [];
     const logs: string[] = [];
@@ -1236,33 +1460,63 @@ describe("pollOfficialPaper runs reconciliation after every successful poll", ()
     console.log = (line: unknown) => { logs.push(String(line)); };
     try {
       await officialPaperMonitor.pollOfficialPaper(db, true, {
-        perMember: async () => { calls.push("perMember"); return [{ memberId: "member_1", snapshotId: "snap_1" }]; },
+        perMember: async () => { calls.push("perMember"); return [{ ownerId: "member_1", snapshotId: "snap_1", reconcile: { ok: true } }]; },
         reconcile: async () => { calls.push("reconcile"); return { ok: true, confirmed: 1 }; }
       });
     } finally {
       console.log = originalLog;
     }
-    expect(calls).toEqual(["perMember", "reconcile"]);
+    expect(calls).toEqual(["perMember"]);
     const payload = JSON.parse(logs.join("\n"));
-    expect(payload.reconcile).toEqual({ ok: true, confirmed: 1 });
+    expect(payload.reconcile).toBeUndefined();
+    expect(payload.snapshots[0].reconcile).toEqual({ ok: true });
     expect(payload.polled).toBe(true);
   });
 
-  it("a failing reconcile is reported, never thrown - the snapshot must not be lost to it", async () => {
+  it("a per-member reconcile failure is reported alongside that snapshot, never rerouted through ambient credentials", async () => {
     const { db } = makeDb();
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (line: unknown) => { logs.push(String(line)); };
     try {
-      await officialPaperMonitor.pollOfficialPaper(db, true, {
-        perMember: async () => [{ memberId: "member_1", snapshotId: "snap_1" }],
-        reconcile: async () => ({ ok: false, error: "长桥不可达" })
-      });
+      await expect(officialPaperMonitor.pollOfficialPaper(db, true, {
+          perMember: async () => [{ ownerId: "member_1", snapshotId: "snap_1", reconcile: { ok: false, error: "长桥不可达" } }],
+          reconcile: async () => ({ ok: false, error: "长桥不可达" })
+        }))
+        .rejects.toThrow(/reconciliation failed|member_1/iu);
     } finally {
       console.log = originalLog;
     }
     const payload = JSON.parse(logs.join("\n"));
     expect(payload.polled).toBe(true);
-    expect(payload.reconcile).toEqual({ ok: false, error: "长桥不可达" });
+    expect(payload.snapshots[0].reconcile).toEqual({ ok: false, error: "长桥不可达" });
+  });
+
+  it("throws when legacy reconciliation fails after preserving the snapshot", async () => {
+    const { db } = makeDb();
+    seedMember(db, "member_1");
+    const originalLog = console.log;
+    const originalMode = process.env.LONGBRIDGE_ACCOUNT_MODE;
+    const originalEnabled = process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED;
+    const originalLive = process.env.ALLOW_LIVE_EXECUTION;
+    console.log = () => undefined;
+    process.env.LONGBRIDGE_ACCOUNT_MODE = "paper";
+    process.env.LONGBRIDGE_OFFICIAL_PAPER_ENABLED = "true";
+    process.env.ALLOW_LIVE_EXECUTION = "false";
+    try {
+      await expect(officialPaperMonitor.pollOfficialPaper(db, true, {
+          perMember: async () => null,
+          fetchShared: async () => buildSnapshot(),
+          reconcile: async () => ({ ok: false, error: "对账持续失败" })
+        }))
+        .rejects.toThrow(/对账持续失败/);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM official_paper_snapshots WHERE reason = 'hourly_poll'").get())
+        .toEqual({ c: 1 });
+    } finally {
+      console.log = originalLog;
+      restoreEnv("LONGBRIDGE_ACCOUNT_MODE", originalMode);
+      restoreEnv("LONGBRIDGE_OFFICIAL_PAPER_ENABLED", originalEnabled);
+      restoreEnv("ALLOW_LIVE_EXECUTION", originalLive);
+    }
   });
 });

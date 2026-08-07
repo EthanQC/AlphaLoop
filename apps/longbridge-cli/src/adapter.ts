@@ -137,6 +137,12 @@ export interface AdapterSubmitRequest {
   outsideRth?: string | undefined;
 }
 
+export interface OrderHistoryRequest {
+  startAt: string;
+  endAt: string;
+  symbol?: string | undefined;
+}
+
 export interface FinanceCalendarRequest {
   category: string;
   start: string;
@@ -155,6 +161,8 @@ export interface LongbridgeAdapter {
   getFinanceCalendar(req: FinanceCalendarRequest): Promise<AdapterCalendarGroup[]>;
   getTodayOrders(): Promise<AdapterOrder[]>;
   getTodayExecutions(): Promise<AdapterExecution[]>;
+  getHistoryOrders(req: OrderHistoryRequest): Promise<AdapterOrder[]>;
+  getHistoryExecutions(req: OrderHistoryRequest): Promise<AdapterExecution[]>;
   submitOrder(req: AdapterSubmitRequest): Promise<{ orderId: string }>;
   getOrderDetail(orderId: string): Promise<AdapterOrder>;
 }

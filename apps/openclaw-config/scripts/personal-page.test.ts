@@ -1254,13 +1254,13 @@ describe("R5: the consistency verdict is computed from what the real writers act
       INSERT INTO official_paper_order_lifecycle
       (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
        side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
-       last_observed_at, raw, notes)
+       last_observed_at, raw, notes, owner_id)
       VALUES ('row_r5', ?, NULL, 'longbridge-paper', 'paper', 'paper', 'NVDA.US', 'stock',
        'buy', 4, 160, 'unconfirmed', 'pending', 'submit_unconfirmed', '2026-07-24T14:00:00.000Z',
-       '2026-07-24T14:00:00.000Z', 'null', '[]')
+       '2026-07-24T14:00:00.000Z', 'null', '[]', NULL)
     `).run(ticketId);
 
-    await reconcileModule.reconcileOfficialPaperOrders(db, {
+    const reconcileResult = await reconcileModule.reconcileOfficialPaperOrders(db, {
       fetchOrders: () => [{
         order_id: "EXT_R5", symbol: "NVDA.US", side: "Buy", quantity: 4, price: 160,
         status: "Filled", created_at: "2026-07-24T14:02:00.000Z"
@@ -1268,6 +1268,12 @@ describe("R5: the consistency verdict is computed from what the real writers act
       fetchExecutions: () => [],
       now: () => new Date("2026-07-24T14:05:00.000Z")
     });
+
+    expect(reconcileResult.adopted).toHaveLength(1);
+    expect(db.prepare(`SELECT owner_id FROM official_paper_order_lifecycle WHERE id = 'row_r5'`).get())
+      .toEqual({ owner_id: "member_r5_rec" });
+    expect(db.prepare(`SELECT owner_id FROM execution_reports`).all())
+      .toEqual([{ owner_id: "member_r5_rec" }]);
 
     const body = consistencyBody(db, "member_r5_rec");
     expect(body).toContain("一致性：一致（");

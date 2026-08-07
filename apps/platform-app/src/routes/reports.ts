@@ -145,6 +145,7 @@ const READING_PATH_SEGMENTS: Record<string, ReportType> = {
  * kind (hourly_poll, hourly_poll_per_member, manual) did not produce this
  * file and therefore say nothing about who it belongs to. */
 const OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl";
+const MEMBER_OFFICIAL_PAPER_REPORT_REASON = "post_open_pnl_per_member";
 
 /** `owner_id` values that are NOT a member: `'__shared__'` is the writer's own
  * "could not attribute this to exactly one member" sentinel (official-paper-
@@ -243,6 +244,34 @@ function attributionFor(
   date: string
 ): OfficialPaperAttribution {
   return attributions.get(date) ?? NO_SNAPSHOT_ROW;
+}
+
+function hasPerMemberPaperSnapshot(db: DatabaseSync, date: string, ownerId: string): boolean {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM official_paper_snapshots
+    WHERE reason = ? AND substr(fetched_at, 1, 10) = ? AND owner_id = ?
+    LIMIT 1
+  `).get(MEMBER_OFFICIAL_PAPER_REPORT_REASON, date, ownerId));
+}
+
+function attributionForPaperEntry(
+  db: DatabaseSync,
+  legacyAttributions: Map<string, OfficialPaperAttribution>,
+  entry: ReportIndexEntry
+): OfficialPaperAttribution {
+  if (!entry.ownerId) {
+    return attributionFor(legacyAttributions, entry.date);
+  }
+  if (NON_MEMBER_OWNER_IDS.has(entry.ownerId)) {
+    return { kind: "unattributable", reason: `文件归属 ${entry.ownerId} 不是成员身份` };
+  }
+  if (!hasPerMemberPaperSnapshot(db, entry.date, entry.ownerId)) {
+    return {
+      kind: "unattributable",
+      reason: `没有找到与成员文件 ${entry.ownerId}/${entry.date} 同次生成的账户记录`
+    };
+  }
+  return { kind: "owner", ownerId: entry.ownerId };
 }
 
 function isOwnerScopedType(type: ReportType): boolean {
@@ -435,7 +464,7 @@ function loadViewerOwnedPaperReports(
   const entries: ReportIndexEntry[] = [];
   const withheld: WithheldPaperReports = { otherOwner: 0, unattributable: 0 };
   for (const entry of candidates) {
-    const attribution = attributionFor(attributions, entry.date);
+    const attribution = attributionForPaperEntry(db, attributions, entry);
     if (attribution.kind === "unattributable") {
       withheld.unattributable += 1;
     } else if (attribution.ownerId === viewerId) {
@@ -1054,6 +1083,9 @@ function refusedOwnerScopedReport(
   nonce: string,
   now: Date
 ): boolean {
+  if (hasPerMemberPaperSnapshot(deps.db, dateParam, member.id)) {
+    return false;
+  }
   const attribution = attributionFor(resolveOfficialPaperAttributions(deps.db), dateParam);
   if (attribution.kind === "owner" && attribution.ownerId === member.id) {
     return false;
@@ -1102,7 +1134,21 @@ function renderReadingPage(
   }
 
   const entries = ownerScoped ? scanOwnerScopedReports(deps.repoRoot) : scanReports(deps.repoRoot);
-  const entry = entries.find((candidate) => candidate.type === type && candidate.date === dateParam);
+  // A per-member snapshot means this date belongs to the new one-file-per-
+  // account format. In that mode the viewer may read only their exact owner-
+  // suffixed artifact; a missing file is a 404, never permission to fall back
+  // to a same-date legacy/shared artifact. Legacy selection remains available
+  // only when the date was authorized by the legacy attribution rule above.
+  const perMemberMode = ownerScoped
+    && hasPerMemberPaperSnapshot(deps.db, dateParam, member.id);
+  const entry = entries.find((candidate) => (
+    candidate.type === type
+    && candidate.date === dateParam
+    && (
+      !ownerScoped
+      || (perMemberMode ? candidate.ownerId === member.id : candidate.ownerId === undefined)
+    )
+  ));
   if (!entry) {
     send(404, renderNotFoundPage(member, nonce, now));
     return;

@@ -58,7 +58,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   AuditLogRepository,
-  createId,
   ExecutionReportRepository,
   MemberRepository,
   openTradingDatabase,
@@ -82,6 +81,7 @@ export const DEFAULT_ORPHAN_CORRELATION_WINDOW_MS = 30 * 60 * 1000;
 // order of magnitude as the orphan correlation window above) before this
 // file concludes the order never reached the broker at all.
 export const DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS = 30 * 60 * 1000;
+export const DEFAULT_SUBMITTING_GRACE_MS = 30 * 60 * 1000;
 
 // Shared-account reconciliation has the same owner semantics as the snapshot
 // writer: exactly one active member is attributable; zero or multiple active
@@ -104,35 +104,6 @@ export function resolveReconciliationOwnerId(db) {
 // linked", per the Task 5 deliverable, not an error.
 const PROPOSAL_TICKET_PREFIX = "ticket_prop_";
 
-// FIX 1: lifecycle stages that mean "the order genuinely reached the broker
-// and is either still live or fully filled" - NOT a completed
-// cancel/rejection. Only these stages ever un-stick an adopted order's
-// linked proposal off 'failed'; cancelled/rejected/expired/unknown leave the
-// proposal exactly as markFailed already left it (a cancelled/rejected order
-// really did fail, so 'failed' remains the correct terminal proposal state).
-const LIVE_OR_FILLED_LIFECYCLE_STAGES = new Set(["submitted", "pending", "filled"]);
-
-// FIX 2: WaitToCancel/PendingCancel map to stage 'pending' in
-// broker-status-map.mjs (a cancel REQUEST in flight - the order is still
-// open, so 'pending' IS the right lifecycle stage) - which puts them inside
-// LIVE_OR_FILLED_LIFECYCLE_STAGES above. But "the owner is actively trying to
-// cancel this order" is NOT evidence the trade went through, so the un-stick
-// must never fire off one of these raw statuses: if the cancel completes, the
-// proposal really did fail; if it doesn't (the order fills first), a later
-// reconcile pass observes 'Filled' and un-sticks then, with the truthful
-// stage. broker-status-map.mjs (read-only single source of truth) does not
-// distinguish cancel-in-flight from other 'pending' statuses in its OUTPUT
-// ({stage:'pending', localStatus:'pending'} for both), so this set mirrors
-// its two cancel-in-flight table keys verbatim, normalized with the exact
-// same convention as the map's own normalizeStatus (lowercase, strip
-// everything but [a-z0-9]).
-const CANCEL_IN_FLIGHT_NORMALIZED_STATUSES = new Set(["waittocancel", "pendingcancel"]);
-
-function isCancelInFlightBrokerStatus(brokerStatusRaw) {
-  const normalized = String(brokerStatusRaw ?? "").toLowerCase().replace(/[^a-z0-9]/gu, "");
-  return CANCEL_IN_FLIGHT_NORMALIZED_STATUSES.has(normalized);
-}
-
 function proposalIdFromTicketId(ticketId) {
   if (typeof ticketId !== "string" || !ticketId.startsWith(PROPOSAL_TICKET_PREFIX)) {
     return null;
@@ -148,25 +119,115 @@ function proposalIdFromTicketId(ticketId) {
  */
 export async function reconcileOfficialPaperOrders(db, options = {}) {
   const {
-    fetchOrders = () => runLongbridgeJson("trade", ["order"]),
-    fetchExecutions = () => runLongbridgeJson("trade", ["order", "executions"]),
+    execOptions = {},
     now = () => new Date(),
     symbolFilters = new Set(),
+    explicitOwnerId,
     orphanCorrelationWindowMs = DEFAULT_ORPHAN_CORRELATION_WINDOW_MS,
-    submitUnconfirmedTimeoutMs = DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS
+    submitUnconfirmedTimeoutMs = DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS,
+    submittingGraceMs = DEFAULT_SUBMITTING_GRACE_MS
   } = options;
 
   const audit = new AuditLogRepository(db);
   const proposals = new ProposalRepository(db);
   const reports = new ExecutionReportRepository(db);
-  const sharedAccountOwnerId = resolveReconciliationOwnerId(db);
+  const accountOwnerId = explicitOwnerId ?? resolveReconciliationOwnerId(db);
+  // Broker order ids are account-local. Only legacy/global reconciliation may
+  // migrate pre-v20 NULL-owner rows. An explicit member account must use an
+  // exact owner row or create its own lifecycle record.
+  const allowUnattributedLegacyRows = explicitOwnerId === undefined;
+  const observedDate = now();
+  const observedAt = observedDate.toISOString();
+  const nowMs = observedDate.getTime();
+  const fetchOrders = options.fetchOrders ?? (() => runLongbridgeJson("trade", ["order"], execOptions));
+  const fetchExecutions = options.fetchExecutions ?? (() => runLongbridgeJson("trade", ["order", "executions"], execOptions));
+  // Unit callers that inject today's list remain explicitly history-blind
+  // unless they also inject the history seam. Production (no injection)
+  // always enables the pinned SDK's bounded history APIs.
+  const fetchHistoricalOrders = options.fetchHistoricalOrders
+    ?? (options.fetchOrders === undefined
+      ? ({ startAt, endAt, symbol }) => runLongbridgeJson(
+        "trade",
+        ["order", "history", "--symbol", symbol, "--start", startAt, "--end", endAt],
+        execOptions
+      )
+      : null);
+  const fetchHistoricalExecutions = options.fetchHistoricalExecutions
+    ?? (options.fetchExecutions === undefined
+      ? ({ startAt, endAt, symbol }) => runLongbridgeJson(
+        "trade",
+        ["order", "history", "executions", "--symbol", symbol, "--start", startAt, "--end", endAt],
+        execOptions
+      )
+      : null);
+
+  const unresolvedBeforeFetch = listUnconfirmedRows(
+    db,
+    proposals,
+    accountOwnerId,
+    symbolFilters,
+    allowUnattributedLegacyRows
+  );
+  const crossDayRows = unresolvedBeforeFetch.filter((row) => {
+    const submittedAtMs = new Date(String(row.submitted_at)).getTime();
+    return Number.isFinite(submittedAtMs)
+      && nowMs - submittedAtMs >= submitUnconfirmedTimeoutMs
+      && tradingDateKey(submittedAtMs) !== tradingDateKey(nowMs);
+  });
+  const historyCoveredRowIds = new Set();
+  let historicalOrders = [];
+  let historicalExecutions = [];
+  if (crossDayRows.length > 0 && fetchHistoricalOrders) {
+    for (const row of crossDayRows) {
+      const submittedAtMs = new Date(String(row.submitted_at)).getTime();
+      const historyWindow = {
+        startAt: new Date(submittedAtMs - orphanCorrelationWindowMs).toISOString(),
+        endAt: new Date(Math.min(nowMs, submittedAtMs + orphanCorrelationWindowMs)).toISOString(),
+        symbol: String(row.symbol).toUpperCase()
+      };
+      const orderPage = validateBrokerOrders(requireBrokerArrayPayload(
+        await fetchHistoricalOrders(historyWindow),
+        "historical orders"
+      ));
+      // Longbridge's history endpoint is capped at 1000 rows, while the
+      // pinned Node SDK discards the upstream `has_more` bit and exposes only
+      // Order[]. A full page therefore cannot prove absence; fail closed
+      // before any lifecycle write instead of releasing budget on truncation.
+      if (orderPage.length >= 1000) {
+        throw new Error(`Longbridge historical orders returned ${orderPage.length} rows; completeness cannot be proven at the 1000-row truncation boundary.`);
+      }
+      const relevantOrders = orderPage.filter((order) => historicalOrderMatchesUnconfirmedRow(
+        order,
+        [row],
+        orphanCorrelationWindowMs
+      ));
+      const selectedOrderIds = new Set(relevantOrders.map((order) => brokerExternalOrderId(order)));
+      historicalOrders.push(...relevantOrders);
+
+      if (fetchHistoricalExecutions) {
+        const executionPage = validateBrokerExecutions(requireBrokerArrayPayload(
+          await fetchHistoricalExecutions(historyWindow),
+          "historical executions"
+        ));
+        if (executionPage.length >= 1000) {
+          throw new Error(`Longbridge historical executions returned ${executionPage.length} rows; completeness cannot be proven at the 1000-row truncation boundary.`);
+        }
+        historicalExecutions.push(...executionPage.filter((execution) => selectedOrderIds.has(brokerExternalOrderId(execution))));
+      }
+      historyCoveredRowIds.add(row.id);
+    }
+  }
 
   const ordersPayload = await fetchOrders();
   const executionsPayload = await fetchExecutions();
-  const orders = asArray(ordersPayload)
-    .filter((order) => symbolFilters.size === 0 || symbolFilters.has(String(order.symbol ?? "").toUpperCase()));
-  const executions = asArray(executionsPayload);
-  const observedAt = now().toISOString();
+  const orders = dedupeBrokerRows([
+    ...validateBrokerOrders(requireBrokerArrayPayload(ordersPayload, "orders")),
+    ...historicalOrders
+  ]).filter((order) => symbolFilters.size === 0 || symbolFilters.has(String(order.symbol ?? "").toUpperCase()));
+  const executions = dedupeBrokerRows([
+    ...validateBrokerExecutions(requireBrokerArrayPayload(executionsPayload, "executions")),
+    ...historicalExecutions
+  ], true);
 
   const matched = [];
   const adopted = [];
@@ -200,10 +261,16 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
     ];
 
     // ---- 1. Already known: matched by external_order_id -----------------
-    const existingByExternalId = getLifecycleByExternalOrderId(db, externalOrderId);
+    const existingByExternalId = getLifecycleByExternalOrderId(
+      db,
+      externalOrderId,
+      accountOwnerId,
+      proposals,
+      allowUnattributedLegacyRows
+    );
     if (existingByExternalId) {
-      const ownerId = resolveLifecycleOwnerId(proposals, existingByExternalId, sharedAccountOwnerId);
-      updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes, ownerId });
+      const ownerId = resolveLifecycleOwnerId(proposals, existingByExternalId, accountOwnerId);
+      updateMatchedLifecycleRow(db, existingByExternalId.id, { brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes, ownerId });
       matched.push({
         externalOrderId,
         ticketId: existingByExternalId.ticket_id ?? null,
@@ -246,12 +313,17 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
       side,
       quantity,
       orderSubmittedAtMs: submittedAtMs,
-      windowMs: orphanCorrelationWindowMs
+      windowMs: orphanCorrelationWindowMs,
+      nowMs,
+      submittingGraceMs,
+      ownerId: accountOwnerId,
+      proposals,
+      allowUnattributedLegacyRows
     });
 
     if (correlation?.kind === "adopt") {
       const candidate = correlation.row;
-      const ownerId = resolveLifecycleOwnerId(proposals, candidate, sharedAccountOwnerId);
+      const ownerId = resolveLifecycleOwnerId(proposals, candidate, accountOwnerId);
       claimOrphanLifecycleRow(db, candidate.id, { externalOrderId, brokerStatus: brokerStatusRaw, localStatus, stage, observedAt, raw, notes, ownerId });
       audit.write("reconcile", "orphan_broker_order_adopted", {
         externalOrderId,
@@ -302,7 +374,7 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
       // own upcoming finalizeExecution UPDATE (keyed by ticket_id) writing
       // this SAME external_order_id - and inserting a brand-new orphan row
       // for it instead would permanently collide with that later UPDATE on
-      // the external_order_id UNIQUE constraint. Correct move: do nothing to
+      // the account-scoped external-order UNIQUE constraint. Correct move: do nothing to
       // the lifecycle table at all and let broker-executor's own callback
       // complete the row normally; audit-log the observation for visibility.
       const candidate = correlation.row;
@@ -331,14 +403,14 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
       observedAt,
       raw,
       notes,
-      ownerId: sharedAccountOwnerId
+      ownerId: accountOwnerId
     });
     audit.write("reconcile", "orphan_broker_order", {
       externalOrderId,
       symbol,
       side,
       quantity,
-      ownerId: sharedAccountOwnerId,
+      ownerId: accountOwnerId,
       lifecycleStage: stage,
       reason: "no lifecycle row matched by external_order_id, and no submit_unconfirmed/submitting lifecycle row correlates within the adoption window"
     });
@@ -351,11 +423,14 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
   // candidates for "broker never got it" - but only past the timeout window,
   // so a submit_unconfirmed row from moments ago (broker reporting lag is
   // normal) is left alone for a later reconcile pass to resolve.
-  const nowMs = now().getTime();
   const timedOut = [];
-  const stillUnconfirmed = db
-    .prepare(`SELECT * FROM official_paper_order_lifecycle WHERE lifecycle_stage = 'submit_unconfirmed' AND external_order_id IS NULL`)
-    .all();
+  const stillUnconfirmed = listUnconfirmedRows(
+    db,
+    proposals,
+    accountOwnerId,
+    symbolFilters,
+    allowUnattributedLegacyRows
+  );
 
   for (const row of stillUnconfirmed) {
     const submittedAtMs = new Date(String(row.submitted_at)).getTime();
@@ -363,32 +438,56 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
       continue;
     }
 
-    const reason = `对账超时：券商当日订单列表中未观察到该工单（提交于 ${row.submitted_at}），已超过 ${Math.round(submitUnconfirmedTimeoutMs / 60000)} 分钟裁决窗口，判定为提交失败。`;
-    db.prepare(`
-      UPDATE official_paper_order_lifecycle
-      SET lifecycle_stage = 'failed', local_status = 'rejected', last_observed_at = ?, notes = ?
-      WHERE id = ?
-    `).run(observedAt, JSON.stringify([reason]), row.id);
+    // A cross-session timeout requires a successfully retrieved history
+    // window that starts before the unresolved submission. Without that
+    // evidence the lease stays conservatively unresolved and counted in risk.
+    if (tradingDateKey(submittedAtMs) !== tradingDateKey(nowMs)
+      && !historyCoveredRowIds.has(row.id)) {
+      audit.write("reconcile", "unconfirmed_cross_day_deferred", {
+        ticketId: row.ticket_id,
+        symbol: row.symbol,
+        lifecycleStage: row.lifecycle_stage,
+        submittedAt: row.submitted_at
+      });
+      continue;
+    }
 
-    audit.write("reconcile", "submit_unconfirmed_timeout_failed", {
-      ticketId: row.ticket_id,
-      symbol: row.symbol,
-      side: row.side,
-      quantity: row.quantity,
-      submittedAt: row.submitted_at
-    });
-
+    const evidenceLabel = tradingDateKey(submittedAtMs) === tradingDateKey(nowMs)
+      ? "同一交易日订单列表"
+      : "覆盖提交时点的历史订单窗口";
+    const reason = `对账超时：券商${evidenceLabel}中未观察到该工单（提交于 ${row.submitted_at}），已超过 ${Math.round(submitUnconfirmedTimeoutMs / 60000)} 分钟裁决窗口，判定为提交失败。`;
     const proposalId = proposalIdFromTicketId(row.ticket_id);
-    if (proposalId) {
-      try {
-        proposals.markFailed(proposalId, reason);
-      } catch (error) {
-        audit.write("reconcile", "submit_unconfirmed_timeout_markfailed_error", {
-          proposalId,
-          ticketId: row.ticket_id,
-          error: String(error?.message ?? error)
-        });
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const update = db.prepare(`
+        UPDATE official_paper_order_lifecycle
+        SET lifecycle_stage = 'failed', local_status = 'rejected', last_observed_at = ?, notes = ?
+        WHERE id = ? AND lifecycle_stage IN ('submit_unconfirmed', 'submitting') AND external_order_id IS NULL
+      `).run(observedAt, JSON.stringify([reason]), row.id);
+      if (Number(update.changes) !== 1) {
+        throw new Error(`Lifecycle row ${row.id} changed during timeout adjudication; refusing partial commit.`);
       }
+
+      audit.write("reconcile", "submit_unconfirmed_timeout_failed", {
+        ticketId: row.ticket_id,
+        symbol: row.symbol,
+        side: row.side,
+        quantity: row.quantity,
+        submittedAt: row.submitted_at
+      });
+
+      if (proposalId) {
+        proposals.markFailed(proposalId, reason);
+      }
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        // Preserve the first persistence failure; the unresolved lifecycle
+        // row remains the replay lease whenever rollback succeeds.
+      }
+      throw error;
     }
 
     timedOut.push({ ticketId: row.ticket_id ?? null, symbol: row.symbol, proposalId });
@@ -407,13 +506,10 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 //   (b) that proposal is currently 'failed' (idempotent: a second reconcile
 //       pass over the same already-adopted order finds status 'executed'
 //       already and is a no-op here - no second report), AND
-//   (c) the observed broker stage is live/filled (LIVE_OR_FILLED_LIFECYCLE_
-//       STAGES), never a cancelled/rejected/expired/unknown stage - those
-//       really did fail, so 'failed' is the correct terminal state, AND
-//   (d) FIX 2: the RAW broker status is not a cancel-in-flight one
-//       (WaitToCancel/PendingCancel) - those map to stage 'pending' (the
-//       order is still open), but a cancel being requested is not evidence
-//       the trade went through; see CANCEL_IN_FLIGHT_NORMALIZED_STATUSES.
+//   (c) a broker order with an external id was actually observed. The exact
+//       lifecycle stage changes the report wording and risk treatment, but
+//       never whether the constitution-required execution-attempt report
+//       exists (including rejected/cancelled/cancel-in-flight/unknown).
 // Called from BOTH the adopt branch (order correlated to a
 // submit_unconfirmed / timeout-failed row this pass) and the matched branch
 // (order already known by external_order_id whose freshly observed stage is
@@ -435,14 +531,6 @@ export async function reconcileOfficialPaperOrders(db, options = {}) {
 function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
   const { ticketId, stage, symbol, side, quantity, limitPrice, externalOrderId, brokerStatusRaw, localStatus, observedAt } = input;
 
-  if (!LIVE_OR_FILLED_LIFECYCLE_STAGES.has(stage)) {
-    return;
-  }
-
-  if (isCancelInFlightBrokerStatus(brokerStatusRaw)) {
-    return;
-  }
-
   const proposalId = proposalIdFromTicketId(ticketId);
   if (!proposalId) {
     return;
@@ -460,24 +548,41 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
     return;
   }
 
-  if (!proposal || proposal.status !== "failed") {
-    // Not linked, already executed (idempotent replay), or in some other
-    // status this fix has no business touching - leave it alone.
+  if (!proposal) {
+    return;
+  }
+  const repairableStatuses = new Set(["approved", "approved_half", "failed", "executed"]);
+  if (!repairableStatuses.has(proposal.status)) {
+    // Broker truth is not authority to consume a pending/rejected/expired
+    // human decision. Only an already-approved execution, the known
+    // submit_unconfirmed failure state, or an executed row missing its report
+    // can be completed here.
     return;
   }
 
-  try {
-    proposals.markExecuted(proposalId, ticketId);
-  } catch (error) {
-    audit.write("reconcile", "adopted_failed_proposal_markexecuted_error", {
-      proposalId,
-      ticketId,
-      error: String(error?.message ?? error)
-    });
+  const deterministicReportId = `report_reconcile_${proposalId}`;
+  const existingReport = db.prepare(`
+    SELECT id, created_at,
+      json_extract(metadata, '$.lifecycleStage') AS lifecycle_stage,
+      json_extract(metadata, '$.brokerStatus') AS broker_status
+    FROM execution_reports
+    WHERE category = 'trade' AND owner_id = ?
+      AND (
+        id = ?
+        OR json_extract(metadata, '$.ticketId') = ?
+        OR json_extract(metadata, '$.proposalId') = ?
+      )
+    ORDER BY created_at ASC
+    LIMIT 1
+  `).get(proposal.ownerId, deterministicReportId, ticketId, proposalId);
+  const reportId = existingReport?.id ?? deterministicReportId;
+  const reportNeedsRefresh = !existingReport
+    || existingReport.lifecycle_stage !== stage
+    || existingReport.broker_status !== brokerStatusRaw;
+  if (proposal.status === "executed" && proposal.ticketId === ticketId && !reportNeedsRefresh) {
     return;
   }
 
-  const reportId = createId("report");
   const notionalUsd = typeof limitPrice === "number" ? limitPrice * quantity : undefined;
   // F5 (2026-07-28 round 3): the price was received, used for notionalUsd, and
   // then thrown away - neither the body nor the metadata carried it, so
@@ -496,66 +601,115 @@ function reconcileStuckFailedProposal(db, proposals, reports, audit, input) {
   // report must say so instead of hard-coding a fill claim.
   const statusLine = stage === "filled"
     ? "状态：对账已确认成交（此前误判为提交未确认）"
-    : "状态：对账确认订单已提交并在券商侧存活（此前误判为提交未确认，尚未观察到成交）";
-  reports.save({
-    id: reportId,
-    category: "trade",
-    // N2 (2026-07-28 verifier): stamp the owner at the WRITE, exactly as
-    // broker-executor's own success path does. This writer used to omit
-    // ownerId entirely, so a reconciled real fill landed with owner_id NULL -
-    // invisible on the member's own weekly 「本周我的交易 vs 策略一致性回顾」
-    // and countable only inside the anonymous unattributed disclosure. The
-    // proposal whose status this same function just corrected is the
-    // server-side owner of record; there is no other moment at which the
-    // attribution can still be recovered.
-    ownerId: proposal.ownerId,
-    title: `${symbol} 执行报告`,
-    body: [
-      `工单：${ticketId}`,
-      statusLine,
-      "执行方：长桥官方模拟盘",
-      `外部订单号：${externalOrderId}`,
-      `券商状态：${brokerStatusRaw}`,
-      `生命周期阶段：${stage}`,
-      ...(hasLimitPrice ? [`限价：${limitPrice.toFixed(2)}`] : []),
-      "",
-      "原因：",
-      "- reconcile 在券商当日订单列表中发现该工单已成交/存活，此前 broker-executor 因 CLI 调用失败或超时误判为提交未确认并标记提案失败。",
-      "- 已将提案状态由 failed 更正为 executed，并补记一条交易执行报告。"
-    ].join("\n"),
-    metadata: {
-      ticketId,
-      proposalId,
-      environment: "paper",
-      assetClass: "stock",
-      symbol,
-      side,
-      quantity,
-      ...(hasLimitPrice ? { limitPrice } : {}),
-      ...(notionalUsd !== undefined ? { notionalUsd } : {}),
-      externalOrderId,
-      brokerStatus: brokerStatusRaw,
-      localStatus,
-      lifecycleStage: stage,
-      source: "reconcile-official-paper-orders",
-      note: "对账补记（adopt 或 matched 分支）：此前因 submit_unconfirmed 误判失败，现确认订单已成交/存活。"
-    },
-    createdAt: observedAt
-  });
+    : stage === "cancelled"
+      ? "状态：对账确认券商已取消订单（执行尝试已完成）"
+      : stage === "rejected"
+        ? "状态：对账确认券商已拒绝/过期订单（执行尝试已完成）"
+        : stage === "unknown_broker_status"
+          ? "状态：对账已找到券商订单，但状态值尚未识别（成交状态未知，继续占用风险预算）"
+          : "状态：对账确认订单已提交并在券商侧存活（尚未观察到成交）";
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    if (reportNeedsRefresh) {
+      reports.save({
+        id: reportId,
+        category: "trade",
+        // The proposal is the server-side owner of record. Never infer the
+        // report recipient from the broker payload or ambient account.
+        ownerId: proposal.ownerId,
+        title: `${symbol} 执行报告`,
+        body: [
+          `工单：${ticketId}`,
+          statusLine,
+          "执行方：长桥官方模拟盘",
+          `外部订单号：${externalOrderId}`,
+          `券商状态：${brokerStatusRaw}`,
+          `生命周期阶段：${stage}`,
+          ...(hasLimitPrice ? [`限价：${limitPrice.toFixed(2)}`] : []),
+          "",
+          "原因：",
+          "- reconcile 在券商订单或历史订单列表中发现该工单，本地提交回调或后续持久化此前未完整收口。",
+          proposal.status === "failed"
+            ? "- 已将提案状态由 failed 更正为 executed，并补记一条幂等交易执行报告。"
+            : "- 已将提案状态收口为 executed，并补记一条幂等交易执行报告。"
+        ].join("\n"),
+        metadata: {
+          ticketId,
+          proposalId,
+          environment: "paper",
+          assetClass: "stock",
+          symbol,
+          side,
+          quantity,
+          ...(hasLimitPrice ? { limitPrice } : {}),
+          ...(notionalUsd !== undefined ? { notionalUsd } : {}),
+          externalOrderId,
+          brokerStatus: brokerStatusRaw,
+          localStatus,
+          lifecycleStage: stage,
+          source: "reconcile-official-paper-orders",
+          note: "对账补记（adopt 或 matched 分支）：券商已确认订单，现原子收口提案状态与执行报告。"
+        },
+        // Refresh the same report in place as broker truth becomes more
+        // specific (unknown/pending -> filled/cancelled/etc.). Keep the
+        // original report timestamp and id so this remains exactly one
+        // constitutional per-trade report, never a misleading stale one.
+        createdAt: existingReport?.created_at ?? observedAt
+      });
+    }
 
-  audit.write("reconcile", "adopted_order_unstuck_failed_proposal", {
-    proposalId,
-    ticketId,
-    externalOrderId,
-    lifecycleStage: stage,
-    reportId
-  });
+    proposals.markExecuted(proposalId, ticketId);
+    audit.write("reconcile", "adopted_order_unstuck_failed_proposal", {
+      proposalId,
+      ticketId,
+      externalOrderId,
+      lifecycleStage: stage,
+      reportId
+    });
+    db.exec("COMMIT;");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK;");
+    } catch {
+      // Keep the original persistence failure. The lifecycle broker truth is
+      // durable and the next reconcile pass will retry this idempotently.
+    }
+    throw error;
+  }
 }
 
-function getLifecycleByExternalOrderId(db, externalOrderId) {
-  return db
-    .prepare(`SELECT * FROM official_paper_order_lifecycle WHERE external_order_id = ? LIMIT 1`)
+function getLifecycleByExternalOrderId(db, externalOrderId, ownerId, proposals, allowUnattributedLegacyRows) {
+  const scoped = db
+    .prepare(`SELECT * FROM official_paper_order_lifecycle WHERE external_order_id = ? AND owner_id = ? LIMIT 1`)
+    .get(externalOrderId, ownerId) ?? null;
+  if (scoped) return scoped;
+  if (!allowUnattributedLegacyRows) return null;
+  // v20 preserves unattributed pre-account rows as NULL. A first account-
+  // scoped observation may claim exactly that legacy row; all fresh writes
+  // carry owner_id and never enter this fallback.
+  const historical = db
+    .prepare(`SELECT * FROM official_paper_order_lifecycle WHERE external_order_id = ? AND (owner_id IS NULL OR owner_id = '') LIMIT 1`)
     .get(externalOrderId) ?? null;
+  return historical && lifecycleRowBelongsToAccount(proposals, historical, ownerId) ? historical : null;
+}
+
+/**
+ * @param {import("../../../packages/shared-types/dist/index.js").ProposalRepository} proposals
+ * @param {Record<string, unknown>} lifecycleRow
+ * @param {string} accountOwnerId
+ */
+function lifecycleRowBelongsToAccount(proposals, lifecycleRow, accountOwnerId, allowUnattributedLegacyRows = true) {
+  const existingOwnerId = String(lifecycleRow?.owner_id ?? "").trim();
+  if (existingOwnerId) return existingOwnerId === accountOwnerId;
+  if (!allowUnattributedLegacyRows) return false;
+
+  // A truly unattributed historical/manual row can be claimed by the current
+  // account. A proposal-shaped ticket is different: its proposal is the only
+  // trustworthy account attribution, so a missing proposal must fail closed.
+  const proposalId = proposalIdFromTicketId(lifecycleRow?.ticket_id);
+  if (!proposalId) return true;
+  const proposal = proposals.getById(proposalId);
+  return proposal?.ownerId === accountOwnerId;
 }
 
 /**
@@ -585,13 +739,18 @@ function resolveLifecycleOwnerId(proposals, lifecycleRow, sharedAccountOwnerId) 
 // external_order_id can NEVER have its ticket_id changed by a routine status
 // refresh, structurally, not via a COALESCE direction that could later be
 // flipped back by accident.
-function updateMatchedLifecycleRow(db, externalOrderId, { brokerStatus, localStatus, stage, observedAt, raw, notes, ownerId }) {
+function updateMatchedLifecycleRow(db, rowId, { brokerStatus, localStatus, stage, observedAt, raw, notes, ownerId }) {
   db.prepare(`
     UPDATE official_paper_order_lifecycle
-    SET broker_status = ?, local_status = ?, lifecycle_stage = ?, last_observed_at = ?, raw = ?, notes = ?,
+    SET broker_status = ?, local_status = ?, lifecycle_stage = ?,
+        last_observed_at = CASE
+          WHEN lifecycle_stage = 'filled' AND ? = 'filled' THEN last_observed_at
+          ELSE ?
+        END,
+        raw = ?, notes = ?,
         owner_id = COALESCE(NULLIF(owner_id, ''), ?)
-    WHERE external_order_id = ?
-  `).run(brokerStatus, localStatus, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), ownerId, externalOrderId);
+    WHERE id = ?
+  `).run(brokerStatus, localStatus, stage, stage, observedAt, JSON.stringify(raw), JSON.stringify(notes), ownerId, rowId);
 }
 
 // Adoption: fills in external_order_id (guaranteed NULL on a
@@ -616,7 +775,7 @@ function claimOrphanLifecycleRow(db, rowId, { externalOrderId, brokerStatus, loc
 
 // Brand-new row for a broker order nothing in the lifecycle table can be
 // correlated to - ticket_id is NULL, permanently (nothing here ever guesses
-// one). Idempotent across reruns via ON CONFLICT(external_order_id): a
+// one). Idempotent across reruns via the account-scoped conflict key: a
 // second reconcile pass over the SAME broker order finds it already exists
 // (by external_order_id) via getLifecycleByExternalOrderId ABOVE and takes
 // the "matched" branch instead, so in practice this ON CONFLICT branch is a
@@ -629,7 +788,7 @@ function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity,
      side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
      last_observed_at, raw, notes, owner_id)
     VALUES (?, NULL, ?, 'longbridge-paper', 'paper', 'paper', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(external_order_id) DO UPDATE SET
+    ON CONFLICT(owner_id, external_order_id) DO UPDATE SET
       broker_status = excluded.broker_status,
       local_status = excluded.local_status,
       lifecycle_stage = excluded.lifecycle_stage,
@@ -638,7 +797,7 @@ function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity,
       notes = excluded.notes,
       owner_id = COALESCE(NULLIF(official_paper_order_lifecycle.owner_id, ''), excluded.owner_id)
   `).run(
-    `lb_order_${externalOrderId}`,
+    `lb_order_${ownerId}_${externalOrderId}`,
     externalOrderId,
     symbol,
     guessAssetClass(symbol),
@@ -681,47 +840,177 @@ function insertOrphanLifecycleRow(db, { externalOrderId, symbol, side, quantity,
 // over timeout-'failed' ones (still-open adjudication beats correcting a
 // closed one), and both are preferred over 'submitting' since adoption is
 // the more actionable outcome.
-function findOrphanCorrelationCandidate(db, { symbol, side, quantity, orderSubmittedAtMs, windowMs }) {
+function findOrphanCorrelationCandidate(db, {
+  symbol,
+  side,
+  quantity,
+  orderSubmittedAtMs,
+  windowMs,
+  nowMs,
+  submittingGraceMs,
+  ownerId,
+  proposals,
+  allowUnattributedLegacyRows
+}) {
   const rows = db.prepare(`
     SELECT * FROM official_paper_order_lifecycle
     WHERE symbol = ? AND side = ? AND quantity = ?
+      AND (owner_id = ? OR owner_id IS NULL OR owner_id = '')
       AND external_order_id IS NULL
       AND (
         lifecycle_stage IN ('submit_unconfirmed', 'submitting')
         OR (lifecycle_stage = 'failed' AND local_status = 'rejected')
       )
-  `).all(symbol, side, quantity);
+  `).all(symbol, side, quantity, ownerId)
+    .filter((row) => lifecycleRowBelongsToAccount(
+      proposals,
+      row,
+      ownerId,
+      allowUnattributedLegacyRows
+    ));
 
   const withinWindow = rows
-    .map((row) => ({ row, deltaMs: Math.abs(new Date(String(row.submitted_at)).getTime() - orderSubmittedAtMs) }))
+    .map((row) => ({
+      row,
+      ownerRank: String(row.owner_id ?? "").trim() === ownerId ? 0 : 1,
+      deltaMs: Math.abs(new Date(String(row.submitted_at)).getTime() - orderSubmittedAtMs)
+    }))
     .filter(({ deltaMs }) => Number.isFinite(deltaMs) && deltaMs <= windowMs)
-    .sort((a, b) => a.deltaMs - b.deltaMs);
+    .sort((a, b) => a.ownerRank - b.ownerRank || a.deltaMs - b.deltaMs);
 
-  const adoptable = withinWindow.find(({ row }) => row.lifecycle_stage === "submit_unconfirmed")
-    ?? withinWindow.find(({ row }) => row.lifecycle_stage === "failed");
+  // Account attribution outranks lifecycle-stage preference. Once an exact
+  // owner row exists, a historical NULL/blank row must not be adopted merely
+  // because submit_unconfirmed is normally more actionable than failed or
+  // submitting. Mixing the two ranks can claim the legacy row while the
+  // executor is still finalizing the exact row, causing state divergence and
+  // an account-scoped external-order uniqueness collision.
+  const bestOwnerRank = withinWindow[0]?.ownerRank;
+  const accountCandidates = bestOwnerRank === undefined
+    ? []
+    : withinWindow.filter(({ ownerRank }) => ownerRank === bestOwnerRank);
+
+  const adoptable = accountCandidates.find(({ row }) => row.lifecycle_stage === "submit_unconfirmed")
+    ?? accountCandidates.find(({ row }) => row.lifecycle_stage === "failed");
   if (adoptable) {
     return { kind: "adopt", row: adoptable.row };
   }
 
-  const inFlight = withinWindow.find(({ row }) => row.lifecycle_stage === "submitting");
+  const inFlight = accountCandidates.find(({ row }) => row.lifecycle_stage === "submitting");
   if (inFlight) {
+    const submittedAtMs = new Date(String(inFlight.row.submitted_at)).getTime();
+    if (Number.isFinite(submittedAtMs) && nowMs - submittedAtMs >= submittingGraceMs) {
+      // The executor is synchronous after it records `submitting`; a row that
+      // remains there beyond the grace period is a crashed/lost callback, not
+      // an active race. Broker truth may safely claim that exact row, after
+      // which the normal proposal/report repair path completes local state.
+      return { kind: "adopt", row: inFlight.row };
+    }
     return { kind: "defer", row: inFlight.row };
   }
 
   return null;
 }
 
-function asArray(value) {
+function listUnconfirmedRows(db, proposals, accountOwnerId, symbolFilters, allowUnattributedLegacyRows) {
+  return db.prepare(`
+    SELECT * FROM official_paper_order_lifecycle
+    WHERE lifecycle_stage IN ('submit_unconfirmed', 'submitting') AND external_order_id IS NULL
+      AND (owner_id = ? OR owner_id IS NULL OR owner_id = '')
+  `).all(accountOwnerId)
+    .filter((row) => lifecycleRowBelongsToAccount(
+      proposals,
+      row,
+      accountOwnerId,
+      allowUnattributedLegacyRows
+    ))
+    // A symbol-scoped pass has no evidence about rows outside its scope.
+    .filter((row) => symbolFilters.size === 0 || symbolFilters.has(String(row.symbol ?? "").toUpperCase()));
+}
+
+function brokerExternalOrderId(row) {
+  return String(row?.order_id ?? row?.orderId ?? row?.id ?? "").trim();
+}
+
+function dedupeBrokerRows(rows, executions = false) {
+  const seen = new Set();
+  const result = [];
+  for (const row of rows) {
+    const orderId = brokerExternalOrderId(row);
+    const key = executions
+      ? String(row?.trade_id ?? row?.tradeId ?? `${orderId}|${row?.trade_done_at ?? row?.tradeDoneAt ?? ""}|${row?.quantity ?? ""}|${row?.price ?? ""}`)
+      : orderId;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(row);
+  }
+  return result;
+}
+
+function historicalOrderMatchesUnconfirmedRow(order, rows, windowMs) {
+  const orderSubmittedAtMs = new Date(String(order.created_at ?? order.createdAt ?? "")).getTime();
+  if (!Number.isFinite(orderSubmittedAtMs)) return false;
+  const symbol = String(order.symbol ?? "").toUpperCase();
+  const side = normalizeSide(order.side);
+  const quantity = toNumber(order.quantity);
+  return rows.some((row) => {
+    const rowSubmittedAtMs = new Date(String(row.submitted_at)).getTime();
+    return String(row.symbol ?? "").toUpperCase() === symbol
+      && normalizeSide(row.side) === side
+      && toNumber(row.quantity) === quantity
+      && Number.isFinite(rowSubmittedAtMs)
+      && Math.abs(orderSubmittedAtMs - rowSubmittedAtMs) <= windowMs;
+  });
+}
+
+function tradingDateKey(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "invalid";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const part = (type) => parts.find((entry) => entry.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function requireBrokerArrayPayload(value, expectedKey) {
   if (Array.isArray(value)) {
     return value;
   }
-  if (Array.isArray(value?.orders)) {
-    return value.orders;
+  if (value && typeof value === "object" && Array.isArray(value[expectedKey])) {
+    return value[expectedKey];
   }
-  if (Array.isArray(value?.executions)) {
-    return value.executions;
+  throw new Error(`Longbridge ${expectedKey} payload is invalid; refusing fail-open reconciliation.`);
+}
+
+function validateBrokerOrders(orders) {
+  for (const [index, order] of orders.entries()) {
+    const objectLike = order && typeof order === "object" && !Array.isArray(order);
+    const externalOrderId = objectLike ? String(order.order_id ?? order.orderId ?? order.id ?? "").trim() : "";
+    const symbol = objectLike ? String(order.symbol ?? "").trim() : "";
+    const side = objectLike ? String(order.side ?? "").trim().toLowerCase() : "";
+    const quantity = objectLike ? Number(order.quantity) : Number.NaN;
+    const status = objectLike ? String(order.status ?? "").trim() : "";
+    const createdAtMs = objectLike ? new Date(String(order.created_at ?? order.createdAt ?? "")).getTime() : Number.NaN;
+    if (!objectLike || !externalOrderId || !symbol || !["buy", "sell"].includes(side)
+      || !Number.isFinite(quantity) || quantity <= 0 || !status || !Number.isFinite(createdAtMs)) {
+      throw new Error(`Longbridge orders payload element ${index} is invalid; refusing timeout adjudication.`);
+    }
   }
-  return [];
+  return orders;
+}
+
+function validateBrokerExecutions(executions) {
+  for (const [index, execution] of executions.entries()) {
+    const objectLike = execution && typeof execution === "object" && !Array.isArray(execution);
+    const externalOrderId = objectLike ? String(execution.order_id ?? execution.orderId ?? "").trim() : "";
+    if (!objectLike || !externalOrderId) {
+      throw new Error(`Longbridge executions payload element ${index} is invalid; refusing reconciliation.`);
+    }
+  }
+  return executions;
 }
 
 function normalizeSide(value) {

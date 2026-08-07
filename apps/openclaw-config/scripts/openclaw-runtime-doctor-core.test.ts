@@ -60,7 +60,17 @@ function at<T>(rows: readonly T[], index: number, what: string): T {
 // Shared "everything else is healthy" listener stub so the new task H2
 // checks below (launchd-jobs / alerts-poller-health) can be asserted on in
 // isolation, without the pre-existing gateway/runner checks also firing.
+const CRON_RUNNER_HEALTH_STUBBED_OK = {
+  cronRunnerHealthProbe: {
+    ok: true,
+    url: "http://127.0.0.1:18792/health",
+    status: 200,
+    body: { ok: true, service: "openclaw-cron-runner" }
+  }
+};
+
 const HEALTHY_LISTENERS = {
+  ...CRON_RUNNER_HEALTH_STUBBED_OK,
   gatewayListeners: [{ pid: 100, command: "node", endpoint: "127.0.0.1:18789" }],
   cronRunnerListeners: [{ pid: 200, command: "node", endpoint: "127.0.0.1:18792" }],
   memorydMcpProbe: { ok: true, url: "http://127.0.0.1:8766/mcp", serverName: "memoryd", sessionId: true }
@@ -184,9 +194,21 @@ const stubbedLoopbackFetch = async (url: string, init?: unknown): Promise<unknow
   return { ok: true, status: 200, statusText: "OK", json: async () => body };
 };
 
-const PLATFORM_APP_HEALTH_STUBBED_OK = { platformAppPort: STUBBED_PLATFORM_APP_PORT, fetchImpl: stubbedLoopbackFetch };
-const RSSHUB_HEALTH_STUBBED_OK = { rsshubBaseUrl: `http://127.0.0.1:${STUBBED_RSSHUB_PORT}`, fetchImpl: stubbedLoopbackFetch };
-const BROKER_EXECUTOR_HEALTH_STUBBED_OK = { brokerExecutorPort: STUBBED_BROKER_EXECUTOR_PORT, fetchImpl: stubbedLoopbackFetch };
+const PLATFORM_APP_HEALTH_STUBBED_OK = {
+  ...CRON_RUNNER_HEALTH_STUBBED_OK,
+  platformAppPort: STUBBED_PLATFORM_APP_PORT,
+  fetchImpl: stubbedLoopbackFetch
+};
+const RSSHUB_HEALTH_STUBBED_OK = {
+  ...CRON_RUNNER_HEALTH_STUBBED_OK,
+  rsshubBaseUrl: `http://127.0.0.1:${STUBBED_RSSHUB_PORT}`,
+  fetchImpl: stubbedLoopbackFetch
+};
+const BROKER_EXECUTOR_HEALTH_STUBBED_OK = {
+  ...CRON_RUNNER_HEALTH_STUBBED_OK,
+  brokerExecutorPort: STUBBED_BROKER_EXECUTOR_PORT,
+  fetchImpl: stubbedLoopbackFetch
+};
 
 // v2 persona deployment fix: analyzeOpenClawRuntimeSnapshot now also checks
 // that the control agent workspace's AGENTS.md (the persona file
@@ -1096,6 +1118,37 @@ describe("alerts-poller-health check (task H2)", () => {
     ]));
   });
 
+  it("accepts five minutes of clock skew but warns on a farther-future market-alerts heartbeat", async () => {
+    const nowMs = Date.parse("2026-07-13T15:00:00.000Z"); // regular market hours
+    const runDoctor = async (offsetMs: number) => {
+      const dbPath = join(makeTempDir("alphaloop-doctor-db-"), "trading.sqlite");
+      const db = openTradingDatabase(dbPath);
+      const startedAt = new Date(nowMs + offsetMs).toISOString();
+      recordJobRun(db, { job: "market-alerts", startedAt, finishedAt: startedAt, ok: true });
+      db.close();
+      return doctor.analyzeOpenClawRuntimeSnapshot({
+        ...CONTROL_PERSONA_HEALTHY,
+        ...HEALTHY_LISTENERS,
+        ...PLATFORM_APP_HEALTH_STUBBED_OK,
+        ...RSSHUB_HEALTH_STUBBED_OK,
+        ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+        launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+        nowMs,
+        dbPath
+      });
+    };
+
+    const withinReport = await runDoctor(4 * 60_000);
+    expect(withinReport.findings.some((entry) => entry.code === "alerts-poller-health.stale_heartbeat")).toBe(false);
+
+    const futureReport = await runDoctor(6 * 60_000);
+    expect(futureReport.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "alerts-poller-health.stale_heartbeat", severity: "warn" })
+    ]));
+    expect(futureReport.findings.find((entry) => entry.code === "alerts-poller-health.stale_heartbeat")?.message)
+      .toContain("5 分钟时钟偏差");
+  });
+
   it("does not warn about a stale heartbeat outside US regular market hours", async () => {
     const dir = makeTempDir("alphaloop-doctor-db-");
     const dbPath = join(dir, "trading.sqlite");
@@ -1313,6 +1366,34 @@ describe("scheduled-job-heartbeat check (Task 24)", () => {
     ]));
   });
 
+  it("accepts up to five minutes of clock skew but warns on a farther-future heartbeat", async () => {
+    const withinDbPath = join(makeTempDir("alphaloop-doctor-db-"), "trading.sqlite");
+    const withinDb = openTradingDatabase(withinDbPath);
+    recordJobRun(withinDb, {
+      job: "official-paper-poll",
+      startedAt: new Date(SATURDAY_NOON + 4 * 60_000).toISOString(),
+      ok: true
+    });
+    withinDb.close();
+
+    const withinReport = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(withinDbPath));
+    expect(withinReport.findings.some((entry) => entry.code === "scheduled-job-heartbeat.official-paper-poll.stale")).toBe(false);
+
+    const futureDbPath = join(makeTempDir("alphaloop-doctor-db-"), "trading.sqlite");
+    const futureDb = openTradingDatabase(futureDbPath);
+    recordJobRun(futureDb, {
+      job: "official-paper-poll",
+      startedAt: new Date(SATURDAY_NOON + 6 * 60_000).toISOString(),
+      ok: true
+    });
+    futureDb.close();
+
+    const futureReport = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotWith(futureDbPath));
+    expect(futureReport.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "scheduled-job-heartbeat.official-paper-poll.stale", severity: "warn" })
+    ]));
+  });
+
   it("fails the report when a scheduled job has 3+ consecutive failed runs", async () => {
     const dir = makeTempDir("alphaloop-doctor-db-");
     const dbPath = join(dir, "trading.sqlite");
@@ -1328,6 +1409,190 @@ describe("scheduled-job-heartbeat check (Task 24)", () => {
     expect(report.findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "scheduled-job-heartbeat.daily-backup.consecutive_failures", severity: "error" })
     ]));
+  });
+});
+
+describe("cron-runner-health check", () => {
+  function listenEphemeral(server: ReturnType<typeof createServer>): Promise<number> {
+    return new Promise((resolvePort) => {
+      server.listen(0, "127.0.0.1", () => resolvePort((server.address() as AddressInfo).port));
+    });
+  }
+
+  function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+    return new Promise((resolveClose) => server.close(() => resolveClose()));
+  }
+
+  function snapshotFor(port: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      ...OUTSIDE_MARKET_HOURS,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      cronRunnerPort: port,
+      cronRunnerHealthProbe: undefined,
+      ...extra
+    };
+  }
+
+  it("accepts the real cron-runner 200 health contract", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, service: "openclaw-cron-runner", errors: [] }));
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port));
+      expect(report.findings.some((finding) => finding.code.startsWith("runner-health."))).toBe(false);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports a 503 with the cron-runner degraded error fields", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        service: "openclaw-cron-runner",
+        alertsDegraded: true,
+        lastAlertError: "Feishu delivery timed out",
+        errors: ["alert-channel-degraded[report]: Feishu delivery timed out"]
+      }));
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port));
+      expect(report.ok).toBe(false);
+      const finding = report.findings.find((entry) => entry.code === "runner-health.degraded");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain("alert-channel-degraded[report]");
+      expect(finding?.message).toContain("Feishu delivery timed out");
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("keeps an unreachable cron-runner health endpoint as a warning on a machine with no deploy footprint", async () => {
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(18792, {
+      launchdJobs: NO_LAUNCHD_JOBS_LOADED,
+      launchdPlists: { system: [], user: [] },
+      deployLedger: [],
+      cronRunnerHealthProbe: {
+        ok: false,
+        kind: "unreachable",
+        url: "http://127.0.0.1:18792/health",
+        reason: "connection refused"
+      }
+    }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "runner-health.unreachable", severity: "warn" })
+    ]));
+  });
+
+  it("rejects a 200 response from the wrong service", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, service: "platform-app" }));
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port));
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "runner-health.unexpected_body", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports a non-200/non-503 response by status even when its body is not JSON", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("internal failure");
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port));
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "runner-health.unexpected_status", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("rejects a malformed 503 that omits the degraded errors", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, service: "openclaw-cron-runner", errors: [] }));
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const report = await doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port));
+      expect(report.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "runner-health.unexpected_body", severity: "error" })
+      ]));
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("times out when the cron-runner never sends response headers", async () => {
+    const server = createServer(() => {});
+    const port = await listenEphemeral(server);
+
+    try {
+      const reportPromise = doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port, {
+        cronRunnerHealthTimeoutMs: 25
+      }));
+      const outcome = await Promise.race([
+        reportPromise,
+        new Promise<{ hung: true }>((resolve) => setTimeout(() => resolve({ hung: true }), 250))
+      ]);
+      expect(outcome).toMatchObject({ ok: false });
+      expect("findings" in outcome && outcome.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "runner-health.unreachable", severity: "error" })
+      ]));
+    } finally {
+      server.closeAllConnections();
+      await closeServer(server);
+    }
+  });
+
+  it("times out when headers arrive but the cron-runner body never completes", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+    });
+    const port = await listenEphemeral(server);
+
+    try {
+      const reportPromise = doctor.analyzeOpenClawRuntimeSnapshot(snapshotFor(port, {
+        cronRunnerHealthTimeoutMs: 25
+      }));
+      const outcome = await Promise.race([
+        reportPromise,
+        new Promise<{ hung: true }>((resolve) => setTimeout(() => resolve({ hung: true }), 250))
+      ]);
+      expect(outcome).toMatchObject({ ok: false });
+      expect("findings" in outcome && outcome.findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "runner-health.unreachable", severity: "error" })
+      ]));
+    } finally {
+      server.closeAllConnections();
+      await closeServer(server);
+    }
   });
 });
 
@@ -2015,6 +2280,45 @@ describe("news-engine-health check (Phase 4 Task 8)", () => {
     expect(message).toContain("新闻引擎超过 48 小时无新事件");
   });
 
+  it("accepts up to five minutes of source clock skew but warns on a farther-future news timestamp", async () => {
+    const nowMs = Date.parse("2026-07-14T12:00:00.000Z");
+    const withinDbPath = join(makeTempDir("alphaloop-doctor-news-db-"), "trading.sqlite");
+    const withinDb = openTradingDatabase(withinDbPath);
+    seedEvent(withinDb, new Date(nowMs + 4 * 60_000).toISOString());
+    withinDb.close();
+
+    const withinReport = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs,
+      dbPath: withinDbPath
+    });
+    expect(withinReport.findings.some((entry) => entry.code === "news-engine-health.stale")).toBe(false);
+
+    const futureDbPath = join(makeTempDir("alphaloop-doctor-news-db-"), "trading.sqlite");
+    const futureDb = openTradingDatabase(futureDbPath);
+    seedEvent(futureDb, new Date(nowMs + 6 * 60_000).toISOString());
+    futureDb.close();
+
+    const futureReport = await doctor.analyzeOpenClawRuntimeSnapshot({
+      ...CONTROL_PERSONA_HEALTHY,
+      ...HEALTHY_LISTENERS,
+      ...PLATFORM_APP_HEALTH_STUBBED_OK,
+      ...RSSHUB_HEALTH_STUBBED_OK,
+      ...BROKER_EXECUTOR_HEALTH_STUBBED_OK,
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED,
+      nowMs,
+      dbPath: futureDbPath
+    });
+    expect(futureReport.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "news-engine-health.stale", severity: "warn" })
+    ]));
+  });
+
   it("treats an all-unknown-time news_events table (count > 0, MAX(last_published_at) NULL) as stale too", async () => {
     const dir = makeTempDir("alphaloop-doctor-news-db-");
     const dbPath = join(dir, "trading.sqlite");
@@ -2317,6 +2621,18 @@ describe("daily-backup-health check (round-4 finding I5)", () => {
     expect(finding?.message).toContain("trading-2026-07-27.sqlite");
   });
 
+  it("fails closed when future-dated backup names would otherwise look perpetually fresh", async () => {
+    const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
+    seedRealBackup(runtimeRoot, NOW_MS + 24 * 60 * 60_000);
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(backupSnapshot(runtimeRoot));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "daily-backup-health.future_timestamp", severity: "error" })
+    ]));
+  });
+
   it("warns, without failing, when the daemon is installed but has never produced a backup", async () => {
     const runtimeRoot = makeTempDir("alphaloop-doctor-backup-");
 
@@ -2393,14 +2709,19 @@ describe("official-paper-health check (round-4 finding I5)", () => {
   // Writes the row through the REAL producer (official-paper-monitor.mjs's
   // own saveSnapshot), so the `reason` values and column names the doctor
   // queries are the ones the daemon actually writes.
-  function seedSnapshot(dbPath: string, reason: string, fetchedAt: string): void {
+  function seedSnapshot(
+    dbPath: string,
+    reason: string,
+    fetchedAt: string,
+    ownerId = "__shared__"
+  ): void {
     const db = openTradingDatabase(dbPath);
     try {
       saveSnapshot(db, {
         fetchedAt,
         primaryAsset: { net_assets: 100000, total_cash: 50000 },
         positions: []
-      }, reason, "__shared__");
+      }, reason, ownerId);
     } finally {
       db.close();
     }
@@ -2451,6 +2772,123 @@ describe("official-paper-health check (round-4 finding I5)", () => {
       join(repoRoot, "reports", "official-paper", `${new Date(MIDDAY_ET - 2 * 60 * 60_000).toISOString().slice(0, 10)}-post-open.md`),
       "# 官方模拟盘\n"
     );
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("accepts up to five minutes of snapshot clock skew but fails closed beyond it", async () => {
+    const withinDbPath = freshDbPath();
+    seedSnapshot(withinDbPath, "hourly_poll", new Date(MIDDAY_ET + 4 * 60_000).toISOString());
+    const withinReport = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(withinDbPath, {
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.filter((job) => job.label !== "com.openclaw.trading.official-paper.pnl")
+    }));
+    expect(withinReport.findings.some((finding) => finding.code === "official-paper-health.poll.stale")).toBe(false);
+
+    const futureDbPath = freshDbPath();
+    seedSnapshot(futureDbPath, "hourly_poll", new Date(MIDDAY_ET + 6 * 60_000).toISOString());
+    const futureReport = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(futureDbPath, {
+      launchdJobs: ALL_LAUNCHD_JOBS_LOADED.filter((job) => job.label !== "com.openclaw.trading.official-paper.pnl")
+    }));
+    expect(futureReport.ok).toBe(false);
+    expect(futureReport.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.poll.stale", severity: "error" })
+    ]));
+  });
+
+  it("accepts fresh per-member poll/PnL rows only when every owner artifact exists", async () => {
+    const dbPath = freshDbPath();
+    const fetchedAt = new Date(MIDDAY_ET - 30 * 60_000).toISOString();
+    for (const ownerId of ["member_1", "member_2"]) {
+      seedSnapshot(dbPath, "hourly_poll_per_member", fetchedAt, ownerId);
+      seedSnapshot(dbPath, "post_open_pnl_per_member", fetchedAt, ownerId);
+    }
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-members-");
+    const reportDir = join(repoRoot, "reports", "official-paper");
+    mkdirSync(reportDir, { recursive: true });
+    for (const ownerId of ["member_1", "member_2"]) {
+      writeFileSync(join(reportDir, `${fetchedAt.slice(0, 10)}-post-open--${ownerId}.md`), "# 官方模拟盘\n");
+    }
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("fails when one fresh per-member PnL row has no owner-matching artifact", async () => {
+    const dbPath = freshDbPath();
+    const fetchedAt = new Date(MIDDAY_ET - 30 * 60_000).toISOString();
+    for (const ownerId of ["member_1", "member_2"]) {
+      seedSnapshot(dbPath, "hourly_poll_per_member", fetchedAt, ownerId);
+      seedSnapshot(dbPath, "post_open_pnl_per_member", fetchedAt, ownerId);
+    }
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-member-missing-");
+    const reportDir = join(repoRoot, "reports", "official-paper");
+    mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, `${fetchedAt.slice(0, 10)}-post-open--member_1.md`), "# 官方模拟盘\n");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(false);
+    expect(report.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "official-paper-health.pnl.report_missing", severity: "error" })
+    ]));
+    expect(report.findings.find((finding) => finding.code === "official-paper-health.pnl.report_missing")?.message)
+      .toContain("member_2");
+  });
+
+  it("switches back to a newer legacy family instead of following historical per-member rows forever", async () => {
+    const dbPath = freshDbPath();
+    const oldMemberAt = new Date(MIDDAY_ET - 26 * 60 * 60_000).toISOString();
+    const legacyAt = new Date(MIDDAY_ET - 30 * 60_000).toISOString();
+    seedSnapshot(dbPath, "hourly_poll_per_member", oldMemberAt, "member_retired");
+    seedSnapshot(dbPath, "post_open_pnl_per_member", oldMemberAt, "member_retired");
+    seedSnapshot(dbPath, "hourly_poll", legacyAt);
+    seedSnapshot(dbPath, "post_open_pnl", legacyAt);
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-return-legacy-");
+    const reportDir = join(repoRoot, "reports", "official-paper");
+    mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, `${legacyAt.slice(0, 10)}-post-open.md`), "# 官方模拟盘\n");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("does not require artifacts for owners absent from the latest per-member run date", async () => {
+    const dbPath = freshDbPath();
+    const retiredAt = new Date(MIDDAY_ET - 26 * 60 * 60_000).toISOString();
+    const currentAt = new Date(MIDDAY_ET - 30 * 60_000).toISOString();
+    seedSnapshot(dbPath, "hourly_poll_per_member", retiredAt, "member_retired");
+    seedSnapshot(dbPath, "post_open_pnl_per_member", retiredAt, "member_retired");
+    seedSnapshot(dbPath, "hourly_poll_per_member", currentAt, "member_1");
+    seedSnapshot(dbPath, "post_open_pnl_per_member", currentAt, "member_1");
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-retired-owner-");
+    const reportDir = join(repoRoot, "reports", "official-paper");
+    mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, `${currentAt.slice(0, 10)}-post-open--member_1.md`), "# 官方模拟盘\n");
+
+    const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
+
+    expect(report.ok).toBe(true);
+    expect(report.findings.some((finding) => finding.code.startsWith("official-paper-health."))).toBe(false);
+  });
+
+  it("does not keep a withdrawn poll owner in later same-day hourly batches", async () => {
+    const dbPath = freshDbPath();
+    const retiredPollAt = new Date(MIDDAY_ET - 3 * 60 * 60_000).toISOString();
+    const currentAt = new Date(MIDDAY_ET - 30 * 60_000).toISOString();
+    seedSnapshot(dbPath, "hourly_poll_per_member", retiredPollAt, "member_retired");
+    seedSnapshot(dbPath, "hourly_poll_per_member", currentAt, "member_1");
+    seedSnapshot(dbPath, "post_open_pnl_per_member", currentAt, "member_1");
+    const repoRoot = makeTempDir("alphaloop-doctor-paper-retired-poll-");
+    const reportDir = join(repoRoot, "reports", "official-paper");
+    mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, `${currentAt.slice(0, 10)}-post-open--member_1.md`), "# 官方模拟盘\n");
 
     const report = await doctor.analyzeOpenClawRuntimeSnapshot(paperSnapshot(dbPath, { repoRoot }));
 

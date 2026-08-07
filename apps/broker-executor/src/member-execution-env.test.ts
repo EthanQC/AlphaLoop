@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resolveMemberExecutionContext } from "./member-execution-env.js";
 
@@ -66,6 +66,103 @@ describe("resolveMemberExecutionContext", () => {
       activeMemberIds: ["mem_owner", "mem_other"],
       baseEnv: safeBase
     })).toThrow(/member-specific|owner-specific|multi-member/i);
+  });
+
+  it("does not treat a credential-path lookup error as an empty tree eligible for legacy global mode", () => {
+    const ownerId = `mem_${"x".repeat(300)}`;
+    expect(() => resolveMemberExecutionContext(ownerId, {
+      credentialsRoot: tempRoot(),
+      activeMemberIds: [ownerId],
+      baseEnv: safeBase
+    })).toThrow();
+  });
+
+  it("does not treat an unknown file in the credential root as an empty legacy tree", () => {
+    const root = tempRoot();
+    writeFileSync(join(root, "unexpected-state"), "present", { mode: 0o600 });
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: root,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/credentials|legacy|member/i);
+  });
+
+  it("does not treat an unknown empty directory in the credential root as an empty legacy tree", () => {
+    const root = tempRoot();
+    mkdirSync(join(root, "inactive_or_unknown"), { mode: 0o700 });
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: root,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/credentials|legacy|member/i);
+  });
+
+  it("rejects a symlinked credentials root instead of following it into legacy global mode", () => {
+    const target = tempRoot();
+    const parent = tempRoot();
+    const symlinkRoot = join(parent, "credentials-link");
+    symlinkSync(target, symlinkRoot);
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: symlinkRoot,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/credentials root|directory|symlink/i);
+  });
+
+  it("rejects a credentials root with group or other permissions", () => {
+    const root = tempRoot();
+    chmodSync(root, 0o755);
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: root,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/permission|0700/i);
+  });
+
+  it("rejects a broad-permission credentials root even when the owner file exists", () => {
+    const root = tempRoot();
+    writeCredentials(root, "mem_owner", "LONGBRIDGE_ACCESS_TOKEN=owner\nLONGBRIDGE_ACCOUNT_MODE=paper\n");
+    chmodSync(root, 0o755);
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: root,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/permission|0700/i);
+  });
+
+  it("rejects a symlinked credentials root even when the owner file exists", () => {
+    const target = tempRoot();
+    writeCredentials(target, "mem_owner", "LONGBRIDGE_ACCESS_TOKEN=owner\nLONGBRIDGE_ACCOUNT_MODE=paper\n");
+    const parent = tempRoot();
+    const symlinkRoot = join(parent, "credentials-link");
+    symlinkSync(target, symlinkRoot);
+
+    expect(() => resolveMemberExecutionContext("mem_owner", {
+      credentialsRoot: symlinkRoot,
+      activeMemberIds: ["mem_owner"],
+      baseEnv: safeBase
+    })).toThrow(/credentials root|directory|symlink/i);
+  });
+
+  it.skipIf(typeof process.getuid !== "function")("rejects a credentials root not owned by the broker-executor uid", () => {
+    const root = tempRoot();
+    const currentUid = process.getuid?.() ?? 0;
+    vi.spyOn(process, "getuid").mockReturnValue(currentUid + 1);
+
+    try {
+      expect(() => resolveMemberExecutionContext("mem_owner", {
+        credentialsRoot: root,
+        activeMemberIds: ["mem_owner"],
+        baseEnv: safeBase
+      })).toThrow(/not owned|broker-executor user/i);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("loads only the requested owner's secure file, strips global credentials, and isolates caches", () => {

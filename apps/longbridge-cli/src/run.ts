@@ -133,6 +133,18 @@ export async function runCommand(command: Command, deps: RunDeps): Promise<unkno
       return buildOrderListPayload(await adapter.getTodayOrders());
     case "order-executions":
       return buildExecutionsPayload(await adapter.getTodayExecutions());
+    case "order-history":
+      return buildOrderListPayload(await adapter.getHistoryOrders({
+        startAt: command.startAt,
+        endAt: command.endAt,
+        ...(command.symbol !== undefined ? { symbol: command.symbol } : {})
+      }));
+    case "order-history-executions":
+      return buildExecutionsPayload(await adapter.getHistoryExecutions({
+        startAt: command.startAt,
+        endAt: command.endAt,
+        ...(command.symbol !== undefined ? { symbol: command.symbol } : {})
+      }));
     case "order-detail":
       return buildOrderDetailPayload(await adapter.getOrderDetail(command.orderId));
     case "order-submit": {

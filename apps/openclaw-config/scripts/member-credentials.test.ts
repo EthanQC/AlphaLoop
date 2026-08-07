@@ -1,12 +1,13 @@
 // Phase 6 Task 6 (2026-07-15 plan): direct tests for the multi-account
 // credential loader - present/missing/wide-perms-warning/env isolation.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   buildMemberSubprocessEnv,
+  isMemberCredentialTreeEmpty,
   loadMemberCredentials,
   resolveCredentialsRoot
 } from "./member-credentials.mjs";
@@ -21,7 +22,8 @@ function makeRoot(): string {
 
 function writeMemberEnv(root: string, memberId: string, contents: string, mode = 0o600): string {
   const memberDir = join(root, memberId);
-  mkdirSync(memberDir, { recursive: true });
+  mkdirSync(memberDir, { recursive: true, mode: 0o700 });
+  chmodSync(memberDir, 0o700);
   const envPath = join(memberDir, "longbridge.env");
   writeFileSync(envPath, contents, "utf8");
   chmodSync(envPath, mode);
@@ -65,6 +67,41 @@ describe("loadMemberCredentials: missing member has no linked broker account (de
     mkdirSync(join(root, "member_partial"), { recursive: true });
     expect(loadMemberCredentials("member_partial", { rootDir: root })).toBeNull();
   });
+
+  it("does not treat filesystem lookup errors as a missing credential file/shared-account fallback", () => {
+    const root = makeRoot();
+    const overlongPathComponent = `member_${"x".repeat(300)}`;
+    expect(() => loadMemberCredentials(overlongPathComponent, { rootDir: root })).toThrow();
+  });
+});
+
+describe("isMemberCredentialTreeEmpty: legacy shared-account gate", () => {
+  it("is true only for a genuinely empty or missing credential root", () => {
+    const root = makeRoot();
+    expect(isMemberCredentialTreeEmpty({ rootDir: root })).toBe(true);
+    expect(isMemberCredentialTreeEmpty({ rootDir: join(root, "missing") })).toBe(true);
+  });
+
+  it("treats an unknown member credential and a suspicious symlink as non-empty", () => {
+    const root = makeRoot();
+    writeMemberEnv(root, "inactive_or_unknown", "LONGBRIDGE_ACCESS_TOKEN=token");
+    expect(isMemberCredentialTreeEmpty({ rootDir: root })).toBe(false);
+
+    const symlinkRoot = makeRoot();
+    const target = makeRoot();
+    symlinkSync(target, join(symlinkRoot, "suspicious-member"));
+    expect(isMemberCredentialTreeEmpty({ rootDir: symlinkRoot })).toBe(false);
+  });
+
+  it("treats every unknown root entry, including an empty directory, as non-empty", () => {
+    const emptyUnknownDirRoot = makeRoot();
+    mkdirSync(join(emptyUnknownDirRoot, "unknown-member"), { mode: 0o700 });
+    expect(isMemberCredentialTreeEmpty({ rootDir: emptyUnknownDirRoot })).toBe(false);
+
+    const unknownFileRoot = makeRoot();
+    writeFileSync(join(unknownFileRoot, "README.txt"), "not a credential", { mode: 0o600 });
+    expect(isMemberCredentialTreeEmpty({ rootDir: unknownFileRoot })).toBe(false);
+  });
 });
 
 describe("loadMemberCredentials: present credentials", () => {
@@ -104,19 +141,51 @@ describe("loadMemberCredentials: present credentials", () => {
     writeMemberEnv(root, "member_1", "LONGBRIDGE_ACCESS_TOKEN=token-1", 0o600);
 
     const creds = loadMemberCredentials("member_1", { rootDir: root });
-    expect(creds?.warnings).toBeUndefined();
+    expect(creds).not.toBeNull();
   });
 
-  it("warns (but does not block) when the credentials file is readable by group/other", () => {
+  it("fails closed when the credentials file is readable by group/other", () => {
     const root = makeRoot();
     writeMemberEnv(root, "member_1", "LONGBRIDGE_ACCESS_TOKEN=token-1", 0o644);
 
-    const creds = loadMemberCredentials("member_1", { rootDir: root });
+    expect(() => loadMemberCredentials("member_1", { rootDir: root })).toThrow(/permission|0600/iu);
+  });
 
-    expect(creds).not.toBeNull();
-    expect(creds?.env.LONGBRIDGE_ACCESS_TOKEN).toBe("token-1");
-    expect(creds?.warnings?.length).toBeGreaterThan(0);
-    expect(creds?.warnings?.[0]).toMatch(/权限过宽/u);
+  it("rejects symlink credential files instead of following them", () => {
+    const root = makeRoot();
+    const target = writeMemberEnv(root, "target", "LONGBRIDGE_ACCESS_TOKEN=target-token");
+    const memberDir = join(root, "member_symlink");
+    mkdirSync(memberDir, { mode: 0o700 });
+    chmodSync(memberDir, 0o700);
+    symlinkSync(target, join(memberDir, "longbridge.env"));
+
+    expect(() => loadMemberCredentials("member_symlink", { rootDir: root })).toThrow(/regular file|symlink/iu);
+  });
+
+  it("rejects a member directory that is not owner-only", () => {
+    const root = makeRoot();
+    writeMemberEnv(root, "member_open", "LONGBRIDGE_ACCESS_TOKEN=token-open");
+    chmodSync(join(root, "member_open"), 0o755);
+
+    expect(() => loadMemberCredentials("member_open", { rootDir: root })).toThrow(/permission|0700/iu);
+  });
+
+  it("rejects a credentials root that is not owner-only", () => {
+    const root = makeRoot();
+    writeMemberEnv(root, "member_open_root", "LONGBRIDGE_ACCESS_TOKEN=token-open");
+    chmodSync(root, 0o755);
+
+    expect(() => loadMemberCredentials("member_open_root", { rootDir: root })).toThrow(/permission|0700/iu);
+  });
+
+  it("rejects a symlink credentials root instead of traversing it", () => {
+    const parent = makeRoot();
+    const target = makeRoot();
+    writeMemberEnv(target, "member_linked_root", "LONGBRIDGE_ACCESS_TOKEN=token-linked");
+    const linkedRoot = join(parent, "credentials-link");
+    symlinkSync(target, linkedRoot);
+
+    expect(() => loadMemberCredentials("member_linked_root", { rootDir: linkedRoot })).toThrow(/real directory|symlink/iu);
   });
 
   it("two members get independently isolated cache paths", () => {
@@ -195,5 +264,36 @@ describe("buildMemberSubprocessEnv: fresh env object, HOME/rate-limit override, 
     expect(envA.LONGBRIDGE_ACCESS_TOKEN).toBe("token-a");
     expect(envB.LONGBRIDGE_ACCESS_TOKEN).toBe("token-b");
     expect(envA.HOME).not.toBe(envB.HOME);
+  });
+
+  it("strips every ambient Longbridge/Longport credential before applying the member file", () => {
+    const root = makeRoot();
+    writeMemberEnv(root, "member_1", "LONGBRIDGE_ACCESS_TOKEN=member-token");
+    const creds = loadMemberCredentials("member_1", { rootDir: root })!;
+    const original = { ...process.env };
+    process.env.LONGBRIDGE_ACCESS_TOKEN = "global-token";
+    process.env.LONGPORT_ACCESS_TOKEN = "global-longport-token";
+    process.env.LONGBRIDGE_OPENAPI_TOKEN_PATH = "/tmp/global-token-file";
+    try {
+      const subprocessEnv = buildMemberSubprocessEnv(creds);
+      expect(subprocessEnv.LONGBRIDGE_ACCESS_TOKEN).toBe("member-token");
+      expect(subprocessEnv.LONGPORT_ACCESS_TOKEN).toBeUndefined();
+      expect(subprocessEnv.LONGBRIDGE_OPENAPI_TOKEN_PATH).toBeUndefined();
+    } finally {
+      process.env = original;
+    }
+  });
+
+  it("fails closed when a member file has no member-specific access token", () => {
+    const root = makeRoot();
+    writeMemberEnv(root, "member_1", "LONGBRIDGE_APP_KEY=member-key");
+    const creds = loadMemberCredentials("member_1", { rootDir: root })!;
+    const original = { ...process.env };
+    process.env.LONGBRIDGE_ACCESS_TOKEN = "global-token-must-not-fall-through";
+    try {
+      expect(() => buildMemberSubprocessEnv(creds)).toThrow(/access token/iu);
+    } finally {
+      process.env = original;
+    }
   });
 });

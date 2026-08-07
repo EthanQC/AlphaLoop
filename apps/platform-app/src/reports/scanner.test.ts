@@ -99,6 +99,18 @@ describe("scanReports", () => {
     expect(entries[0]).toMatchObject({ type: "official-paper", date: "2026-06-17" });
   });
 
+  it("parses per-member official-paper artifacts without mixing owners on the same date", () => {
+    writeReport("official-paper", "2026-08-08-post-open--member_a.md", "# A 的模拟盘\n");
+    writeReport("official-paper", "2026-08-08-post-open--member_b.md", "# B 的模拟盘\n");
+    writeReport("official-paper", "2026-08-08-post-open--..md", "# 非法归属\n");
+
+    const entries = scanOwnerScopedReports(repoRoot);
+
+    expect(entries).toHaveLength(2);
+    expect(entries.map((entry) => entry.ownerId).sort()).toEqual(["member_a", "member_b"]);
+    expect(entries.every((entry) => entry.date === "2026-08-08")).toBe(true);
+  });
+
   it("extracts the title from the first `# ` heading line", () => {
     writeReport(
       "daily",

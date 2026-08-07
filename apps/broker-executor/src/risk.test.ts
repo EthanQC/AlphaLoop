@@ -262,6 +262,58 @@ describe("evaluateRisk", () => {
     expect(result.reasons.join(" ")).toMatch(/官方模拟盘账户快照/u);
   });
 
+  it("accepts official-paper facts whose clock is at most five minutes ahead", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_small_clock_skew",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        side: "buy",
+        symbol: "AAPL",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 100
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date(Date.now() + 4 * 60_000).toISOString()
+      }
+    );
+
+    expect(result.status).toBe("allow");
+    expect(result.reasons.join(" ")).not.toMatch(/官方模拟盘账户快照/u);
+  });
+
+  it("fails closed when official-paper facts are more than five minutes in the future", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_future_snapshot",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        side: "buy",
+        symbol: "AAPL",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 100
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date(Date.now() + 6 * 60_000).toISOString()
+      }
+    );
+
+    expect(result.status).toBe("block");
+    expect(result.reasons.join(" ")).toMatch(/官方模拟盘账户快照/u);
+  });
+
   it("does not block de-risking sells only because the official paper budget is already over 10%", () => {
     const result = evaluateRisk(
       {
@@ -286,6 +338,90 @@ describe("evaluateRisk", () => {
     );
 
     expect(result.reasons.join(" ")).not.toMatch(/OpenClaw 官方模拟盘预算/u);
+  });
+
+  it("fails closed on any sell-to-open even when its notional is below the 10% budget", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_small_short",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        symbol: "TSLA",
+        side: "sell",
+        quantity: 10,
+        conviction: "normal",
+        notionalUsd: 1_000
+      },
+      baseRules(),
+      {
+        accountNetLiq: 100_000,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        heldQuantityForSymbol: 0
+      }
+    );
+
+    expect(result.status).toBe("block");
+    expect(result.reasons.join(" ")).toMatch(/卖空|多头持仓/u);
+  });
+
+  it("blocks a risk-increasing buy when the fresh snapshot valuation is degraded", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_degraded_buy",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        symbol: "AAPL",
+        side: "buy",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 100
+      },
+      baseRules(),
+      {
+        // Currency normalization can be the degraded dimension. Zero means
+        // no trustworthy USD account value could be derived; the fresh row
+        // may still prove held quantity for de-risking.
+        accountNetLiq: 0,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        valuationReliable: false
+      }
+    );
+
+    expect(result.status).toBe("block");
+    expect(result.reasons.join(" ")).toMatch(/估值|实时价格|币种/u);
+  });
+
+  it("still allows a covered de-risking sell when valuation is degraded", () => {
+    const result = evaluateRisk(
+      {
+        id: "ticket_degraded_derisk",
+        source: "openclaw-official-paper",
+        submittedAt: new Date().toISOString(),
+        environment: "paper",
+        assetClass: "stock",
+        symbol: "AAPL",
+        side: "sell",
+        quantity: 1,
+        conviction: "normal",
+        notionalUsd: 100
+      },
+      baseRules(),
+      {
+        accountNetLiq: 0,
+        currentExposureUsd: 0,
+        fetchedAt: new Date().toISOString(),
+        heldQuantityForSymbol: 1,
+        valuationReliable: false
+      }
+    );
+
+    expect(result.status).toBe("allow");
   });
 
   it("blocks a second small naked short when the owner's open risk plus the new short exceeds the 10% account budget", () => {
@@ -316,14 +452,10 @@ describe("evaluateRisk", () => {
     expect(result.reasons.join(" ")).toMatch(/OpenClaw 官方模拟盘预算/u);
   });
 
-  // FIX 2 (audit-class finding): the paper-sell exemption used to zero out
-  // riskIncreasingNotional for EVERY paper sell regardless of whether the
-  // owner actually held the position - a sell-to-open (naked short) of any
-  // size read as ideaExposure 0 and sailed past the 10% cap. Gated on the
-  // owner's ACTUAL held long for that symbol (heldQuantityForSymbol): a sell
-  // up to the held long is risk-reducing (exempt); any excess beyond it (a
-  // short-open) counts as risk-increasing notional, subject to the same 10%
-  // idea-exposure cap as a buy.
+  // The paper-sell exemption is gated on the owner's actual held long. A sell
+  // up to that position is risk-reducing; any excess is sell-to-open and now
+  // fails closed because the persisted broker snapshot cannot yet prove short
+  // direction/gross exposure after the fill.
   describe("sell exemption gated on held position (FIX 2)", () => {
     it("allows a sell fully within the held long, even though it exceeds the 10% idea-exposure cap in notional terms", () => {
       const result = evaluateRisk(
@@ -353,7 +485,7 @@ describe("evaluateRisk", () => {
       expect(result.status).toBe("allow");
     });
 
-    it("blocks a sell that exceeds the held long (a short-open) once the excess notional is over budget", () => {
+    it("blocks a sell that exceeds the held long (a short-open)", () => {
       const result = evaluateRisk(
         {
           id: "ticket_sell_exceeds_held",
@@ -382,7 +514,7 @@ describe("evaluateRisk", () => {
       expect(result.reasons.join(" ")).toMatch(/单个想法暴露/u);
     });
 
-    it("blocks a naked-short sell over budget when the owner holds no position in the symbol at all", () => {
+    it("blocks a naked-short sell when the owner holds no position in the symbol at all", () => {
       const result = evaluateRisk(
         {
           id: "ticket_sell_no_position",

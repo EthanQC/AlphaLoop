@@ -26,7 +26,13 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ExecutionReportRepository, MemberRepository, openTradingDatabase, ProposalRepository } from "../../../packages/shared-types/dist/index.js";
+import {
+  ExecutionReportRepository,
+  MemberRepository,
+  OfficialPaperOrderLifecycleRepository,
+  openTradingDatabase,
+  ProposalRepository
+} from "../../../packages/shared-types/dist/index.js";
 
 const reconcileModule = await import("./reconcile-official-paper-orders.mjs");
 const { reconcileOfficialPaperOrders, DEFAULT_ORPHAN_CORRELATION_WINDOW_MS, DEFAULT_SUBMIT_UNCONFIRMED_TIMEOUT_MS } = reconcileModule;
@@ -87,6 +93,7 @@ interface LifecycleRowOverrides {
   lifecycleStage?: string;
   submittedAt?: string;
   lastObservedAt?: string;
+  ownerId?: string | null;
 }
 
 function insertLifecycleRow(db: DatabaseSync, overrides: LifecycleRowOverrides = {}): string {
@@ -96,8 +103,8 @@ function insertLifecycleRow(db: DatabaseSync, overrides: LifecycleRowOverrides =
     INSERT INTO official_paper_order_lifecycle
     (id, ticket_id, external_order_id, provider, environment, account_mode, symbol, asset_class,
      side, quantity, limit_price, broker_status, local_status, lifecycle_stage, submitted_at,
-     last_observed_at, raw, notes)
-    VALUES (?, ?, ?, 'longbridge-paper', 'paper', 'paper', ?, 'stock', ?, ?, ?, ?, ?, ?, ?, ?, 'null', '[]')
+     last_observed_at, raw, notes, owner_id)
+    VALUES (?, ?, ?, 'longbridge-paper', 'paper', 'paper', ?, 'stock', ?, ?, ?, ?, ?, ?, ?, ?, 'null', '[]', ?)
   `).run(
     id,
     overrides.ticketId ?? null,
@@ -110,7 +117,8 @@ function insertLifecycleRow(db: DatabaseSync, overrides: LifecycleRowOverrides =
     overrides.localStatus ?? "pending",
     overrides.lifecycleStage ?? "submitting",
     submittedAt,
-    overrides.lastObservedAt ?? submittedAt
+    overrides.lastObservedAt ?? submittedAt,
+    overrides.ownerId ?? null
   );
   return id;
 }
@@ -167,6 +175,7 @@ describe("normal fill / partial fill / cancel-in-progress", () => {
     const db = makeDb();
     insertLifecycleRow(db, {
       id: "row_fill", ticketId: "ticket_prop_p1", externalOrderId: "EXT1",
+      ownerId: "__shared__",
       lifecycleStage: "submitted", brokerStatus: "New", localStatus: "submitted",
       submittedAt: "2026-07-15T14:00:00.000Z"
     });
@@ -180,9 +189,52 @@ describe("normal fill / partial fill / cancel-in-progress", () => {
     expect(result.matched).toHaveLength(1);
   });
 
+  it("does not move an already-filled order past a newer snapshot when reconcile observes it again", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    insertLifecycleRow(db, {
+      id: "row_historical_fill", ticketId: "ticket_historical_fill",
+      externalOrderId: "EXT_HISTORICAL_FILL", ownerId: "member_a",
+      symbol: "AAPL.US", side: "sell", quantity: 50, limitPrice: 100,
+      lifecycleStage: "filled", brokerStatus: "Filled", localStatus: "accepted",
+      submittedAt: "2026-07-15T13:30:00.000Z",
+      lastObservedAt: "2026-07-15T13:50:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_historical_buy_fill", ticketId: "ticket_historical_buy_fill",
+      externalOrderId: "EXT_HISTORICAL_BUY_FILL", ownerId: "member_a",
+      symbol: "MSFT.US", side: "buy", quantity: 5, limitPrice: 200,
+      lifecycleStage: "filled", brokerStatus: "Filled", localStatus: "accepted",
+      submittedAt: "2026-07-15T13:35:00.000Z",
+      lastObservedAt: "2026-07-15T13:55:00.000Z"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_HISTORICAL_FILL", symbol: "AAPL.US", side: "Sell", quantity: 50,
+        price: 100, status: "Filled", created_at: "2026-07-15T13:30:00.000Z"
+      }),
+      brokerOrder({
+        order_id: "EXT_HISTORICAL_BUY_FILL", symbol: "MSFT.US", side: "Buy", quantity: 5,
+        price: 200, status: "Filled", created_at: "2026-07-15T13:35:00.000Z"
+      })
+    ], {
+      explicitOwnerId: "member_a",
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    const row = getRow(db, "row_historical_fill");
+    expect(row.last_observed_at).toBe("2026-07-15T13:50:00.000Z");
+    expect(getRow(db, "row_historical_buy_fill").last_observed_at).toBe("2026-07-15T13:55:00.000Z");
+    const lifecycle = new OfficialPaperOrderLifecycleRepository(db);
+    const snapshotFetchedAt = "2026-07-15T14:00:00.000Z";
+    expect(lifecycle.sumOpenNotionalForOwner("member_a", snapshotFetchedAt)).toBe(0);
+    expect(lifecycle.sumOpenSellQuantityForOwnerSymbol("member_a", "AAPL.US", snapshotFetchedAt)).toBe(0);
+  });
+
   it("partial fill: maps to 'pending', not 'accepted'", async () => {
     const db = makeDb();
-    insertLifecycleRow(db, { id: "row_partial", ticketId: "ticket_prop_p2", externalOrderId: "EXT2", lifecycleStage: "submitted" });
+    insertLifecycleRow(db, { id: "row_partial", ticketId: "ticket_prop_p2", externalOrderId: "EXT2", ownerId: "__shared__", lifecycleStage: "submitted" });
 
     await runReconcile(db, [brokerOrder({ order_id: "EXT2", status: "PartialFilled" })]);
 
@@ -193,7 +245,7 @@ describe("normal fill / partial fill / cancel-in-progress", () => {
 
   it("cancel-in-progress: WaitToCancel maps to 'pending', never 'unknown' (finding #5)", async () => {
     const db = makeDb();
-    insertLifecycleRow(db, { id: "row_cancel", ticketId: "ticket_prop_p3", externalOrderId: "EXT3", lifecycleStage: "submitted" });
+    insertLifecycleRow(db, { id: "row_cancel", ticketId: "ticket_prop_p3", externalOrderId: "EXT3", ownerId: "__shared__", lifecycleStage: "submitted" });
 
     await runReconcile(db, [brokerOrder({ order_id: "EXT3", status: "WaitToCancel" })]);
 
@@ -209,6 +261,7 @@ describe("reconcile-before-executor-callback", () => {
     const db = makeDb();
     insertLifecycleRow(db, {
       id: "row_inflight", ticketId: "ticket_prop_p4", externalOrderId: null,
+      ownerId: "__shared__",
       symbol: "MSFT.US", side: "buy", quantity: 5, lifecycleStage: "submitting",
       submittedAt: "2026-07-15T14:00:00.000Z"
     });
@@ -252,6 +305,7 @@ describe("orphan adoption via submit_unconfirmed correlation", () => {
     const db = makeDb();
     insertLifecycleRow(db, {
       id: "row_unconfirmed", ticketId: "ticket_prop_p5", externalOrderId: null,
+      ownerId: "__shared__",
       symbol: "TSLA.US", side: "sell", quantity: 3, lifecycleStage: "submit_unconfirmed",
       brokerStatus: "unconfirmed", localStatus: "pending",
       submittedAt: "2026-07-15T14:00:00.000Z"
@@ -310,6 +364,71 @@ describe("orphan adoption via submit_unconfirmed correlation", () => {
       })
     ]);
     expect(getRow(db, "row_owner_backfill").owner_id).toBe("member_owner");
+  });
+
+  it("prefers an exact-owner failed row over a historical NULL-owner submit_unconfirmed row", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    const legacyProposal = seedProposal(db, {
+      ownerId: "member_a", symbol: "NFLX.US", side: "buy", quantity: 2, limitPrice: 500
+    });
+    insertLifecycleRow(db, {
+      id: "row_exact_failed", ticketId: "ticket_exact_failed", ownerId: "member_a",
+      symbol: "NFLX.US", side: "buy", quantity: 2, limitPrice: 500,
+      lifecycleStage: "failed", brokerStatus: "unconfirmed", localStatus: "rejected",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_legacy_unconfirmed", ticketId: `ticket_prop_${legacyProposal.id}`, ownerId: null,
+      symbol: "NFLX.US", side: "buy", quantity: 2, limitPrice: 500,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:01.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_EXACT_FAILED", symbol: "NFLX.US", side: "Buy", quantity: 2,
+        price: 500, status: "New", created_at: "2026-07-15T14:00:02.000Z"
+      })
+    ], { explicitOwnerId: "member_a" });
+
+    expect(getRow(db, "row_exact_failed").external_order_id).toBe("EXT_EXACT_FAILED");
+    expect(getRow(db, "row_legacy_unconfirmed").external_order_id).toBeNull();
+    expect(result.adopted).toHaveLength(1);
+    expect(result.adopted[0]?.ticketId).toBe("ticket_exact_failed");
+  });
+
+  it("defers an exact-owner submitting row instead of adopting a historical NULL-owner submit_unconfirmed row", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    const legacyProposal = seedProposal(db, {
+      ownerId: "member_a", symbol: "META.US", side: "buy", quantity: 3, limitPrice: 600
+    });
+    insertLifecycleRow(db, {
+      id: "row_exact_submitting", ticketId: "ticket_exact_submitting", ownerId: "member_a",
+      symbol: "META.US", side: "buy", quantity: 3, limitPrice: 600,
+      lifecycleStage: "submitting", brokerStatus: "pending_submission", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_legacy_unconfirmed_for_inflight", ticketId: `ticket_prop_${legacyProposal.id}`, ownerId: null,
+      symbol: "META.US", side: "buy", quantity: 3, limitPrice: 600,
+      lifecycleStage: "submit_unconfirmed", brokerStatus: "unconfirmed", localStatus: "pending",
+      submittedAt: "2026-07-15T14:00:01.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_EXACT_SUBMITTING", symbol: "META.US", side: "Buy", quantity: 3,
+        price: 600, status: "New", created_at: "2026-07-15T14:00:02.000Z"
+      })
+    ], { explicitOwnerId: "member_a" });
+
+    expect(getRow(db, "row_exact_submitting").external_order_id).toBeNull();
+    expect(getRow(db, "row_legacy_unconfirmed_for_inflight").external_order_id).toBeNull();
+    expect(result.deferredInFlight).toHaveLength(1);
+    expect(result.deferredInFlight[0]?.candidateTicketId).toBe("ticket_exact_submitting");
+    expect(result.adopted).toHaveLength(0);
   });
 
   it("does not adopt a submit_unconfirmed row outside the correlation window", async () => {
@@ -434,6 +553,529 @@ describe("submit_unconfirmed adjudication (both directions)", () => {
     expect(getRow(db, "row_unlinked").lifecycle_stage).toBe("failed");
     expect(result.timedOut).toEqual([{ ticketId: "manual_1234567890", symbol: "IBM.US", proposalId: null }]);
   });
+
+  it("only adjudicates submit_unconfirmed rows selected by the symbol filter", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_aapl_outside_filter", ticketId: "manual_aapl", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T12:00:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_tsla_selected", ticketId: "manual_tsla", externalOrderId: null,
+      ownerId: "__shared__", symbol: "TSLA.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T12:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [], {
+      nowIso: "2026-07-15T14:10:00.000Z",
+      symbolFilters: new Set(["TSLA.US"])
+    });
+
+    expect(getRow(db, "row_aapl_outside_filter").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(getRow(db, "row_tsla_selected").lifecycle_stage).toBe("failed");
+    expect(result.timedOut).toEqual([{ ticketId: "manual_tsla", symbol: "TSLA.US", proposalId: null }]);
+  });
+
+  it("fails closed on an invalid broker orders payload instead of treating it as an empty list", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_invalid_payload", ticketId: "manual_invalid_payload", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T12:00:00.000Z"
+    });
+
+    await expect(reconcileOfficialPaperOrders(db, {
+      fetchOrders: async () => ({ error: "upstream response shape changed" }),
+      fetchExecutions: async () => [],
+      now: () => new Date("2026-07-15T14:10:00.000Z")
+    })).rejects.toThrow(/orders payload.*invalid/iu);
+
+    expect(getRow(db, "row_invalid_payload").lifecycle_stage).toBe("submit_unconfirmed");
+  });
+
+  it("fails closed when an orders array contains a malformed element", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_invalid_order_element", ticketId: "manual_invalid_order_element", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T12:00:00.000Z"
+    });
+
+    await expect(reconcileOfficialPaperOrders(db, {
+      fetchOrders: async () => [{ error: "upstream changed each row shape" }],
+      fetchExecutions: async () => [],
+      now: () => new Date("2026-07-15T14:10:00.000Z")
+    })).rejects.toThrow(/orders payload element.*invalid/iu);
+
+    expect(getRow(db, "row_invalid_order_element").lifecycle_stage).toBe("submit_unconfirmed");
+  });
+
+  it("does not use a new trading day's today-orders list to fail yesterday's unconfirmed order", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_previous_trading_day", ticketId: "manual_previous_day", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T19:50:00.000Z"
+    });
+
+    const result = await runReconcile(db, [], { nowIso: "2026-07-16T14:10:00.000Z" });
+
+    expect(getRow(db, "row_previous_trading_day").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("recovers a previous-day unconfirmed order from bounded broker history", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_previous_day_recovered", ticketId: "manual_previous_day_recovered", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1, limitPrice: 100,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T19:50:00.000Z"
+    });
+    const historyCalls: Array<{ startAt: string; endAt: string; symbol?: string }> = [];
+
+    const result = await runReconcile(db, [], {
+      nowIso: "2026-07-16T14:10:00.000Z",
+      fetchHistoricalOrders: async (window: { startAt: string; endAt: string }) => {
+        historyCalls.push(window);
+        return [brokerOrder({
+          order_id: "EXT_FROM_HISTORY", symbol: "AAPL.US", side: "Buy", quantity: 1,
+          price: 100, status: "Filled", created_at: "2026-07-15T19:50:10.000Z"
+        })];
+      },
+      fetchHistoricalExecutions: async () => []
+    });
+
+    expect(historyCalls).toHaveLength(1);
+    expect(new Date(historyCalls[0]!.startAt).getTime()).toBeLessThanOrEqual(new Date("2026-07-15T19:50:00.000Z").getTime());
+    expect(new Date(historyCalls[0]!.endAt).getTime()).toBeLessThanOrEqual(
+      new Date("2026-07-15T19:50:00.000Z").getTime() + DEFAULT_ORPHAN_CORRELATION_WINDOW_MS
+    );
+    expect(historyCalls[0]).toMatchObject({ symbol: "AAPL.US" });
+    expect(getRow(db, "row_previous_day_recovered")).toMatchObject({
+      external_order_id: "EXT_FROM_HISTORY",
+      lifecycle_stage: "filled"
+    });
+    expect(result.adopted).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("uses a successful covering history query to adjudicate a missing previous-day order", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_previous_day_absent", ticketId: "manual_previous_day_absent", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T19:50:00.000Z"
+    });
+
+    const result = await runReconcile(db, [], {
+      nowIso: "2026-07-16T14:10:00.000Z",
+      fetchHistoricalOrders: async () => [],
+      fetchHistoricalExecutions: async () => []
+    });
+
+    expect(getRow(db, "row_previous_day_absent").lifecycle_stage).toBe("failed");
+    expect(result.timedOut).toEqual([{
+      ticketId: "manual_previous_day_absent", symbol: "AAPL.US", proposalId: null
+    }]);
+  });
+
+  it("fails closed without mutating cross-day rows when history retrieval fails", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_history_failure", ticketId: "manual_history_failure", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T19:50:00.000Z"
+    });
+
+    await expect(runReconcile(db, [], {
+      nowIso: "2026-07-16T14:10:00.000Z",
+      fetchHistoricalOrders: async () => { throw new Error("history upstream unavailable"); },
+      fetchHistoricalExecutions: async () => []
+    })).rejects.toThrow(/history upstream unavailable/u);
+
+    expect(getRow(db, "row_history_failure").lifecycle_stage).toBe("submit_unconfirmed");
+  });
+
+  it("refuses timeout adjudication when a history page reaches the SDK's 1000-row truncation boundary", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_history_truncated", ticketId: "manual_history_truncated", externalOrderId: null,
+      ownerId: "__shared__", symbol: "AAPL.US", side: "buy", quantity: 1,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T19:50:00.000Z"
+    });
+    const fullPage = Array.from({ length: 1000 }, (_, index) => brokerOrder({
+      order_id: `EXT_PAGE_${index}`, symbol: "AAPL.US", side: "Sell", quantity: 1,
+      status: "Filled", created_at: `2026-07-15T19:${String(index % 60).padStart(2, "0")}:00.000Z`
+    }));
+
+    await expect(runReconcile(db, [], {
+      nowIso: "2026-07-16T14:10:00.000Z",
+      fetchHistoricalOrders: async () => fullPage,
+      fetchHistoricalExecutions: async () => []
+    })).rejects.toThrow(/1000|truncat|完整覆盖/iu);
+
+    expect(getRow(db, "row_history_truncated").lifecycle_stage).toBe("submit_unconfirmed");
+  });
+
+  it("queries far-apart unresolved submissions in separate bounded windows", async () => {
+    const db = makeDb();
+    for (const [id, submittedAt] of [
+      ["row_history_older", "2026-06-15T19:50:00.000Z"],
+      ["row_history_newer", "2026-07-15T19:50:00.000Z"]
+    ] as const) {
+      insertLifecycleRow(db, {
+        id, ticketId: `manual_${id}`, externalOrderId: null, ownerId: "__shared__",
+        symbol: "AAPL.US", side: "buy", quantity: 1,
+        lifecycleStage: "submit_unconfirmed", submittedAt
+      });
+    }
+    const historyCalls: Array<{ startAt: string; endAt: string }> = [];
+
+    await runReconcile(db, [], {
+      nowIso: "2026-07-16T14:10:00.000Z",
+      fetchHistoricalOrders: async (window: { startAt: string; endAt: string }) => {
+        historyCalls.push(window);
+        return [];
+      },
+      fetchHistoricalExecutions: async () => []
+    });
+
+    expect(historyCalls).toHaveLength(2);
+    for (const window of historyCalls) {
+      expect(new Date(window.endAt).getTime() - new Date(window.startAt).getTime())
+        .toBe(2 * DEFAULT_ORPHAN_CORRELATION_WINDOW_MS);
+    }
+  });
+});
+
+describe("stale submitting recovery", () => {
+  it("adopts a broker order after the in-flight grace period and completes its approved proposal", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "NVDA.US", quantity: 2, limitPrice: 120 });
+    new ProposalRepository(db).consumeApproval(proposal.approvalToken!, {
+      decision: "approved",
+      decidedBy: "member_1",
+      decidedAt: "2026-07-15T12:59:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_stale_submitting_with_order", ticketId: `ticket_prop_${proposal.id}`,
+      ownerId: "member_1", symbol: "NVDA.US", side: "buy", quantity: 2, limitPrice: 120,
+      lifecycleStage: "submitting", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [brokerOrder({
+      order_id: "EXT_STALE_SUBMITTING",
+      symbol: "NVDA.US",
+      quantity: 2,
+      price: 120,
+      status: "Filled",
+      created_at: "2026-07-15T13:01:00.000Z"
+    })], { nowIso: "2026-07-15T14:10:00.000Z" });
+
+    expect(result.adopted).toHaveLength(1);
+    expect(result.deferredInFlight).toHaveLength(0);
+    expect(getRow(db, "row_stale_submitting_with_order")).toMatchObject({
+      external_order_id: "EXT_STALE_SUBMITTING",
+      lifecycle_stage: "filled"
+    });
+    expect(new ProposalRepository(db).getById(proposal.id)).toMatchObject({
+      status: "executed",
+      ticketId: `ticket_prop_${proposal.id}`
+    });
+    expect(executionReportsCount(db)).toBe(1);
+  });
+
+  it("fails a same-day stale submitting row only after a valid empty broker list and the timeout", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "AMD.US", quantity: 2 });
+    new ProposalRepository(db).consumeApproval(proposal.approvalToken!, {
+      decision: "approved",
+      decidedBy: "member_1",
+      decidedAt: "2026-07-15T12:59:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_stale_submitting_without_order", ticketId: `ticket_prop_${proposal.id}`,
+      ownerId: "member_1", symbol: "AMD.US", side: "buy", quantity: 2,
+      lifecycleStage: "submitting", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [], { nowIso: "2026-07-15T14:10:00.000Z" });
+
+    expect(getRow(db, "row_stale_submitting_without_order").lifecycle_stage).toBe("failed");
+    expect(result.timedOut).toHaveLength(1);
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+  });
+
+  it("records a rejected broker attempt and closes its approved proposal exactly once", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "NVDA.US", quantity: 2, limitPrice: 120 });
+    new ProposalRepository(db).consumeApproval(proposal.approvalToken!, {
+      decision: "approved",
+      decidedBy: "member_1",
+      decidedAt: "2026-07-15T12:59:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_stale_submitting_rejected", ticketId: `ticket_prop_${proposal.id}`,
+      ownerId: "member_1", symbol: "NVDA.US", side: "buy", quantity: 2, limitPrice: 120,
+      lifecycleStage: "submitting", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+    const orders = [brokerOrder({
+      order_id: "EXT_STALE_REJECTED",
+      symbol: "NVDA.US",
+      quantity: 2,
+      price: 120,
+      status: "Rejected",
+      created_at: "2026-07-15T13:01:00.000Z"
+    })];
+
+    await runReconcile(db, orders, { nowIso: "2026-07-15T14:10:00.000Z" });
+    await runReconcile(db, orders, { nowIso: "2026-07-15T14:11:00.000Z" });
+
+    expect(getRow(db, "row_stale_submitting_rejected")).toMatchObject({
+      external_order_id: "EXT_STALE_REJECTED",
+      lifecycle_stage: "rejected"
+    });
+    expect(new ProposalRepository(db).getById(proposal.id)).toMatchObject({
+      status: "executed",
+      ticketId: `ticket_prop_${proposal.id}`
+    });
+    expect(executionReportsCount(db)).toBe(1);
+  });
+
+  it("rolls back the lifecycle timeout when the linked proposal cannot be marked failed", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "AMD.US", quantity: 2 });
+    new ProposalRepository(db).consumeApproval(proposal.approvalToken!, {
+      decision: "approved",
+      decidedBy: "member_1",
+      decidedAt: "2026-07-15T12:59:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_timeout_atomic", ticketId: `ticket_prop_${proposal.id}`,
+      ownerId: "member_1", symbol: "AMD.US", side: "buy", quantity: 2,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+    db.exec(`
+      CREATE TRIGGER fail_timeout_proposal_update
+      BEFORE UPDATE OF status ON proposals
+      WHEN NEW.status = 'failed'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected proposal timeout failure');
+      END;
+    `);
+
+    await expect(runReconcile(db, [], { nowIso: "2026-07-15T14:10:00.000Z" }))
+      .rejects.toThrow(/injected proposal timeout failure/);
+    expect(getRow(db, "row_timeout_atomic").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("approved");
+
+    db.exec(`DROP TRIGGER fail_timeout_proposal_update;`);
+    const recovered = await runReconcile(db, [], { nowIso: "2026-07-15T14:11:00.000Z" });
+    expect(recovered.timedOut).toHaveLength(1);
+    expect(getRow(db, "row_timeout_atomic").lifecycle_stage).toBe("failed");
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+  });
+});
+
+describe("per-member account reconciliation isolation", () => {
+  it("does not reuse an unattributed legacy row when another account has the same broker order id", async () => {
+    const db = makeDb();
+    seedMember(db, "member_b");
+    insertLifecycleRow(db, {
+      id: "row_legacy_account_local_id", ticketId: null, externalOrderId: "EXT_ACCOUNT_LOCAL_COLLISION",
+      ownerId: null, symbol: "OLD.US", side: "sell", quantity: 7,
+      lifecycleStage: "submitted", brokerStatus: "New", localStatus: "submitted"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_ACCOUNT_LOCAL_COLLISION", symbol: "NEW.US", side: "Buy", quantity: 2,
+        status: "Filled", created_at: "2026-07-15T13:02:00.000Z"
+      })
+    ], { explicitOwnerId: "member_b" });
+
+    const collidingRows = allRows(db).filter((row) => row.external_order_id === "EXT_ACCOUNT_LOCAL_COLLISION");
+    expect(collidingRows).toHaveLength(2);
+    expect(collidingRows.find((row) => row.id === "row_legacy_account_local_id")).toMatchObject({
+      owner_id: null,
+      symbol: "OLD.US",
+      side: "sell",
+      quantity: 7,
+      lifecycle_stage: "submitted"
+    });
+    expect(collidingRows.find((row) => row.owner_id === "member_b")).toMatchObject({
+      symbol: "NEW.US",
+      side: "buy",
+      quantity: 2,
+      lifecycle_stage: "filled"
+    });
+  });
+
+  it("does not adopt or time out an unattributed legacy unconfirmed row during explicit member reconciliation", async () => {
+    const db = makeDb();
+    seedMember(db, "member_b");
+    insertLifecycleRow(db, {
+      id: "row_legacy_unconfirmed_other_account", ticketId: "manual_legacy", externalOrderId: null,
+      ownerId: null, symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({
+        order_id: "EXT_MEMBER_B_AAPL", symbol: "AAPL.US", side: "Buy", quantity: 10,
+        status: "New", created_at: "2026-07-15T13:02:00.000Z"
+      })
+    ], {
+      explicitOwnerId: "member_b",
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    expect(getRow(db, "row_legacy_unconfirmed_other_account")).toMatchObject({
+      owner_id: null,
+      external_order_id: null,
+      lifecycle_stage: "submit_unconfirmed"
+    });
+    expect(getRowByExternalOrderId(db, "EXT_MEMBER_B_AAPL")?.owner_id).toBe("member_b");
+    expect(result.adopted).toHaveLength(0);
+    expect(result.orphaned).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("attributes new broker orphans to the explicit account owner", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    seedMember(db, "member_b");
+
+    await runReconcile(db, [brokerOrder({ order_id: "EXT_MEMBER_A" })], {
+      explicitOwnerId: "member_a"
+    });
+
+    expect(getRowByExternalOrderId(db, "EXT_MEMBER_A")?.owner_id).toBe("member_a");
+  });
+
+  it("never adopts or times out another account owner's lifecycle rows", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_member_a", ticketId: "ticket_prop_a", ownerId: "member_a",
+      symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+    insertLifecycleRow(db, {
+      id: "row_member_b", ticketId: "ticket_prop_b", ownerId: "member_b",
+      symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_MEMBER_A_ADOPT", created_at: "2026-07-15T13:02:00.000Z" })
+    ], {
+      explicitOwnerId: "member_a",
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    expect(getRow(db, "row_member_a").external_order_id).toBe("EXT_MEMBER_A_ADOPT");
+    expect(getRow(db, "row_member_b").external_order_id).toBeNull();
+    expect(getRow(db, "row_member_b").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(result.adopted).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("keeps legacy-account reconciliation scoped to its active owner", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    insertLifecycleRow(db, {
+      id: "row_dormant_member_b", ticketId: "ticket_prop_b", ownerId: "member_b",
+      symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_LEGACY_MEMBER_A", created_at: "2026-07-15T13:02:00.000Z" })
+    ], {
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    expect(getRow(db, "row_dormant_member_b").external_order_id).toBeNull();
+    expect(getRow(db, "row_dormant_member_b").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(getRowByExternalOrderId(db, "EXT_LEGACY_MEMBER_A")?.owner_id).toBe("member_a");
+    expect(result.adopted).toHaveLength(0);
+    expect(result.orphaned).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("does not claim a historical null-owner row linked to another member's proposal", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    seedMember(db, "member_b");
+    db.prepare(`UPDATE members SET status = 'revoked' WHERE id = ?`).run("member_b");
+    const proposalB = seedProposal(db, { ownerId: "member_b" });
+    insertLifecycleRow(db, {
+      id: "row_null_owner_member_b", ticketId: `ticket_prop_${proposalB.id}`, ownerId: null,
+      symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_LEGACY_NULL_MEMBER_A", created_at: "2026-07-15T13:02:00.000Z" })
+    ], {
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    expect(getRow(db, "row_null_owner_member_b").external_order_id).toBeNull();
+    expect(getRow(db, "row_null_owner_member_b").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(getRowByExternalOrderId(db, "EXT_LEGACY_NULL_MEMBER_A")?.owner_id).toBe("member_a");
+    expect(result.adopted).toHaveLength(0);
+    expect(result.orphaned).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("fails closed for a historical null-owner row whose proposal is missing", async () => {
+    const db = makeDb();
+    seedMember(db, "member_a");
+    insertLifecycleRow(db, {
+      id: "row_null_owner_missing_proposal", ticketId: "ticket_prop_missing", ownerId: null,
+      symbol: "AAPL.US", side: "buy", quantity: 10,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+
+    const result = await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_LEGACY_MISSING_PROPOSAL", created_at: "2026-07-15T13:02:00.000Z" })
+    ], {
+      nowIso: "2026-07-15T14:10:00.000Z"
+    });
+
+    expect(getRow(db, "row_null_owner_missing_proposal").external_order_id).toBeNull();
+    expect(getRow(db, "row_null_owner_missing_proposal").lifecycle_stage).toBe("submit_unconfirmed");
+    expect(getRowByExternalOrderId(db, "EXT_LEGACY_MISSING_PROPOSAL")?.owner_id).toBe("member_a");
+    expect(result.adopted).toHaveLength(0);
+    expect(result.orphaned).toHaveLength(1);
+    expect(result.timedOut).toHaveLength(0);
+  });
+
+  it("updates only the selected account when two owners have the same broker order id", async () => {
+    const db = makeDb();
+    insertLifecycleRow(db, {
+      id: "row_same_id_a", ticketId: "ticket_a", externalOrderId: "EXT_ACCOUNT_LOCAL",
+      ownerId: "member_a", lifecycleStage: "submitted", brokerStatus: "New", localStatus: "submitted"
+    });
+    insertLifecycleRow(db, {
+      id: "row_same_id_b", ticketId: "ticket_b", externalOrderId: "EXT_ACCOUNT_LOCAL",
+      ownerId: "member_b", lifecycleStage: "submitted", brokerStatus: "New", localStatus: "submitted"
+    });
+
+    await runReconcile(db, [
+      brokerOrder({ order_id: "EXT_ACCOUNT_LOCAL", status: "Filled" })
+    ], { explicitOwnerId: "member_a" });
+
+    expect(getRow(db, "row_same_id_a").lifecycle_stage).toBe("filled");
+    expect(getRow(db, "row_same_id_b").lifecycle_stage).toBe("submitted");
+    expect(getRow(db, "row_same_id_b").broker_status).toBe("New");
+  });
 });
 
 describe("idempotent reconcile (finding #6: no execution_reports, ever)", () => {
@@ -441,10 +1083,12 @@ describe("idempotent reconcile (finding #6: no execution_reports, ever)", () => 
     const db = makeDb();
     insertLifecycleRow(db, {
       id: "row_a", ticketId: "ticket_prop_a", externalOrderId: "EXT_A", lifecycleStage: "submitted",
+      ownerId: "__shared__",
       symbol: "AAPL.US", side: "buy", quantity: 10, submittedAt: "2026-07-15T14:00:00.000Z"
     });
     insertLifecycleRow(db, {
       id: "row_b", ticketId: "ticket_prop_b", externalOrderId: null, lifecycleStage: "submit_unconfirmed",
+      ownerId: "__shared__",
       symbol: "MSFT.US", side: "buy", quantity: 6, submittedAt: "2026-07-15T14:00:00.000Z"
     });
     const orders = [
@@ -517,6 +1161,48 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
     expect(reports[0]?.metadata?.proposalId).toBe(proposal.id);
   });
 
+  it("atomically retries a failed report write without leaving the proposal executed and reportless", async () => {
+    const db = makeDb();
+    seedMember(db, "member_1");
+    const proposal = seedProposal(db, { ownerId: "member_1", symbol: "NVDA.US", quantity: 2, limitPrice: 120 });
+    new ProposalRepository(db).markFailed(proposal.id, "执行未确认");
+    insertLifecycleRow(db, {
+      id: "row_reconcile_report_retry", ticketId: `ticket_prop_${proposal.id}`,
+      ownerId: "member_1", symbol: "NVDA.US", side: "buy", quantity: 2, limitPrice: 120,
+      lifecycleStage: "submit_unconfirmed", submittedAt: "2026-07-15T13:00:00.000Z"
+    });
+    const orders = [brokerOrder({
+      order_id: "EXT_RECONCILE_REPORT_RETRY",
+      symbol: "NVDA.US",
+      quantity: 2,
+      price: 120,
+      status: "Filled",
+      created_at: "2026-07-15T13:01:00.000Z"
+    })];
+    db.exec(`
+      CREATE TRIGGER fail_reconcile_report_insert
+      BEFORE INSERT ON execution_reports
+      BEGIN
+        SELECT RAISE(ABORT, 'injected reconcile report failure');
+      END;
+    `);
+
+    await expect(runReconcile(db, orders, { nowIso: "2026-07-15T14:10:00.000Z" }))
+      .rejects.toThrow(/injected reconcile report failure/);
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
+    expect(executionReportsCount(db)).toBe(0);
+
+    db.exec(`DROP TRIGGER fail_reconcile_report_insert;`);
+    await runReconcile(db, orders, { nowIso: "2026-07-15T14:11:00.000Z" });
+    await runReconcile(db, orders, { nowIso: "2026-07-15T14:12:00.000Z" });
+
+    expect(new ProposalRepository(db).getById(proposal.id)).toMatchObject({
+      status: "executed",
+      ticketId: `ticket_prop_${proposal.id}`
+    });
+    expect(executionReportsCount(db)).toBe(1);
+  });
+
   // N2 (2026-07-28 verifier): this writer used to call reports.save() with no
   // ownerId at all, so a reconciled REAL fill was written with owner_id NULL.
   // The owner-scoped read (selectExecutionReports, `WHERE owner_id = ?`) then
@@ -547,7 +1233,7 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
     expect(stored).toEqual([{ owner_id: "member_1" }]);
   });
 
-  it("does NOT transition the proposal when the adopted stage is cancelled/rejected", async () => {
+  it("records a rejected execution attempt instead of leaving it reportless", async () => {
     const db = makeDb();
     seedMember(db, "member_1");
     const proposal = seedProposal(db, { symbol: "AMD.US", side: "buy", quantity: 2, limitPrice: 90 });
@@ -566,8 +1252,11 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
     ]);
 
     const updatedProposal = new ProposalRepository(db).getById(proposal.id);
-    expect(updatedProposal?.status).toBe("failed");
-    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+    expect(updatedProposal?.status).toBe("executed");
+    expect(updatedProposal?.ticketId).toBe(ticketId);
+    const reports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.body).toContain("已拒绝/过期");
   });
 
   it("is idempotent: a second reconcile pass over the same now-matched order does not write a second execution report", async () => {
@@ -597,15 +1286,11 @@ describe("FIX 1: adopting a filled broker order un-sticks its proposal from 'fai
   });
 });
 
-// FIX 1a (matched-branch un-stick): an order adopted while the broker reports
-// an UNMAPPED status lands at stage 'unknown_broker_status' - excluded from
-// the live/filled un-stick set, so the adopt-branch un-stick correctly does
-// nothing. But when a LATER pass sees the same order 'Filled', that pass goes
-// through the matched-by-external_order_id branch - which must ALSO invoke
-// the un-stick, or the proposal stays 'failed' forever for really-bought
-// shares.
+// FIX 1a (matched-branch refresh): an unmapped broker status still proves an
+// execution attempt exists and therefore gets one conservative report. A
+// later Filled observation refreshes lifecycle truth without duplicating it.
 describe("FIX 1a: matched-branch un-stick after adoption at an unmapped broker status", () => {
-  it("adopt at unknown status leaves proposal failed; next pass observing Filled un-sticks it to executed", async () => {
+  it("adopt at unknown status closes the attempt conservatively; later Filled refresh stays idempotent", async () => {
     const db = makeDb();
     seedMember(db, "member_1");
     const proposal = seedProposal(db, { symbol: "NVDA.US", side: "buy", quantity: 7, limitPrice: 120 });
@@ -625,8 +1310,10 @@ describe("FIX 1a: matched-branch un-stick after adoption at an unmapped broker s
     ]);
     expect(first.adopted).toHaveLength(1);
     expect(getRow(db, "row_unmapped_then_filled").lifecycle_stage).toBe("unknown_broker_status");
-    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
-    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("executed");
+    const unknownReports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(unknownReports).toHaveLength(1);
+    expect(unknownReports[0]?.body).toContain("状态值尚未识别");
 
     // Pass 2: same order now reported Filled -> MATCHED branch must un-stick.
     const second = await runReconcile(db, [
@@ -637,7 +1324,11 @@ describe("FIX 1a: matched-branch un-stick after adoption at an unmapped broker s
     const updatedProposal = new ProposalRepository(db).getById(proposal.id);
     expect(updatedProposal?.status).toBe("executed");
     expect(updatedProposal?.ticketId).toBe(ticketId);
-    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(1);
+    const filledReports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(filledReports).toHaveLength(1);
+    expect(filledReports[0]?.body).toContain("已确认成交");
+    expect(filledReports[0]?.body).not.toContain("状态值尚未识别");
+    expect(filledReports[0]?.metadata).toMatchObject({ lifecycleStage: "filled", brokerStatus: "Filled" });
     expect(allRows(db)).toHaveLength(1);
   });
 
@@ -733,14 +1424,10 @@ describe("FIX 1b: broker order first observed after the submit_unconfirmed timeo
   });
 });
 
-// FIX 2: WaitToCancel/PendingCancel map to stage 'pending' (a cancel REQUEST
-// in flight - the order is still open, so 'pending' is the right lifecycle
-// stage), but "a cancel is being requested" is NOT evidence the trade went
-// through - the un-stick must not fire for those raw statuses. And when the
-// un-stick DOES fire for a merely-live (submitted/pending) order, its report
-// must not hard-code a 成交 (filled) claim.
-describe("FIX 2: cancel-in-flight never un-sticks, and un-stick report wording reflects the actual stage", () => {
-  it("adopting a WaitToCancel order does NOT un-stick the failed proposal (and writes no trade report)", async () => {
+// FIX 2: WaitToCancel/PendingCancel map to pending, so the report must record
+// the execution attempt without claiming a fill.
+describe("FIX 2: report wording reflects the actual broker lifecycle stage", () => {
+  it("adopting a WaitToCancel order records the attempt without claiming a fill", async () => {
     const db = makeDb();
     seedMember(db, "member_1");
     const proposal = seedProposal(db, { symbol: "GOOG.US", side: "buy", quantity: 5, limitPrice: 150 });
@@ -759,8 +1446,11 @@ describe("FIX 2: cancel-in-flight never un-sticks, and un-stick report wording r
 
     expect(result.adopted).toHaveLength(1);
     expect(getRow(db, "row_cancel_inflight").lifecycle_stage).toBe("pending");
-    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("failed");
-    expect(new ExecutionReportRepository(db).listRecent(10, ["trade"])).toHaveLength(0);
+    expect(new ProposalRepository(db).getById(proposal.id)?.status).toBe("executed");
+    const reports = new ExecutionReportRepository(db).listRecent(10, ["trade"]);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.body).toContain("已提交");
+    expect(reports[0]?.body).not.toContain("已确认成交");
   });
 
   it("a 'submitted'-stage un-stick report does not claim 成交; a 'filled'-stage one does", async () => {

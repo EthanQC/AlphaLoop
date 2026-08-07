@@ -20,6 +20,8 @@ function fakeAdapter(overrides: Partial<LongbridgeAdapter> = {}): LongbridgeAdap
     getFinanceCalendar: async () => [],
     getTodayOrders: async () => [],
     getTodayExecutions: async () => [],
+    getHistoryOrders: async () => [],
+    getHistoryExecutions: async () => [],
     submitOrder: async () => ({ orderId: "1" }),
     getOrderDetail: async () => ({ orderId: "1", symbol: "X.US", side: "buy", status: "New" }),
     ...overrides

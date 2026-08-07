@@ -14,6 +14,8 @@ function fakeAdapter(overrides: Partial<LongbridgeAdapter> = {}): LongbridgeAdap
     getFinanceCalendar: async () => [],
     getTodayOrders: async () => [],
     getTodayExecutions: async () => [],
+    getHistoryOrders: async () => [],
+    getHistoryExecutions: async () => [],
     submitOrder: async () => ({ orderId: "unset" }),
     getOrderDetail: async () => ({ orderId: "unset", symbol: "X.US", side: "buy", status: "New" }),
     ...overrides
@@ -140,6 +142,30 @@ describe("runCommand data commands", () => {
     );
     expect(submitted).toMatchObject({ symbol: "QQQ.US", side: "buy", quantity: "1", price: "551.64" });
     expect(payload).toMatchObject({ order_id: "1044001" });
+  });
+
+  it("passes exact bounded instants to history order and execution APIs", async () => {
+    const startAt = "2026-07-15T19:00:00.000Z";
+    const endAt = "2026-07-16T15:00:00.000Z";
+    const received: Array<{ kind: string; startAt: string; endAt: string }> = [];
+    const adapter = fakeAdapter({
+      getHistoryOrders: async (request) => {
+        received.push({ kind: "orders", ...request });
+        return [];
+      },
+      getHistoryExecutions: async (request) => {
+        received.push({ kind: "executions", ...request });
+        return [];
+      }
+    });
+
+    await runCommand({ kind: "order-history", symbol: "AAPL.US", startAt, endAt }, deps({ global: adapter }));
+    await runCommand({ kind: "order-history-executions", startAt, endAt }, deps({ global: adapter }));
+
+    expect(received).toEqual([
+      { kind: "orders", symbol: "AAPL.US", startAt, endAt },
+      { kind: "executions", startAt, endAt }
+    ]);
   });
 
   it("fails the submit when the adapter reports success without a usable order id", async () => {

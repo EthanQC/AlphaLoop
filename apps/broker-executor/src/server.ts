@@ -12,7 +12,6 @@ import {
   type OrderTicket,
   type RuleSet,
   assertOrderTicket,
-  createId,
   normalizeSymbol,
   notFound,
   readJsonBody,
@@ -124,6 +123,129 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
     return deps.now ? deps.now() : new Date();
   }
 
+  function buildTicketFromProposal(
+    proposal: NonNullable<ReturnType<ProposalRepository["getById"]>>,
+    ticketId: string,
+    submittedAt: string
+  ): OrderTicket {
+    if (proposal.limitPrice === undefined) {
+      throw new Error(`提案 ${proposal.id} 缺少限价，无法重建执行工单。`);
+    }
+    return {
+      id: ticketId,
+      source: "proposals-cli",
+      submittedAt,
+      environment: "paper",
+      assetClass: "stock",
+      symbol: normalizeSymbol(proposal.symbol),
+      side: proposal.side,
+      quantity: proposal.quantity,
+      conviction: proposal.confidence === "high" ? "high" : "normal",
+      notionalUsd: proposal.quantity * proposal.limitPrice,
+      ownerId: proposal.ownerId,
+      proposalId: proposal.id,
+      marketSnapshot: {
+        bid: proposal.limitPrice,
+        ask: proposal.limitPrice,
+        last: proposal.limitPrice,
+        timestamp: submittedAt
+      }
+    };
+  }
+
+  function executionResultFromLifecycle(
+    lifecycle: NonNullable<ReturnType<OfficialPaperOrderLifecycleRepository["getByTicketId"]>>
+  ): ExecutionResult {
+    const raw = lifecycle.raw && typeof lifecycle.raw === "object" && !Array.isArray(lifecycle.raw)
+      ? lifecycle.raw as Record<string, JsonValue>
+      : undefined;
+    const recovery = raw?.recoveryExecutionResult
+      && typeof raw.recoveryExecutionResult === "object"
+      && !Array.isArray(raw.recoveryExecutionResult)
+      ? raw.recoveryExecutionResult as Record<string, JsonValue>
+      : undefined;
+    const fillPrice = typeof recovery?.fillPrice === "number" && Number.isFinite(recovery.fillPrice)
+      ? recovery.fillPrice
+      : undefined;
+    return sanitizeExecutionResult({
+      ticketId: lifecycle.ticketId ?? lifecycle.id,
+      environment: "paper",
+      status: lifecycle.localStatus,
+      provider: "longbridge-paper",
+      ...(lifecycle.externalOrderId ? { externalOrderId: lifecycle.externalOrderId } : {}),
+      ...(fillPrice === undefined ? {} : { fillPrice }),
+      ...(lifecycle.limitPrice === undefined ? {} : { limitPrice: lifecycle.limitPrice }),
+      brokerStatus: lifecycle.brokerStatus,
+      brokerOrderStage: lifecycle.lifecycleStage,
+      submittedAt: lifecycle.submittedAt,
+      observedAt: lifecycle.lastObservedAt,
+      ...(recovery?.rawBrokerPayload === undefined ? {} : { rawBrokerPayload: recovery.rawBrokerPayload }),
+      reasons: lifecycle.notes
+    });
+  }
+
+  function ensureExecutionCompletion(
+    proposal: NonNullable<ReturnType<ProposalRepository["getById"]>>,
+    ticket: OrderTicket,
+    result: ExecutionResult
+  ): string {
+    const deterministicReportId = `report_exec_${proposal.id}`;
+    const existingReport = db.prepare(`
+      SELECT id FROM execution_reports
+      WHERE category = 'trade' AND owner_id = ?
+        AND (
+          id = ?
+          OR json_extract(metadata, '$.ticketId') = ?
+          OR json_extract(metadata, '$.proposalId') = ?
+        )
+      ORDER BY created_at ASC
+      LIMIT 1
+    `).get(proposal.ownerId, deterministicReportId, ticket.id, proposal.id) as { id?: string } | undefined;
+    const reportId = existingReport?.id ?? deterministicReportId;
+    const proposalComplete = proposal.status === "executed" && proposal.ticketId === ticket.id;
+    if (existingReport && proposalComplete) {
+      return reportId;
+    }
+
+    // The broker write is already irreversible at this point. Keep the local
+    // report + proposal transition atomic, while leaving the finalized
+    // lifecycle row outside this transaction as the durable replay lease. A
+    // failed local commit is therefore repaired on the next identical POST;
+    // the broker command is never invoked again.
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      if (!existingReport) {
+        reports.save({
+          id: reportId,
+          category: "trade",
+          ownerId: proposal.ownerId,
+          title: `${ticket.symbol} 执行报告`,
+          body: buildExecutionReportBody(ticket, result),
+          metadata: buildExecutionReportMetadata(ticket, proposal.id, result),
+          createdAt: nowDate().toISOString()
+        });
+      }
+      proposals.markExecuted(proposal.id, ticket.id);
+      audit.write("broker-executor", "ticket.executed", {
+        proposalId: proposal.id,
+        ticketId: ticket.id,
+        result,
+        reportId,
+        repaired: Boolean(existingReport) || proposal.status !== "approved" && proposal.status !== "approved_half"
+      });
+      db.exec("COMMIT;");
+      return reportId;
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        // Preserve the original local persistence error; a rollback failure
+        // is still safe because the finalized lifecycle prevents re-submit.
+      }
+      throw error;
+    }
+  }
+
   // Per-owner official-paper account facts. A NULL-owner snapshot is a legacy
   // shared-account artifact and is only eligible when execution itself is in
   // the single-active-member legacy-global mode. Member-credential mode must
@@ -143,47 +265,198 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
   function readLatestOfficialPaperRiskFactsForOwner(
     ownerId: string,
     symbol: string,
-    allowLegacySharedFallback: boolean
+    executionMode: MemberExecutionContext["mode"]
   ): OfficialPaperRiskFacts | undefined {
+    const reasons = executionMode === "member"
+      ? ["hourly_poll_per_member", "post_open_pnl_per_member"]
+      : ["hourly_poll", "post_open_pnl"];
     const ownRow = db
       .prepare(`
-        SELECT fetched_at, net_assets, market_value, positions
+        SELECT fetched_at, net_assets, market_value, positions, raw
         FROM official_paper_snapshots
-        WHERE owner_id = ?
+        WHERE owner_id = ? AND reason IN (?, ?)
         ORDER BY fetched_at DESC
         LIMIT 1
       `)
-      .get(ownerId) as Record<string, unknown> | undefined;
+      .get(ownerId, ...reasons) as Record<string, unknown> | undefined;
 
-    const legacyRow = allowLegacySharedFallback ? (db
+    const legacyRow = executionMode === "legacy-global" ? (db
       .prepare(`
-        SELECT fetched_at, net_assets, market_value, positions
+        SELECT fetched_at, net_assets, market_value, positions, raw
         FROM official_paper_snapshots
-        WHERE owner_id IS NULL
+        WHERE owner_id IS NULL AND reason IN (?, ?)
         ORDER BY fetched_at DESC
         LIMIT 1
       `)
-      .get() as Record<string, unknown> | undefined) : undefined;
+      .get(...reasons) as Record<string, unknown> | undefined) : undefined;
     const row = ownRow ?? legacyRow;
 
     if (!row) {
       return undefined;
     }
 
-    const accountNetLiq = Number(row.net_assets);
-    const currentExposureUsd = Number(row.market_value);
+    const reportedAccountNetLiq = Number(row.net_assets);
+    const recordedExposureUsd = Number(row.market_value);
     const fetchedAt = String(row.fetched_at ?? "");
-    if (!Number.isFinite(accountNetLiq) || !Number.isFinite(currentExposureUsd)) {
+    if (!Number.isFinite(reportedAccountNetLiq) || !Number.isFinite(recordedExposureUsd)) {
       return undefined;
     }
 
     const heldQuantityForSymbol = extractHeldQuantity(row.positions, symbol);
+    const positionValuation = readPositionValuation(row.positions);
+    const accountNetLiqUsd = readAccountNetLiqUsd(row.raw, reportedAccountNetLiq, positionValuation);
+    // A reliable position set lets old rows that stored signed/net
+    // market_value participate safely. Long and short notionals add in
+    // absolute terms; they never cancel for the 10% Constitution budget. Take
+    // the larger of recorded and recomputed values so an empty position array
+    // cannot lower already-recorded USD exposure. When valuation is degraded,
+    // expose no invented USD number: valuationReliable=false blocks new risk,
+    // while the independently parsed held quantity still permits a covered
+    // sell to de-risk.
+    const currentExposureUsd = positionValuation.reliable
+      ? Math.max(recordedExposureUsd, positionValuation.grossExposureUsd)
+      : 0;
+    const valuationReliable = positionValuation.reliable && accountNetLiqUsd !== undefined;
     return {
-      accountNetLiq,
+      accountNetLiq: accountNetLiqUsd ?? 0,
       currentExposureUsd,
       fetchedAt,
+      valuationReliable,
       ...(heldQuantityForSymbol !== undefined ? { heldQuantityForSymbol } : {})
     };
+  }
+
+  interface PositionValuationUsd {
+    reliable: boolean;
+    grossExposureUsd: number;
+    netValueUsd: number;
+  }
+
+  function readPositionValuation(rawPositions: unknown): PositionValuationUsd {
+    if (typeof rawPositions !== "string") {
+      return { reliable: false, grossExposureUsd: 0, netValueUsd: 0 };
+    }
+    let positions: unknown;
+    try {
+      positions = JSON.parse(rawPositions);
+    } catch {
+      return { reliable: false, grossExposureUsd: 0, netValueUsd: 0 };
+    }
+    if (!Array.isArray(positions)) {
+      return { reliable: false, grossExposureUsd: 0, netValueUsd: 0 };
+    }
+    let grossExposureUsd = 0;
+    let netValueUsd = 0;
+    for (const position of positions) {
+      const row = position as Record<string, unknown>;
+      const quantity = Number(row?.quantity);
+      const price = Number(row?.price);
+      const currency = normalizeCurrency(row?.currency);
+      if (
+        !Number.isFinite(quantity)
+        || quantity === 0
+        || currency !== "USD"
+        || row?.priceSource !== "live"
+        || !Number.isFinite(price)
+        || price <= 0
+      ) {
+        return { reliable: false, grossExposureUsd: 0, netValueUsd: 0 };
+      }
+      grossExposureUsd += Math.abs(quantity * price);
+      netValueUsd += quantity * price;
+    }
+    return { reliable: true, grossExposureUsd, netValueUsd };
+  }
+
+  // The real mini snapshot reports net_assets/total_cash in HKD while its
+  // funded cash bucket and QQQ position are both explicitly USD. The raw blob
+  // carries no broker FX quote. Never infer one from total_cash/cash_infos:
+  // production history has already shown that implied ratio jump between
+  // incompatible broker rate-table values. Instead either:
+  //   1. trust net_assets only when its own reporting currency is USD; or
+  //   2. rebuild an FX-free USD account value from explicitly USD
+  //      available_cash buckets plus explicitly USD live-priced positions.
+  // Any non-zero foreign bucket, missing bucket list, missing currency, or
+  // degraded position makes the conversion unprovable and therefore blocks
+  // new risk through valuationReliable=false.
+  function readAccountNetLiqUsd(
+    rawSnapshot: unknown,
+    reportedAccountNetLiq: number,
+    positions: PositionValuationUsd
+  ): number | undefined {
+    if (typeof rawSnapshot !== "string") {
+      return undefined;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawSnapshot);
+    } catch {
+      return undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const primaryAsset = (parsed as Record<string, unknown>).primaryAsset;
+    if (!primaryAsset || typeof primaryAsset !== "object" || Array.isArray(primaryAsset)) {
+      return undefined;
+    }
+    const asset = primaryAsset as Record<string, unknown>;
+    const reportingCurrency = normalizeCurrency(asset.currency);
+    if (!reportingCurrency) {
+      return undefined;
+    }
+    if (reportingCurrency === "USD") {
+      return positions.reliable && reportedAccountNetLiq > 0 ? reportedAccountNetLiq : undefined;
+    }
+    if (!positions.reliable || !Array.isArray(asset.cash_infos)) {
+      return undefined;
+    }
+
+    let usdCash = 0;
+    let sawCashBucket = false;
+    for (const value of asset.cash_infos) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+      }
+      const cash = value as Record<string, unknown>;
+      const currency = normalizeCurrency(cash.currency);
+      const availableCash = readFiniteNumber(cash.available_cash);
+      if (!currency || availableCash === undefined) {
+        return undefined;
+      }
+      sawCashBucket = true;
+      if (availableCash === 0) {
+        continue;
+      }
+      if (currency !== "USD") {
+        return undefined;
+      }
+      usdCash += availableCash;
+    }
+    if (!sawCashBucket) {
+      return undefined;
+    }
+    const rebuilt = usdCash + positions.netValueUsd;
+    return Number.isFinite(rebuilt) && rebuilt > 0 ? rebuilt : undefined;
+  }
+
+  function normalizeCurrency(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+    const normalized = value.trim().toUpperCase();
+    return normalized || undefined;
+  }
+
+  function readFiniteNumber(value: unknown): number | undefined {
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : undefined;
+    }
+    if (typeof value !== "string" || value.trim() === "") {
+      return undefined;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
 
   function extractHeldQuantity(rawPositions: unknown, symbol: string): number | undefined {
@@ -205,14 +478,35 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
     // held position invisible (held=undefined -> conservative 0), 400-blocking
     // a full de-risking sell.
     const targetSymbol = normalizeSymbol(symbol);
-    const match = positions.find(
-      (position) => normalizeSymbol(String((position as Record<string, unknown>)?.symbol ?? "")) === targetSymbol
-    ) as Record<string, unknown> | undefined;
-    if (!match) {
-      return undefined;
+    let found = false;
+    let sellableLongQuantity = 0;
+    for (const position of positions) {
+      const row = position as Record<string, unknown>;
+      if (normalizeSymbol(String(row?.symbol ?? "")) !== targetSymbol) {
+        continue;
+      }
+      found = true;
+      const quantity = Number(row.quantity);
+      if (!Number.isFinite(quantity)) {
+        return undefined;
+      }
+      if (quantity <= 0) {
+        continue;
+      }
+      const available = Number(row.available);
+      if (!Number.isFinite(available)) {
+        return undefined;
+      }
+      sellableLongQuantity += Math.min(quantity, Math.max(0, available));
+      if (!Number.isFinite(sellableLongQuantity)) {
+        return undefined;
+      }
     }
-    const quantity = Number(match.quantity);
-    return Number.isFinite(quantity) ? quantity : undefined;
+    // Longbridge flattens account-channel position groups, so the same symbol
+    // can appear more than once. Covered-sell capacity is the sum of each
+    // row's proven available long quantity, capped by that row's total long;
+    // frozen shares, shorts, and missing availability never create capacity.
+    return found ? sellableLongQuantity : undefined;
   }
 
   return createServer(async (req, res) => {
@@ -295,7 +589,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         if (existingLifecycle) {
           audit.write("broker-executor", "ticket.replay", { proposalId, ticketId });
 
-          if (existingLifecycle.lifecycleStage === "submit_unconfirmed") {
+          if (existingLifecycle.lifecycleStage === "submit_unconfirmed" || !existingLifecycle.externalOrderId) {
             sendJson(res, 507, {
               ticketId,
               proposalId,
@@ -306,6 +600,20 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
             });
             return;
           }
+
+          const replayProposal = proposals.getById(proposalId);
+          if (!replayProposal) {
+            sendJson(res, 500, {
+              ticketId,
+              proposalId,
+              error: "工单已存在但关联提案缺失；已拒绝重新下单，等待人工修复本地记录。",
+              replay: true
+            });
+            return;
+          }
+          const replayTicket = buildTicketFromProposal(replayProposal, ticketId, existingLifecycle.submittedAt);
+          const replayResult = executionResultFromLifecycle(existingLifecycle);
+          const reportId = ensureExecutionCompletion(replayProposal, replayTicket, replayResult);
 
           sendJson(res, 200, {
             ticketId,
@@ -318,6 +626,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
             brokerStatus: existingLifecycle.brokerStatus,
             brokerOrderStage: existingLifecycle.lifecycleStage,
             reasons: existingLifecycle.notes,
+            reportId,
             replay: true
           });
           return;
@@ -344,38 +653,32 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
           sendJson(res, 400, { error: "提案缺少限价（limit_price），无法核算风险，拒绝执行。" });
           return;
         }
+        // OrderTicket carries `notionalUsd`, but Proposal has no currency and
+        // the persisted snapshots expose no trustworthy order-FX quote. A HK
+        // limit price (for example 0700.HK at HKD 300) must therefore never be
+        // relabelled as USD and sent into the 10% budget math. Keep automated
+        // execution strictly on explicit Longbridge `.US` symbols until the
+        // proposal/order contract carries currency plus a verified FX source.
+        const executionSymbol = normalizeSymbol(proposal.symbol);
+        if (!executionSymbol.endsWith(".US")) {
+          audit.write("broker-executor", "ticket.rejected.currency", {
+            proposalId,
+            ticketId,
+            ownerId: proposal.ownerId,
+            symbol: executionSymbol || proposal.symbol,
+            reason: "non_usd_order_notional_unconvertible"
+          });
+          sendJson(res, 400, {
+            error: "自动执行仅接受显式 .US 美股代码；当前提案限价无法可靠换算为美元，已在创建执行记录和调用券商前拒绝。"
+          });
+          return;
+        }
 
         // Server-built ticket: symbol/side/quantity/limitPrice/ownerId ALWAYS
         // come from the authoritative proposal row, never from the request
         // body (plan: "metadata 风险参数不再信 body verbatim").
         const submittedAt = nowDate().toISOString();
-        const notionalUsd = proposal.quantity * proposal.limitPrice;
-        const ticket: OrderTicket = {
-          id: ticketId,
-          source: "proposals-cli",
-          submittedAt,
-          environment: "paper",
-          assetClass: "stock",
-          symbol: proposal.symbol,
-          side: proposal.side,
-          quantity: proposal.quantity,
-          conviction: proposal.confidence === "high" ? "high" : "normal",
-          notionalUsd,
-          ownerId: proposal.ownerId,
-          proposalId: proposal.id,
-          // executeLongbridgePaperOrder derives its submission price from
-          // marketSnapshot.ask/last (buy) or bid/last (sell) - this is a
-          // limit order at the proposal's own limit_price, so that price is
-          // supplied directly as bid/ask/last rather than sourced from a
-          // live quote (which this hardened path deliberately does not
-          // fetch - the price was already fixed at proposal-approval time).
-          marketSnapshot: {
-            bid: proposal.limitPrice,
-            ask: proposal.limitPrice,
-            last: proposal.limitPrice,
-            timestamp: submittedAt
-          }
-        };
+        const ticket = buildTicketFromProposal(proposal, ticketId, submittedAt);
         assertOrderTicket(ticket);
 
         const boundaryRejection = rejectDisabledExecution(ticket);
@@ -409,8 +712,8 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         // owner's own OPEN (not yet filled/cancelled/rejected) orders ----
         let riskFacts = readLatestOfficialPaperRiskFactsForOwner(
           proposal.ownerId,
-          proposal.symbol,
-          executionContext.mode === "legacy-global"
+          ticket.symbol,
+          executionContext.mode
         );
         // FIX 1 (order-splitting naked short): the snapshot's held quantity
         // does not see this owner's own RESTING sell orders yet - without
@@ -424,14 +727,18 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         if (proposal.side === "sell" && riskFacts?.heldQuantityForSymbol !== undefined) {
           const openSellQuantity = officialPaperOrders.sumOpenSellQuantityForOwnerSymbol(
             proposal.ownerId,
-            proposal.symbol
+            ticket.symbol,
+            riskFacts.fetchedAt
           );
           riskFacts = {
             ...riskFacts,
             heldQuantityForSymbol: Math.max(0, riskFacts.heldQuantityForSymbol - openSellQuantity)
           };
         }
-        const openOrdersNotionalUsd = officialPaperOrders.sumOpenNotionalForOwner(proposal.ownerId);
+        const openOrdersNotionalUsd = officialPaperOrders.sumOpenNotionalForOwner(
+          proposal.ownerId,
+          riskFacts?.fetchedAt
+        );
         const dayStartIso = startOfUtcDay(nowDate()).toISOString();
         const openIdeas = officialPaperOrders.countSubmittedTodayForOwner(proposal.ownerId, dayStartIso);
         // dailyNewRiskPercent approximates "risk already committed today" by
@@ -464,7 +771,7 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
         officialPaperOrders.insertSubmitting({
           ticketId,
           ownerId: proposal.ownerId,
-          symbol: proposal.symbol,
+          symbol: ticket.symbol,
           assetClass: "stock",
           side: proposal.side,
           quantity: proposal.quantity,
@@ -535,32 +842,15 @@ export function createBrokerExecutorServer(deps: BrokerExecutorServerDeps): Serv
           localStatus: safeResult.status,
           lifecycleStage: safeResult.brokerOrderStage ?? "unknown",
           ...(safeResult.limitPrice !== undefined ? { limitPrice: safeResult.limitPrice } : {}),
-          ...(safeResult.rawBrokerPayload !== undefined ? { raw: safeResult.rawBrokerPayload } : {}),
+          raw: toJsonValue({
+            brokerPayload: safeResult.rawBrokerPayload ?? null,
+            recoveryExecutionResult: safeResult
+          }),
           notes: safeResult.reasons,
           observedAt
         });
 
-        const reportId = createId("report");
-        reports.save({
-          id: reportId,
-          category: "trade",
-          // C1 (2026-07-28 review): stamp the owner at the write. This row
-          // describes ONE member's fill, and until schema v17 it was stored
-          // with no owner at all - which is what let the public daily/weekly
-          // print every member's order flow (nothing downstream had an owner
-          // dimension to filter on, and the attribution is unrecoverable once
-          // the row is written without it). `proposal.ownerId` is the same
-          // server-derived owner the ticket and the lifecycle row already use;
-          // never a request-body ownerId.
-          ownerId: proposal.ownerId,
-          title: `${ticket.symbol} 执行报告`,
-          body: buildExecutionReportBody(ticket, safeResult),
-          metadata: buildExecutionReportMetadata(ticket, proposalId, safeResult),
-          createdAt: new Date().toISOString()
-        });
-
-        proposals.markExecuted(proposal.id, ticketId);
-        audit.write("broker-executor", "ticket.executed", { proposalId, ticketId, result: safeResult, reportId });
+        const reportId = ensureExecutionCompletion(proposal, ticket, safeResult);
 
         sendJson(res, 200, { ...safeResult, ticketId, proposalId, reportId, risk });
         return;

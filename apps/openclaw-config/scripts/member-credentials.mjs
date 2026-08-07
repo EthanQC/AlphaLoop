@@ -23,7 +23,17 @@
 // it just means that member has no linked broker account yet (the common
 // case for every member today). Callers degrade to "this member has no
 // account" (loadMemberCredentials returns null), never throw.
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -45,7 +55,12 @@ const LONGBRIDGE_CREDENTIAL_KEYS = [
   "LONGBRIDGE_REGION",
   "LONGPORT_APP_KEY",
   "LONGPORT_APP_SECRET",
-  "LONGPORT_ACCESS_TOKEN"
+  "LONGPORT_ACCESS_TOKEN",
+  "LONGPORT_REGION"
+];
+const GLOBAL_AUTH_KEYS_TO_STRIP = [
+  ...LONGBRIDGE_CREDENTIAL_KEYS,
+  "LONGBRIDGE_OPENAPI_TOKEN_PATH"
 ];
 
 /**
@@ -61,14 +76,33 @@ export function resolveCredentialsRoot(rootDir) {
 }
 
 /**
+ * Returns true only when the credential root is missing or contains no
+ * credential-bearing/suspicious entries. This is the compatibility gate for
+ * the ambient legacy account: once any member credential (including an
+ * inactive/unknown member) or symlink exists, callers must not silently read
+ * the process-global account for a different active member.
+ */
+export function isMemberCredentialTreeEmpty({ rootDir } = {}) {
+  const root = resolveCredentialsRoot(rootDir);
+  if (!pathEntryExists(root)) {
+    return true;
+  }
+  assertSecureDirectory(root, "member credentials root");
+  // The active-member loader decides which known directory is usable. This
+  // gate answers a narrower safety question: may callers fall back to the
+  // ambient shared account? Only a literally empty root is unambiguous;
+  // unknown/partial directories and ordinary files are configuration state,
+  // not permission to silently select another account.
+  return readdirSync(root, { withFileTypes: true }).length === 0;
+}
+
+/**
  * @typedef {object} MemberCredentials
  * @property {Record<string, string>} env - LONGBRIDGE_* / LONGPORT_* values parsed from
  *   the member's longbridge.env, ready to merge into a subprocess env.
  * @property {{home: string, rateLimitDir: string}} cachePaths - per-member
  *   isolated cache directories (created on disk by this function so a
  *   caller can use them immediately).
- * @property {string[]} [warnings] - present only when non-empty (matches
- *   this codebase's existing warnings-array convention, e.g. proposals.mjs).
  */
 
 /**
@@ -77,12 +111,11 @@ export function resolveCredentialsRoot(rootDir) {
  * member has no credentials directory/file at all - "this member has no
  * linked broker account" is an entirely normal, common state, not an error.
  *
- * A credentials file whose permissions are wider than owner-only (i.e. any
- * group/other bit set - `mode & 0o077 !== 0`) is NOT blocked - trading
- * secrets on a misconfigured filesystem are still usable, this is a
- * defense-in-depth warning, not a hard gate - but the returned object
- * carries a `warnings` entry so a caller (a future doctor/audit script, or
- * just this function's own console output) can surface it.
+ * Once a credential path exists, every filesystem check is fail-closed: the
+ * member directory must be a real owner-only directory; longbridge.env must
+ * be a real owner-only file owned by this process uid; and the file is opened
+ * with O_NOFOLLOW and compared with its pre-open inode to close symlink/TOCTOU
+ * gaps. A missing file is still the ordinary "member has no account" signal.
  *
  * @param {string} memberId
  * @param {{rootDir?: string}} [options]
@@ -93,29 +126,19 @@ export function loadMemberCredentials(memberId, { rootDir } = {}) {
     throw new Error(`Unsafe member id for credentials lookup: ${JSON.stringify(memberId)}`);
   }
   const root = resolveCredentialsRoot(rootDir);
+  if (!pathEntryExists(root)) {
+    return null;
+  }
+  assertSecureDirectory(root, "member credentials root");
   const memberDir = join(root, memberId);
   const envPath = join(memberDir, "longbridge.env");
 
-  if (!existsSync(envPath)) {
+  if (!pathEntryExists(envPath)) {
     return null;
   }
 
-  const warnings = [];
-  try {
-    const stats = statSync(envPath);
-    // 0o077 = any group or other permission bit (read/write/execute). An
-    // owner-only file is 0o600/0o400/... - `mode & 0o077 === 0`.
-    if ((stats.mode & 0o077) !== 0) {
-      warnings.push(`凭据文件权限过宽（非仅所有者可读）：${envPath}（建议 chmod 600）`);
-    }
-  } catch {
-    // A stat failure right after existsSync succeeded (e.g. TOCTOU race, a
-    // permissions-only edge case) does not itself invalidate the read below -
-    // the actual readFileSync call is the authoritative success/failure.
-  }
-
-  const raw = readFileSync(envPath, "utf8");
-  const parsed = parseEnvText(raw);
+  assertSecureDirectory(memberDir, "member credentials directory");
+  const parsed = readSecureCredentialFile(envPath);
 
   const env = {};
   for (const key of LONGBRIDGE_CREDENTIAL_KEYS) {
@@ -128,19 +151,12 @@ export function loadMemberCredentials(memberId, { rootDir } = {}) {
     home: join(memberDir, ".longbridge-home"),
     rateLimitDir: join(memberDir, "rate-limit")
   };
-  mkdirSync(cachePaths.home, { recursive: true, mode: 0o700 });
-  mkdirSync(cachePaths.rateLimitDir, { recursive: true, mode: 0o700 });
-  // An earlier monitor version created these with the ambient umask (often
-  // 0755). They contain account-specific CLI/rate-limit state and are managed
-  // exclusively by this loader, so tighten an existing directory as well as
-  // setting the creation mode for a new one.
-  chmodSync(cachePaths.home, 0o700);
-  chmodSync(cachePaths.rateLimitDir, 0o700);
+  ensureSecureDirectory(cachePaths.home, "member Longbridge cache directory");
+  ensureSecureDirectory(cachePaths.rateLimitDir, "member rate-limit directory");
 
   return {
     env,
-    cachePaths,
-    ...(warnings.length > 0 ? { warnings } : {})
+    cachePaths
   };
 }
 
@@ -168,8 +184,79 @@ export function loadMemberCredentials(memberId, { rootDir } = {}) {
  * @returns {Record<string, string>}
  */
 export function buildMemberSubprocessEnv(creds) {
-  const env = { ...process.env, ...creds.env };
+  const env = { ...process.env };
+  for (const key of GLOBAL_AUTH_KEYS_TO_STRIP) {
+    delete env[key];
+  }
+  Object.assign(env, creds.env);
   env.HOME = creds.cachePaths.home;
   env.LONGBRIDGE_RATE_LIMIT_DIR = creds.cachePaths.rateLimitDir;
+  if (!env.LONGBRIDGE_ACCESS_TOKEN?.trim() && !env.LONGPORT_ACCESS_TOKEN?.trim()) {
+    throw new Error("Member-specific Longbridge credentials do not contain an access token.");
+  }
   return env;
+}
+
+function pathEntryExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function readSecureCredentialFile(path) {
+  const before = lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`Broker credentials must be a regular file, not a symlink: ${path}.`);
+  }
+  assertOwnerOnly(before.mode, path);
+  assertOwnedByCurrentUser(before.uid, path);
+
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(path, constants.O_RDONLY | noFollow);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`Broker credentials changed during secure open: ${path}.`);
+    }
+    assertOwnerOnly(opened.mode, path);
+    assertOwnedByCurrentUser(opened.uid, path);
+    return parseEnvText(readFileSync(fd, "utf8"));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function assertSecureDirectory(path, label) {
+  const stats = lstatSync(path);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory, not a symlink: ${path}.`);
+  }
+  assertOwnerOnly(stats.mode, path);
+  assertOwnedByCurrentUser(stats.uid, path);
+}
+
+function ensureSecureDirectory(path, label) {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: false, mode: 0o700 });
+  }
+  assertSecureDirectory(path, label);
+}
+
+function assertOwnerOnly(mode, path) {
+  if ((mode & 0o077) !== 0) {
+    throw new Error(`Broker credentials permission must be owner-only (0600 file / 0700 directory): ${path}.`);
+  }
+}
+
+function assertOwnedByCurrentUser(uid, path) {
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (currentUid !== undefined && uid !== currentUid) {
+    throw new Error(`Broker credentials are not owned by the monitoring user: ${path}.`);
+  }
 }

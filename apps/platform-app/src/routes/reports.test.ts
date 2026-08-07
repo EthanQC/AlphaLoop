@@ -792,6 +792,45 @@ describe("reports routes", () => {
       }
     });
 
+    it("per-member artifacts let two owners read only their own account on the same date", async () => {
+      const otherMarkdown = PAPER_ACCOUNT_MARKDOWN
+        .replaceAll("122951.22", "220000.00")
+        .replaceAll("QQQ.US", "AAPL.US");
+      writeReport(repoRoot, "official-paper", `${DATE}-post-open--${member.id}.md`, PAPER_ACCOUNT_MARKDOWN);
+      writeReport(repoRoot, "official-paper", `${DATE}-post-open--${otherMember.id}.md`, otherMarkdown);
+      seedPaperSnapshot(db, { fetchedAt: FETCHED_AT, ownerId: member.id, reason: "post_open_pnl_per_member" });
+      seedPaperSnapshot(db, { fetchedAt: `${DATE}T13:41:00.000Z`, ownerId: otherMember.id, reason: "post_open_pnl_per_member" });
+
+      const ownerResponse = await authed(`/official-paper/${DATE}`);
+      expect(ownerResponse.status).toBe(200);
+      const ownerBody = await ownerResponse.text();
+      expect(ownerBody).toContain("122951.22");
+      expect(ownerBody).toContain("QQQ.US");
+      expect(ownerBody).not.toContain("220000.00");
+      expect(ownerBody).not.toContain("AAPL.US");
+
+      const otherResponse = await authedAsOther(`/official-paper/${DATE}`);
+      expect(otherResponse.status).toBe(200);
+      const otherBody = await otherResponse.text();
+      expect(otherBody).toContain("220000.00");
+      expect(otherBody).toContain("AAPL.US");
+      expect(otherBody).not.toContain("122951.22");
+      expect(otherBody).not.toContain("QQQ.US");
+    });
+
+    it("never falls back to a same-date legacy file when the viewer's per-member artifact is missing", async () => {
+      writePaperReport();
+      seedPaperSnapshot(db, {
+        fetchedAt: FETCHED_AT,
+        ownerId: member.id,
+        reason: "post_open_pnl_per_member"
+      });
+
+      const response = await authed(`/official-paper/${DATE}`);
+      expect(response.status).toBe(404);
+      await expectNoAccountContent(response);
+    });
+
     it("unattributable (no snapshot row at all): 403, not 200 - an unattributed file is never readable", async () => {
       writePaperReport();
 

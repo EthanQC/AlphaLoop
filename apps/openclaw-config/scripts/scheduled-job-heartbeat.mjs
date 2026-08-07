@@ -32,7 +32,8 @@
 // What it does provide, reusing job-run-log.mjs's existing storage rather
 // than forking it:
 //
-//   1. one run_log row per invocation (ok or not), which is the heartbeat;
+//   1. one run_log row per invocation (ok, failed, or neutral/not-due), which
+//      proves process liveness without erasing the last due run's health;
 //   2. an operator escalation card once a job has failed
 //      SCHEDULED_JOB_ESCALATION_THRESHOLD times in a row, throttled to one
 //      card per SCHEDULED_JOB_ESCALATION_THROTTLE_MS while the outage stays
@@ -232,10 +233,16 @@ export async function runScheduledJobWithHeartbeat(db, options, body) {
 
   const finishedAtDate = now();
   const ok = failure === null;
+  const neutral = ok
+    && result !== null
+    && typeof result === "object"
+    && result.skipped === true;
   const consecutiveFailures = ok ? 0 : previousFailures + 1;
-  const evidence = [];
+  const evidence = neutral
+    ? [{ event: "scheduled_not_due", at: finishedAtDate.toISOString(), reason: String(result.reason ?? "not_due") }]
+    : [];
 
-  if (sendCard) {
+  if (sendCard && !neutral) {
     // Marker lookups only matter when a card might actually be sent; skipping
     // them otherwise keeps the no-transport path (tests, ad-hoc CLI runs) to a
     // single INSERT.
