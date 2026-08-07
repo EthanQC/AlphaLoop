@@ -12,6 +12,7 @@ import {
   judgeReportDeliveryState,
   parseOpenClawCronList
 } from "./openclaw-runtime-doctor-probes.mjs";
+import { readListeners } from "./listener-probe.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const runtimeDir = join(repoRoot, "runtime", "openclaw-cron-runner");
@@ -90,24 +91,6 @@ try {
 
 console.log(JSON.stringify({ ok: analysis.ok, snapshot: printedSnapshot, findings: analysis.findings }, null, 2));
 process.exitCode = analysis.ok ? 0 : 1;
-
-function readListeners(port) {
-  const output = tryExec("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]);
-  return output
-    .split(/\r?\n/u)
-    .slice(1)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const parts = line.split(/\s+/u);
-      return {
-        command: parts[0],
-        pid: Number(parts[1]),
-        endpoint: parts.at(-1)
-      };
-    })
-    .filter((entry) => Number.isFinite(entry.pid));
-}
 
 function readGatewayErrorLines() {
   const paths = [
