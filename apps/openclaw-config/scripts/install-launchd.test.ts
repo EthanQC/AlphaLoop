@@ -669,6 +669,10 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     expect(commandOf("com.alphaloop.memoryd")).toContain("MEMORYD_MCP_ADMIN='0'");
     expect(commandOf("com.alphaloop.memoryd")).toContain("MEMORYD_DATA_ROOT=");
     expect(commandOf("com.openclaw.trading.cron-runner")).toContain("openclaw-cron-runner.mjs");
+    expect(plistValue(plistFor("com.openclaw.trading.cron-runner"), "StandardOutPath"))
+      .toBe(join(machine.home, "runtime", "launchd", "com.openclaw.trading.cron-runner.out.log"));
+    expect(plistValue(plistFor("com.openclaw.trading.cron-runner"), "StandardErrorPath"))
+      .toBe(join(machine.home, "runtime", "launchd", "com.openclaw.trading.cron-runner.err.log"));
     // openclaw-cron-runner.mjs spawns每个 cron job via PNPM_BIN; a daemon that
     // lost it would boot fine and then ENOENT on every job.
     expect(commandOf("com.openclaw.trading.cron-runner")).toContain("export PNPM_BIN=");

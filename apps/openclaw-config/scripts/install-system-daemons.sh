@@ -175,7 +175,7 @@ OPENCLAW_LOG_DIR="${TARGET_HOME}/.openclaw/logs"
 # an operator tailing logs/market-alerts.err.log (and every doc that names it)
 # still points at the live file after the promotion.
 REPO_LOG_DIR="${REPO_ROOT}/logs"
-RUNTIME_LAUNCHD_DIR="${REPO_ROOT}/runtime/launchd"
+RUNTIME_LAUNCHD_DIR="${DEPLOY_RUNTIME_ROOT}/launchd"
 AGENTS_DIR="${TARGET_HOME}/Library/LaunchAgents"
 # Finding M7: BACKUP_DIR is only a NAME here. It used to be `mkdir -p`'d
 # unconditionally alongside the log directories below, which meant every run
