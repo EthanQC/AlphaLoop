@@ -324,14 +324,14 @@ daemon_uses_proxy() {
 # directory, writing a plist or calling launchctl. Documented in both READMEs
 # as the thing to run before the real `sudo` invocation, because every value
 # below is derived rather than typed and getting TARGET_USER wrong installs
-# nine daemons pointing at a home directory that isn't yours.
+# ten daemons pointing at a home directory that isn't yours.
 #
-# "Nine" is this script's current daemon count (README, the run summary, the
+# "Ten" is this script's current daemon count (README, the run summary, the
 # gateway warning below), it is not written down anywhere in this file, and it
-# would go stale the day a ninth `system` row is added to the manifest. So it
+# would go stale the day an eleventh `system` row is added to the manifest. So it
 # is re-counted from the manifest itself on every `pnpm test`:
 #
-# @claim-count 9 :: apps/openclaw-config/scripts/install-launchd-ownership.txt :: ^system\s
+# @claim-count 10 :: apps/openclaw-config/scripts/install-launchd-ownership.txt :: ^system\s
 #
 # ⚠ WHAT THIS SCRIPT INTERRUPTS THAT IS NOT OURS (round 6).
 #
@@ -455,7 +455,7 @@ if [ "${SYSTEM_DIR}" = "/Library/LaunchDaemons" ] && [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Same rule as PNPM_BIN, and for a stronger reason: NODE_BIN is written into
-# four of the nine plists AND is what runs the health check that decides
+# four of the ten plists AND is what runs the health check that decides
 # whether a service's fallback may be archived. A missing node used to produce
 # four daemons that load and then ENOENT on every run; from round 6 it would
 # additionally make every verification unrunnable.
@@ -800,6 +800,21 @@ write_plist \
   "false" \
   "${SCHEDULE_OFFICIAL_PAPER_PNL}"
 
+# RSSHub is intentionally a one-shot daemon: Colima owns the container
+# runtime after this command returns, so KeepAlive must remain false. The
+# container is provisioned separately with a loopback-only port mapping; this
+# job never pulls, builds, or creates it. `&&` is deliberate: Docker is never
+# asked to use the operator's context until Colima has started successfully,
+# and a missing pre-created `rsshub` container propagates Docker's non-zero
+# exit into the launchd error log.
+write_plist \
+  "${TMP_DIR}/com.alphaloop.rsshub.plist" \
+  "com.alphaloop.rsshub" \
+  "${COMMON_ENV} cd '${REPO_ROOT}' && colima start && docker start rsshub" \
+  "${REPO_LOG_DIR}/rsshub.log" \
+  "${REPO_LOG_DIR}/rsshub.err.log" \
+  "false"
+
 # The manifest is authoritative at RUN time, not just in tests: if a daemon is
 # added above without a "system" row (or a row is added without a daemon), the
 # installer refuses to touch /Library/LaunchDaemons at all rather than leaving
@@ -882,7 +897,7 @@ done
 #
 #   Finding D4 (round 5). The header here claimed the result was "safe to
 #   interrupt anywhere: at every point the machine is either running the old
-#   copy or the new one". It was not: phase A stopped all nine user labels up
+#   copy or the new one". It was not: phase A stopped all ten user labels up
 #   front and phase B then brought the daemons up one at a time behind a settle
 #   delay, so the LAST label was stopped and not yet replaced for the whole of
 #   phase B. Measured by running the pre-round-5 script against a stub launchctl
@@ -920,7 +935,7 @@ done
 # What that does and does not promise. A service cannot be handed over without a
 # gap - the old copy must stop before the new one starts, or two copies race on
 # the same trading database and the same port. What is true: the gap belongs to
-# ONE service, the other eight keep running through it, no service is ever
+# ONE service, the other nine keep running through it, no service is ever
 # running twice, a service whose daemon does not come up HEALTHY is left running
 # the same copy it was running before this script started, and re-running from
 # the top converges (every step is idempotent; each daemon is enabled and booted
@@ -938,7 +953,7 @@ done
 
 print_gateway_warning
 
-# Which daemon replaces a given user-level label. For the nine system labels
+# Which daemon replaces a given user-level label. For the ten system labels
 # the daemon has the same name; these two rows are the only places where the
 # old user-level name and the daemon that replaces it differ.
 # Single-sourced with the node installers: launchd-agent-archive.mjs holds the
@@ -1227,7 +1242,7 @@ EOF
   fi
 
   # FATAL FOR THIS LABEL, not for the run: record it, put this service's own
-  # fallback back, and keep going so the other eight are still installed.
+  # fallback back, and keep going so the other nine are still installed.
   bootstrap_output=""
   if ! bootstrap_output="$("${LAUNCHCTL}" bootstrap system "${system_plist}" 2>&1)"; then
     record_failure "${system_label}" "launchctl bootstrap system ${system_plist}: ${bootstrap_output}"

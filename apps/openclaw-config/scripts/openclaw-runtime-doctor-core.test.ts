@@ -344,7 +344,7 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
       { label: "com.openclaw.trading.cron-runner", domain: "system", slug: "cron-runner" },
       { label: "com.openclaw.trading.official-paper.poll", domain: "system", slug: "official-paper.poll" },
       { label: "com.openclaw.trading.official-paper.pnl", domain: "system", slug: "official-paper.pnl" },
-      { label: "com.alphaloop.rsshub", domain: "user", slug: "rsshub" }
+      { label: "com.alphaloop.rsshub", domain: "system", slug: "rsshub" }
     ]);
   });
 
@@ -395,9 +395,8 @@ describe("launchd-jobs check (task H2, rebuilt for round-3 finding F2: domain-aw
     expect(messageFor("platform-app")).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
     expect(messageFor("platform-app")).not.toContain("launchd:install-backup-alerts");
     expect(messageFor("cron-runner")).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
-    // rsshub is the one job that legitimately stays user-level.
-    expect(messageFor("rsshub")).toContain("pnpm launchd:install-backup-alerts");
-    expect(messageFor("rsshub")).not.toContain("install-system-daemons.sh");
+    expect(messageFor("rsshub")).toContain("sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh");
+    expect(messageFor("rsshub")).not.toContain("launchd:install-backup-alerts");
   });
 
   it("reports nothing once every job is loaded in its own domain", async () => {
@@ -773,11 +772,11 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     expect(parsedRow.stderrPath).toBe("/Users/qingchang/AlphaLoop/logs/rsshub.err.log");
   });
 
-  it("REPLAY - the mini before the migration: six wrong_domain errors, plus the one job whose last run really failed", async () => {
+  it("REPLAY - the mini before the migration: seven wrong_domain errors, plus the one job whose last run really failed", async () => {
     // The mini's actual pre-migration layout, measured read-only on
-    // 2026-07-28: seven user-level agents (six of them labels that belong in
-    // the system domain), two real system daemons, and rsshub - which is in
-    // its correct domain but exits 1 every time, because its body is
+    // 2026-07-28: seven user-level agents (all of them labels that now belong
+    // in the system domain), two real system daemons, and rsshub - which
+    // exits 1 every time, because its body is
     // `docker start rsshub`.
     const userLabels = [
       "com.alphaloop.daily-backup",
@@ -800,18 +799,18 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     );
 
     const findings = launchdFindings(await analyzeLaunchdOnly(jobs));
-    expect(findings.filter((finding) => finding.code.endsWith(".wrong_domain"))).toHaveLength(6);
+    expect(findings.filter((finding) => finding.code.endsWith(".wrong_domain"))).toHaveLength(7);
     expect(findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "launchd-jobs.rsshub.last_run_failed", severity: "error" })
     ]));
-    expect(findings).toHaveLength(8);
+    expect(findings).toHaveLength(9);
   });
 
   it("REPLAY - after the migration, with every service actually up: zero launchd findings", async () => {
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         textFor: (_domain, label) => (label === "com.alphaloop.rsshub"
           ? MINI_RSSHUB_PRINT_OK
@@ -830,7 +829,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         textFor: () => MINI_RSSHUB_PRINT_FAILED
       })
@@ -866,7 +865,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         // Only the KeepAlive services carry the crashed-and-restarted text;
         // the scheduled ones stay on their real healthy shape, so this test
@@ -898,7 +897,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         textFor: (_domain, label) => (isResident(label)
           ? MINI_RESIDENT_PRINT_RUNNING
@@ -932,7 +931,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         textFor: (_domain, label) => (isResident(label)
           ? MINI_RESIDENT_PRINT_RUNNING.replace("\truns = 10", looping(label) ? "\truns = 918" : "\truns = 2")
@@ -975,7 +974,7 @@ describe("launchd runtime state (round-4 finding I5: 'loaded' is not 'working')"
     const jobs = doctor.readLaunchdJobStates(
       doctor.REQUIRED_LAUNCHD_JOBS,
       replayLaunchctl({
-        userLabels: ["com.alphaloop.rsshub"],
+        userLabels: [],
         systemLabels: SYSTEM_LABELS,
         textFor: (_domain, label) => (isResident(label) ? withoutExitCode : MINI_RSSHUB_PRINT_OK)
       })
@@ -2145,6 +2144,8 @@ describe("rsshub-health check (Phase 4 Task 8)", () => {
     const finding = report.findings.find((entry) => entry.code === "rsshub-health.unreachable");
     expect(finding?.severity).toBe("error");
     expect(finding?.message).toContain("logs/rsshub.err.log");
+    expect(finding?.message).toContain("colima start");
+    expect(finding?.message).toContain("docker start rsshub");
   });
 
   it("resolves the base URL from process.env.RSSHUB_BASE_URL when no snapshot override is given", async () => {

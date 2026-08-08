@@ -479,7 +479,7 @@ afterEach(() => {
 });
 
 describe("launchd ownership manifest", () => {
-  it("scopes every unattended service to the system domain and keeps only rsshub user-level", () => {
+  it("scopes every unattended service, including rsshub, to the system domain", () => {
     expect(SYSTEM_LABELS).toEqual([
       "ai.openclaw.system.gateway",
       "com.openclaw.system.trading.broker-executor",
@@ -489,9 +489,10 @@ describe("launchd ownership manifest", () => {
       "com.alphaloop.daily-backup",
       "com.openclaw.trading.cron-runner",
       "com.openclaw.trading.official-paper.poll",
-      "com.openclaw.trading.official-paper.pnl"
+      "com.openclaw.trading.official-paper.pnl",
+      "com.alphaloop.rsshub"
     ]);
-    expect(USER_LABELS).toEqual(["com.alphaloop.rsshub"]);
+    expect(USER_LABELS).toEqual([]);
   });
 
   it("gives every label exactly one row, so 'who owns this label' can never be ambiguous", () => {
@@ -519,12 +520,12 @@ describe("launchd ownership manifest", () => {
       .flatMap((line) => line.match(/\b(?:com|ai|pm2|homebrew)\.[\w.-]+\b/gu) ?? []);
     expect(commentedLabels.length).toBeGreaterThan(0);
     expect(readLaunchdOwnership().every((row) => row.scope !== "#")).toBe(true);
-    expect(launchdLabelsWithScope("user")).toEqual(["com.alphaloop.rsshub"]);
+    expect(launchdLabelsWithScope("user")).toEqual([]);
   });
 });
 
 describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
-  it("renders only the user-scoped template and refuses to write a second copy of any system-owned label", () => {
+  it("renders no system-owned template and refuses to write a user-level rsshub copy", () => {
     const fakeHome = makeTempDir("alphaloop-fake-home-");
     const stubBinDir = join(fakeHome, ".local", "bin");
     mkdirSync(stubBinDir, { recursive: true });
@@ -541,23 +542,12 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
 
     const destDir = join(fakeHome, "Library", "LaunchAgents");
 
-    // Phase 4 Task 8 (news engine deployment wiring): proves
-    // com.alphaloop.rsshub.plist.template is picked up - the script's
-    // `*.plist.template` glob already covers new files with zero script
-    // changes, but that claim is worth verifying against the REAL
-    // script/template pair rather than assuming.
+    // RSSHub is system-owned and has no user-level template, so it must never
+    // be rendered into the GUI user's LaunchAgents directory.
     const rsshubPlist = join(destDir, "com.alphaloop.rsshub.plist");
-    expect(existsSync(rsshubPlist)).toBe(true);
-    const rsshubRendered = readFileSync(rsshubPlist, "utf8");
-    expect(rsshubRendered).not.toContain("__REPO_ROOT__");
-    expect(rsshubRendered).toContain(repoRoot);
-    expect(plistValue(rsshubPlist, "Label")).toBe("com.alphaloop.rsshub");
-    expect(plistValue(rsshubPlist, "ProgramArguments.2")).toContain("docker start rsshub");
-
-    // The rendered file's destination path was actually handed to `launchctl
-    // load` (our stub), not just written to disk - proves the install path,
-    // not only the render step.
-    expect(readFileSync(launchctlLog, "utf8")).toContain(`load ${rsshubPlist}`);
+    expect(existsSync(rsshubPlist)).toBe(false);
+    const launchctlCalls = existsSync(launchctlLog) ? readFileSync(launchctlLog, "utf8") : "";
+    expect(launchctlCalls).not.toContain(`load ${rsshubPlist}`);
 
     // Task 9: platform-app / market-alerts / daily-backup are LaunchDaemons
     // now. Their templates are still on disk (install-system-daemons.sh
@@ -568,7 +558,7 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
     for (const label of [...SYSTEM_LABELS, ...RETIRED_LABELS]) {
       expect(existsSync(join(destDir, `${label}.plist`))).toBe(false);
     }
-    expect(plistLabelsIn(destDir)).toEqual(["com.alphaloop.rsshub"]);
+    expect(plistLabelsIn(destDir)).toEqual([]);
 
     // com.openclaw.gateway.plist is scoped `external` (the `openclaw` CLI owns
     // that label) - confirms the fake-HOME run still exercises that carve-out
@@ -694,6 +684,17 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     expect(commandOf("com.openclaw.trading.official-paper.poll")).toContain("official-paper-monitor.mjs' poll");
     expect(plistValue(plistFor("com.openclaw.trading.official-paper.pnl"), "StartCalendarInterval.Minute")).toBe("0");
     expect(commandOf("com.openclaw.trading.official-paper.pnl")).toContain("official-paper-monitor.mjs' pnl");
+
+    const rsshub = plistFor("com.alphaloop.rsshub");
+    expect(plistValue(rsshub, "KeepAlive")).toBe("false");
+    expect(plistValue(rsshub, "RunAtLoad")).toBe("true");
+    expect(plistValue(rsshub, "UserName")).toBe(userInfo().username);
+    expect(plistValue(rsshub, "EnvironmentVariables.HOME")).toBe(machine.home);
+    expect(plistValue(rsshub, "EnvironmentVariables.PATH")).toContain("/opt/homebrew/bin");
+    expect(commandOf("com.alphaloop.rsshub")).toContain("colima start");
+    expect(commandOf("com.alphaloop.rsshub")).toContain("colima start && docker start rsshub");
+    expect(commandOf("com.alphaloop.rsshub")).toMatch(/colima start.*docker start rsshub/u);
+    expect(commandOf("com.alphaloop.rsshub")).not.toContain("docker run");
   });
 
   it("migrates a machine that still has the old user-level agents, and is safe to re-run", () => {

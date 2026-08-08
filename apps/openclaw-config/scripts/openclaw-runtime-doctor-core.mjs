@@ -2275,20 +2275,19 @@ async function checkRsshubHealth(snapshot) {
       attempt = await fetchWithTimeout("/");
     }
   } catch (fetchError) {
-    // com.alphaloop.rsshub is the one user-domain label here. Loaded means the
-    // agent ran `docker start rsshub` at login: the container should be
-    // answering on 1200, and "it is not" is the failure that agent exists to
-    // prevent (measured on the mini: last exit code = 1, i.e. `docker start`
-    // failed and nothing noticed).
+    // com.alphaloop.rsshub is a system-domain one-shot daemon. Loaded means
+    // it has started the operator's Colima runtime and then run `docker start
+    // rsshub`: the container should be answering on 1200, and "it is not" is
+    // the failure that daemon exists to prevent.
     const severity = probeSeverityFor(snapshot, "com.alphaloop.rsshub");
     return [severity(
       "rsshub-health.unreachable",
       `RSSHub 健康检查不可达（${baseUrl}）：${describeError(fetchError)}。`
         + (severity === error
-          ? `${LOADED_BUT_UNREACHABLE_SUFFIX}com.alphaloop.rsshub 只负责 docker start，不会创建容器；`
+          ? `${LOADED_BUT_UNREACHABLE_SUFFIX}com.alphaloop.rsshub 会先运行 colima start，再运行 docker start rsshub；不会创建容器；`
             + `请看 logs/rsshub.err.log，容器不存在时用 ${RSSHUB_P10_CONTAINER_COMMAND} 重建（必须走 login shell）。`
           : `如果这台机器还没有创建过 rsshub 容器，请先完成 P10 点火：${RSSHUB_P10_CONTAINER_COMMAND}；`
-            + `如果容器已经创建过、只是这次重启后没跟着起，请跑 pnpm launchd:install-backup-alerts 安装 com.alphaloop.rsshub 任务（负责 docker start rsshub）。`)
+            + `如果容器已经创建过、只是这次重启后没跟着起，请跑 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh 安装系统域 com.alphaloop.rsshub 任务（先 colima start，再 docker start rsshub）。`)
     )];
   }
 

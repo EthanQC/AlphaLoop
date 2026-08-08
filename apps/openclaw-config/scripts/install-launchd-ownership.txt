@@ -48,15 +48,12 @@ system   com.alphaloop.daily-backup
 system   com.openclaw.trading.cron-runner
 system   com.openclaw.trading.official-paper.poll
 system   com.openclaw.trading.official-paper.pnl
-
-# com.alphaloop.rsshub stays user-level ON PURPOSE. Its whole body is
-# `docker start rsshub`, and the container runtime it talks to on the mini is
-# itself a per-user LaunchAgent (homebrew.mxcl.colima) whose socket and
-# context live under the user's ~/.colima + ~/.docker. A system daemon would
-# fire before that socket exists and die with "Cannot connect to the Docker
-# daemon"; promoting it would make the news pipeline's RSS source LESS
-# reliable, not more. It follows the runtime it depends on.
-user     com.alphaloop.rsshub
+# RSSHub must recover before a GUI login after a cold reboot. The daemon runs
+# as the operator (not root), explicitly starts that user's Colima runtime,
+# then starts the pre-created loopback-only container. `colima start` is
+# idempotent; a missing runtime or container deliberately makes the one-shot
+# job fail and leaves the error in logs/rsshub.err.log.
+system   com.alphaloop.rsshub
 
 # Superseded by com.openclaw.system.trading.broker-executor above. Kept here
 # (rather than deleted) so every installer keeps actively booting it out: a
@@ -94,7 +91,7 @@ external com.openclaw.gateway
 # That daemon is installed by `cloudflared service install`, NOT by this repo,
 # so its scope is "external" - nothing here writes or removes it. It also wins
 # on the exact axis this manifest exists for: it is a system daemon, so it
-# comes back after a reboot with no GUI login, which is why the eight labels
+# comes back after a reboot with no GUI login, which is why the ten labels
 # above were moved out of ~/Library/LaunchAgents in the first place.
 #
 # install-cloudflared-tunnel.mjs installs a DIFFERENT label

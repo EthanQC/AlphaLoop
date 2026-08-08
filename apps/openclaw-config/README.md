@@ -14,11 +14,11 @@
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
 - `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先跑两道预检（都退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）：报告投递需要的两个变量，以及「第 3 步的 sudo 要密码但这次运行没有终端」——后者不拦的话第 0/1/2 步会成功、第 3 步必然失败，而第 2 步装上的用户级 gateway 正要靠第 3 步接管走，于是 18789 上留下两个 gateway 抢端口。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
-- `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 9 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
+- `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 10 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
 - `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没通过 `launchd-health.mjs` 的 residency 判定时干脆不动，见下面「谁拥有哪个标签」第 2 条）。
 - `scripts/launchd-agent-archive.mjs`：上面那条规则的 **node 侧**实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它（shell 安装器另有一份自己的实现，见下面「谁拥有哪个标签」）。
-- `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前仅 `com.alphaloop.rsshub`），并顺带跑一次 `openclaw gateway install`。
+- `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前没有），并顺带跑一次 `openclaw gateway install`。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 - `scripts/install-cloudflared-tunnel.mjs`：给**还没有 connector 的机器**安装用户级 cloudflared 隧道（token 模式）。mini 上已经跑着系统级的 `com.cloudflare.cloudflared`，所以这条脚本在那里会拒绝执行，见下面「公网入口」。
 
@@ -81,7 +81,7 @@ pnpm official-paper:pnl
 | `retired` | 谁都不许装，所有安装脚本都会主动 bootout 掉，并**统一移进** `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`（同一个父目录、同一套时间戳命名，每次运行各建各的子目录；谁都不删除） | — |
 | `external` | 由 `openclaw` CLI 自己拥有，本仓库不碰 | — |
 
-当前只有 `com.alphaloop.rsshub` 是 `user`：它整个任务体就是 `docker start rsshub`，而它依赖的容器运行时（`homebrew.mxcl.colima`）本身就是用户级 LaunchAgent，socket 和 context 都在用户家目录下。系统 daemon 会赶在那个 socket 存在之前启动然后报 "Cannot connect to the Docker daemon"——把它提升到系统域只会让新闻源更不可靠。
+当前没有 AlphaLoop 的 `user` 标签。`com.alphaloop.rsshub` 是系统域 one-shot daemon，但通过 `UserName`/`HOME` 以操作者身份运行：它先执行幂等的 `colima start`，再执行 `docker start rsshub`，因此可在没有 GUI 登录的冷启动后恢复该用户的 Colima socket 与 Docker context。它不创建、拉取或重建容器；缺运行时或缺预创建容器都会非零退出并写入 `logs/rsshub.err.log`。
 
 ### 公网入口：`com.cloudflare.cloudflared` 才是那一个
 
@@ -91,7 +91,7 @@ mini 上只读实测：`/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`
 
 而 `install-cloudflared-tunnel.mjs` 装的是 `com.alphaloop.cloudflared-tunnel`——**另一个标签**，用户级 LaunchAgent，token 模式。名字不同意味着 launchd 不会用新的替换旧的，而是两个 connector 一起跑。所以：
 
-- **系统 daemon 赢。** 它是 root 拥有、由 `cloudflared service install` 安装的第三方产物（scope `external`，本仓库任何脚本都不写它、不删它），而且它是系统域——开机不需要图形登录就能起来，正是这轮把 8 个标签搬去 `/Library/LaunchDaemons` 的同一个理由。用户级 LaunchAgent 在这条标准上是退步。
+- **系统 daemon 赢。** 它是 root 拥有、由 `cloudflared service install` 安装的第三方产物（scope `external`，本仓库任何脚本都不写它、不删它），而且它是系统域——开机不需要图形登录就能起来，正是这轮把 10 个标签搬去 `/Library/LaunchDaemons` 的同一个理由。用户级 LaunchAgent 在这条标准上是退步。
 - `install-cloudflared-tunnel.mjs` 现在会在 `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist` 存在时拒绝安装（消息里给出改 `/etc/cloudflared/config.yml` + `launchctl kickstart` 的正确做法），`--force` 才能越过。判断放在 `ensureCloudflaredInstalled()` 之前，所以拒绝时不会顺手 `brew install` 一个包。`--dry-run` 的 JSON 里多了 `systemDaemonPresent` / `wouldRefuse` 两个字段。
 - 它的自己那个标签**故意不写进清单**：装了系统 daemon 的机器上它永远不该被安装，而没有 connector 的新机器由操作者显式选路径。
 - doctor 不探测这两个标签中的任何一个（`external` 行不参与 `launchd-jobs.*`）。隧道健康只能手工确认：`curl -sS -o /dev/null -w '%{http_code}\n' https://reports.qingverse.com/health`。
@@ -99,10 +99,10 @@ mini 上只读实测：`/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`
 ### 三个安装脚本各自做什么（2026-07-28 之后）
 
 ```bash
-# 1) 只安装 scope=user 的模板（当前 = com.alphaloop.rsshub），外加 openclaw gateway install
+# 1) 当前没有 scope=user 模板；此命令只执行 openclaw gateway install
 pnpm launchd:install-backup-alerts
 
-# 2) 安装全部 8 个 scope=system 的 daemon；先干跑确认装给谁，再 sudo 真装
+# 2) 安装全部 10 个 scope=system 的 daemon；先干跑确认装给谁，再 sudo 真装
 PRINT_CONFIG_ONLY=1 zsh apps/openclaw-config/scripts/install-system-daemons.sh
 sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh
 
@@ -141,7 +141,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.alphaloop.memoryd.pli
 
   这个顺序有一个 2026-07-30 才修掉的代价（task 28，mini 上完整跑 `deploy.sh` 两次实测两次都挂在这）：`install-launchd.sh` 刚把用户级 gateway **启动**起来，几十秒后 `install-system-daemons.sh` 就要把它 bootout——而 `launchctl bootout` 对一个不立刻响应 SIGTERM 的进程是**立即返回、后台慢慢收**的（gateway 自己的 plist 写着 `ExitTimeOut=20`；真实 launchd 实测：bootout 35ms 返回 0，`launchctl print` 之后还能连续答 20.2 秒，pid 全程不变——是 drain，不是 KeepAlive 复活）。旧代码 bootout 之后**立刻**复查一次 `launchctl print`，于是刚被启动的 gateway 必然还在，整次安装被判失败；15 分钟后从第 3 步 resume 反而能过，因为 drain 早就结束了。现在 bootout 之后按真实截止时间轮询（`BOOTOUT_SETTLE_SECONDS`，默认 30 秒 > ExitTimeOut 20 秒），等到才算停、等不到才按「bootout 之后还活着」失败——完整跑第一次就能过，卡死的 agent 依旧按第 4 条拒绝交接。
 
-以前这里还有第二条：「`launchd:install-user` 最好排在 daemon 安装之后，因为前者 `rmSync` 直接删、后者移进备份目录」。那条约束**是靠文档执行的，而文档执行不了**——第 5 轮 D1 实测到的正是它失效的样子：`install-system-daemons.sh` 因为某个 daemon 起不来而有意保留了它的用户级 plist、退出码 1，紧接着的 `pnpm launchd:install-user` 把这份 plist 无备份删掉、退出码 0。`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 三个标签在本仓库里没有任何模板（`apps/openclaw-config/launchd/` 只有 platform-app / market-alerts / daily-backup / rsshub 四个模板加两个历史 plist），删掉就再也生成不出来，而 mini 上这三份 plist 现在都还在。
+以前这里还有第二条：「`launchd:install-user` 最好排在 daemon 安装之后，因为前者 `rmSync` 直接删、后者移进备份目录」。那条约束**是靠文档执行的，而文档执行不了**——第 5 轮 D1 实测到的正是它失效的样子：`install-system-daemons.sh` 因为某个 daemon 起不来而有意保留了它的用户级 plist、退出码 1，紧接着的 `pnpm launchd:install-user` 把这份 plist 无备份删掉、退出码 0。`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 三个标签在本仓库里没有任何模板（`apps/openclaw-config/launchd/` 只有 platform-app / market-alerts / daily-backup 三个历史模板加两个历史 plist），删掉就再也生成不出来，而 mini 上这三份 plist 现在都还在。
 
 现在这条约束由代码保证，不再由顺序保证。三个安装器遵守同一条规则，但**不是同一份代码**：两个 node 安装器共用 `scripts/launchd-agent-archive.mjs`；shell 安装器（`install-system-daemons.sh`）是独立的 zsh 实现，只在「daemon 到底算不算起来了」这一步上和它们、和 doctor 共用 `scripts/launchd-health.mjs`，另外它的 `supersedes()` 与该模块的 `SYSTEM_DAEMON_SUPERSEDING` 由 `install-launchd.test.ts` 断言相等——
 
@@ -235,7 +235,7 @@ OPENCLAW_PROXY_LABELS="ai.openclaw.system.gateway com.openclaw.trading.cron-runn
 
 ### 定时任务的 run_log 心跳与连续失败升级（Task 24）
 
-launchd 的 8 个 system daemon 里有 4 个是**定时任务**（其余是常驻服务）：`com.alphaloop.market-alerts`（每 300 秒）、`com.alphaloop.daily-backup`（每天 05:30）、`com.openclaw.trading.official-paper.poll`（每小时 :30）、`com.openclaw.trading.official-paper.pnl`（每小时 :00）。
+launchd 的 10 个 system daemon 里有 4 个是**定时任务**（其余包含常驻服务与 RSSHub one-shot）：`com.alphaloop.market-alerts`（每 300 秒）、`com.alphaloop.daily-backup`（每天 05:30）、`com.openclaw.trading.official-paper.poll`（每小时 :30）、`com.openclaw.trading.official-paper.pnl`（每小时 :00）。
 
 2026-07-29 在 mini 上只读实测：
 
@@ -327,11 +327,11 @@ zsh -lc 'docker start rsshub 2>/dev/null || docker run -d --name rsshub -p 127.0
 - **`zsh -lc` 不能省。** 非 login shell 里 `command -v docker` 什么都不返回（`zsh:1: command not found: docker`），login shell 里才是 `/opt/homebrew/bin/docker`。用 ssh 或脚本远程执行时默认拿到的正是前者。
 - **不要用裸 `docker run`。** 容器已存在时它以 "The container name /rsshub is already in use" 非零退出，把一次正常的重跑变成看起来像失败的部署。`docker start` 在容器已在运行时空转返回 0、容器停止时把它拉起来、容器不存在时返回 1，所以上面的 `||` 写法三种状态都对。
 
-容器创建后，`com.alphaloop.rsshub` launchd 任务（`launchd:install-backup-alerts` 一并安装）负责在每次机器重启后跑 `docker start rsshub`，确保容器继续常驻——它不创建、不重建容器，容器不存在时这一步会失败（`logs/rsshub.err.log` 里会看到 "No such container"），此时需要回去手动跑一遍上面那条命令。
+容器创建后，系统域 `com.alphaloop.rsshub` 任务（由 `sudo zsh apps/openclaw-config/scripts/install-system-daemons.sh` 安装）负责在每次机器重启后先跑 `colima start`、成功后再跑 `docker start rsshub`，确保容器继续常驻——它不创建、不拉取、不重建容器，Colima 或容器不存在时这一步会非零失败（`logs/rsshub.err.log`），此时先修复运行时或手动跑一遍上面那条容器点火命令。
 
 `pnpm openclaw:runtime:doctor` 覆盖两个新闻引擎检查项：
 
-- `rsshub-health`：GET `${RSSHUB_BASE_URL 或默认值}/healthz`（404 时回退 `/`）——容器不可达时，`com.alphaloop.rsshub` 没装是 warn（点名上面的 P10 命令和 `pnpm launchd:install-backup-alerts`），已装则是 error（那个 agent 的全部职责就是 `docker start rsshub`）；返回非 200 状态码一律 error。见上面「回环探针的严重级取决于 launchd 怎么说」。
+- `rsshub-health`：GET `${RSSHUB_BASE_URL 或默认值}/healthz`（404 时回退 `/`）——容器不可达时，系统域 `com.alphaloop.rsshub` 没装是 warn（点名上面的 P10 命令和系统安装器），已装则是 error（该 daemon 的职责是先 `colima start`、再 `docker start rsshub`）；返回非 200 状态码一律 error。见上面「回环探针的严重级取决于 launchd 怎么说」。
 - `news-engine-health`：`news_events` 表最新一条 `last_published_at` 距今超过 48 小时且表内已有数据（非全新库）→ warn「新闻引擎超过 48 小时无新事件」；全新库（0 条事件）不报告。
 
 ### 日报/周报/个股分析调度：已迁移到 OpenClaw cron（2026-07-14）
