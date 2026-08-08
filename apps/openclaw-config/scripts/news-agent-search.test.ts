@@ -187,6 +187,36 @@ describe("runL2TopicSearch", () => {
     expect(result.results[0].publishedAt).toBeNull();
   });
 
+  it("normalizes an L2 timestamp more than five minutes in the future to unknown", async () => {
+    const now = Date.parse("2026-08-08T10:00:00.000Z");
+    const searchBackend = backendReturning([[rawItem({ publishedAt: "2026-08-08T10:06:00.000Z" })], [], [], []]);
+
+    const result = await agentSearch.runL2TopicSearch({
+      searchBackend,
+      budget: 4,
+      symbols: ["AAPL.US"],
+      l1Titles: [],
+      now: () => now
+    });
+
+    expect(result.results[0].publishedAt).toBeNull();
+  });
+
+  it("keeps a parseable L2 timestamp in the past", async () => {
+    const now = Date.parse("2026-08-08T10:00:00.000Z");
+    const searchBackend = backendReturning([[rawItem({ publishedAt: "2026-08-08T09:59:00.000Z" })], [], [], []]);
+
+    const result = await agentSearch.runL2TopicSearch({
+      searchBackend,
+      budget: 4,
+      symbols: ["AAPL.US"],
+      l1Titles: [],
+      now: () => now
+    });
+
+    expect(result.results[0].publishedAt).toBe("2026-08-08T09:59:00.000Z");
+  });
+
   it("degrades and keeps partial results when the backend throws mid-run", async () => {
     let call = 0;
     const searchBackend = vi.fn(async () => {

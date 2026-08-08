@@ -101,12 +101,16 @@ function coerceImpact(rawImpact) {
 // unparseable/missing value must NEVER be fabricated as Date.now(), matching
 // the #31 audit-fix rule report-news.mjs/news-engine.mjs already follow for
 // L1 articles.
-function parsePublishedAt(value) {
+function parsePublishedAt(value, now = () => Date.now()) {
   if (value === null || value === undefined || value === "") {
     return null;
   }
   const ts = new Date(String(value)).getTime();
-  return Number.isFinite(ts) ? new Date(ts).toISOString() : null;
+  if (!Number.isFinite(ts)) {
+    return null;
+  }
+  const currentTime = Number(now());
+  return Number.isFinite(currentTime) && ts > currentTime + 5 * 60_000 ? null : new Date(ts).toISOString();
 }
 
 // Builds the audit-only `rawText` field - see the module header's
@@ -136,7 +140,7 @@ function wrapExternalText(rawItem) {
 // coerceImpact above), and title/summary_zh/evidence_quote/impact.reason -
 // every field this module lets a report render - are funneled through
 // defuseMarkdownInText (Task 1 #29) before this function returns.
-function validateResultItem(rawItem) {
+function validateResultItem(rawItem, { now = () => Date.now() } = {}) {
   const url = String(rawItem?.url ?? "").trim();
   if (!url) {
     return { dropped: "no_url" };
@@ -151,7 +155,7 @@ function validateResultItem(rawItem) {
     title: defuseMarkdownInText(String(rawItem?.title ?? "").trim()),
     publisher: String(rawItem?.publisher ?? "").trim() || "未知来源",
     url,
-    publishedAt: parsePublishedAt(rawItem?.publishedAt),
+    publishedAt: parsePublishedAt(rawItem?.publishedAt, now),
     summary_zh: defuseMarkdownInText(summaryZhRaw.trim()),
     impact: coerceImpact(rawItem?.impact),
     evidence_quote: defuseMarkdownInText(String(rawItem?.evidence_quote ?? "").trim()),
@@ -184,7 +188,7 @@ function validateResultItem(rawItem) {
 // attempted - "each backend call decrements" is unconditional on the
 // call's outcome), which is why `callsUsed` is incremented before the
 // backend is actually invoked, not after a successful resolution.
-async function executeQueries(searchBackend, queries, budget) {
+async function executeQueries(searchBackend, queries, budget, { now = () => Date.now() } = {}) {
   const list = Array.isArray(queries) ? queries : [];
   const safeBudget = Math.max(0, Number(budget) || 0);
 
@@ -212,7 +216,7 @@ async function executeQueries(searchBackend, queries, budget) {
 
     const rawResults = Array.isArray(response?.results) ? response.results : [];
     for (const rawItem of rawResults) {
-      const outcome = validateResultItem(rawItem);
+      const outcome = validateResultItem(rawItem, { now });
       if (outcome.dropped === "no_url") {
         droppedNoUrl += 1;
       } else if (outcome.dropped === "not_chinese") {
@@ -321,11 +325,11 @@ function planL2Queries({ symbols, l1Titles, budget }) {
 //   droppedNoUrl: number, droppedNotChinese: number,
 //   degraded: boolean, degradedReason: string|null
 // }}
-export async function runL2TopicSearch({ searchBackend, budget, symbols = [], l1Titles = [] } = {}) {
+export async function runL2TopicSearch({ searchBackend, budget, symbols = [], l1Titles = [], now = () => Date.now() } = {}) {
   const safeBudget = Math.max(0, Number(budget) || 0);
   const { plan, idealSize } = planL2Queries({ symbols, l1Titles, budget: safeBudget });
 
-  const execution = await executeQueries(searchBackend, plan, safeBudget);
+  const execution = await executeQueries(searchBackend, plan, safeBudget, { now });
 
   return {
     results: execution.results,

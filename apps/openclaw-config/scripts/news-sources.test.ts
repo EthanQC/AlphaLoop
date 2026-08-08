@@ -211,6 +211,116 @@ describe("fetchFinnhubCompanyNews", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("retries a transient abort and reacquires the limiter before returning the recovered articles", async () => {
+    const limiter = { acquire: vi.fn() };
+    let requestCount = 0;
+    const fetchImpl = vi.fn(async () => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        throw new Error("This operation was aborted");
+      }
+      return okJsonResponse([
+        { id: 3, headline: "Recovered company news", url: "https://example.com/recovered", datetime: 1_784_000_000 }
+      ]);
+    });
+
+    const articles = await sources.fetchFinnhubCompanyNews("AAPL.US", {
+      apiKey: "secret-finnhub-key",
+      fetchImpl,
+      limiter,
+      attempts: 2
+    });
+
+    expect(articles.map((article) => article.title)).toEqual(["Recovered company news"]);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(limiter.acquire).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a Finnhub 5xx response and returns the later successful response", async () => {
+    let requestCount = 0;
+    const fetchImpl = vi.fn(async () => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return failResponse(503, "Service Unavailable");
+      }
+      return okJsonResponse([
+        { id: 4, headline: "Recovered after 5xx", url: "https://example.com/recovered-5xx", datetime: 1_784_000_000 }
+      ]);
+    });
+
+    const articles = await sources.fetchFinnhubCompanyNews("AAPL.US", {
+      apiKey: "secret-finnhub-key",
+      fetchImpl,
+      attempts: 2
+    });
+
+    expect(articles.map((article) => article.title)).toEqual(["Recovered after 5xx"]);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("times out a stalled Finnhub response body and retries with a fresh request", async () => {
+    let requestCount = 0;
+    const fetchImpl = vi.fn(async () => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => new Promise(() => {})
+        };
+      }
+      return okJsonResponse([
+        { id: 5, headline: "Recovered after stalled body", url: "https://example.com/recovered-body", datetime: 1_784_000_000 }
+      ]);
+    });
+    let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+    const watchdog = new Promise<never>((_resolve, reject) => {
+      watchdogTimer = setTimeout(() => reject(new Error("test watchdog: response body deadline did not fire")), 1_500);
+    });
+
+    try {
+      const articles = await Promise.race([
+        sources.fetchFinnhubCompanyNews("AAPL.US", {
+          apiKey: "secret-finnhub-key",
+          fetchImpl,
+          attempts: 2,
+          timeoutMs: 10
+        }),
+        watchdog
+      ]);
+
+      expect(articles.map((article) => article.title)).toEqual(["Recovered after stalled body"]);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      clearTimeout(watchdogTimer);
+    }
+  });
+
+  it("falls back to the finite default attempt count when attempts is Infinity", async () => {
+    let requestCount = 0;
+    const fetchImpl = vi.fn(async () => {
+      requestCount += 1;
+      return failResponse(requestCount < 3 ? 503 : 429, requestCount < 3 ? "Service Unavailable" : "Too Many Requests");
+    });
+
+    await expect(
+      sources.fetchFinnhubCompanyNews("AAPL.US", { apiKey: "secret-finnhub-key", fetchImpl, attempts: Infinity })
+    ).rejects.toThrow(/503/);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a Finnhub 429 response", async () => {
+    const fetchImpl = vi.fn(async () => failResponse(429, "Too Many Requests"));
+
+    await expect(
+      sources.fetchFinnhubCompanyNews("AAPL.US", { apiKey: "secret-finnhub-key", fetchImpl, attempts: 3 })
+    ).rejects.toThrow(/429/);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("redacts the API key out of an error thrown by a rejecting fetchImpl", async () => {
     const apiKey = "secret-finnhub-key-abc123";
     const fetchImpl = vi.fn(async () => {
@@ -238,6 +348,7 @@ describe("fetchFinnhubCompanyNews", () => {
     }
     expect(caught).toBeInstanceOf(Error);
     expect(String(caught?.message)).not.toContain(apiKey);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -357,6 +468,46 @@ describe("collectL1News", () => {
       longbridgeNewsFetcher
     });
 
+    expect(result.sourceHealth["finnhub:AAPL.US"]).toBe("ok");
+    expect(result.articles.some((article) => article.source === "finnhub")).toBe(true);
+  });
+
+  it("uses REPORT_NEWS_FETCH_ATTEMPTS and REPORT_NEWS_FETCH_TIMEOUT_MS for Finnhub while other sources continue", async () => {
+    let finnhubRequests = 0;
+    const fetchImpl = vi.fn((url, init) => {
+      const href = String(url);
+      if (href.includes("finnhub.io")) {
+        finnhubRequests += 1;
+        if (finnhubRequests === 1) {
+          return new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(new Error("This operation was aborted")));
+          });
+        }
+        return Promise.resolve(okJsonResponse([
+          { id: 10, headline: "Finnhub retry succeeds", url: "https://example.com/finnhub-retry", datetime: 1_784_000_000 }
+        ]));
+      }
+      if (href.includes("127.0.0.1:1200")) {
+        return Promise.resolve(okTextResponse(rssXml([{ title: "RSSHub 条目", link: `https://example.com/rsshub-${Math.random()}` }])));
+      }
+      if (href.includes("query2.finance.yahoo.com")) {
+        return Promise.resolve(okJsonResponse({ news: [] }));
+      }
+      return Promise.resolve(okTextResponse(rssXml([])));
+    });
+
+    const result = await sources.collectL1News({
+      symbols: ["AAPL.US"],
+      env: {
+        FINNHUB_API_KEY: "finnhub-key-123",
+        REPORT_NEWS_FETCH_ATTEMPTS: "2",
+        REPORT_NEWS_FETCH_TIMEOUT_MS: "10"
+      },
+      fetchImpl,
+      longbridgeNewsFetcher: async () => []
+    });
+
+    expect(finnhubRequests).toBe(2);
     expect(result.sourceHealth["finnhub:AAPL.US"]).toBe("ok");
     expect(result.articles.some((article) => article.source === "finnhub")).toBe(true);
   });

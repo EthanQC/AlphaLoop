@@ -217,14 +217,17 @@ function redactSecret(text, secret) {
 // This is deliberately whole-function rather than per-throw-site redaction:
 // a future error path added here without remembering to redact it
 // individually would otherwise be a silent key leak.
-export async function fetchFinnhubCompanyNews(symbol, { apiKey, fetchImpl = fetch, limiter, timeoutMs = 12_000 } = {}) {
+export async function fetchFinnhubCompanyNews(symbol, {
+  apiKey,
+  fetchImpl = fetch,
+  limiter,
+  attempts = 2,
+  timeoutMs = 12_000
+} = {}) {
   const key = String(apiKey ?? "").trim();
   try {
     if (!key) {
       throw new Error("Finnhub API key is required (FINNHUB_API_KEY not set).");
-    }
-    if (limiter) {
-      limiter.acquire(`company-news:${symbol}`);
     }
 
     const now = new Date();
@@ -233,18 +236,41 @@ export async function fetchFinnhubCompanyNews(symbol, { apiKey, fetchImpl = fetc
     url.searchParams.set("from", formatFinnhubDate(new Date(now.getTime() - MS_PER_DAY)));
     url.searchParams.set("to", formatFinnhubDate(now));
 
-    const response = await fetchResponseWithTimeout(url, {
-      fetchImpl,
-      timeoutMs,
-      headers: { "X-Finnhub-Token": key }
-    });
-    if (!response.ok) {
-      throw new Error(`Finnhub HTTP ${response.status} ${response.statusText} for ${symbol}`);
-    }
+    const parsedAttempts = Number(attempts);
+    const maxAttempts = Number.isFinite(parsedAttempts) ? Math.max(1, Math.floor(parsedAttempts)) : 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let result;
+      if (limiter) {
+        limiter.acquire(`company-news:${symbol}`);
+      }
+      try {
+        result = await fetchFinnhubJsonWithTimeout(url, {
+          fetchImpl,
+          timeoutMs,
+          headers: { "X-Finnhub-Token": key }
+        });
+      } catch (error) {
+        if (attempt < maxAttempts && isRetryableFinnhubTransportError(error)) {
+          await sleep(500 * attempt);
+          continue;
+        }
+        throw error;
+      }
 
-    const payload = await response.json();
-    const rows = Array.isArray(payload) ? payload : [];
-    return rows.map((row) => normalizeFinnhubArticle(symbol, row)).filter(Boolean);
+      const { response, payload } = result;
+      if (!response.ok) {
+        const error = new Error(`Finnhub HTTP ${response.status} ${response.statusText} for ${symbol}`);
+        if (response.status >= 500 && attempt < maxAttempts) {
+          await sleep(500 * attempt);
+          continue;
+        }
+        throw error;
+      }
+
+      const rows = Array.isArray(payload) ? payload : [];
+      return rows.map((row) => normalizeFinnhubArticle(symbol, row)).filter(Boolean);
+    }
+    throw new Error(`Finnhub company-news exhausted ${maxAttempts} attempts for ${symbol}`);
   } catch (error) {
     throw new Error(redactSecret(String(error?.message ?? error), key));
   }
@@ -431,6 +457,7 @@ export async function collectL1News({
   const rsshubBaseUrl = String(env?.RSSHUB_BASE_URL ?? "").trim() || DEFAULT_RSSHUB_BASE_URL;
   const finnhubApiKey = String(env?.FINNHUB_API_KEY ?? "").trim();
   const limiter = finnhubLimiter ?? createFinnhubRateLimiter();
+  const finnhubRetry = newsFetchRetryOptions(env, fetchImpl);
 
   const warnings = [];
   const sourceHealth = {};
@@ -451,7 +478,13 @@ export async function collectL1News({
       tasks.push({
         healthKey: `finnhub:${symbol}`,
         warningLabel: `${symbol} Finnhub 新闻`,
-        promise: fetchFinnhubCompanyNews(symbol, { apiKey: finnhubApiKey, fetchImpl, limiter })
+        promise: fetchFinnhubCompanyNews(symbol, {
+          apiKey: finnhubApiKey,
+          fetchImpl,
+          limiter,
+          attempts: finnhubRetry.attempts,
+          timeoutMs: finnhubRetry.timeoutMs
+        })
       });
     }
   }
@@ -523,6 +556,47 @@ async function fetchResponseWithTimeout(url, { fetchImpl = fetch, timeoutMs = 12
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, headers ? { signal: controller.signal, headers } : { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+class FinnhubRequestTimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`Finnhub request timed out after ${timeoutMs}ms`);
+    this.name = "FinnhubRequestTimeoutError";
+  }
+}
+
+function isRetryableFinnhubTransportError(error) {
+  if (error instanceof FinnhubRequestTimeoutError || error?.name === "AbortError" || error?.name === "TypeError") {
+    return true;
+  }
+  return /\b(abort(?:ed)?|network|fetch|socket|connection|timeout|reset)\b/iu.test(String(error?.message ?? error));
+}
+
+async function fetchFinnhubJsonWithTimeout(url, { fetchImpl = fetch, timeoutMs = 12_000, headers } = {}) {
+  const requestedTimeout = Number(timeoutMs);
+  const deadlineMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? requestedTimeout : 12_000;
+  const controller = new AbortController();
+  let timeout;
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new FinnhubRequestTimeoutError(deadlineMs));
+    }, deadlineMs);
+  });
+
+  try {
+    const response = await Promise.race([
+      fetchImpl(url, headers ? { signal: controller.signal, headers } : { signal: controller.signal }),
+      deadline
+    ]);
+    if (!response.ok) {
+      return { response, payload: undefined };
+    }
+    const payload = await Promise.race([response.json(), deadline]);
+    return { response, payload };
   } finally {
     clearTimeout(timeout);
   }
