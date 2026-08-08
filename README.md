@@ -120,7 +120,7 @@ tmux new -s deploy          # 断线后回来：tmux attach -t deploy
 cd ~/AlphaLoop && DEPLOY_ACK_GATEWAY_RESTART=yes zsh apps/openclaw-config/scripts/deploy.sh
 ```
 
-**这里刻意不用 `nohup … &`。** 它确实能挡住 SIGHUP，但同时也把终端拿走了，而第 3 步的 sudo 要密码就得有终端——实测的结果是第 3 步必然失败在「已经动了 gateway、还没接管」的中间态（见上面那一节）。tmux 两头都占：断线不会带走它，里面又有真正的终端可以问密码。sudo 确实不要密码（NOPASSWD）的机器上 `nohup` 才是安全的，那时脚本的 sudo 预检也不会拦你。
+**这里刻意不用 `nohup … &`。** 它确实能挡住 SIGHUP，但同时也把终端拿走了，而第 3 步的 sudo 要密码就得有终端——实测的结果是第 3 步在真正安装系统服务之前就会因为没有 TTY 而拒绝执行，后续步骤也不会运行。tmux 两头都占：断线不会带走它，里面又有真正的终端可以问密码。sudo 确实不要密码（NOPASSWD）的机器上 `nohup` 才是安全的，那时脚本的 sudo 预检也不会拦你。
 
 它按顺序跑第 0 到第 8 步，**任何一步非零退出就立刻停下**，并且把每一步的退出码写进 `runtime/deploy/steps.jsonl`。失败时它会告诉你：哪一步失败、后面哪些步骤因此没有执行、以及怎么从那一步继续：
 
@@ -167,6 +167,7 @@ pnpm install && pnpm build
 # 2. 安装 memoryd runtime，并校验 ownership 清单。当前不写任何用户级任务，
 #    也不会调用 `openclaw gateway install`；gateway 只由第 3 步的系统 daemon 安装。
 #    因此这一步可在冷启动、无人登录、没有 gui/<uid> launchd 域时安全运行。
+pnpm memoryd:install-runtime
 pnpm launchd:install-backup-alerts
 
 # 3. 安装 10 个无人值守服务到 /Library/LaunchDaemons。【需要 sudo，且会重启 gateway，见上面的警告】
@@ -244,6 +245,7 @@ pnpm openclaw:runtime:doctor
 
 | 命令 | 需要 sudo | 装到哪 | 服务以谁的身份运行 |
 | --- | --- | --- | --- |
+| `pnpm memoryd:install-runtime` | 否 | `~/Library/Application Support/AlphaLoop/memoryd-runtime` | 不直接启动服务 |
 | `pnpm launchd:install-backup-alerts` | 否 | 当前无写入（只校验 ownership） | — |
 | `sudo zsh .../install-system-daemons.sh` | **是** | `/Library/LaunchDaemons` | plist 里的 `UserName`，默认取 `SUDO_USER`（即敲 sudo 的那个人），**不是 root** |
 | `pnpm launchd:install-user` | 否 | 什么都不装（只退役，且只移动不删除） | — |
