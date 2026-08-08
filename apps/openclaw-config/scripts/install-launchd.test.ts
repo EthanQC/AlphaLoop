@@ -565,9 +565,10 @@ describe("install-launchd.sh fake-HOME dry run (Phase 3 Task 8)", () => {
     // rather than silently no-op'ing everything.
     expect(existsSync(join(destDir, "com.openclaw.gateway.plist"))).toBe(false);
 
-    // The script's final `openclaw gateway install` step still ran to
-    // completion (i.e. nothing upstream aborted the script early).
-    expect(readFileSync(openclawLog, "utf8")).toContain("gateway install");
+    // The repo-owned system gateway is installed in step 3. A headless step 2
+    // must not try to create the conflicting GUI-domain gateway: macOS has no
+    // gui/<uid> domain before login, and that used to abort the deployment.
+    expect(existsSync(openclawLog)).toBe(false);
   });
 
   it("fails loudly on a template with no ownership row instead of silently not installing it", () => {
@@ -1936,7 +1937,7 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
     const { status, output } = runDeploy(runbook);
 
     expect(status).toBe(1);
-    expect(output).toMatch(/第 2 步（安装用户级 LaunchAgent）失败/u);
+    expect(output).toMatch(/第 2 步（安装 memoryd runtime 并校验用户级 ownership）失败/u);
     expect(calls(runbook)).toContain("pnpm memoryd:install-runtime");
     expect(calls(runbook)).not.toContain("pnpm launchd:install-backup-alerts");
     expect(calls(runbook)).not.toContain("sudo zsh");
@@ -2198,7 +2199,7 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
   const injections: Array<[number, string, Record<string, string>, RegExp]> = [
     [0, "拉取新代码", { FAIL_GIT_PULL: "1" }, /pnpm install|pnpm build/u],
     [1, "安装依赖并构建", { FAIL_PNPM_SCRIPT: "build" }, /launchd:install-backup-alerts/u],
-    [2, "安装用户级 LaunchAgent", { FAIL_PNPM_SCRIPT: "launchd:install-backup-alerts" }, /sudo/u],
+    [2, "安装 memoryd runtime 并校验用户级 ownership", { FAIL_PNPM_SCRIPT: "launchd:install-backup-alerts" }, /sudo/u],
     [3, "安装系统 daemon", { FAIL_SUDO: "1" }, /launchd:install-user/u],
     [4, "退役旧的用户级副本", { FAIL_PNPM_SCRIPT: "launchd:install-user" }, /openclaw:cron:install/u],
     [5, "注册 openclaw cron 任务", { FAIL_PNPM_SCRIPT: "openclaw:cron:install" }, /render-openclaw-config/u],
@@ -2364,8 +2365,8 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
   });
 
   // =========================================================================
-  // ROUND 8, finding L6: A PASSWORD-REQUIRING sudo WITH NO tty STRANDED THE
-  // DEPLOY EXACTLY WHERE IT HURTS MOST.
+  // ROUND 8, finding L6: A PASSWORD-REQUIRING sudo WITH NO tty makes the
+  // deployment deterministically stop at step 3.
   //
   // Measured read-only on the mini (2026-07-29): `sudo -n true` answers
   // 「sudo: a password is required」. Step 3 is `sudo zsh
@@ -2379,14 +2380,8 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
   //   steps 0/1/2 succeed -> step 3 exits 1 with "sudo: no tty present"
   //   -> receipts 0:0,1:0,2:0,3:1, gate red.
   //
-  // The gate was honest; the machine was not fine. Step 2 installs the
-  // USER-LEVEL ai.openclaw.gateway and the step that boots it back out is the
-  // one that just failed - so 18789 is left with two gateways contending, and
-  // that port is the only entrance to the operator's 185-agent fleet. The path
-  // fails deterministically, and it fails after the gateway has been touched
-  // and before it has been handed over.
-  //
-  // So it is refused up front, where refusing costs nothing.
+  // Step 2 no longer creates a GUI gateway, but the path still fails
+  // deterministically after a needless pull/build. Refuse it up front.
   // =========================================================================
   function requirePasswordForSudo(runbook: Runbook): void {
     const sudo = join(runbook.root, "bin", "sudo");
@@ -2413,20 +2408,19 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
 
     expect(status).toBe(3);
     expect(output).toMatch(/sudo 要密码，但这次运行没有终端可以问 —— 什么都还没有动/u);
-    // The whole point: the user-level gateway of step 2 is never installed, so
-    // nothing ends up contending for 18789.
+    // Nothing runs before the deterministic sudo failure.
     expect(calls(runbook)).not.toMatch(/launchd:install-backup-alerts/u);
     expect(receipts(runbook)).toEqual([]);
   });
 
-  it("tells the operator why this is worse than an ordinary failed step, and how to run it instead", () => {
+  it("tells the operator which later steps would be skipped and how to run it instead", () => {
     const runbook = makeRunbook("alphaloop-r8-sudo-advice-");
     requirePasswordForSudo(runbook);
 
     const { output } = runDeploy(runbook);
 
-    expect(output).toMatch(/用户级 ai\.openclaw\.gateway/u);
-    expect(output).toMatch(/18789/u);
+    expect(output).toMatch(/后续系统服务安装和验收都不会执行/u);
+    expect(output).not.toMatch(/用户级 ai\.openclaw\.gateway/u);
     expect(output).toMatch(/tmux new -s deploy/u);
     expect(output).toMatch(/sudo -v &&/u);
     expect(output).toMatch(/DEPLOY_ALLOW_SUDO_PROMPT=yes/u);
@@ -2472,7 +2466,7 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
 // ===========================================================================
 // TASK 28 (2026-07-30): A FULL deploy.sh RUN COULD NOT PASS STEP 3.
 //
-// Reproduced twice on the mini: step 2 (`pnpm launchd:install-backup-alerts`
+// Reproduced twice on the mini before the headless step-2 fix: step 2 (`pnpm launchd:install-backup-alerts`
 // -> install-launchd.sh -> `openclaw gateway install`) installs AND STARTS the
 // user-level gui/501/ai.openclaw.gateway - the ordering the README mandates,
 // so that step 3 can boot it out. Step 3's bootout of that seconds-old agent
@@ -2485,10 +2479,10 @@ describe("round 6: deploy.sh stops at the first failed step", () => {
 //
 // The suite above stubs pnpm and sudo entirely, so no test in it could see
 // this: nothing there ever put a freshly-started agent in front of step 3.
-// Here steps 2 and 3 are REAL - the real install-launchd.sh (whose `openclaw
-// gateway install` really starts the agent, via the stub CLI's opt-in) and
-// the real install-system-daemons.sh, sharing one stub-launchd job table
-// whose bootout drains like the measured launchd (see bootoutDrainSeconds).
+// Here steps 2 and 3 are REAL - the real install-launchd.sh and the real
+// install-system-daemons.sh, sharing one stub-launchd job table whose bootout
+// drains like the measured launchd (see bootoutDrainSeconds). Step 2 now owns
+// no GUI-domain gateway at all; step 3 is the sole gateway installer.
 // Steps 0/1/4-8 stay stubs: they neither touch launchd nor did they fail.
 // ===========================================================================
 describe("task 28: a full deploy.sh run converges on the first try", () => {
@@ -2601,7 +2595,7 @@ describe("task 28: a full deploy.sh run converges on the first try", () => {
     return latest;
   }
 
-  it("passes first try - step 3 waits out the gateway step 2 just started - and a re-run converges too", () => {
+  it("passes headlessly first try without creating a GUI gateway, and a re-run converges too", () => {
     const sandbox = makeFullDeploySandbox("alphaloop-t28-full-", {
       bootoutDrainSeconds: 1,
       bootoutDrainRecentWindowSeconds: 3600
@@ -2611,19 +2605,18 @@ describe("task 28: a full deploy.sh run converges on the first try", () => {
 
     expect(first.output).toMatch(/第 0 1 2 3 4 5 6 7 8 步 —— 全部退出 0/u);
     expect(first.status).toBe(0);
-    // Step 2 really ran before step 3 and really started the user gateway -
-    // the README's mandated ordering, exercised rather than assumed.
+    // Step 2 really ran before step 3 but did not invoke OpenClaw or create a
+    // GUI-domain gateway. This is the cold-boot/no-login production shape.
     const log = readFileSync(sandbox.callLog, "utf8");
     expect(log.indexOf("pnpm launchd:install-backup-alerts")).toBeGreaterThanOrEqual(0);
     expect(log.indexOf("pnpm launchd:install-backup-alerts")).toBeLessThan(log.indexOf("sudo zsh"));
-    expect(readFileSync(sandbox.machine.openclawLog, "utf8")).toContain("gateway install");
+    expect(existsSync(sandbox.machine.openclawLog)).toBe(false);
     expect([...latestExitPerStep(sandbox).entries()].sort((a, b) => a[0] - b[0]))
       .toEqual([[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0], [8, 0]]);
-    // The handover happened: daemons up, the step-2 gateway taken over and
-    // archived, nothing left running in the user domain.
+    // The system daemons are up and nothing was created in the user domain.
     expect(loadedSystemLabels(sandbox.machine)).toEqual([...SYSTEM_LABELS].sort());
     expect(loadedUserLabels(sandbox.machine)).not.toContain("ai.openclaw.gateway");
-    expect(archivedLabels(sandbox.machine)).toContain("ai.openclaw.gateway");
+    expect(archivedLabels(sandbox.machine)).not.toContain("ai.openclaw.gateway");
 
     // Idempotence, and the system-domain half of the fix: run 2 boots out the
     // eight daemons run 1 bootstrapped seconds ago - every one of them
@@ -2640,6 +2633,7 @@ describe("task 28: a full deploy.sh run converges on the first try", () => {
     const sandbox = makeFullDeploySandbox("alphaloop-t28-wedged-", {
       surviveBootoutLabels: ["ai.openclaw.gateway"]
     });
+    seedRunningUserAgents(sandbox.machine, ["ai.openclaw.gateway"]);
     // A wedged label is only declared after the full deadline, so keep the
     // deadline short here - the property is the refusal, not the wait.
     sandbox.env.BOOTOUT_SETTLE_SECONDS = "1";

@@ -64,8 +64,8 @@ for template in "${REPO_ROOT}"/apps/openclaw-config/launchd/*.plist(N) "${REPO_R
   echo "Loaded ${output}"
 done
 
-if [ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-  openclaw gateway install --force --runtime node --token "${OPENCLAW_GATEWAY_TOKEN}"
-else
-  openclaw gateway install --force --runtime node
-fi
+# The gateway is repo-owned in the system domain and is installed exclusively
+# by install-system-daemons.sh. Do not call `openclaw gateway install` here:
+# that command creates a conflicting gui/<uid> LaunchAgent, and on a cold,
+# headless boot the GUI domain does not exist at all, so the standard deploy
+# would fail before it reached the system installer.

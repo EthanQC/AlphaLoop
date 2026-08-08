@@ -1077,10 +1077,10 @@ EOF
 # looks.
 #
 # Task 28 (2026-07-30). "Survives bootout" is decided by a DEADLINE now, not by
-# one immediate re-check. Measured live on the mini, twice: a FULL deploy.sh
-# run always failed here with 「is STILL loaded after bootout」 for
-# ai.openclaw.gateway (started seconds earlier by runbook step 2, exactly as
-# the README orders) plus platform-app and cron-runner, while a resume from
+# one immediate re-check. Measured live on the mini, twice before step 2
+# stopped creating the GUI-domain gateway: a FULL deploy.sh run always failed
+# here with 「is STILL loaded after bootout」 for ai.openclaw.gateway plus
+# platform-app and cron-runner, while a resume from
 # step 3 fifteen minutes later succeeded - the bootouts had settled in
 # between. The mechanism (measured on a real launchd, see
 # BOOTOUT_SETTLE_SECONDS): bootout returns immediately and the label stays in
@@ -1089,7 +1089,7 @@ EOF
 # this is a drain to wait out, not a KeepAlive resurrection to disable. The
 # immediate re-check therefore condemned every label whose process did not die
 # in the microseconds between two launchctl invocations - and a full run
-# always presented it one, because step 2 had just started the gateway.
+# always presented it one, because the old step 2 had just started the gateway.
 # bootout_settled below polls until the label leaves the job table or the
 # deadline passes; only the deadline turns into the fail-closed path.
 bootout_settled() {

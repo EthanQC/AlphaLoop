@@ -92,7 +92,7 @@ grep -E '^(FEISHU_GROUP_CHAT_ID|PLATFORM_PUBLIC_BASE_URL)=' ~/AlphaLoop/.env.loc
 
 第三条必须走 login shell：mini 上 `ssh … 'command -v docker'` 什么都不返回，`ssh … zsh -lc 'command -v docker'` 才返回 `/opt/homebrew/bin/docker`。Homebrew 的 PATH 只在 login shell 里，第 7 步会踩到这一点。
 
-**sudo 要不要密码，决定你能怎么跑。** 第 3 步是 `sudo zsh install-system-daemons.sh`。`sudo -n true` 打印「a password is required」就说明这台机器的 sudo 要密码（mini 上 2026-07-29 只读实测就是这样），那么**这次部署必须跑在一个有终端的会话里**。原因不是麻烦，是实测出来的后果：要密码的 sudo + 没有终端（`nohup … &`、`ssh host '<命令>'` 都是这种），第 0/1/2 步会全部成功，第 3 步以 `sudo: no tty present` 失败——而第 2 步**已经装上了用户级 `ai.openclaw.gateway`**，把它清掉的正是没跑成的第 3 步。结果是 18789 上两个 gateway 抢同一个端口，而那是你 185 个 agent 的唯一入口。脚本现在会在第 0 步之前就以退出码 3 拦住这种跑法（什么都不动），但知道为什么比被拦住更有用。
+**sudo 要不要密码，决定你能怎么跑。** 第 3 步是 `sudo zsh install-system-daemons.sh`。`sudo -n true` 打印「a password is required」就说明这台机器的 sudo 要密码（mini 上 2026-07-29 只读实测就是这样），那么**这次部署必须跑在一个有终端的会话里**。要密码的 sudo + 没有终端（`nohup … &`、`ssh host '<命令>'` 都是这种）会让第 0/1/2 步成功、第 3 步以 `sudo: no tty present` 失败，后续系统服务安装和验收都不执行。脚本会在第 0 步之前以退出码 3 拦住这种确定失败的跑法。
 
 **最后一条是配置。** `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL` 没配时，`deploy.sh` 会以退出码 3 拒绝启动。注意它拒绝的是**脚本自己**——下面那条命令里手敲的 `git pull` 排在它前面，已经把检出换成新代码了。所以要么先把这两个变量补进 `.env.local` 再开始，要么明确接受「新代码 + 旧 dist + 旧 daemon」这个中间态并带上 `DEPLOY_ALLOW_MISSING_CONFIG=yes`。
 
@@ -143,7 +143,7 @@ DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=3 zsh apps/openclaw-config/scrip
 
 **被打断的部署也会留下证据。** 2026-07-29 之前脚本没有任何信号 trap，实测三次：SIGINT 打断第 0 步 → 退出 130、账本里一条收据都没有；SIGHUP / SIGTERM 打断第 1 步 → 屏幕上最后一行是「── 第 1 步 安装依赖并构建 ──」然后脚本就没了，没有小结、没有失败行、没有续跑命令——而验收门在这三种情况下**全是绿的**（只有一条 warn）。控制器是通过 ssh 驱动这次部署的，掉线产生的正是这个形状。现在：被打断的那一步（或正要开始的那一步）会按 129/130/143 写进账本，验收门因此报 error，屏幕上照常打印小结、续跑命令和「下次在 tmux 里跑」的建议。两个说明白的边界：信号只发给脚本 pid（而不是整个进程组）时，shell 会等当前这一步的子进程返回才处理它，收据是晚、不是丢；`kill -9` 无法被任何程序拦截，那种情况下只剩 doctor 的 `deploy-ledger.incomplete`（warn）。
 
-**第 0 步之前的 sudo 预检。** 三个条件同时成立时，脚本以退出码 3 拒绝启动、**一步都不跑**：这次运行会跑到第 3 步、`sudo -n true` 说要密码、并且 stdin 不是终端。任何一个不成立都放行（NOPASSWD 的机器、tmux/前台会话、`DEPLOY_FROM_STEP=4` 跳过第 3 步）。拦它的理由是实测出来的：这三条同时成立时第 3 步必然失败，而失败点恰好落在第 2 步已经装上用户级 gateway、第 3 步还没把它接管走的中间——18789 上于是有两个 gateway 抢同一个端口。确认这台机器不要密码就显式写 `DEPLOY_ALLOW_SUDO_PROMPT=yes`。
+**第 0 步之前的 sudo 预检。** 三个条件同时成立时，脚本以退出码 3 拒绝启动、**一步都不跑**：这次运行会跑到第 3 步、`sudo -n true` 说要密码、并且 stdin 不是终端。任何一个不成立都放行（NOPASSWD 的机器、tmux/前台会话、`DEPLOY_FROM_STEP=4` 跳过第 3 步）。这三条同时成立时第 3 步必然失败；确认这台机器不要密码就显式写 `DEPLOY_ALLOW_SUDO_PROMPT=yes`。
 
 **第 0 步之前的配置预检。** 脚本会先看 `FEISHU_GROUP_CHAT_ID` 和 `PLATFORM_PUBLIC_BASE_URL`（进程环境优先，其次 `.env.local`，解析规则和 daemon 用的 `loadLocalEnv` 一致）。缺任何一个就以退出码 3 停下，**一步都不跑**。判空和 doctor 一样是 `trim()` 之后再看长度：`FEISHU_GROUP_CHAT_ID="   "` 算**没配**（2026-07-29 之前它能通过预检，九步跑完之后第 8 步才报 `no_group_chat`）；"环境里导出了但值是空的"也算没配，因为 doctor 那边 `process.env` 会盖掉 `.env.local` 的值。原因是这两个变量正是 doctor 会报 error 的那两个：mini 上它们今天都没配，所以第 0-7 步可以全部成功而第 8 步照样退出 1——语义没错，但读日志的人会把它当成"部署回退了"。想先装服务、稍后补配置，就显式写 `DEPLOY_ALLOW_MISSING_CONFIG=yes`：第 0-7 步照跑，第 8 步仍然会红，红的是配置。
 
@@ -164,15 +164,9 @@ git -C ~/AlphaLoop fetch origin && git -C ~/AlphaLoop pull --ff-only origin main
 # 1. daemon 直接跑 dist 产物，必须先装依赖并构建（可重跑）
 pnpm install && pnpm build
 
-# 2. 安装器不会写任何 AlphaLoop 用户级任务，只顺带执行 `openclaw gateway install`。
-#    必须排在第 3 步之前：这一步会创建【并启动】用户级 ai.openclaw.gateway，第 3 步会把它
-#    bootout；顺序反了，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
-#    这个顺序的代价在 2026-07-30 修掉了（task 28）：bootout 一个刚启动、SIGTERM 收得慢的
-#    agent 时，launchctl 立即返回而 launchd 还要 drain 最多 ExitTimeOut=20 秒；第 3 步以前
-#    bootout 完立刻复查，所以【完整跑必挂在第 3 步、resume 才能过】（mini 实测两次）。现在
-#    第 3 步会按截止时间轮询等 drain 结束（BOOTOUT_SETTLE_SECONDS，默认 30 秒），完整跑
-#    第一次就能过；等满仍活着的 agent 依旧判失败、该服务拒绝交接。
-#    可重跑：gateway CLI 会重新安装自己的用户级 agent；第 3 步会接管它。
+# 2. 安装 memoryd runtime，并校验 ownership 清单。当前不写任何用户级任务，
+#    也不会调用 `openclaw gateway install`；gateway 只由第 3 步的系统 daemon 安装。
+#    因此这一步可在冷启动、无人登录、没有 gui/<uid> launchd 域时安全运行。
 pnpm launchd:install-backup-alerts
 
 # 3. 安装 10 个无人值守服务到 /Library/LaunchDaemons。【需要 sudo，且会重启 gateway，见上面的警告】
@@ -250,7 +244,7 @@ pnpm openclaw:runtime:doctor
 
 | 命令 | 需要 sudo | 装到哪 | 服务以谁的身份运行 |
 | --- | --- | --- | --- |
-| `pnpm launchd:install-backup-alerts` | 否 | `~/Library/LaunchAgents` | 当前登录用户 |
+| `pnpm launchd:install-backup-alerts` | 否 | 当前无写入（只校验 ownership） | — |
 | `sudo zsh .../install-system-daemons.sh` | **是** | `/Library/LaunchDaemons` | plist 里的 `UserName`，默认取 `SUDO_USER`（即敲 sudo 的那个人），**不是 root** |
 | `pnpm launchd:install-user` | 否 | 什么都不装（只退役，且只移动不删除） | — |
 | `pnpm openclaw:cron:install` | 否 | `openclaw cron`（不写 plist） | 当前登录用户的 gateway 会话 |
@@ -259,7 +253,7 @@ pnpm openclaw:runtime:doctor
 
 `install-system-daemons.sh` 的 `TARGET_USER` 默认值：有 `SUDO_USER` 就用它，否则用 `id -un`；解析成 `root` 会直接拒绝安装（repo 检出、`~/.openclaw` 凭据、node 都在操作者家目录里，让 daemon 跑成 root 是错的）。装给别人用 `TARGET_USER=<用户名> sudo -E zsh ...`。它同样会检查 `NODE_BIN`（默认 `~/.local/node-v24/bin/node`）确实是个可执行的 node——那条路径会被写进三个 plist，指错了就是三个"能加载、每次运行都 ENOENT"的 daemon。
 
-**不要**再按旧文档单独跑 `pnpm launchd:install-user` 或 `pnpm launchd:install-backup-alerts` 当作"完整安装"：前者现在只退役、不安装，后者只执行 `openclaw gateway install`。这两条都不会安装任何 AlphaLoop 无人值守服务；必须运行第 3 步的系统安装器。
+**不要**再按旧文档单独跑 `pnpm launchd:install-user` 或 `pnpm launchd:install-backup-alerts` 当作"完整安装"：前者现在只退役、不安装，后者只校验用户级 ownership。这两条都不会安装任何 AlphaLoop 无人值守服务；必须运行第 3 步的系统安装器。
 
 迁移一台还在跑旧布局的机器——跑上面那条 `deploy.sh` 即可，不需要额外的手工清理。整条链路上**没有任何一步会删除 plist**：第 3、4、5 步一律是移进 `~/Library/LaunchAgents.disabled/openclaw-system-backup-<时间戳>/`。要回退某个服务到旧的用户级副本：
 

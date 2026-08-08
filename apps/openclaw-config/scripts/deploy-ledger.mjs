@@ -54,8 +54,8 @@ import { dirname, join } from "node:path";
 export const DEPLOY_STEPS = [
   { step: 0, key: "pull", title: "把新代码拉到这台机器（唯一的代码传输步骤）" },
   { step: 1, key: "build", title: "pnpm install + pnpm build（daemon 直接跑 dist 产物）" },
-  { step: 2, key: "install-user-agents", title: "安装用户级 LaunchAgent（rsshub）+ openclaw gateway install" },
-  { step: 3, key: "install-system-daemons", title: "把 8 个无人值守服务装进 /Library/LaunchDaemons（sudo）" },
+  { step: 2, key: "install-user-agents", title: "安装 memoryd runtime 并校验用户级 LaunchAgent ownership" },
+  { step: 3, key: "install-system-daemons", title: "把 10 个无人值守服务装进 /Library/LaunchDaemons（sudo）" },
   { step: 4, key: "retire-user-agents", title: "退役旧的用户级副本（只移动、不删除）" },
   { step: 5, key: "install-cron", title: "注册 5 个报告类 openclaw cron 任务" },
   { step: 6, key: "render-persona", title: "部署 control agent 人设" },

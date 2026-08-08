@@ -260,13 +260,8 @@ fi
 #
 # 实测这个组合（真 deploy.sh、真账本、要密码的 sudo、stdin 不是 tty）：
 #   第 0/1/2 步全部成功 → 第 3 步 `sudo: no tty present` 退出 1 → 部署停在这里，
-#   收据 0:0,1:0,2:0,3:1，验收门确实报红。
-# 门是诚实的，但机器已经被改坏了：第 2 步【已经装上了用户级 ai.openclaw.gateway】，
-# 而把它 bootout 的正是没跑成的第 3 步。于是 18789 上同时存在用户级和系统级两个
-# gateway——那个端口正是操作者 185 个 agent 的唯一入口。
-#
-# 也就是说：这条路必然失败，而且失败点恰好在「已经动了 gateway、还没接管」的中间。
-# 所以在第 0 步之前就把它拦掉——拦下来的时候机器一点没动。
+#   收据 0:0,1:0,2:0,3:1，验收门确实报红。步骤 2 已不再创建用户 gateway，
+#   但这条路仍然必然失败并浪费构建时间，所以在第 0 步之前就把它拦掉。
 #
 # 三个条件同时成立才拦：第 3 步这次真的会跑、sudo 确实要密码、而且没有终端可问。
 # 任何一个不成立都放行（NOPASSWD 的机器、前台跑的会话、DEPLOY_FROM_STEP=4 跳过第 3 步）。
@@ -285,9 +280,8 @@ check_sudo_preflight() {
           echo "环境未就绪：sudo 要密码，但这次运行没有终端可以问 —— 什么都还没有动。"
           echo ""
           echo "第 3 步是 sudo zsh install-system-daemons.sh。现在这样跑下去，第 0/1/2 步会成功，"
-          echo "第 3 步会以「sudo: no tty present and no askpass program specified」失败——"
-          echo "而第 2 步【已经装上了用户级 ai.openclaw.gateway】，把它清掉的正是没跑成的第 3 步。"
-          echo "结果是 18789 上两个 gateway 抢同一个端口，那正是你 185 个 agent 的唯一入口。"
+          echo "第 3 步会以「sudo: no tty present and no askpass program specified」失败，"
+          echo "后续系统服务安装和验收都不会执行。"
           echo ""
           echo "改成下面任一种跑法（都能让 sudo 有地方问密码，也都不怕 ssh 断线）："
           echo "  · 在 mini 上开 tmux，再在里面前台跑（推荐，断线不会带走它）："
@@ -552,8 +546,7 @@ report_and_exit() {
     # Round-8 finding L6: this used to recommend `nohup … &`. That does survive
     # a dropped ssh - and it also takes the terminal away, which on a machine
     # whose sudo needs a password (the mini, measured) makes step 3 fail every
-    # time, right after step 2 has installed the user-level gateway that step 3
-    # was going to take over. tmux survives the drop AND keeps a real tty.
+    # time. tmux survives the drop AND keeps a real tty.
     echo "如果是 ssh 断线打断的，下一次在 tmux 里跑——断线不会带走它，第 3 步的 sudo 也还有地方问密码：" >&2
     echo "  tmux new -s deploy" >&2
     echo "  DEPLOY_ACK_GATEWAY_RESTART=yes DEPLOY_FROM_STEP=${PENDING_STEP} zsh ${SCRIPT_PATH}" >&2
@@ -670,7 +663,7 @@ step_acceptance() {
 
 run_step 0 "拉取新代码" step_pull
 run_step 1 "安装依赖并构建" step_build
-run_step 2 "安装用户级 LaunchAgent" step_user_agents
+run_step 2 "安装 memoryd runtime 并校验用户级 ownership" step_user_agents
 run_step 3 "安装系统 daemon" step_system_daemons
 run_step 4 "退役旧的用户级副本" step_retire
 run_step 5 "注册 openclaw cron 任务" step_cron

@@ -12,13 +12,13 @@
 - `scripts/submit-official-paper-equity-order.mjs`：通过 `broker-executor` 提交官方模拟盘股票/ETF ticket。
 - `scripts/feishu-context.mjs`：飞书群上下文入库和 @ 回复提示注入。
 - `scripts/install-launchd-ownership.txt`：**哪个标签归哪个 launchd 域**的唯一事实来源；下面所有安装脚本和 `openclaw:runtime:doctor` 都读它。
-- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先跑两道预检（都退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）：报告投递需要的两个变量，以及「第 3 步的 sudo 要密码但这次运行没有终端」——后者不拦的话第 0/1/2 步会成功、第 3 步必然失败，而第 2 步装上的用户级 gateway 正要靠第 3 步接管走，于是 18789 上留下两个 gateway 抢端口。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
+- `scripts/deploy.sh`：**部署 runbook 本体**（第 0→8 步）。fail-fast，每一步的退出码写进 `runtime/deploy/steps.jsonl`，跑之前强制确认 gateway 重启会打断操作者自己的 agent，并在第 0 步之前先跑两道预检（都退出 3 且一步都不跑，和「部署失败」的退出码 1 分开）：报告投递需要的两个变量，以及「第 3 步的 sudo 要密码但这次运行没有终端」。SIGHUP/SIGINT/SIGTERM 有 trap：被打断时把当前那一步按 129/130/143 记进账本再退出，验收门因此看得见它。
 - `scripts/deploy-ledger.mjs`：那份收据的读写与判定，doctor 的 `deploy-ledger` 检查项读它。
 - `scripts/install-system-daemons.sh`：**唯一**安装无人值守服务的脚本，把 10 个 daemon 写进 `/Library/LaunchDaemons`（需要 sudo）。
 - `scripts/launchd-health.mjs`：`launchctl print` 的解析 + 「这个 daemon 到底算不算起来了」的判定。安装脚本和 doctor **共用同一份**，所以两者不可能对"健康"有两种理解。
 - `scripts/install-user-schedules.mjs`：2026-07-28 起**只退役、不安装**——把系统域拥有的标签和历史报告 plist 从 `~/Library/LaunchAgents` 里移进归档目录（不删除；接管它的 daemon 没通过 `launchd-health.mjs` 的 residency 判定时干脆不动，见下面「谁拥有哪个标签」第 2 条）。
 - `scripts/launchd-agent-archive.mjs`：上面那条规则的 **node 侧**实现，`install-user-schedules.mjs` 和 `install-openclaw-cron.mjs` 共用它（shell 安装器另有一份自己的实现，见下面「谁拥有哪个标签」）。
-- `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前没有），并顺带跑一次 `openclaw gateway install`。
+- `scripts/install-launchd.sh`：只安装 ownership 里 scope 为 `user` 的模板（当前没有）；不会创建用户级 gateway。
 - `scripts/members.mjs`：platform-app 身份层的成员/token 管理 CLI（`add`/`list`/`revoke`/`token issue`/`token revoke`）。
 - `scripts/install-cloudflared-tunnel.mjs`：给**还没有 connector 的机器**安装用户级 cloudflared 隧道（token 模式）。mini 上已经跑着系统级的 `com.cloudflare.cloudflared`，所以这条脚本在那里会拒绝执行，见下面「公网入口」。
 
@@ -99,7 +99,7 @@ mini 上只读实测：`/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`
 ### 三个安装脚本各自做什么（2026-07-28 之后）
 
 ```bash
-# 1) 当前没有 scope=user 模板；此命令只执行 openclaw gateway install
+# 1) 当前没有 scope=user 模板；此命令只校验 ownership，不写用户任务
 pnpm launchd:install-backup-alerts
 
 # 2) 安装全部 10 个 scope=system 的 daemon；先干跑确认装给谁，再 sudo 真装
@@ -135,11 +135,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.alphaloop.memoryd.pli
 
 历史包袱提醒：ac741d8 之前 `launchd:install-user` 和 `openclaw:cron:install` 各自会安装 plist，那时的文档要求"三条都跑一遍"。现在它们只剩退役逻辑，照旧文档跑会把运行中的服务全部下线而什么都装不上。
 
-只剩一条顺序约束：
-
-- `install-launchd.sh` 必须排在 `install-system-daemons.sh` **之前**。它结尾的 `openclaw gateway install` 会重新创建用户级 `ai.openclaw.gateway`，而只有后跑的 `install-system-daemons.sh` 才会把它 bootout 掉；反过来跑，用户级 gateway 会活到最后，和系统 gateway 抢同一个 18789 端口。
-
-  这个顺序有一个 2026-07-30 才修掉的代价（task 28，mini 上完整跑 `deploy.sh` 两次实测两次都挂在这）：`install-launchd.sh` 刚把用户级 gateway **启动**起来，几十秒后 `install-system-daemons.sh` 就要把它 bootout——而 `launchctl bootout` 对一个不立刻响应 SIGTERM 的进程是**立即返回、后台慢慢收**的（gateway 自己的 plist 写着 `ExitTimeOut=20`；真实 launchd 实测：bootout 35ms 返回 0，`launchctl print` 之后还能连续答 20.2 秒，pid 全程不变——是 drain，不是 KeepAlive 复活）。旧代码 bootout 之后**立刻**复查一次 `launchctl print`，于是刚被启动的 gateway 必然还在，整次安装被判失败；15 分钟后从第 3 步 resume 反而能过，因为 drain 早就结束了。现在 bootout 之后按真实截止时间轮询（`BOOTOUT_SETTLE_SECONDS`，默认 30 秒 > ExitTimeOut 20 秒），等到才算停、等不到才按「bootout 之后还活着」失败——完整跑第一次就能过，卡死的 agent 依旧按第 4 条拒绝交接。
+用户级安装器不再调用 `openclaw gateway install`，所以安装顺序不再制造第二个 18789 gateway，也能在无人登录、没有 `gui/<uid>` launchd 域时运行。系统安装器仍会迁移并等待历史用户级 gateway 完成 bootout；卡死的旧 agent 继续 fail closed。
 
 以前这里还有第二条：「`launchd:install-user` 最好排在 daemon 安装之后，因为前者 `rmSync` 直接删、后者移进备份目录」。那条约束**是靠文档执行的，而文档执行不了**——第 5 轮 D1 实测到的正是它失效的样子：`install-system-daemons.sh` 因为某个 daemon 起不来而有意保留了它的用户级 plist、退出码 1，紧接着的 `pnpm launchd:install-user` 把这份 plist 无备份删掉、退出码 0。`com.openclaw.trading.cron-runner` / `official-paper.poll` / `official-paper.pnl` 三个标签在本仓库里没有任何模板（`apps/openclaw-config/launchd/` 只有 platform-app / market-alerts / daily-backup 三个历史模板加两个历史 plist），删掉就再也生成不出来，而 mini 上这三份 plist 现在都还在。
 

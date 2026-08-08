@@ -46,10 +46,9 @@ function findingFor(report: { findings: Finding[] }, code: string): Finding {
 }
 
 describe("doctor: two processes on one port", () => {
-  // The deploy path really can produce this: install-launchd.sh ends in
-  // `openclaw gateway install`, which re-creates the user-level
-  // ai.openclaw.gateway agent next to the system daemon - a known, documented
-  // limitation in install-launchd-ownership.txt. The doctor is what notices.
+  // A legacy/manual `openclaw gateway install` can still create the user-level
+  // ai.openclaw.gateway next to the system daemon. The standard deploy no
+  // longer does so, but the doctor must still notice this unsafe state.
   it("reports gateway.duplicate_listener when 18789 has more than one listening pid", async () => {
     const report = await doctor.analyzeOpenClawRuntimeSnapshot({
       gatewayListeners: [

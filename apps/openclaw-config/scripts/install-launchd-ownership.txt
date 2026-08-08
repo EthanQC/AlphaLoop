@@ -62,16 +62,12 @@ system   com.alphaloop.rsshub
 # failure this manifest exists to prevent.
 retired  com.openclaw.trading.broker-executor
 
-# The gateway labels are installed by `openclaw gateway install`, not by us.
-# install-system-daemons.sh runs ai.openclaw.system.gateway as a real system
-# daemon and boots out ai.openclaw.gateway on the way (unchanged behaviour,
-# see that script). KNOWN, PRE-EXISTING LIMITATION, not fixed by this task:
-# install-launchd.sh still ends with `openclaw gateway install`, so running it
-# AFTER install-system-daemons.sh re-creates the user-level ai.openclaw.gateway
-# agent. That agent binds the same port as the system daemon and loses, so it
-# is noisy rather than dangerous - but it means the documented deploy order
-# (install-launchd.sh first, install-system-daemons.sh last) still matters for
-# the gateway alone. Every other label above is order-independent.
+# The live gateway is ai.openclaw.system.gateway, installed only by
+# install-system-daemons.sh. These external rows describe historical or
+# third-party labels that our user-level installer must never render.
+# install-system-daemons.sh still boots out a legacy ai.openclaw.gateway during
+# migration, but install-launchd.sh no longer recreates it. That is required
+# for headless cold-boot deployments, where gui/<uid> does not exist.
 external ai.openclaw.gateway
 external com.openclaw.gateway
 
