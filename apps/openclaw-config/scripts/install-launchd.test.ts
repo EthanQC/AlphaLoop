@@ -24,7 +24,7 @@
 // worthless. This file already lives in vitest.config.ts's serial lane, which
 // is where subprocess-spawning suites belong.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -632,6 +632,28 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
     }
 
     expect(launchAgentLabels(machine)).toEqual([]);
+  });
+
+  it("tightens an existing memoryd data root from 0755 to 0700", () => {
+    const machine = makeFakeMachine("alphaloop-daemons-memoryd-mode-");
+    const memorydDataRoot = join(machine.home, "Library", "Application Support", "AlphaLoop", "memoryd");
+    mkdirSync(memorydDataRoot, { recursive: true });
+    chmodSync(memorydDataRoot, 0o755);
+    machine.env.MEMORYD_DATA_ROOT = memorydDataRoot;
+
+    runSystemDaemons(machine);
+
+    expect(statSync(memorydDataRoot).mode & 0o777).toBe(0o700);
+  });
+
+  it("renders memoryd with launchd Umask 077", () => {
+    const machine = makeFakeMachine("alphaloop-daemons-memoryd-umask-");
+
+    runSystemDaemons(machine);
+
+    const memorydPlist = join(machine.systemDir, "com.alphaloop.memoryd.plist");
+    // XML plist integers are decimal: 63 is octal 077.
+    expect(plistValue(memorydPlist, "Umask")).toBe("63");
   });
 
   it("keeps each promoted job's real command and cadence (KeepAlive for services, a schedule for the periodic ones)", () => {

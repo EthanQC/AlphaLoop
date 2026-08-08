@@ -561,6 +561,12 @@ if [ "$(id -u)" -eq 0 ]; then
   # from a pre-D3 run of this same script.
   chown "${TARGET_USER}:${TARGET_GID}" "${AGENTS_DIR}"
 fi
+# memoryd stores Markdown and search indexes below this root. Tighten the root
+# itself on every install (including an existing pre-fix 0755 directory)
+# before any memoryd LaunchDaemon can be bootstrapped below. This is
+# intentionally not recursive: the daemon's Umask handles all future entries
+# without rewriting the permissions of an existing data tree.
+chmod 700 "${MEMORYD_DATA_ROOT}"
 
 # Finding M7: `mkdir -p` under sudo creates BOTH the backup directory and its
 # parent as root:wheel inside the operator's own home - on the mini
@@ -610,7 +616,7 @@ write_plist() {
   local stderr_path="$5"
   local keep_alive="$6"
   local schedule_xml="${7:-}"
-  local label_xml command_xml stdout_xml stderr_xml repo_root_xml target_user_xml target_home_xml path_env_xml proxy_url_xml no_proxy_xml proxy_xml
+  local label_xml command_xml stdout_xml stderr_xml repo_root_xml target_user_xml target_home_xml path_env_xml proxy_url_xml no_proxy_xml proxy_xml umask_xml
 
   label_xml="$(xml_escape "${label}")"
   command_xml="$(xml_escape "${command}")"
@@ -649,6 +655,15 @@ write_plist() {
 "
   fi
 
+  # launchd plist integers are decimal: 63 is octal 077. Scope this to
+  # memoryd so every file and directory it creates inherits private defaults;
+  # the other daemons retain their existing process umask.
+  umask_xml=""
+  if [ "${label}" = "com.alphaloop.memoryd" ]; then
+    umask_xml='    <key>Umask</key>
+    <integer>63</integer>'
+  fi
+
   cat > "${plist_path}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -664,6 +679,7 @@ write_plist() {
     <true/>
     <key>KeepAlive</key>
     <${keep_alive}/>
+${umask_xml}
 ${schedule_xml}
     <key>WorkingDirectory</key>
     <string>${repo_root_xml}</string>
