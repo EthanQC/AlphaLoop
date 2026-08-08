@@ -505,7 +505,7 @@ describe("launchd ownership manifest", () => {
   });
 
   // The manifest's prose explains each decision and therefore names labels
-  // inside comments (why rsshub stays user-level, which daemon supersedes
+  // inside comments (why rsshub belongs in the system domain, which daemon supersedes
   // broker-executor). A parser that took the first line mentioning a label
   // resolved rsshub's scope to "#" and skipped installing it entirely - which
   // is exactly what the awk lookups in both shell installers did before the
@@ -1021,7 +1021,7 @@ describe("install-system-daemons.sh (Task 9: unattended services survive a login
       expect(output).toContain("com.alphaloop.platform-app");
       expect(output).toContain("Bootstrap failed: 5: Input/output error");
       // Names how many are up, so "it failed" is never read as "nothing runs".
-      expect(output).toMatch(/8 of 9 ARE running/u);
+      expect(output).toMatch(/9 of 10 ARE running/u);
       // Round-5 D1/D4: the failed service's own fallback is put back, and the
       // operator is told not to reach for the installer that used to delete it.
       expect(output).toMatch(/DO NOT run 'pnpm launchd:install-user' as a workaround/u);
@@ -1445,7 +1445,7 @@ describe("round 6: a deploy-path failure cannot end in a green gate", () => {
     const { status, output } = runSystemDaemonsExpectingFailure(machine);
 
     expect(status).toBe(1);
-    expect(output).toMatch(/FAILED - 3 of 9 daemons did not come up/u);
+    expect(output).toMatch(/FAILED - 3 of 10 daemons did not come up/u);
     expect(output).toMatch(/com\.alphaloop\.platform-app: bootstrapped but NOT RUNNING/u);
     expect(output).toMatch(/com\.alphaloop\.market-alerts: its first run under launchd failed/u);
     expect(output).toMatch(/last exit code = 1/u);

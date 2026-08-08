@@ -340,8 +340,8 @@ const ALERTS_CONSECUTIVE_FAILURE_THRESHOLD = 3;
 const RSSHUB_HEALTH_DEFAULT_BASE_URL = "http://127.0.0.1:1200";
 const RSSHUB_HEALTH_TIMEOUT_MS = 1500;
 // The real, one-time P10 ignition command that creates the container this
-// check is probing (see apps/openclaw-config/launchd/com.alphaloop.rsshub.
-// plist.template's own header comment) - named in the unreachable warning so
+// check is probing (see the RSSHub write_plist block in
+// install-system-daemons.sh) - named in the unreachable warning so
 // an operator who has never run P10 yet gets the actual next step, not just
 // "it's down".
 const RSSHUB_P10_CONTAINER_COMMAND = "docker run -d --name rsshub -p 127.0.0.1:1200:1200 diygod/rsshub";
