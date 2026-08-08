@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,10 @@ function seedTradingDb(dbPath: string): void {
     VALUES (?, ?, ?, ?, ?)
   `).run("audit_seed", "backup-test", "seed", "{}", Date.now());
   db.close();
+}
+
+function permissions(path: string): number {
+  return statSync(path).mode & 0o777;
 }
 
 describe("formatLocalDate", () => {
@@ -195,6 +199,122 @@ describe("memoryd archiving", () => {
 
     expect(existsSync(join(destDir, "trading-2026-07-12.sqlite"))).toBe(false);
     expect(existsSync(join(destDir, "memoryd-2026-07-12.tgz"))).toBe(false);
+  });
+});
+
+describe("backup artifact permissions", () => {
+  it("creates the managed backup directory and trading SQLite snapshot owner-only", () => {
+    const dbDir = makeTempDir("alphaloop-backup-permissions-db-");
+    const parentDir = makeTempDir("alphaloop-backup-permissions-parent-");
+    const destDir = join(parentDir, "managed-backups");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+
+    const result = backup.runBackup({
+      dbPath,
+      dest: destDir,
+      now: new Date("2026-07-12T01:00:00.000Z")
+    });
+
+    expect(permissions(destDir)).toBe(0o700);
+    expect(permissions(result.files[0]!)).toBe(0o600);
+  });
+
+  it("creates the memoryd tarball owner-only even under a permissive ambient umask", () => {
+    const dbDir = makeTempDir("alphaloop-memoryd-permissions-db-");
+    const destDir = join(makeTempDir("alphaloop-memoryd-permissions-parent-"), "managed-backups");
+    const memorydRoot = makeTempDir("alphaloop-memoryd-permissions-root-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    seedTradingDb(dbPath);
+    writeFileSync(join(memorydRoot, "notes.md"), "private memory");
+
+    const previousUmask = process.umask(0o000);
+    try {
+      const result = backup.runBackup({
+        dbPath,
+        dest: destDir,
+        memorydRoot,
+        now: new Date("2026-07-12T01:00:00.000Z")
+      });
+      const memorydBackup = join(destDir, "memoryd-2026-07-12.tgz");
+
+      expect(result.files).toContain(memorydBackup);
+      expect(permissions(memorydBackup)).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("hardens retained managed artifacts without changing unrelated pre-existing content", () => {
+    const dbDir = makeTempDir("alphaloop-retained-permissions-db-");
+    const destDir = makeTempDir("alphaloop-retained-permissions-dest-");
+    const dbPath = join(dbDir, "trading.sqlite");
+    const retainedSqlite = join(destDir, "trading-2026-07-11.sqlite");
+    const retainedTarball = join(destDir, "memoryd-2026-07-11.tgz");
+    const unrelatedFile = join(destDir, "README.md");
+    seedTradingDb(dbPath);
+    writeFileSync(retainedSqlite, "old private sqlite backup");
+    writeFileSync(retainedTarball, "old private memoryd backup");
+    writeFileSync(unrelatedFile, "unrelated file");
+    chmodSync(retainedSqlite, 0o644);
+    chmodSync(retainedTarball, 0o644);
+    chmodSync(unrelatedFile, 0o644);
+
+    backup.runBackup({
+      dbPath,
+      dest: destDir,
+      retentionDays: 30,
+      now: new Date("2026-07-12T01:00:00.000Z")
+    });
+
+    expect(permissions(retainedSqlite)).toBe(0o600);
+    expect(permissions(retainedTarball)).toBe(0o600);
+    expect(permissions(unrelatedFile)).toBe(0o644);
+  });
+
+  it("creates the memoryd temporary artifact owner-only under a permissive ambient umask", () => {
+    const destDir = makeTempDir("alphaloop-memoryd-tmp-permissions-dest-");
+    const memorydRoot = makeTempDir("alphaloop-memoryd-tmp-permissions-root-");
+    const destPath = join(destDir, "memoryd-2026-07-12.tgz");
+    writeFileSync(join(memorydRoot, "notes.md"), "private memory");
+
+    const previousUmask = process.umask(0o000);
+    try {
+      backup.backupMemorydRoot(memorydRoot, destPath, {
+        spawnTar: (_command: string, args: string[]) => {
+          const tmpPath = args[1]!;
+          writeFileSync(tmpPath, "tar output in progress");
+          expect(permissions(tmpPath)).toBe(0o600);
+          return { status: 0 };
+        }
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(permissions(destPath)).toBe(0o600);
+  });
+
+  it("preserves an existing memoryd archive and removes its temporary file when permission hardening fails", () => {
+    const destDir = makeTempDir("alphaloop-memoryd-harden-fail-dest-");
+    const memorydRoot = makeTempDir("alphaloop-memoryd-harden-fail-root-");
+    const destPath = join(destDir, "memoryd-2026-07-12.tgz");
+    const goodBytes = Buffer.from("known-good archive");
+    writeFileSync(join(memorydRoot, "notes.md"), "private memory");
+    writeFileSync(destPath, goodBytes);
+
+    expect(() => backup.backupMemorydRoot(memorydRoot, destPath, {
+      spawnTar: (_command: string, args: string[]) => {
+        writeFileSync(args[1]!, "new archive awaiting hardening");
+        return { status: 0 };
+      },
+      hardenArtifact: () => {
+        throw new Error("permission hardening denied");
+      }
+    })).toThrow(/permission hardening denied/u);
+
+    expect(readFileSync(destPath).equals(goodBytes)).toBe(true);
+    expect(existsSync(`${destPath}.tmp`)).toBe(false);
   });
 });
 

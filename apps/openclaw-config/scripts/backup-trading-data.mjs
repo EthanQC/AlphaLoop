@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,35 @@ const BACKUP_FILE_PATTERN = /^(?:trading|memoryd)-(\d{4}-\d{2}-\d{2})\.(?:sqlite
 // tmp file stamped with a PREVIOUS day's date is a hard-crash leftover (process killed mid-VACUUM
 // before the rename) that nothing else will ever revisit, so without this it lingers forever.
 const TMP_BACKUP_FILE_PATTERN = /^(?:trading|memoryd)-(\d{4}-\d{2}-\d{2})\.(?:sqlite|tgz)\.tmp$/u;
+const OWNER_ONLY_DIRECTORY_MODE = 0o700;
+const OWNER_ONLY_FILE_MODE = 0o600;
+
+/** Runs synchronous artifact creation with an owner-only umask, then restores the caller's mask. */
+function withOwnerOnlyUmask(operation) {
+  const previousUmask = process.umask(0o077);
+  try {
+    return operation();
+  } finally {
+    process.umask(previousUmask);
+  }
+}
+
+/** Applies the final owner-only mode before an artifact is atomically published. */
+function hardenTemporaryArtifact(tmpPath) {
+  chmodSync(tmpPath, OWNER_ONLY_FILE_MODE);
+}
+
+/** Hardens only regular backup artifacts already managed in this directory; unrelated entries stay untouched. */
+function hardenManagedBackupArtifacts(dest) {
+  for (const entry of readdirSync(dest)) {
+    if (!parseBackupFileDate(entry)) continue;
+
+    const artifactPath = join(dest, entry);
+    if (lstatSync(artifactPath).isFile()) {
+      hardenTemporaryArtifact(artifactPath);
+    }
+  }
+}
 
 /**
  * Formats a date as a YYYY-MM-DD calendar date in the given IANA time zone.
@@ -140,7 +169,7 @@ export function backupTradingDatabase(dbPath, destPath) {
   const sourceDb = new DatabaseSync(dbPath, { readOnly: true, timeout: 5000 });
   try {
     try {
-      sourceDb.exec(`VACUUM INTO '${escapeSqliteLiteral(tmpPath)}'`);
+      withOwnerOnlyUmask(() => sourceDb.exec(`VACUUM INTO '${escapeSqliteLiteral(tmpPath)}'`));
     } finally {
       sourceDb.close();
     }
@@ -153,8 +182,16 @@ export function backupTradingDatabase(dbPath, destPath) {
     throw error;
   }
 
-  // VACUUM INTO succeeded; atomically replace the destination with the finished snapshot.
-  renameSync(tmpPath, destPath);
+  // Harden the temporary output before publishing it. If this fails, leave any prior same-day
+  // backup untouched and remove the new temporary file rather than publishing it permissively.
+  try {
+    hardenTemporaryArtifact(tmpPath);
+    // VACUUM INTO succeeded; atomically replace the destination with the finished snapshot.
+    renameSync(tmpPath, destPath);
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
+    throw error;
+  }
 }
 
 /**
@@ -163,7 +200,10 @@ export function backupTradingDatabase(dbPath, destPath) {
  * online multi-file SQLite snapshot, and memoryd rebuilds these derived files
  * from Markdown after restore.
  */
-export function backupMemorydRoot(memorydRoot, destPath, { spawnTar = spawnSync } = {}) {
+export function backupMemorydRoot(memorydRoot, destPath, {
+  spawnTar = spawnSync,
+  hardenArtifact = hardenTemporaryArtifact
+} = {}) {
   const tmpPath = `${destPath}.tmp`;
   rmSync(tmpPath, { force: true });
 
@@ -176,11 +216,12 @@ export function backupMemorydRoot(memorydRoot, destPath, { spawnTar = spawnSync 
     "."
   ];
   try {
-    const result = spawnTar("tar", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const result = withOwnerOnlyUmask(() => spawnTar("tar", args, { stdio: ["ignore", "ignore", "pipe"] }));
     if (result.error) throw result.error;
     if (result.status !== 0) {
       throw new Error(`tar exited with status ${result.status}: ${result.stderr?.toString("utf8") ?? ""}`);
     }
+    hardenArtifact(tmpPath);
     renameSync(tmpPath, destPath);
   } catch (error) {
     rmSync(tmpPath, { force: true });
@@ -226,7 +267,9 @@ export function runBackup({
   // step happens to notice first.
   assertValidRetentionDays(retentionDays);
 
-  mkdirSync(dest, { recursive: true });
+  mkdirSync(dest, { recursive: true, mode: OWNER_ONLY_DIRECTORY_MODE });
+  chmodSync(dest, OWNER_ONLY_DIRECTORY_MODE);
+  hardenManagedBackupArtifacts(dest);
   const dateStamp = formatLocalDate(now, timeZone);
 
   const files = [];
